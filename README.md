@@ -176,10 +176,6 @@ cmd_set:3
 | Expiration | Background sweep | Background sweep |
 | Async I/O | epoll/kqueue/io_uring | Tokio |
 
-## License
-
-See LICENSE file for details.
-
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
