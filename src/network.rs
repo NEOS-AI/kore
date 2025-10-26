@@ -12,6 +12,8 @@ pub struct Server {
     config: Arc<Config>,
 }
 
+const BUFFER_SIZE: usize = 8192;
+
 impl Server {
     pub fn new(cache: Arc<Cache>, config: Arc<Config>) -> Self {
         Self { cache, config }
@@ -59,9 +61,10 @@ async fn handle_connection(
     // Set TCP_NODELAY (disable Nagle's algorithm)
     socket.set_nodelay(true)?;
 
+    // RESP (REdis Serialization Protocol) parser and command handler
     let mut parser = RespParser::new();
     let mut handler = CommandHandler::new(cache, config);
-    let mut buf = vec![0u8; 8192];
+    let mut buf = vec![0u8; BUFFER_SIZE]; // 8KB buffer
 
     loop {
         // Read data from socket

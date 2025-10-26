@@ -1,5 +1,5 @@
-use bytes::{Buf, Bytes, BytesMut};
 use crate::error::{Error, Result};
+use bytes::{Buf, Bytes, BytesMut};
 
 /// RESP (REdis Serialization Protocol) value types
 #[derive(Debug, Clone, PartialEq)]
@@ -316,10 +316,7 @@ mod tests {
         parser.feed(b"$6\r\nfoobar\r\n");
 
         let value = parser.parse().unwrap().unwrap();
-        assert_eq!(
-            value,
-            RespValue::BulkString(Some(Bytes::from("foobar")))
-        );
+        assert_eq!(value, RespValue::BulkString(Some(Bytes::from("foobar"))));
     }
 
     #[test]
@@ -339,14 +336,8 @@ mod tests {
         let value = parser.parse().unwrap().unwrap();
         let arr = value.as_array().unwrap();
         assert_eq!(arr.len(), 2);
-        assert_eq!(
-            arr[0],
-            RespValue::BulkString(Some(Bytes::from("foo")))
-        );
-        assert_eq!(
-            arr[1],
-            RespValue::BulkString(Some(Bytes::from("bar")))
-        );
+        assert_eq!(arr[0], RespValue::BulkString(Some(Bytes::from("foo"))));
+        assert_eq!(arr[1], RespValue::BulkString(Some(Bytes::from("bar"))));
     }
 
     #[test]
