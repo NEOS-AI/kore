@@ -34,6 +34,8 @@ impl Server {
                     let cache = self.cache.clone();
                     let config = self.config.clone();
 
+                    // Spawn a new task to handle the connection
+                    // Tokio will schedule this on its thread pool (number of threads configured at runtime)
                     tokio::spawn(async move {
                         if let Err(e) = handle_connection(socket, cache, config).await {
                             warn!("Connection error from {}: {}", peer_addr, e);
