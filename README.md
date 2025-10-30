@@ -1,6 +1,6 @@
 # Kore
 
-A low-latency, high-performance caching database written in Rust, inspired by [pogocache](../pogocache).
+A low-latency, high-performance caching database written in Rust.
 
 ## Features
 
@@ -175,7 +175,3 @@ cmd_set:3
 | Eviction | 2-random | 2-random |
 | Expiration | Background sweep | Background sweep |
 | Async I/O | epoll/kqueue/io_uring | Tokio |
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
