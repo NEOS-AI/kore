@@ -306,7 +306,8 @@ impl Cache {
         }
     }
 
-    /// Evict entries using 2-random algorithm
+    /// Evict entries using 2-random algorithm.
+    /// When memory is full, randomly pick two entries and evict the older one.
     fn evict_lru(&self, needed: usize) -> Result<()> {
         let mut freed = 0;
 
@@ -323,8 +324,13 @@ impl Cache {
                 .min_by_key(|(_, entry)| entry.created_at);
 
             if let Some((key, entry)) = oldest {
-                self.map.remove(&key);
-                freed += entry.size();
+                // log eviction
+                tracing::debug!("Evicting key {:?} (created at {:?})", key, entry.created_at);
+
+                self.map.remove(&key);  // Remove from map
+                freed += entry.size();  // Keep track of freed memory
+
+                // Update memory usage
                 self.memory_usage
                     .fetch_sub(entry.size(), Ordering::Relaxed);
                 self.stats.incr(&self.stats.evicted_lru);
