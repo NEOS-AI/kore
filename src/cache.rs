@@ -60,8 +60,8 @@ impl Cache {
         value: Bytes,
         opts: StoreOptions,
     ) -> Result<Option<SharedEntry>> {
-        // Check entry size
-        let entry_size = key.len() + value.len();
+        // Check entry size (including struct overhead)
+        let entry_size = key.len() + value.len() + std::mem::size_of::<Entry>();
         let max_entry_size = self.max_entry_size.load(Ordering::Relaxed);
         if entry_size > max_entry_size {
             self.stats.incr(&self.stats.store_too_large);

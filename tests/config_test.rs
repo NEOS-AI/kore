@@ -106,20 +106,23 @@ async fn test_runtime_max_entry_size_change() {
 async fn test_max_entry_size_boundary() {
     let max_size = 5 * 1024 * 1024; // 5MB
     let cache = Cache::new_with_sweep(16, 1024 * 1024 * 100, max_size, false);
-    
-    // Test exactly at the boundary (key + value = max_size)
+
+    // Calculate the overhead size (Entry struct size)
+    let entry_overhead = std::mem::size_of::<kore::entry::Entry>();
+
+    // Test exactly at the boundary (key + value + overhead = max_size)
     let key = Bytes::from("test_key");
     let key_len = key.len();
-    let value = Bytes::from(vec![b'x'; max_size - key_len]);
-    
+    let value = Bytes::from(vec![b'x'; max_size - key_len - entry_overhead]);
+
     let result = cache.store(key.clone(), value, Default::default());
     assert!(result.is_ok());
-    
+
     // Test just over the boundary
     let key2 = Bytes::from("test_key2");
     let key2_len = key2.len();
-    let value2 = Bytes::from(vec![b'y'; max_size - key2_len + 1]);
-    
+    let value2 = Bytes::from(vec![b'y'; max_size - key2_len - entry_overhead + 1]);
+
     let result2 = cache.store(key2, value2, Default::default());
     assert!(result2.is_err());
 }

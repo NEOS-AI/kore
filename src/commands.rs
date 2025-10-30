@@ -471,7 +471,7 @@ impl CommandHandler {
         let stats = &self.cache.stats;
         let info = format!(
             "# Server\r\n\
-             kore_version:0.1.0\r\n\
+             kore_version:{}\r\n\
              \r\n\
              # Stats\r\n\
              total_commands_processed:{}\r\n\
@@ -493,6 +493,7 @@ impl CommandHandler {
              \r\n\
              # Keyspace\r\n\
              db0:keys={}\r\n",
+            env!("CARGO_PKG_VERSION"),
             stats.cmd_get.load(Ordering::Relaxed)
                 + stats.cmd_set.load(Ordering::Relaxed)
                 + stats.cmd_del.load(Ordering::Relaxed),
