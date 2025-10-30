@@ -98,9 +98,6 @@ async fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
 
     async fn setup_test_server() -> (Arc<Cache>, Arc<Config>, String) {
         let config = Arc::new(Config {
@@ -114,6 +111,7 @@ mod tests {
             loadfactor: 0.75,
             maxconns: 100,
             auth: String::new(),
+            maxentrysize: 500 * 1024 * 1024, // 500MB
             verbosity: 0,
         });
 

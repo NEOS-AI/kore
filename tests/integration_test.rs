@@ -4,7 +4,7 @@ use kore::Cache;
 
 #[test]
 fn test_basic_set_get() {
-    let cache = Cache::new_with_sweep(16, 1024 * 1024 * 100, false); // 100MB, no background sweep
+    let cache = Cache::new_with_sweep(16, 1024 * 1024 * 100, 500 * 1024 * 1024, false); // 100MB, no background sweep
 
     let key = Bytes::from("test_key");
     let value = Bytes::from("test_value");
@@ -19,7 +19,7 @@ fn test_basic_set_get() {
 
 #[test]
 fn test_delete() {
-    let cache = Cache::new_with_sweep(16, 1024 * 1024 * 100, false);
+    let cache = Cache::new_with_sweep(16, 1024 * 1024 * 100, 500 * 1024 * 1024, false);
 
     let key = Bytes::from("test_key");
     let value = Bytes::from("test_value");
@@ -33,7 +33,7 @@ fn test_delete() {
 
 #[test]
 fn test_incr_decr() {
-    let cache = Cache::new_with_sweep(16, 1024 * 1024 * 100, false);
+    let cache = Cache::new_with_sweep(16, 1024 * 1024 * 100, 500 * 1024 * 1024, false);
 
     let key = Bytes::from("counter");
 
@@ -52,7 +52,7 @@ fn test_incr_decr() {
 
 #[test]
 fn test_nx_option() {
-    let cache = Cache::new_with_sweep(16, 1024 * 1024 * 100, false);
+    let cache = Cache::new_with_sweep(16, 1024 * 1024 * 100, 500 * 1024 * 1024, false);
 
     let key = Bytes::from("test_key");
     let value1 = Bytes::from("value1");
@@ -79,7 +79,7 @@ fn test_nx_option() {
 
 #[test]
 fn test_xx_option() {
-    let cache = Cache::new_with_sweep(16, 1024 * 1024 * 100, false);
+    let cache = Cache::new_with_sweep(16, 1024 * 1024 * 100, 500 * 1024 * 1024, false);
 
     let key = Bytes::from("test_key");
     let value1 = Bytes::from("value1");
@@ -107,7 +107,7 @@ fn test_xx_option() {
 fn test_expiration() {
     use std::time::Duration;
 
-    let cache = Cache::new_with_sweep(16, 1024 * 1024 * 100, false);
+    let cache = Cache::new_with_sweep(16, 1024 * 1024 * 100, 500 * 1024 * 1024, false);
 
     let key = Bytes::from("temp_key");
     let value = Bytes::from("temp_value");
@@ -132,7 +132,7 @@ fn test_expiration() {
 
 #[test]
 fn test_flush() {
-    let cache = Cache::new_with_sweep(16, 1024 * 1024 * 100, false);
+    let cache = Cache::new_with_sweep(16, 1024 * 1024 * 100, 500 * 1024 * 1024, false);
 
     // Add some entries
     for i in 0..10 {
@@ -151,7 +151,7 @@ fn test_flush() {
 
 #[test]
 fn test_keys_pattern() {
-    let cache = Cache::new_with_sweep(16, 1024 * 1024 * 100, false);
+    let cache = Cache::new_with_sweep(16, 1024 * 1024 * 100, 500 * 1024 * 1024, false);
 
     // Add entries with different prefixes
     cache.store(Bytes::from("user:1"), Bytes::from("alice"), StoreOptions::default()).unwrap();
@@ -175,7 +175,7 @@ fn test_keys_pattern() {
 fn test_stats() {
     use std::sync::atomic::Ordering;
 
-    let cache = Cache::new_with_sweep(16, 1024 * 1024 * 100, false);
+    let cache = Cache::new_with_sweep(16, 1024 * 1024 * 100, 500 * 1024 * 1024, false);
 
     let key = Bytes::from("test_key");
     let value = Bytes::from("test_value");

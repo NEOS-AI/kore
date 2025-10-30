@@ -18,6 +18,8 @@ pub struct Cache {
     pub max_memory: usize,
     /// Current memory usage
     memory_usage: AtomicUsize,
+    /// Maximum entry size in bytes
+    max_entry_size: AtomicUsize,
     /// Enable eviction when memory is full
     evict_enabled: AtomicBool,
     /// Enable automatic sweeping
@@ -26,15 +28,16 @@ pub struct Cache {
 
 impl Cache {
     pub fn new(num_shards: usize, max_memory: usize) -> Arc<Self> {
-        Self::new_with_sweep(num_shards, max_memory, true)
+        Self::new_with_sweep(num_shards, max_memory, 500 * 1024 * 1024, true)
     }
 
-    pub fn new_with_sweep(num_shards: usize, max_memory: usize, start_sweep: bool) -> Arc<Self> {
+    pub fn new_with_sweep(num_shards: usize, max_memory: usize, max_entry_size: usize, start_sweep: bool) -> Arc<Self> {
         let cache = Arc::new(Self {
             map: ShardedHashMap::new(num_shards, 1024),
             stats: Arc::new(Stats::new()),
             max_memory,
             memory_usage: AtomicUsize::new(0),
+            max_entry_size: AtomicUsize::new(max_entry_size),
             evict_enabled: AtomicBool::new(true),
             autosweep_enabled: AtomicBool::new(true),
         });
@@ -59,8 +62,8 @@ impl Cache {
     ) -> Result<Option<SharedEntry>> {
         // Check entry size
         let entry_size = key.len() + value.len();
-        if entry_size > 500 * 1024 * 1024 {
-            // 500MB max
+        let max_entry_size = self.max_entry_size.load(Ordering::Relaxed);
+        if entry_size > max_entry_size {
             self.stats.incr(&self.stats.store_too_large);
             return Err(Error::EntryTooLarge);
         }
@@ -384,5 +387,24 @@ impl Cache {
     /// Set eviction enabled
     pub fn set_evict(&self, enabled: bool) {
         self.evict_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Get maximum entry size
+    pub fn get_max_entry_size(&self) -> usize {
+        self.max_entry_size.load(Ordering::Relaxed)
+    }
+
+    /// Set maximum entry size with validation
+    pub fn set_max_entry_size(&self, size: usize) -> Result<()> {
+        // Minimum 1KB
+        if size < 1024 {
+            return Err(Error::InvalidArgument("max entry size too small (minimum 1KB)".into()));
+        }
+        // Cannot exceed max memory
+        if size > self.max_memory {
+            return Err(Error::InvalidArgument("max entry size cannot exceed max memory".into()));
+        }
+        self.max_entry_size.store(size, Ordering::Relaxed);
+        Ok(())
     }
 }

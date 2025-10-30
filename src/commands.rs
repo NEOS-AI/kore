@@ -72,6 +72,7 @@ impl CommandHandler {
             "FLUSHDB" | "FLUSHALL" => self.handle_flush(&args[1..]),
             "INFO" => self.handle_info(&args[1..]),
             "SWEEP" => self.handle_sweep(&args[1..]),
+            "CONFIG" => self.handle_config(&args[1..]),
             _ => Ok(RespValue::error(format!("ERR unknown command '{}'", cmd_upper))),
         }
     }
@@ -488,6 +489,7 @@ impl CommandHandler {
              # Memory\r\n\
              used_memory:{}\r\n\
              maxmemory:{}\r\n\
+             maxentrysize:{}\r\n\
              \r\n\
              # Keyspace\r\n\
              db0:keys={}\r\n",
@@ -506,6 +508,7 @@ impl CommandHandler {
             stats.evicted_lru.load(Ordering::Relaxed),
             self.cache.memory_usage(),
             self.cache.max_memory,
+            self.cache.get_max_entry_size(),
             self.cache.dbsize(),
         );
 
@@ -531,5 +534,72 @@ impl CommandHandler {
         }
 
         Err(Error::InvalidArgument("expected integer".into()))
+    }
+
+    fn handle_config(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            return Ok(RespValue::error("ERR wrong number of arguments for 'config'"));
+        }
+
+        let subcmd = match args[0].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_uppercase(),
+            None => return Ok(RespValue::error("ERR invalid subcommand")),
+        };
+
+        match subcmd.as_str() {
+            "GET" => {
+                if args.len() != 2 {
+                    return Ok(RespValue::error("ERR wrong number of arguments for 'config get'"));
+                }
+
+                let param = match args[1].as_bulk_string() {
+                    Some(s) => String::from_utf8_lossy(s).to_lowercase(),
+                    None => return Ok(RespValue::error("ERR invalid parameter")),
+                };
+
+                match param.as_str() {
+                    "maxentrysize" | "max-entry-size" => {
+                        let value = self.cache.get_max_entry_size();
+                        Ok(RespValue::Array(vec![
+                            RespValue::BulkString(Some(Bytes::from("maxentrysize"))),
+                            RespValue::BulkString(Some(Bytes::from(value.to_string()))),
+                        ]))
+                    }
+                    _ => {
+                        // Return empty array for unknown parameters (Redis behavior)
+                        Ok(RespValue::Array(vec![]))
+                    }
+                }
+            }
+            "SET" => {
+                if args.len() != 3 {
+                    return Ok(RespValue::error("ERR wrong number of arguments for 'config set'"));
+                }
+
+                let param = match args[1].as_bulk_string() {
+                    Some(s) => String::from_utf8_lossy(s).to_lowercase(),
+                    None => return Ok(RespValue::error("ERR invalid parameter")),
+                };
+
+                let value_str = match args[2].as_bulk_string() {
+                    Some(s) => String::from_utf8_lossy(s),
+                    None => return Ok(RespValue::error("ERR invalid value")),
+                };
+
+                match param.as_str() {
+                    "maxentrysize" | "max-entry-size" => {
+                        let size: usize = value_str.parse()
+                            .map_err(|_| Error::InvalidArgument("invalid size".into()))?;
+                        
+                        match self.cache.set_max_entry_size(size) {
+                            Ok(_) => Ok(RespValue::ok()),
+                            Err(e) => Ok(RespValue::error(format!("ERR {}", e))),
+                        }
+                    }
+                    _ => Ok(RespValue::error("ERR Unsupported CONFIG parameter")),
+                }
+            }
+            _ => Ok(RespValue::error("ERR Unknown subcommand or wrong number of arguments")),
+        }
     }
 }

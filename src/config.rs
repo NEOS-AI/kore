@@ -45,6 +45,10 @@ pub struct Config {
     #[arg(long, default_value = "")]
     pub auth: String,
 
+    /// Maximum entry size in bytes (default: 500MB)
+    #[arg(long, default_value = "524288000")]
+    pub maxentrysize: usize,
+
     /// Verbosity level (0-3)
     #[arg(short = 'v', long, default_value = "1")]
     pub verbosity: u8,

@@ -55,6 +55,7 @@ With custom options:
 - `--threads <THREADS>`: Number of worker threads (default: number of CPU cores)
 - `--shards <SHARDS>`: Number of shards for the hashmap (default: 4096)
 - `--maxmemory <BYTES>`: Maximum memory in bytes (default: 80% of system memory)
+- `--maxentrysize <BYTES>`: Maximum entry size in bytes (default: 524288000 = 500MB)
 - `--evict <BOOL>`: Enable eviction when memory is full (default: true)
 - `--autosweep <BOOL>`: Enable automatic sweeping of expired entries (default: true)
 - `--loadfactor <FLOAT>`: Load factor (0.55-0.95) (default: 0.75)
@@ -96,6 +97,13 @@ With custom options:
 - `INFO` - Get server statistics
 - `SWEEP` - Manually trigger expired entry sweep
 
+### Configuration Operations
+- `CONFIG GET parameter` - Get runtime configuration value
+- `CONFIG SET parameter value` - Set runtime configuration value
+
+#### Supported CONFIG Parameters
+- `maxentrysize` / `max-entry-size` - Maximum entry size in bytes (minimum: 1024, cannot exceed maxmemory)
+
 ## Example Usage
 
 Using redis-cli or any Redis-compatible client:
@@ -117,6 +125,26 @@ OK
 
 127.0.0.1:6379> INCRBY counter 10
 (integer) 11
+
+127.0.0.1:6379> CONFIG GET maxentrysize
+1) "maxentrysize"
+2) "524288000"
+
+127.0.0.1:6379> CONFIG SET maxentrysize 104857600
+OK
+
+127.0.0.1:6379> INFO
+# Server
+kore_version:0.1.0
+
+# Stats
+...
+
+# Memory
+used_memory:...
+maxmemory:...
+maxentrysize:104857600
+...
 
 127.0.0.1:6379> SET tempkey "expires soon" EX 60
 OK
@@ -162,16 +190,3 @@ cmd_set:3
 - RESP (REdis Serialization Protocol) parser
 - Supports all RESP value types: simple strings, errors, integers, bulk strings, arrays
 - Zero-copy parsing where possible
-
-## Comparison with Pogocache
-
-| Feature | Pogocache (C) | Kore (Rust) |
-|---------|---------------|-------------|
-| Language | C | Rust |
-| Concurrency | Spinlocks | RwLock (parking_lot) |
-| Memory Safety | Manual | Automatic (Rust) |
-| Protocol | RESP + Memcache + HTTP + Postgres | RESP |
-| Hashing | Robin Hood (custom) | std::HashMap + ahash |
-| Eviction | 2-random | 2-random |
-| Expiration | Background sweep | Background sweep |
-| Async I/O | epoll/kqueue/io_uring | Tokio |

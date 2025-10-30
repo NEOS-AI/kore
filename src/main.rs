@@ -34,7 +34,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Create cache
     let max_memory = config.max_memory();
-    let cache = Cache::new(config.shards, max_memory);
+    let max_entry_size = config.maxentrysize;
+    let cache = Cache::new_with_sweep(config.shards, max_memory, max_entry_size, true);
     cache.set_evict(config.evict);
     cache.set_autosweep(config.autosweep);
 
@@ -43,6 +44,11 @@ async fn main() -> anyhow::Result<()> {
         "Max memory: {} bytes (~{} MB)",
         max_memory,
         max_memory / (1024 * 1024)
+    );
+    info!(
+        "Max entry size: {} bytes (~{} MB)",
+        max_entry_size,
+        max_entry_size / (1024 * 1024)
     );
     info!(
         "Eviction: {}",
