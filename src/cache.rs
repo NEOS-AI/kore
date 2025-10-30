@@ -70,10 +70,18 @@ impl Cache {
 
         // Check memory before insert
         let current_memory = self.memory_usage.load(Ordering::Relaxed);
-        if current_memory + entry_size > self.max_memory {
+
+        // If key already exists, we need to account for the memory that will be freed
+        let existing_size = self.map.get(&key)
+            .map(|e| e.size())
+            .unwrap_or(0);
+
+        let net_memory_change = entry_size.saturating_sub(existing_size);
+
+        if current_memory + net_memory_change > self.max_memory {
             if self.evict_enabled.load(Ordering::Relaxed) {
                 // Try to evict entries to make space
-                self.evict_lru(entry_size)?;
+                self.evict_lru(net_memory_change)?;
             } else {
                 self.stats.incr(&self.stats.store_no_memory);
                 return Err(Error::OutOfMemory);
