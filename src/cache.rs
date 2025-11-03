@@ -24,6 +24,8 @@ pub struct Cache {
     evict_enabled: AtomicBool,
     /// Enable automatic sweeping
     autosweep_enabled: AtomicBool,
+    /// Number of samples for approximated LRU eviction (default: 5)
+    eviction_sample_size: AtomicUsize,
 }
 
 impl Cache {
@@ -31,7 +33,12 @@ impl Cache {
         Self::new_with_sweep(num_shards, max_memory, 500 * 1024 * 1024, true)
     }
 
-    pub fn new_with_sweep(num_shards: usize, max_memory: usize, max_entry_size: usize, start_sweep: bool) -> Arc<Self> {
+    pub fn new_with_sweep(
+        num_shards: usize,
+        max_memory: usize,
+        max_entry_size: usize,
+        start_sweep: bool,
+    ) -> Arc<Self> {
         let cache = Arc::new(Self {
             map: ShardedHashMap::new(num_shards, 1024),
             stats: Arc::new(Stats::new()),
@@ -40,6 +47,7 @@ impl Cache {
             max_entry_size: AtomicUsize::new(max_entry_size),
             evict_enabled: AtomicBool::new(true),
             autosweep_enabled: AtomicBool::new(true),
+            eviction_sample_size: AtomicUsize::new(5), // Redis default
         });
 
         // Start background sweep task if requested
@@ -72,9 +80,7 @@ impl Cache {
         let current_memory = self.memory_usage.load(Ordering::Relaxed);
 
         // If key already exists, we need to account for the memory that will be freed
-        let existing_size = self.map.get(&key)
-            .map(|e| e.size())
-            .unwrap_or(0);
+        let existing_size = self.map.get(&key).map(|e| e.size()).unwrap_or(0);
 
         let net_memory_change = entry_size.saturating_sub(existing_size);
 
@@ -165,11 +171,9 @@ impl Cache {
 
         // Update memory usage
         if let Some(ref old) = old_entry {
-            self.memory_usage
-                .fetch_sub(old.size(), Ordering::Relaxed);
+            self.memory_usage.fetch_sub(old.size(), Ordering::Relaxed);
         }
-        self.memory_usage
-            .fetch_add(entry_size, Ordering::Relaxed);
+        self.memory_usage.fetch_add(entry_size, Ordering::Relaxed);
 
         // Update stats
         self.stats.incr(&self.stats.cmd_set);
@@ -178,7 +182,7 @@ impl Cache {
     }
 
     /// Load a key
-    pub fn load(&self, key: &Bytes, _opts: LoadOptions) -> Result<Option<SharedEntry>> {
+    pub fn load(&self, key: &Bytes, opts: LoadOptions) -> Result<Option<SharedEntry>> {
         self.stats.incr(&self.stats.cmd_get);
 
         match self.map.get(key) {
@@ -186,12 +190,15 @@ impl Cache {
                 if entry.is_expired() {
                     // Remove expired entry
                     self.map.remove(key);
-                    self.memory_usage
-                        .fetch_sub(entry.size(), Ordering::Relaxed);
+                    self.memory_usage.fetch_sub(entry.size(), Ordering::Relaxed);
                     self.stats.incr(&self.stats.evicted_expired);
                     self.stats.incr(&self.stats.misses);
                     Ok(None)
                 } else {
+                    // Update last access time for LRU
+                    if opts.touch {
+                        entry.touch();
+                    }
                     self.stats.incr(&self.stats.hits);
                     Ok(Some(entry))
                 }
@@ -209,8 +216,7 @@ impl Cache {
 
         match self.map.remove(key) {
             Some(entry) => {
-                self.memory_usage
-                    .fetch_sub(entry.size(), Ordering::Relaxed);
+                self.memory_usage.fetch_sub(entry.size(), Ordering::Relaxed);
                 Ok(true)
             }
             None => Ok(false),
@@ -230,10 +236,7 @@ impl Cache {
 
     /// Check if key exists
     pub fn exists(&self, key: &Bytes) -> bool {
-        self.map
-            .get(key)
-            .map(|e| !e.is_expired())
-            .unwrap_or(false)
+        self.map.get(key).map(|e| !e.is_expired()).unwrap_or(false)
     }
 
     /// Get database size
@@ -278,11 +281,7 @@ impl Cache {
         let value_bytes = Bytes::from(new_value.to_string());
 
         // Store new value
-        self.store(
-            key.clone(),
-            value_bytes,
-            StoreOptions::default(),
-        )?;
+        self.store(key.clone(), value_bytes, StoreOptions::default())?;
 
         Ok(new_value)
     }
@@ -317,33 +316,39 @@ impl Cache {
         }
     }
 
-    /// Evict entries using 2-random algorithm.
-    /// When memory is full, randomly pick two entries and evict the older one.
+    /// Evict entries using approximated LRU algorithm.
+    /// Samples N random entries (default 5) and evicts the least recently used one.
+    /// This is much better than 2-random and is similar to what Redis uses.
     fn evict_lru(&self, needed: usize) -> Result<()> {
+        let sample_size = self.eviction_sample_size.load(Ordering::Relaxed);
         let mut freed = 0;
 
         while freed < needed {
-            let candidates = self.map.get_two_random();
+            // Get N random candidates for eviction
+            let candidates = self.map.get_n_random(sample_size);
 
             if candidates.is_empty() {
                 return Err(Error::OutOfMemory);
             }
 
-            // Evict the oldest one
-            let oldest = candidates
+            // Evict the least recently used one
+            let lru = candidates
                 .into_iter()
-                .min_by_key(|(_, entry)| entry.created_at);
+                .min_by_key(|(_, entry)| entry.last_access_time());
 
-            if let Some((key, entry)) = oldest {
+            if let Some((key, entry)) = lru {
                 // log eviction
-                tracing::debug!("Evicting key {:?} (created at {:?})", key, entry.created_at);
+                tracing::debug!(
+                    "Evicting key {:?} (last accessed at {:?})",
+                    key,
+                    entry.last_access_time()
+                );
 
-                self.map.remove(&key);  // Remove from map
-                freed += entry.size();  // Keep track of freed memory
+                self.map.remove(&key); // Remove from map
+                freed += entry.size(); // Keep track of freed memory
 
                 // Update memory usage
-                self.memory_usage
-                    .fetch_sub(entry.size(), Ordering::Relaxed);
+                self.memory_usage.fetch_sub(entry.size(), Ordering::Relaxed);
                 self.stats.incr(&self.stats.evicted_lru);
             } else {
                 break;
@@ -406,13 +411,39 @@ impl Cache {
     pub fn set_max_entry_size(&self, size: usize) -> Result<()> {
         // Minimum 1KB
         if size < 1024 {
-            return Err(Error::InvalidArgument("max entry size too small (minimum 1KB)".into()));
+            return Err(Error::InvalidArgument(
+                "max entry size too small (minimum 1KB)".into(),
+            ));
         }
         // Cannot exceed max memory
         if size > self.max_memory {
-            return Err(Error::InvalidArgument("max entry size cannot exceed max memory".into()));
+            return Err(Error::InvalidArgument(
+                "max entry size cannot exceed max memory".into(),
+            ));
         }
         self.max_entry_size.store(size, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Get eviction sample size
+    pub fn get_eviction_sample_size(&self) -> usize {
+        self.eviction_sample_size.load(Ordering::Relaxed)
+    }
+
+    /// Set eviction sample size with validation
+    pub fn set_eviction_sample_size(&self, size: usize) -> Result<()> {
+        // Minimum 1, maximum 100
+        if size < 1 {
+            return Err(Error::InvalidArgument(
+                "eviction sample size too small (minimum 1)".into(),
+            ));
+        }
+        if size > 100 {
+            return Err(Error::InvalidArgument(
+                "eviction sample size too large (maximum 100)".into(),
+            ));
+        }
+        self.eviction_sample_size.store(size, Ordering::Relaxed);
         Ok(())
     }
 }

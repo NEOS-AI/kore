@@ -239,13 +239,19 @@ impl ShardedHashMap {
 
     /// Get 2 random entries (for 2-random eviction algorithm)
     pub fn get_two_random(&self) -> Vec<(Bytes, SharedEntry)> {
-        let mut result = Vec::with_capacity(2);
+        self.get_n_random(2)
+    }
 
-        if let Some(entry) = self.get_random() {
-            result.push(entry);
-        }
-        if let Some(entry) = self.get_random() {
-            result.push(entry);
+    /// Get N random entries (for approximated LRU eviction)
+    pub fn get_n_random(&self, n: usize) -> Vec<(Bytes, SharedEntry)> {
+        let mut result = Vec::with_capacity(n);
+
+        for _ in 0..n {
+            if let Some(entry) = self.get_random() {
+                result.push(entry);
+            } else {
+                break;
+            }
         }
 
         result

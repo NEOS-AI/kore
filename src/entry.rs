@@ -1,9 +1,10 @@
 use bytes::Bytes;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Cache entry with reference counting and optional expiration
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Entry {
     /// The key
     pub key: Bytes,
@@ -11,6 +12,8 @@ pub struct Entry {
     pub value: Bytes,
     /// Creation time
     pub created_at: Instant,
+    /// Last access time (for LRU eviction) - stored as micros since creation
+    last_access_micros: AtomicU64,
     /// Expiration time (None = no expiration)
     pub expires_at: Option<Instant>,
     /// User-defined flags (for Memcache compatibility)
@@ -25,6 +28,7 @@ impl Entry {
             key,
             value,
             created_at: Instant::now(),
+            last_access_micros: AtomicU64::new(0),
             expires_at: None,
             flags: 0,
             cas: 0,
@@ -74,6 +78,37 @@ impl Entry {
     pub fn size(&self) -> usize {
         self.key.len() + self.value.len() + std::mem::size_of::<Self>()
     }
+
+    /// Update the last access time to now
+    pub fn touch(&self) {
+        let micros_since_creation = self.created_at.elapsed().as_micros() as u64;
+        self.last_access_micros.store(micros_since_creation, Ordering::Relaxed);
+    }
+
+    /// Get the last access time as an Instant
+    pub fn last_access_time(&self) -> Instant {
+        let micros = self.last_access_micros.load(Ordering::Relaxed);
+        if micros == 0 {
+            // Never accessed, return creation time
+            self.created_at
+        } else {
+            self.created_at + Duration::from_micros(micros)
+        }
+    }
+}
+
+impl Clone for Entry {
+    fn clone(&self) -> Self {
+        Self {
+            key: self.key.clone(),
+            value: self.value.clone(),
+            created_at: self.created_at,
+            last_access_micros: AtomicU64::new(self.last_access_micros.load(Ordering::Relaxed)),
+            expires_at: self.expires_at,
+            flags: self.flags,
+            cas: self.cas,
+        }
+    }
 }
 
 /// Reference-counted entry wrapper
@@ -101,10 +136,19 @@ pub struct StoreOptions {
 }
 
 /// Options for loading an entry
-#[derive(Default, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct LoadOptions {
     /// Update access time (for LRU)
     pub touch: bool,
     /// Return CAS value
     pub with_cas: bool,
+}
+
+impl Default for LoadOptions {
+    fn default() -> Self {
+        Self {
+            touch: true, // Enable touch by default for LRU tracking
+            with_cas: false,
+        }
+    }
 }
