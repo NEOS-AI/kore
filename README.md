@@ -7,7 +7,7 @@ A low-latency, high-performance caching database written in Rust.
 - **Low Latency**: Built with Rust and optimized data structures for minimal latency
 - **High Performance**: Sharded hashmap architecture (default 4096 shards) for high concurrency
 - **RESP Protocol**: Compatible with Redis/Valkey protocol
-- **Memory Management**: Configurable max memory with automatic eviction (2-random algorithm)
+- **Memory Management**: Configurable max memory with approximated LRU eviction (Redis-style)
 - **Expiration**: Per-entry TTL support with background sweeping
 - **Thread-Safe**: Lock-free operations where possible, with fine-grained locking
 - **Statistics**: Built-in metrics for hits, misses, evictions, and more
@@ -18,7 +18,7 @@ Kore implements the same core concepts as pogocache but leverages Rust's safety 
 
 - **Sharded Hashmap**: Default 4096 shards to minimize lock contention
 - **Reference Counting**: Arc-based entry management for thread-safe sharing
-- **2-Random Eviction**: When memory is full, samples 2 random entries and evicts the oldest
+- **Approximated LRU Eviction**: Redis-style eviction that samples N random entries (default 5) and evicts the least recently used one
 - **Background Sweeping**: Automatic cleanup of expired entries
 - **Atomic Operations**: Lock-free statistics and counters
 
@@ -182,7 +182,11 @@ cmd_set:3
 
 - Tracks total memory usage across all entries
 - Eviction triggered when memory usage exceeds `maxmemory`
-- 2-random eviction algorithm: samples 2 entries, evicts oldest
+- **Approximated LRU eviction algorithm**: Samples N random entries (default 5), evicts the least recently used one
+  - Much better than simple random eviction
+  - Similar to Redis's eviction strategy
+  - Low overhead (no global LRU list needed)
+  - Tracks last access time per entry using atomic operations
 - Background task sweeps expired entries every second
 
 ### Protocol
