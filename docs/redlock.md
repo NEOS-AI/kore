@@ -250,13 +250,3 @@ Available tests:
 2. **Network dependent**: Requires reliable network
 3. **Clock synchronization**: Assumes reasonable clock sync (NTP)
 4. **No lock queuing**: First-come-first-served with retries
-
-## References
-
-- [Redlock Algorithm](https://redis.io/docs/manual/patterns/distributed-locks/)
-- [Martin Kleppmann's Analysis](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)
-- [Antirez's Response](http://antirez.com/news/101)
-
-## License
-
-Same as Kore project license.

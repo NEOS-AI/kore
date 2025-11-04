@@ -40,6 +40,9 @@ pub enum Error {
 
     #[error("Lock extension failed: {0}")]
     LockExtensionFailed(String),
+
+    #[error("Deadlock detected: {0}")]
+    DeadlockDetected(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

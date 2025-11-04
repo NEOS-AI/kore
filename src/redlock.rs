@@ -1,4 +1,5 @@
 use crate::cache::Cache;
+use crate::deadlock::{DeadlockDetector, DeadlockStatus};
 use crate::entry::{LoadOptions, StoreOptions};
 use crate::error::{Error, Result};
 use bytes::Bytes;
@@ -28,6 +29,9 @@ pub struct Redlock {
     /// Retry configuration
     retry_count: usize,
     retry_delay_ms: u64,
+    
+    /// Deadlock detector (optional)
+    deadlock_detector: Option<Arc<DeadlockDetector>>,
 }
 
 impl Redlock {
@@ -54,6 +58,7 @@ impl Redlock {
             clock_drift_factor: 0.01,
             retry_count: 3,
             retry_delay_ms: 200,
+            deadlock_detector: None,
         })
     }
     
@@ -71,6 +76,28 @@ impl Redlock {
         Ok(redlock)
     }
     
+    /// Enable deadlock detection
+    /// 
+    /// # Arguments
+    /// * `max_wait_time_ms` - Maximum time to wait before flagging potential deadlock
+    /// * `auto_resolve` - Automatically resolve deadlocks by releasing victim locks
+    pub fn with_deadlock_detection(mut self, max_wait_time_ms: u64, auto_resolve: bool) -> Self {
+        self.deadlock_detector = Some(Arc::new(DeadlockDetector::new(max_wait_time_ms, auto_resolve)));
+        self
+    }
+    
+    /// Check for deadlocks
+    pub fn check_deadlock(&self) -> Option<DeadlockStatus> {
+        self.deadlock_detector.as_ref().map(|d| d.detect_deadlock())
+    }
+    
+    /// Get deadlock statistics
+    pub fn get_deadlock_stats(&self) -> Option<crate::deadlock::DeadlockStats> {
+        self.deadlock_detector.as_ref().map(|d| d.get_stats())
+    }
+        Ok(redlock)
+    }
+    
     /// Acquire a distributed lock using the Redlock algorithm
     /// 
     /// # Arguments
@@ -81,11 +108,45 @@ impl Redlock {
     /// # Returns
     /// * `Result<Lock>` - Lock handle if successful, error otherwise
     pub fn lock(&self, resource: &str, val: Bytes, ttl_ms: u64) -> Result<Lock> {
+        // Record wait start if deadlock detection is enabled
+        if let Some(ref detector) = self.deadlock_detector {
+            detector.record_lock_wait(resource.to_string(), val.clone(), ttl_ms);
+        }
+        
         for attempt in 0..self.retry_count {
+            // Check for deadlock before attempting
+            if let Some(ref detector) = self.deadlock_detector {
+                match detector.detect_deadlock() {
+                    DeadlockStatus::Deadlock { cycle, resources } => {
+                        // Clean up wait record
+                        detector.remove_from_waiting(&val);
+                        
+                        return Err(Error::DeadlockDetected(format!(
+                            "Deadlock detected involving {} clients and resources: {:?}",
+                            cycle.len(),
+                            resources
+                        )));
+                    }
+                    DeadlockStatus::NoDeadlock => {
+                        // Continue with lock acquisition
+                    }
+                }
+            }
+            
             match self.try_lock(resource, val.clone(), ttl_ms) {
-                Ok(lock) => return Ok(lock),
+                Ok(lock) => {
+                    // Record successful acquisition
+                    if let Some(ref detector) = self.deadlock_detector {
+                        detector.record_lock_acquired(resource.to_string(), val.clone(), ttl_ms);
+                    }
+                    return Ok(lock);
+                }
                 Err(e) => {
                     if attempt == self.retry_count - 1 {
+                        // Clean up wait record on final failure
+                        if let Some(ref detector) = self.deadlock_detector {
+                            detector.remove_from_waiting(&val);
+                        }
                         return Err(e);
                     }
                     // Add random jitter to prevent thundering herd
@@ -93,6 +154,11 @@ impl Redlock {
                     std::thread::sleep(Duration::from_millis(self.retry_delay_ms + jitter));
                 }
             }
+        }
+        
+        // Clean up wait record
+        if let Some(ref detector) = self.deadlock_detector {
+            detector.remove_from_waiting(&val);
         }
         
         Err(Error::LockAcquisitionFailed("Failed to acquire lock after retries".to_string()))
@@ -162,6 +228,12 @@ impl Redlock {
         let key = Bytes::from(format!("lock:{}", lock.resource));
         let all_instances: Vec<usize> = (0..self.instances.len()).collect();
         self.unlock_instances(&key, &lock.val, &all_instances);
+        
+        // Record lock release
+        if let Some(ref detector) = self.deadlock_detector {
+            detector.record_lock_released(&lock.resource);
+        }
+        
         Ok(())
     }
     
