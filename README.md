@@ -89,8 +89,9 @@ Kore now supports the Redlock algorithm for distributed locking across multiple 
 - Automatic retry with exponential backoff
 - Clock drift compensation
 - Fault-tolerant design
+- **Automatic deadlock detection** (NEW!)
 
-See [Redlock Documentation](docs/redlock.md) for detailed usage.
+See [Redlock Documentation](docs/redlock.md) and [Deadlock Detection](docs/deadlock_detection.md) for detailed usage.
 
 ### Redlock Configuration
 - `--enable-redlock` - Enable Redlock distributed locking
