@@ -104,6 +104,50 @@ With custom options:
 #### Supported CONFIG Parameters
 - `maxentrysize` / `max-entry-size` - Maximum entry size in bytes (minimum: 1024, cannot exceed maxmemory)
 
+### Sorted Set Operations (Ranking System)
+Kore supports sorted sets, ideal for implementing leaderboards and ranking systems:
+
+- `ZADD key score member [score member ...]` - Add or update members with scores
+- `ZRANGE key start stop [WITHSCORES]` - Get members by rank (ascending order)
+- `ZREVRANGE key start stop [WITHSCORES]` - Get members by rank (descending order)
+- `ZCARD key` - Get the number of members
+- `ZSCORE key member` - Get the score of a member
+- `ZREM key member [member ...]` - Remove members
+- `ZRANK key member` - Get the rank (0-based) of a member in ascending order
+- `ZREVRANK key member` - Get the rank (0-based) of a member in descending order
+
+**Implementation Details:**
+- Uses BTreeMap for maintaining score order (O(log n) operations)
+- HashMap for fast member lookup (O(1) operations)
+- Supports Strategy pattern for different iteration strategies (forward/reverse)
+- Thread-safe with RwLock for concurrent access
+
+**Example - Leaderboard:**
+```bash
+# Add players with scores
+ZADD leaderboard 1500 player1 1200 player2 1800 player3
+
+# Get top 3 players (highest scores)
+ZREVRANGE leaderboard 0 2 WITHSCORES
+1) "player3"
+2) "1800"
+3) "player1"
+4) "1500"
+5) "player2"
+6) "1200"
+
+# Update a player's score
+ZADD leaderboard 2000 player2
+
+# Get player's rank (0 = first place)
+ZREVRANK leaderboard player2
+(integer) 0
+
+# Get player's score
+ZSCORE leaderboard player2
+"2000"
+```
+
 ## Example Usage
 
 Using redis-cli or any Redis-compatible client:

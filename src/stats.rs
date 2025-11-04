@@ -10,6 +10,16 @@ pub struct Stats {
     pub cmd_incr: AtomicU64,
     pub cmd_decr: AtomicU64,
 
+    // Sorted Set command counts
+    pub cmd_zadd: AtomicU64,
+    pub cmd_zrange: AtomicU64,
+    pub cmd_zrevrange: AtomicU64,
+    pub cmd_zcard: AtomicU64,
+    pub cmd_zscore: AtomicU64,
+    pub cmd_zrem: AtomicU64,
+    pub cmd_zrank: AtomicU64,
+    pub cmd_zrevrank: AtomicU64,
+
     // Cache hits and misses
     pub hits: AtomicU64,
     pub misses: AtomicU64,
@@ -58,6 +68,14 @@ impl Stats {
         self.cmd_del.store(0, Ordering::Relaxed);
         self.cmd_incr.store(0, Ordering::Relaxed);
         self.cmd_decr.store(0, Ordering::Relaxed);
+        self.cmd_zadd.store(0, Ordering::Relaxed);
+        self.cmd_zrange.store(0, Ordering::Relaxed);
+        self.cmd_zrevrange.store(0, Ordering::Relaxed);
+        self.cmd_zcard.store(0, Ordering::Relaxed);
+        self.cmd_zscore.store(0, Ordering::Relaxed);
+        self.cmd_zrem.store(0, Ordering::Relaxed);
+        self.cmd_zrank.store(0, Ordering::Relaxed);
+        self.cmd_zrevrank.store(0, Ordering::Relaxed);
         self.hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);
         self.evicted_expired.store(0, Ordering::Relaxed);

@@ -1,10 +1,12 @@
 use crate::entry::{Entry, LoadOptions, SharedEntry, StoreOptions};
 use crate::error::{Error, Result};
 use crate::hashmap::ShardedHashMap;
+use crate::sorted_set::{SortedSet, SharedSortedSet};
 use crate::stats::Stats;
 use bytes::Bytes;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::time;
 
@@ -12,6 +14,8 @@ use tokio::time;
 pub struct Cache {
     /// Sharded hashmap for storing entries
     map: ShardedHashMap,
+    /// HashMap for storing sorted sets
+    sorted_sets: Arc<RwLock<HashMap<Bytes, SharedSortedSet>>>,
     /// Statistics
     pub stats: Arc<Stats>,
     /// Maximum memory in bytes
@@ -41,6 +45,7 @@ impl Cache {
     ) -> Arc<Self> {
         let cache = Arc::new(Self {
             map: ShardedHashMap::new(num_shards, 1024),
+            sorted_sets: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(Stats::new()),
             max_memory,
             memory_usage: AtomicUsize::new(0),
@@ -445,5 +450,33 @@ impl Cache {
         }
         self.eviction_sample_size.store(size, Ordering::Relaxed);
         Ok(())
+    }
+
+    // ========== Sorted Set Operations ==========
+
+    /// Get or create a sorted set
+    pub fn get_or_create_sorted_set(&self, key: &Bytes) -> SharedSortedSet {
+        let mut sets = self.sorted_sets.write().unwrap();
+        sets.entry(key.clone())
+            .or_insert_with(|| Arc::new(RwLock::new(SortedSet::new())))
+            .clone()
+    }
+
+    /// Get a sorted set if it exists
+    pub fn get_sorted_set(&self, key: &Bytes) -> Option<SharedSortedSet> {
+        let sets = self.sorted_sets.read().unwrap();
+        sets.get(key).cloned()
+    }
+
+    /// Remove a sorted set
+    pub fn remove_sorted_set(&self, key: &Bytes) -> bool {
+        let mut sets = self.sorted_sets.write().unwrap();
+        sets.remove(key).is_some()
+    }
+
+    /// Check if a sorted set exists
+    pub fn sorted_set_exists(&self, key: &Bytes) -> bool {
+        let sets = self.sorted_sets.read().unwrap();
+        sets.contains_key(key)
     }
 }
