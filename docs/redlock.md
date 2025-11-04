@@ -1,0 +1,262 @@
+# Redlock Implementation in Kore
+
+Kore now supports the **Redlock algorithm** for distributed locking across multiple instances, providing stronger guarantees for mutual exclusion in distributed systems.
+
+## What is Redlock?
+
+Redlock is a distributed lock algorithm designed by Redis creator Antirez. It provides fault-tolerant distributed locks by requiring a quorum of independent instances to agree on lock acquisition.
+
+### Key Features
+
+- **Quorum-based**: Requires majority (N/2 + 1) of instances to acquire a lock
+- **Fault-tolerant**: Continues working even if some instances fail
+- **Clock drift handling**: Accounts for time differences between servers
+- **Automatic retry**: Built-in retry logic with randomized backoff
+- **Auto-release**: Locks automatically released when dropped
+
+## How It Works
+
+1. **Lock Acquisition**:
+   - Generate a unique lock identifier (e.g., UUID)
+   - Try to acquire the lock on all N instances in parallel
+   - If acquired on >= N/2 + 1 instances within TTL, lock is successful
+   - Calculate validity time accounting for clock drift
+
+2. **Lock Release**:
+   - Release lock on all instances
+   - Verify ownership before releasing (prevents accidental release)
+
+3. **Lock Extension**:
+   - Extend TTL on all instances
+   - Requires quorum to succeed
+
+## Usage Examples
+
+### Basic Usage
+
+```rust
+use kore::{Cache, Redlock};
+use bytes::Bytes;
+use std::sync::Arc;
+
+// Create 3 cache instances
+let cache1 = Arc::new(Cache::new(CacheConfig::default()));
+let cache2 = Arc::new(Cache::new(CacheConfig::default()));
+let cache3 = Arc::new(Cache::new(CacheConfig::default()));
+
+// Create Redlock (quorum = 2)
+let redlock = Redlock::new(vec![cache1, cache2, cache3])?;
+
+// Acquire a lock
+let lock = redlock.lock(
+    "my-resource",           // Resource name
+    Bytes::from("client-1"), // Unique identifier
+    10000                    // TTL in milliseconds
+)?;
+
+// Perform critical section
+println!("Lock acquired for: {}", lock.resource());
+
+// Lock is automatically released when dropped
+```
+
+### With Manual Release
+
+```rust
+let lock = redlock.lock("resource", Bytes::from("id"), 5000)?;
+
+// Do work...
+
+// Manually release
+redlock.unlock(&lock)?;
+```
+
+### Extending Lock TTL
+
+```rust
+let lock = redlock.lock("resource", Bytes::from("id"), 5000)?;
+
+// Need more time...
+lock.extend(5000)?; // Add 5 more seconds
+
+// Continue work...
+```
+
+### Custom Configuration
+
+```rust
+let redlock = Redlock::with_config(
+    vec![cache1, cache2, cache3],
+    3,      // retry_count
+    200,    // retry_delay_ms
+    0.01    // clock_drift_factor (1%)
+)?;
+```
+
+### Concurrent Access Example
+
+```rust
+use std::thread;
+
+let redlock = Arc::new(Redlock::new(vec![cache1, cache2, cache3])?);
+
+// Spawn multiple threads competing for the same lock
+for i in 0..10 {
+    let redlock_clone = Arc::clone(&redlock);
+    thread::spawn(move || {
+        let client_id = Bytes::from(format!("client-{}", i));
+        
+        match redlock_clone.lock("shared-resource", client_id, 1000) {
+            Ok(_lock) => {
+                println!("Thread {} acquired lock", i);
+                // Only one thread at a time can reach here
+            }
+            Err(e) => {
+                println!("Thread {} failed: {}", i, e);
+            }
+        }
+    });
+}
+```
+
+## Configuration
+
+### Command Line
+
+```bash
+# Enable Redlock
+kore --enable-redlock \
+     --redlock-instances "host1:6379,host2:6379,host3:6379" \
+     --redlock-retry-count 3 \
+     --redlock-retry-delay-ms 200
+```
+
+### Options
+
+- `--enable-redlock`: Enable Redlock distributed locking
+- `--redlock-instances`: Comma-separated instance addresses
+- `--redlock-retry-count`: Number of retry attempts (default: 3)
+- `--redlock-retry-delay-ms`: Delay between retries (default: 200ms)
+
+## Architecture
+
+```
+┌─────────────┐
+│   Client    │
+└──────┬──────┘
+       │
+       │ lock("resource", "uuid", 10000)
+       │
+       v
+┌──────────────────┐
+│     Redlock      │
+│  (Quorum: 2/3)   │
+└────┬─────┬─────┬─┘
+     │     │     │
+     v     v     v
+  ┌───┐ ┌───┐ ┌───┐
+  │ C1│ │ C2│ │ C3│  Cache Instances
+  └───┘ └───┘ └───┘
+```
+
+## Algorithm Details
+
+### Quorum Calculation
+
+- **N instances**: Quorum = N/2 + 1
+- **3 instances**: Quorum = 2
+- **5 instances**: Quorum = 3
+- **1 instance**: Quorum = 1 (degrades to simple lock)
+
+### Validity Time
+
+```
+validity_time = TTL - elapsed_time - drift
+drift = (TTL * clock_drift_factor) + 2ms
+```
+
+### Retry Logic
+
+1. Attempt to acquire lock
+2. If failed and retries remaining:
+   - Wait `retry_delay_ms + random_jitter`
+   - Try again
+3. Return error after max retries
+
+## Safety Properties
+
+1. **Mutual Exclusion**: At most one client holds a lock at any time
+2. **Deadlock Free**: Locks automatically expire via TTL
+3. **Fault Tolerance**: Works with minority of instances failed
+4. **Liveness**: Lock acquisition eventually succeeds if instances are available
+
+## Performance
+
+### Time Complexity
+
+- **Lock**: O(N) where N = number of instances
+- **Unlock**: O(N)
+- **Extend**: O(N)
+
+### Recommendations
+
+- **3-5 instances**: Optimal for most use cases
+- **Odd number**: Easier quorum calculation
+- **Fast network**: Minimize lock acquisition time
+- **TTL >= 3 seconds**: Account for network delays
+
+## Testing
+
+Run the Redlock tests:
+
+```bash
+cargo test --test redlock_test
+```
+
+Available tests:
+- `test_redlock_basic_lock`: Basic lock acquisition
+- `test_redlock_mutual_exclusion`: Ensures only one client holds lock
+- `test_redlock_auto_release`: Verifies automatic lock release
+- `test_redlock_extend`: Tests lock TTL extension
+- `test_redlock_concurrent_access`: Concurrent access patterns
+- `test_redlock_quorum_requirement`: Verifies quorum logic
+- `test_redlock_ttl_expiration`: Tests TTL expiration
+
+## Comparison: Basic vs Redlock
+
+| Feature | Basic Mode | Redlock Mode |
+|---------|-----------|--------------|
+| Instances | Single | Multiple (3+) |
+| Quorum | N/A | N/2 + 1 |
+| Fault Tolerance | None | High |
+| Clock Drift | Not handled | Handled |
+| Retry Logic | Manual | Automatic |
+| Use Case | Simple apps | Distributed systems |
+| Complexity | O(1) | O(N) |
+
+## Best Practices
+
+1. **Use UUID for lock values**: Ensures uniqueness
+2. **Set appropriate TTL**: Long enough for operation, short enough for recovery
+3. **Handle failures**: Always check lock acquisition result
+4. **Use try-finally**: Or rely on Drop for cleanup
+5. **Monitor lock metrics**: Track acquisition failures
+6. **Odd instance count**: Simplifies quorum
+7. **Network reliability**: Ensure stable connections between instances
+
+## Limitations
+
+1. **Not for long-running tasks**: TTL must account for operation time
+2. **Network dependent**: Requires reliable network
+3. **Clock synchronization**: Assumes reasonable clock sync (NTP)
+4. **No lock queuing**: First-come-first-served with retries
+
+## References
+
+- [Redlock Algorithm](https://redis.io/docs/manual/patterns/distributed-locks/)
+- [Martin Kleppmann's Analysis](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)
+- [Antirez's Response](http://antirez.com/news/101)
+
+## License
+
+Same as Kore project license.

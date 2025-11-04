@@ -52,6 +52,22 @@ pub struct Config {
     /// Verbosity level (0-3)
     #[arg(short = 'v', long, default_value = "1")]
     pub verbosity: u8,
+
+    /// Enable Redlock distributed locking (requires multiple instances)
+    #[arg(long, default_value = "false")]
+    pub enable_redlock: bool,
+
+    /// Redlock instance addresses (comma-separated, e.g., "host1:port1,host2:port2")
+    #[arg(long, default_value = "")]
+    pub redlock_instances: String,
+
+    /// Redlock retry count (default: 3)
+    #[arg(long, default_value = "3")]
+    pub redlock_retry_count: usize,
+
+    /// Redlock retry delay in milliseconds (default: 200)
+    #[arg(long, default_value = "200")]
+    pub redlock_retry_delay_ms: u64,
 }
 
 impl Config {
@@ -76,6 +92,19 @@ impl Config {
             (sys.total_memory() as f64 * 0.8) as usize
         } else {
             self.maxmemory
+        }
+    }
+
+    /// Parse Redlock instance addresses
+    pub fn redlock_instance_addrs(&self) -> Vec<String> {
+        if self.redlock_instances.is_empty() {
+            Vec::new()
+        } else {
+            self.redlock_instances
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
         }
     }
 }

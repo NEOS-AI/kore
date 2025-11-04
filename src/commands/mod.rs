@@ -67,6 +67,11 @@ impl CommandHandler {
             "MGET" => self.handle_mget(&args[1..]),
             "MSET" => self.handle_mset(&args[1..]),
             
+            // Distributed lock commands
+            "SETNX" => self.handle_setnx(&args[1..]),
+            "GETDEL" => self.handle_getdel(&args[1..]),
+            "GETEX" => self.handle_getex(&args[1..]),
+            
             // Counter commands
             "INCR" => self.handle_incr(&args[1..]),
             "DECR" => self.handle_decr(&args[1..]),

@@ -45,11 +45,8 @@ impl Cache {
         if opts.nx {
             if let Some(existing) = self.map.get(&key) {
                 if !existing.is_expired() {
-                    return if opts.get {
-                        Ok(Some(existing))
-                    } else {
-                        Ok(None)
-                    };
+                    // Key exists, return the existing value to indicate failure
+                    return Ok(Some(existing));
                 }
             }
         }

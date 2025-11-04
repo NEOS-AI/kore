@@ -34,6 +34,12 @@ pub enum Error {
 
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
+
+    #[error("Lock acquisition failed: {0}")]
+    LockAcquisitionFailed(String),
+
+    #[error("Lock extension failed: {0}")]
+    LockExtensionFailed(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -78,6 +78,26 @@ With custom options:
 - `MGET key [key ...]`
 - `MSET key value [key value ...]`
 
+### Distributed Lock Operations
+- `SETNX key value` - SET if Not eXists (returns 1 if set, 0 if key exists)
+- `GETDEL key` - GET and DELete atomically
+- `GETEX key [EX seconds] [PX milliseconds] [EXAT timestamp] [PXAT timestamp] [PERSIST]` - GET with expiration options
+
+**NEW: Redlock Algorithm Support**
+Kore now supports the Redlock algorithm for distributed locking across multiple instances:
+- Quorum-based lock acquisition (N/2 + 1)
+- Automatic retry with exponential backoff
+- Clock drift compensation
+- Fault-tolerant design
+
+See [Redlock Documentation](docs/redlock.md) for detailed usage.
+
+### Redlock Configuration
+- `--enable-redlock` - Enable Redlock distributed locking
+- `--redlock-instances <ADDRS>` - Comma-separated instance addresses
+- `--redlock-retry-count <COUNT>` - Number of retry attempts (default: 3)
+- `--redlock-retry-delay-ms <MS>` - Delay between retries (default: 200)
+
 ### Numeric Operations
 - `INCR key`
 - `DECR key`
@@ -147,6 +167,78 @@ ZREVRANK leaderboard player2
 ZSCORE leaderboard player2
 "2000"
 ```
+
+### Distributed Lock Pattern
+
+Kore supports both basic and advanced (Redlock) distributed locking patterns.
+
+#### Basic Mode (Single Instance)
+
+```bash
+# Acquire a lock with automatic expiration (prevents deadlock)
+SET mylock "unique-request-id" NX EX 10
+OK
+
+# Alternative: Use SETNX (returns 1 if acquired, 0 if failed)
+SETNX mylock "unique-request-id"
+(integer) 1
+
+# Set expiration after acquiring lock
+EXPIRE mylock 10
+(integer) 1
+
+# Check lock ownership before releasing
+GET mylock
+"unique-request-id"
+
+# Release lock atomically
+GETDEL mylock
+"unique-request-id"
+
+# Renew lock TTL while holding it
+GETEX mylock EX 10
+"unique-request-id"
+
+# Remove expiration from a lock (make it permanent)
+GETEX mylock PERSIST
+"unique-request-id"
+```
+
+#### Redlock Mode (Multi-Instance)
+
+```rust
+use kore::{Cache, Redlock};
+use bytes::Bytes;
+use std::sync::Arc;
+
+// Create multiple cache instances
+let cache1 = Arc::new(Cache::new(CacheConfig::default()));
+let cache2 = Arc::new(Cache::new(CacheConfig::default()));
+let cache3 = Arc::new(Cache::new(CacheConfig::default()));
+
+// Create Redlock (quorum = 2 for 3 instances)
+let redlock = Redlock::new(vec![cache1, cache2, cache3])?;
+
+// Acquire a distributed lock
+let lock = redlock.lock("my-resource", Bytes::from("unique-id"), 10000)?;
+
+// Extend lock if needed
+lock.extend(5000)?;
+
+// Lock is automatically released when dropped
+```
+
+**Best Practices for Distributed Locks:**
+- Always use a unique identifier (e.g., UUID) as the lock value
+- Always set an expiration (TTL) to prevent deadlocks
+- Verify ownership before releasing (check value matches)
+- Use `GETDEL` for atomic lock release
+- Use `GETEX` to renew locks during long operations
+- **Use Redlock for multi-instance deployments** for stronger guarantees
+
+**Documentation:**
+- [Distributed Locks Guide](docs/distributed_locks.md)
+- [Redlock Implementation](docs/redlock.md)
 
 ## Example Usage
 
