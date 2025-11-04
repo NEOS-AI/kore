@@ -7,9 +7,9 @@ use std::time::Duration;
 #[test]
 fn test_redlock_basic_lock() {
     // Create 3 independent cache instances
-    let cache1 = Cache::new(256, 100 * 1024 * 1024); // 256 shards, 100MB max
-    let cache2 = Cache::new(256, 100 * 1024 * 1024);
-    let cache3 = Cache::new(256, 100 * 1024 * 1024);
+    let cache1 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false); // 256 shards, 100MB max
+    let cache2 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+    let cache3 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
     
     // Create Redlock with 3 instances (quorum = 2)
     let redlock = Redlock::new(vec![cache1, cache2, cache3]).unwrap();
@@ -27,9 +27,9 @@ fn test_redlock_basic_lock() {
 
 #[test]
 fn test_redlock_mutual_exclusion() {
-    let cache1 = Cache::new(256, 100 * 1024 * 1024);
-    let cache2 = Cache::new(256, 100 * 1024 * 1024);
-    let cache3 = Cache::new(256, 100 * 1024 * 1024);
+    let cache1 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+    let cache2 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+    let cache3 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
     
     let redlock = Redlock::new(vec![cache1, cache2, cache3]).unwrap();
     
@@ -46,9 +46,9 @@ fn test_redlock_mutual_exclusion() {
 
 #[test]
 fn test_redlock_auto_release() {
-    let cache1 = Cache::new(256, 100 * 1024 * 1024);
-    let cache2 = Cache::new(256, 100 * 1024 * 1024);
-    let cache3 = Cache::new(256, 100 * 1024 * 1024);
+    let cache1 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+    let cache2 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+    let cache3 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
     
     let redlock = Redlock::new(vec![cache1, cache2, cache3]).unwrap();
     
@@ -69,9 +69,9 @@ fn test_redlock_auto_release() {
 
 #[test]
 fn test_redlock_extend() {
-    let cache1 = Cache::new(256, 100 * 1024 * 1024);
-    let cache2 = Cache::new(256, 100 * 1024 * 1024);
-    let cache3 = Cache::new(256, 100 * 1024 * 1024);
+    let cache1 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+    let cache2 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+    let cache3 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
     
     let redlock = Redlock::new(vec![cache1, cache2, cache3]).unwrap();
     
@@ -85,9 +85,9 @@ fn test_redlock_extend() {
 
 #[test]
 fn test_redlock_concurrent_access() {
-    let cache1 = Cache::new(256, 100 * 1024 * 1024);
-    let cache2 = Cache::new(256, 100 * 1024 * 1024);
-    let cache3 = Cache::new(256, 100 * 1024 * 1024);
+    let cache1 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+    let cache2 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+    let cache3 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
     
     let redlock = Arc::new(Redlock::new(vec![cache1, cache2, cache3]).unwrap());
     
@@ -123,7 +123,7 @@ fn test_redlock_concurrent_access() {
 fn test_redlock_quorum_requirement() {
     // Create 5 instances (quorum = 3)
     let instances: Vec<Arc<Cache>> = (0..5)
-        .map(|_| Cache::new(256, 100 * 1024 * 1024))
+        .map(|_| Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false))
         .collect();
     
     let redlock = Redlock::new(instances).unwrap();
@@ -139,7 +139,7 @@ fn test_redlock_quorum_requirement() {
 #[test]
 fn test_redlock_single_instance() {
     // Single instance mode (quorum = 1)
-    let cache = Cache::new(256, 100 * 1024 * 1024);
+    let cache = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
     let redlock = Redlock::new(vec![cache]).unwrap();
     
     assert_eq!(redlock.quorum, 1);
@@ -152,9 +152,9 @@ fn test_redlock_single_instance() {
 
 #[test]
 fn test_redlock_ttl_expiration() {
-    let cache1 = Cache::new(256, 100 * 1024 * 1024);
-    let cache2 = Cache::new(256, 100 * 1024 * 1024);
-    let cache3 = Cache::new(256, 100 * 1024 * 1024);
+    let cache1 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+    let cache2 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+    let cache3 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
     
     let redlock = Redlock::new(vec![cache1, cache2, cache3]).unwrap();
     
@@ -177,9 +177,9 @@ fn test_redlock_ttl_expiration() {
 
 #[test]
 fn test_redlock_different_resources() {
-    let cache1 = Cache::new(256, 100 * 1024 * 1024);
-    let cache2 = Cache::new(256, 100 * 1024 * 1024);
-    let cache3 = Cache::new(256, 100 * 1024 * 1024);
+    let cache1 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+    let cache2 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+    let cache3 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
     
     let redlock = Redlock::new(vec![cache1, cache2, cache3]).unwrap();
     

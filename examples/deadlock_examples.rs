@@ -17,7 +17,7 @@ fn example_basic_detection() {
     let cache3 = Cache::new(256, 100 * 1024 * 1024);
     
     // Enable deadlock detection with 5 second timeout, no auto-resolve
-    let redlock = Redlock::new(vec![cache1, cache2, cache3])
+    let _redlock = Redlock::new(vec![cache1, cache2, cache3])
         .unwrap()
         .with_deadlock_detection(5000, false);
     
@@ -91,7 +91,7 @@ fn example_auto_resolve() {
     let cache3 = Cache::new(256, 100 * 1024 * 1024);
     
     // Enable auto-resolve
-    let redlock = Redlock::new(vec![cache1, cache2, cache3])
+    let _redlock = Redlock::new(vec![cache1, cache2, cache3])
         .unwrap()
         .with_deadlock_detection(5000, true); // auto_resolve = true
     
@@ -271,7 +271,7 @@ fn example_three_way_deadlock() {
     let cache2 = Cache::new(256, 100 * 1024 * 1024);
     let cache3 = Cache::new(256, 100 * 1024 * 1024);
     
-    let redlock = Arc::new(
+    let _redlock = Arc::new(
         Redlock::new(vec![cache1, cache2, cache3])
             .unwrap()
             .with_deadlock_detection(10000, false)

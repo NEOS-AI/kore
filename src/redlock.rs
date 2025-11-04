@@ -95,8 +95,6 @@ impl Redlock {
     pub fn get_deadlock_stats(&self) -> Option<crate::deadlock::DeadlockStats> {
         self.deadlock_detector.as_ref().map(|d| d.get_stats())
     }
-        Ok(redlock)
-    }
     
     /// Acquire a distributed lock using the Redlock algorithm
     /// 
@@ -340,9 +338,9 @@ mod tests {
     
     #[test]
     fn test_redlock_creation() {
-        let cache1 = Cache::new(256, 100 * 1024 * 1024);
-        let cache2 = Cache::new(256, 100 * 1024 * 1024);
-        let cache3 = Cache::new(256, 100 * 1024 * 1024);
+        let cache1 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+        let cache2 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+        let cache3 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
         
         let redlock = Redlock::new(vec![cache1, cache2, cache3]).unwrap();
         assert_eq!(redlock.quorum, 2); // 3/2 + 1 = 2
@@ -350,7 +348,7 @@ mod tests {
     
     #[test]
     fn test_redlock_single_instance() {
-        let cache = Cache::new(256, 100 * 1024 * 1024);
+        let cache = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
         let redlock = Redlock::new(vec![cache]).unwrap();
         assert_eq!(redlock.quorum, 1); // 1/2 + 1 = 1
     }
@@ -363,9 +361,9 @@ mod tests {
     
     #[test]
     fn test_lock_acquisition() {
-        let cache1 = Cache::new(256, 100 * 1024 * 1024);
-        let cache2 = Cache::new(256, 100 * 1024 * 1024);
-        let cache3 = Cache::new(256, 100 * 1024 * 1024);
+        let cache1 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+        let cache2 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+        let cache3 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
         
         let redlock = Redlock::new(vec![cache1, cache2, cache3]).unwrap();
         
@@ -378,9 +376,9 @@ mod tests {
     
     #[test]
     fn test_lock_mutual_exclusion() {
-        let cache1 = Cache::new(256, 100 * 1024 * 1024);
-        let cache2 = Cache::new(256, 100 * 1024 * 1024);
-        let cache3 = Cache::new(256, 100 * 1024 * 1024);
+        let cache1 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+        let cache2 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+        let cache3 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
         
         let redlock = Redlock::new(vec![cache1, cache2, cache3]).unwrap();
         

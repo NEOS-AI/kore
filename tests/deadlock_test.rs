@@ -1,14 +1,13 @@
 use kore::{Cache, Redlock, DeadlockDetector, DeadlockStatus};
 use bytes::Bytes;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 #[test]
 fn test_deadlock_detection_simple() {
-    let cache1 = Cache::new(256, 100 * 1024 * 1024);
-    let cache2 = Cache::new(256, 100 * 1024 * 1024);
-    let cache3 = Cache::new(256, 100 * 1024 * 1024);
+    let cache1 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+    let cache2 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+    let cache3 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
     
     let redlock = Redlock::new(vec![cache1, cache2, cache3])
         .unwrap()
@@ -47,9 +46,9 @@ fn test_deadlock_detection_simple() {
 
 #[test]
 fn test_deadlock_stats() {
-    let cache1 = Cache::new(256, 100 * 1024 * 1024);
-    let cache2 = Cache::new(256, 100 * 1024 * 1024);
-    let cache3 = Cache::new(256, 100 * 1024 * 1024);
+    let cache1 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+    let cache2 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+    let cache3 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
     
     let redlock = Redlock::new(vec![cache1, cache2, cache3])
         .unwrap()
@@ -71,9 +70,9 @@ fn test_deadlock_stats() {
 
 #[test]
 fn test_no_deadlock_sequential_locks() {
-    let cache1 = Cache::new(256, 100 * 1024 * 1024);
-    let cache2 = Cache::new(256, 100 * 1024 * 1024);
-    let cache3 = Cache::new(256, 100 * 1024 * 1024);
+    let cache1 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+    let cache2 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+    let cache3 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
     
     let redlock = Redlock::new(vec![cache1, cache2, cache3])
         .unwrap()

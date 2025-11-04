@@ -113,6 +113,10 @@ mod tests {
             auth: String::new(),
             maxentrysize: 500 * 1024 * 1024, // 500MB
             verbosity: 0,
+            enable_redlock: false,
+            redlock_instances: String::new(),
+            redlock_retry_count: 3,
+            redlock_retry_delay_ms: 200,
         });
 
         let cache = Cache::new(config.shards, config.maxmemory);
