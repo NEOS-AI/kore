@@ -3,10 +3,12 @@ mod operations;
 mod expiration;
 mod eviction;
 mod sorted_sets;
+mod geo_sets;
 mod config;
 
 use crate::hashmap::ShardedHashMap;
 use crate::sorted_set::SharedSortedSet;
+use crate::geospatial::GeoSet;
 use crate::stats::Stats;
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -19,6 +21,8 @@ pub struct Cache {
     pub(super) map: ShardedHashMap,
     /// HashMap for storing sorted sets
     pub(super) sorted_sets: Arc<RwLock<HashMap<Bytes, SharedSortedSet>>>,
+    /// HashMap for storing geospatial sets
+    pub(super) geo_sets: Arc<RwLock<HashMap<Bytes, Arc<RwLock<GeoSet>>>>>,
     /// Statistics
     pub stats: Arc<Stats>,
     /// Maximum memory in bytes
@@ -49,6 +53,7 @@ impl Cache {
         let cache = Arc::new(Self {
             map: ShardedHashMap::new(num_shards, 1024),
             sorted_sets: Arc::new(RwLock::new(HashMap::new())),
+            geo_sets: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(Stats::new()),
             max_memory,
             memory_usage: AtomicUsize::new(0),

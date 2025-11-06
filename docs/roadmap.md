@@ -19,21 +19,25 @@
         - [x] 락 소유권 및 대기 추적
         - [x] 통계 및 모니터링
         - [x] Redlock 통합
+    - [ ] Readlock 고급 기능 지원
+        - [ ] Lua 스크립트 지원
+        - [ ] Fair lock queuing
+
+- [x] Geospatial data type support
+    - [x] GEOADD command support
+    - [x] GEOSEARCH commmand support
+    - [x] Tracking the geospatial commands
 
 ## Plans
 
 - [ ] Support for Redis Pub-Sub
-- [ ] Geospatial data type support
-    - [ ] GEOADD command support
-    - [ ] GEOSEARCH commmand support
 - [ ] Cluster (kore cluster)
-- [ ] Redlock 추가 기능
-    - [x] 데드락 자동 감지
-    - [ ] Lua 스크립트 지원
-    - [ ] 락 모니터링 대시보드
-    - [ ] Fair lock queuing
 - [ ] 데드락 감지 고급 기능
     - [ ] 크로스 프로세스 감지
     - [ ] 비동기(async) 지원
     - [ ] 커스텀 희생자 선택 전략
     - [ ] 웹 UI 모니터링
+- [ ] Export data to file
+    - [ ] Export to 'RDB' file
+    - [ ] Export to 'AOF' file
+- [ ] Load data from file (init with file)

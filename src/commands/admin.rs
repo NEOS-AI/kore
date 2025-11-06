@@ -47,7 +47,9 @@ impl CommandHandler {
             + stats.cmd_zscore.load(Ordering::Relaxed)
             + stats.cmd_zrem.load(Ordering::Relaxed)
             + stats.cmd_zrank.load(Ordering::Relaxed)
-            + stats.cmd_zrevrank.load(Ordering::Relaxed);
+            + stats.cmd_zrevrank.load(Ordering::Relaxed)
+            + stats.cmd_geoadd.load(Ordering::Relaxed)
+            + stats.cmd_geosearch.load(Ordering::Relaxed);
         
         let info = format!(
             "# Server\r\n\
@@ -68,6 +70,8 @@ impl CommandHandler {
              cmd_zrem:{}\r\n\
              cmd_zrank:{}\r\n\
              cmd_zrevrank:{}\r\n\
+             cmd_geoadd:{}\r\n\
+             cmd_geosearch:{}\r\n\
              keyspace_hits:{}\r\n\
              keyspace_misses:{}\r\n\
              hit_rate:{:.2}\r\n\
@@ -78,9 +82,10 @@ impl CommandHandler {
              used_memory:{}\r\n\
              maxmemory:{}\r\n\
              maxentrysize:{}\r\n\
+             geo_sets_memory:{}\r\n\
              \r\n\
              # Keyspace\r\n\
-             db0:keys={}\r\n",
+             db0:keys={},geo_sets={}\r\n",
             env!("CARGO_PKG_VERSION"),
             total_cmds,
             stats.cmd_get.load(Ordering::Relaxed),
@@ -96,6 +101,8 @@ impl CommandHandler {
             stats.cmd_zrem.load(Ordering::Relaxed),
             stats.cmd_zrank.load(Ordering::Relaxed),
             stats.cmd_zrevrank.load(Ordering::Relaxed),
+            stats.cmd_geoadd.load(Ordering::Relaxed),
+            stats.cmd_geosearch.load(Ordering::Relaxed),
             stats.hits.load(Ordering::Relaxed),
             stats.misses.load(Ordering::Relaxed),
             stats.get_hit_rate(),
@@ -104,7 +111,9 @@ impl CommandHandler {
             self.cache.memory_usage(),
             self.cache.max_memory,
             self.cache.get_max_entry_size(),
+            self.cache.geo_sets_memory(),
             self.cache.dbsize(),
+            self.cache.geo_set_count(),
         );
 
         Ok(RespValue::BulkString(Some(Bytes::from(info))))

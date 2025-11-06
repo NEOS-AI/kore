@@ -4,6 +4,7 @@ mod counter;
 mod expiration;
 mod admin;
 mod sorted_set;
+mod geospatial;
 
 use crate::cache::Cache;
 use crate::config::Config;
@@ -101,6 +102,10 @@ impl CommandHandler {
             "ZREM" => self.handle_zrem(&args[1..]),
             "ZRANK" => self.handle_zrank(&args[1..]),
             "ZREVRANK" => self.handle_zrevrank(&args[1..]),
+            
+            // Geospatial commands
+            "GEOADD" => self.handle_geoadd(&args[1..]),
+            "GEOSEARCH" => self.handle_geosearch(&args[1..]),
             
             _ => Ok(RespValue::error(format!("ERR unknown command '{}'", cmd_upper))),
         }

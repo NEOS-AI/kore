@@ -20,6 +20,10 @@ pub struct Stats {
     pub cmd_zrank: AtomicU64,
     pub cmd_zrevrank: AtomicU64,
 
+    // Geospatial command counts
+    pub cmd_geoadd: AtomicU64,
+    pub cmd_geosearch: AtomicU64,
+
     // Cache hits and misses
     pub hits: AtomicU64,
     pub misses: AtomicU64,
@@ -76,6 +80,8 @@ impl Stats {
         self.cmd_zrem.store(0, Ordering::Relaxed);
         self.cmd_zrank.store(0, Ordering::Relaxed);
         self.cmd_zrevrank.store(0, Ordering::Relaxed);
+        self.cmd_geoadd.store(0, Ordering::Relaxed);
+        self.cmd_geosearch.store(0, Ordering::Relaxed);
         self.hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);
         self.evicted_expired.store(0, Ordering::Relaxed);
