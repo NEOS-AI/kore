@@ -2,6 +2,7 @@ use crate::cache::Cache;
 use crate::deadlock::{DeadlockDetector, DeadlockStatus};
 use crate::entry::{LoadOptions, StoreOptions};
 use crate::error::{Error, Result};
+use crate::fair_queue::{FairQueue, QueuedClient};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -32,6 +33,9 @@ pub struct Redlock {
     
     /// Deadlock detector (optional)
     deadlock_detector: Option<Arc<DeadlockDetector>>,
+    
+    /// Fair queue for lock ordering (optional)
+    fair_queue: Option<Arc<FairQueue>>,
 }
 
 impl Redlock {
@@ -59,6 +63,7 @@ impl Redlock {
             retry_count: 3,
             retry_delay_ms: 200,
             deadlock_detector: None,
+            fair_queue: None,
         })
     }
     
@@ -86,6 +91,22 @@ impl Redlock {
         self
     }
     
+    /// Enable fair lock queueing
+    /// 
+    /// # Arguments
+    /// * `max_queue_size` - Maximum number of clients that can wait for a single resource
+    pub fn with_fair_queueing(mut self, max_queue_size: usize) -> Self {
+        self.fair_queue = Some(Arc::new(FairQueue::new(max_queue_size)));
+        
+        // Increase retry count for fair queueing to allow proper queue processing
+        // Each client needs time to wait for their turn
+        if self.retry_count < 20 {
+            self.retry_count = 20;
+        }
+        
+        self
+    }
+    
     /// Check for deadlocks
     pub fn check_deadlock(&self) -> Option<DeadlockStatus> {
         self.deadlock_detector.as_ref().map(|d| d.detect_deadlock())
@@ -94,6 +115,21 @@ impl Redlock {
     /// Get deadlock statistics
     pub fn get_deadlock_stats(&self) -> Option<crate::deadlock::DeadlockStats> {
         self.deadlock_detector.as_ref().map(|d| d.get_stats())
+    }
+    
+    /// Get fair queue statistics
+    pub fn get_fair_queue_stats(&self) -> Option<crate::fair_queue::FairQueueStats> {
+        self.fair_queue.as_ref().map(|q| q.get_stats())
+    }
+    
+    /// Get queue position for a client
+    pub fn get_queue_position(&self, resource: &str, client_id: &Bytes) -> Option<usize> {
+        self.fair_queue.as_ref().and_then(|q| q.position(resource, client_id))
+    }
+    
+    /// Get queue length for a resource
+    pub fn get_queue_length(&self, resource: &str) -> usize {
+        self.fair_queue.as_ref().map(|q| q.queue_length(resource)).unwrap_or(0)
     }
     
     /// Acquire a distributed lock using the Redlock algorithm
@@ -106,12 +142,87 @@ impl Redlock {
     /// # Returns
     /// * `Result<Lock>` - Lock handle if successful, error otherwise
     pub fn lock(&self, resource: &str, val: Bytes, ttl_ms: u64) -> Result<Lock> {
+        self.lock_with_priority(resource, val, ttl_ms, 0)
+    }
+    
+    /// Acquire a distributed lock with priority
+    /// 
+    /// # Arguments
+    /// * `resource` - Name of the resource to lock
+    /// * `val` - Unique identifier for this lock (e.g., UUID)
+    /// * `ttl_ms` - Time-to-live for the lock in milliseconds
+    /// * `priority` - Priority (0 = highest, higher numbers = lower priority)
+    /// 
+    /// # Returns
+    /// * `Result<Lock>` - Lock handle if successful, error otherwise
+    pub fn lock_with_priority(&self, resource: &str, val: Bytes, ttl_ms: u64, priority: u32) -> Result<Lock> {
+        // Calculate absolute deadline for this lock attempt
+        let start_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let deadline = start_time + ttl_ms;
+        
+        // If fair queueing is enabled, enqueue the client
+        if let Some(ref queue) = self.fair_queue {
+            let queued_client = QueuedClient::new(val.clone(), resource.to_string(), ttl_ms, priority);
+            
+            if !queue.enqueue(queued_client) {
+                return Err(Error::LockAcquisitionFailed(
+                    format!("Queue is full for resource: {}", resource)
+                ));
+            }
+        }
+        
         // Record wait start if deadlock detection is enabled
         if let Some(ref detector) = self.deadlock_detector {
             detector.record_lock_wait(resource.to_string(), val.clone(), ttl_ms);
         }
         
-        for attempt in 0..self.retry_count {
+        // For fair queueing, use TTL-based retries instead of retry_count
+        // This ensures clients wait for their turn without timing out prematurely
+        let max_attempts = if self.fair_queue.is_some() {
+            // Allow many attempts for fair queueing (limited by TTL, not count)
+            (ttl_ms / self.retry_delay_ms).max(10) as usize
+        } else {
+            self.retry_count
+        };
+        
+        for attempt in 0..max_attempts {
+            // Check if we've exceeded the TTL deadline
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            
+            if now >= deadline {
+                // TTL expired, cleanup and fail
+                if let Some(ref queue) = self.fair_queue {
+                    queue.remove(resource, &val);
+                }
+                if let Some(ref detector) = self.deadlock_detector {
+                    detector.remove_from_waiting(&val);
+                }
+                return Err(Error::LockAcquisitionFailed(
+                    format!("Lock acquisition timeout after {}ms", ttl_ms)
+                ));
+            }
+            
+            // If fair queueing is enabled, check if this client is next in line
+            if let Some(ref queue) = self.fair_queue {
+                if !queue.try_acquire(resource, &val) {
+                    // Not this client's turn yet, wait and retry
+                    // Calculate remaining time to avoid overshooting deadline
+                    let remaining_time = deadline.saturating_sub(now);
+                    let wait_time = std::cmp::min(self.retry_delay_ms, remaining_time);
+                    
+                    if wait_time > 0 {
+                        std::thread::sleep(Duration::from_millis(wait_time));
+                    }
+                    continue;
+                }
+            }
+            
             // Check for deadlock before attempting
             if let Some(ref detector) = self.deadlock_detector {
                 match detector.detect_deadlock() {
@@ -133,6 +244,11 @@ impl Redlock {
             
             match self.try_lock(resource, val.clone(), ttl_ms) {
                 Ok(lock) => {
+                    // Remove from queue if fair queueing is enabled
+                    if let Some(ref queue) = self.fair_queue {
+                        queue.dequeue(resource);
+                    }
+                    
                     // Record successful acquisition
                     if let Some(ref detector) = self.deadlock_detector {
                         detector.record_lock_acquired(resource.to_string(), val.clone(), ttl_ms);
@@ -141,6 +257,11 @@ impl Redlock {
                 }
                 Err(e) => {
                     if attempt == self.retry_count - 1 {
+                        // Remove from queue on final failure
+                        if let Some(ref queue) = self.fair_queue {
+                            queue.remove(resource, &val);
+                        }
+                        
                         // Clean up wait record on final failure
                         if let Some(ref detector) = self.deadlock_detector {
                             detector.remove_from_waiting(&val);
@@ -152,6 +273,11 @@ impl Redlock {
                     std::thread::sleep(Duration::from_millis(self.retry_delay_ms + jitter));
                 }
             }
+        }
+        
+        // Remove from queue on timeout
+        if let Some(ref queue) = self.fair_queue {
+            queue.remove(resource, &val);
         }
         
         // Clean up wait record

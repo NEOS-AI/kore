@@ -90,8 +90,9 @@ Kore now supports the Redlock algorithm for distributed locking across multiple 
 - Clock drift compensation
 - Fault-tolerant design
 - **Automatic deadlock detection** (NEW!)
+- **Fair lock queueing** (NEW!) - FIFO ordering to prevent starvation
 
-See [Redlock Documentation](docs/redlock.md) and [Deadlock Detection](docs/deadlock_detection.md) for detailed usage.
+See [Redlock Documentation](docs/redlock.md), [Deadlock Detection](docs/deadlock_detection.md) for detailed usage.
 
 ### Redlock Configuration
 - `--enable-redlock` - Enable Redlock distributed locking
@@ -218,10 +219,20 @@ let cache2 = Arc::new(Cache::new(CacheConfig::default()));
 let cache3 = Arc::new(Cache::new(CacheConfig::default()));
 
 // Create Redlock (quorum = 2 for 3 instances)
-let redlock = Redlock::new(vec![cache1, cache2, cache3])?;
+let redlock = Redlock::new(vec![cache1, cache2, cache3])?
+    .with_fair_queueing(100)  // Enable fair FIFO ordering
+    .with_deadlock_detection(5000, false);  // Enable deadlock detection
 
 // Acquire a distributed lock
 let lock = redlock.lock("my-resource", Bytes::from("unique-id"), 10000)?;
+
+// Or acquire with priority (0 = highest priority)
+let lock = redlock.lock_with_priority("my-resource", Bytes::from("unique-id"), 10000, 0)?;
+
+// Check queue position
+if let Some(pos) = redlock.get_queue_position("my-resource", &client_id) {
+    println!("Position in queue: {}", pos);
+}
 
 // Extend lock if needed
 lock.extend(5000)?;
@@ -236,10 +247,13 @@ lock.extend(5000)?;
 - Use `GETDEL` for atomic lock release
 - Use `GETEX` to renew locks during long operations
 - **Use Redlock for multi-instance deployments** for stronger guarantees
+- **Enable fair queueing** to prevent lock starvation
+- **Enable deadlock detection** for automatic deadlock prevention
 
 **Documentation:**
 - [Distributed Locks Guide](docs/distributed_locks.md)
 - [Redlock Implementation](docs/redlock.md)
+- [Deadlock Detection](docs/deadlock_detection.md)
 
 ## Example Usage
 

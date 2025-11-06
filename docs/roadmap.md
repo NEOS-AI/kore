@@ -21,7 +21,12 @@
         - [x] Redlock 통합
     - [ ] Readlock 고급 기능 지원
         - [ ] Lua 스크립트 지원
-        - [ ] Fair lock queuing
+        - [x] Fair lock queueing
+            - [x] FIFO 순서 보장
+            - [x] 우선순위(priority) 지원
+            - [x] 큐 통계 및 모니터링
+            - [x] Starvation 방지
+            - [x] 큐 크기 제한
 
 - [x] Geospatial data type support
     - [x] GEOADD command support
