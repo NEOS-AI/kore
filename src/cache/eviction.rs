@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::memory::MemoryCategory;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::time;
@@ -34,11 +35,13 @@ impl Cache {
                     entry.last_access_time()
                 );
 
+                let size = entry.size();
                 self.map.remove(&key); // Remove from map
-                freed += entry.size(); // Keep track of freed memory
+                freed += size; // Keep track of freed memory
 
                 // Update memory usage
-                self.memory_usage.fetch_sub(entry.size(), Ordering::Relaxed);
+                self.memory_usage.fetch_sub(size, Ordering::Relaxed);
+                self.memory_tracker.deallocate(size, MemoryCategory::Cache);
                 self.stats.incr(&self.stats.evicted_lru);
             } else {
                 break;

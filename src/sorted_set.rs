@@ -67,12 +67,11 @@ impl PartialOrd for OrderedFloat {
 
 impl Ord for OrderedFloat {
     fn cmp(&self, other: &Self) -> CmpOrdering {
-        // Handle NaN: treat NaN as less than any number
         match (self.0.is_nan(), other.0.is_nan()) {
             (true, true) => CmpOrdering::Equal,
-            (true, false) => CmpOrdering::Less,
-            (false, true) => CmpOrdering::Greater,
-            (false, false) => self.0.partial_cmp(&other.0).unwrap(),
+            (true, false) => CmpOrdering::Greater,
+            (false, true) => CmpOrdering::Less,
+            (false, false) => self.0.partial_cmp(&other.0).unwrap_or(CmpOrdering::Equal),
         }
     }
 }

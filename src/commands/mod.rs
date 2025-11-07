@@ -5,17 +5,20 @@ mod expiration;
 mod admin;
 mod sorted_set;
 mod geospatial;
+mod pubsub;
 
 use crate::cache::Cache;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::protocol::RespValue;
+use crate::pubsub::ClientId;
 use std::sync::Arc;
 
 pub struct CommandHandler {
     cache: Arc<Cache>,
     config: Arc<Config>,
     authenticated: bool,
+    client_id: Option<ClientId>,
 }
 
 impl CommandHandler {
@@ -25,7 +28,16 @@ impl CommandHandler {
             cache,
             config,
             authenticated,
+            client_id: None,
         }
+    }
+
+    pub fn set_client_id(&mut self, client_id: ClientId) {
+        self.client_id = Some(client_id);
+    }
+
+    pub fn client_id(&self) -> Option<ClientId> {
+        self.client_id
     }
 
     pub async fn handle(&mut self, value: RespValue) -> Result<RespValue> {
@@ -107,6 +119,14 @@ impl CommandHandler {
             "GEOADD" => self.handle_geoadd(&args[1..]),
             "GEOSEARCH" => self.handle_geosearch(&args[1..]),
             
+            // Pub/Sub commands
+            "PUBLISH" => self.handle_publish(&args[1..]),
+            "SUBSCRIBE" => self.handle_subscribe(&args[1..]),
+            "UNSUBSCRIBE" => self.handle_unsubscribe(&args[1..]),
+            "PSUBSCRIBE" => self.handle_psubscribe(&args[1..]),
+            "PUNSUBSCRIBE" => self.handle_punsubscribe(&args[1..]),
+            "PUBSUB" => self.handle_pubsub(&args[1..]),
+            
             _ => Ok(RespValue::error(format!("ERR unknown command '{}'", cmd_upper))),
         }
     }
@@ -126,5 +146,95 @@ impl CommandHandler {
         }
 
         Err(Error::InvalidArgument("expected integer".into()))
+    }
+
+    // Pub/Sub command handlers
+    fn handle_publish(&self, args: &[RespValue]) -> Result<RespValue> {
+        Ok(tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.cache.cmd_publish(args).await
+            })
+        })?)
+    }
+
+    fn handle_subscribe(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        let client_id = self.client_id.ok_or_else(|| {
+            Error::InvalidArgument("client not registered for pub/sub".into())
+        })?;
+        
+        let responses = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.cache.cmd_subscribe(client_id, args).await
+            })
+        })?;
+        
+        // Return multiple responses
+        if responses.len() == 1 {
+            Ok(responses.into_iter().next().unwrap())
+        } else {
+            Ok(RespValue::Array(responses))
+        }
+    }
+
+    fn handle_unsubscribe(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        let client_id = self.client_id.ok_or_else(|| {
+            Error::InvalidArgument("client not registered for pub/sub".into())
+        })?;
+        
+        let responses = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.cache.cmd_unsubscribe(client_id, args).await
+            })
+        })?;
+        
+        if responses.len() == 1 {
+            Ok(responses.into_iter().next().unwrap())
+        } else {
+            Ok(RespValue::Array(responses))
+        }
+    }
+
+    fn handle_psubscribe(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        let client_id = self.client_id.ok_or_else(|| {
+            Error::InvalidArgument("client not registered for pub/sub".into())
+        })?;
+        
+        let responses = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.cache.cmd_psubscribe(client_id, args).await
+            })
+        })?;
+        
+        if responses.len() == 1 {
+            Ok(responses.into_iter().next().unwrap())
+        } else {
+            Ok(RespValue::Array(responses))
+        }
+    }
+
+    fn handle_punsubscribe(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        let client_id = self.client_id.ok_or_else(|| {
+            Error::InvalidArgument("client not registered for pub/sub".into())
+        })?;
+        
+        let responses = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.cache.cmd_punsubscribe(client_id, args).await
+            })
+        })?;
+        
+        if responses.len() == 1 {
+            Ok(responses.into_iter().next().unwrap())
+        } else {
+            Ok(RespValue::Array(responses))
+        }
+    }
+
+    fn handle_pubsub(&self, args: &[RespValue]) -> Result<RespValue> {
+        Ok(tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.cache.cmd_pubsub(args).await
+            })
+        })?)
     }
 }

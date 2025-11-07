@@ -2,9 +2,10 @@
 
 ## Currently working on..
 
+- [x] Support for Redis Pub-Sub
+
 ## Plans
 
-- [ ] Support for Redis Pub-Sub
 - [ ] Cluster (kore cluster)
 - [ ] 데드락 감지 고급 기능
     - [ ] 크로스 프로세스 감지

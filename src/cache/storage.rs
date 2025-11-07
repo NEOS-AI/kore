@@ -1,5 +1,6 @@
 use crate::entry::{Entry, LoadOptions, SharedEntry, StoreOptions};
 use crate::error::{Error, Result};
+use crate::memory::MemoryCategory;
 use bytes::Bytes;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -30,6 +31,17 @@ impl Cache {
         let existing_size = self.map.get(&key).map(|e| e.size()).unwrap_or(0);
 
         let net_memory_change = entry_size.saturating_sub(existing_size);
+
+        // Check MemoryTracker for Cache category
+        if !self.memory_tracker.can_allocate(net_memory_change, MemoryCategory::Cache) {
+            if self.evict_enabled.load(Ordering::Relaxed) {
+                // Try to evict entries to make space
+                self.evict_lru(net_memory_change)?;
+            } else {
+                self.stats.incr(&self.stats.store_no_memory);
+                return Err(Error::OutOfMemory);
+            }
+        }
 
         if current_memory + net_memory_change > self.max_memory {
             if self.evict_enabled.load(Ordering::Relaxed) {
@@ -115,7 +127,14 @@ impl Cache {
 
         // Update memory usage
         if let Some(ref old) = old_entry {
-            self.memory_usage.fetch_sub(old.size(), Ordering::Relaxed);
+            let old_size = old.size();
+            self.memory_usage.fetch_sub(old_size, Ordering::Relaxed);
+            self.memory_tracker.deallocate(old_size, MemoryCategory::Cache);
+        }
+        
+        // Allocate new memory
+        if !self.memory_tracker.allocate(entry_size, MemoryCategory::Cache) {
+            return Err(Error::OutOfMemory);
         }
         self.memory_usage.fetch_add(entry_size, Ordering::Relaxed);
 
@@ -160,7 +179,9 @@ impl Cache {
 
         match self.map.remove(key) {
             Some(entry) => {
-                self.memory_usage.fetch_sub(entry.size(), Ordering::Relaxed);
+                let size = entry.size();
+                self.memory_usage.fetch_sub(size, Ordering::Relaxed);
+                self.memory_tracker.deallocate(size, MemoryCategory::Cache);
                 Ok(true)
             }
             None => Ok(false),

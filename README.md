@@ -170,6 +170,86 @@ ZSCORE leaderboard player2
 "2000"
 ```
 
+### Pub/Sub Operations (Message Broadcasting)
+
+Kore supports Redis-style Pub/Sub for real-time message broadcasting between clients:
+
+- `PUBLISH channel message` - Publish a message to a channel
+- `SUBSCRIBE channel [channel ...]` - Subscribe to one or more channels
+- `UNSUBSCRIBE [channel ...]` - Unsubscribe from channels
+- `PSUBSCRIBE pattern [pattern ...]` - Subscribe to channels matching patterns
+- `PUNSUBSCRIBE [pattern ...]` - Unsubscribe from patterns
+- `PUBSUB CHANNELS [pattern]` - List active channels
+- `PUBSUB NUMSUB [channel ...]` - Get subscriber count per channel
+- `PUBSUB NUMPAT` - Get number of pattern subscriptions
+
+**Pattern Matching:**
+- `*` - Matches any characters
+- `?` - Matches single character
+- `[...]` - Character class matching
+- `\x` - Escape character
+
+**Implementation Details:**
+- Thread-safe with RwLock for concurrent access
+- Broadcast channels for efficient message distribution
+- Automatic client cleanup on disconnect
+- Pattern matching with glob-style syntax
+- No message persistence (memory-based)
+
+**Example - Real-time Notifications:**
+```bash
+# Client 1 - Subscribe to notifications
+SUBSCRIBE notifications
+1) "subscribe"
+2) "notifications"
+3) (integer) 1
+
+# Client 2 - Publish a message
+PUBLISH notifications "New user registered!"
+(integer) 1  # Number of subscribers that received the message
+
+# Client 1 receives:
+1) "message"
+2) "notifications"
+3) "New user registered!"
+
+# Pattern subscription
+PSUBSCRIBE news.*
+
+# Publish to matching channels
+PUBLISH news.tech "AI breakthrough"
+PUBLISH news.sports "Team wins championship"
+
+# Client receives both messages:
+1) "pmessage"
+2) "news.*"
+3) "news.tech"
+4) "AI breakthrough"
+
+# Get statistics
+PUBSUB CHANNELS
+1) "notifications"
+2) "news.tech"
+3) "news.sports"
+
+PUBSUB NUMSUB notifications
+1) "notifications"
+2) (integer) 3
+
+PUBSUB NUMPAT
+(integer) 5
+```
+
+**Use Cases:**
+- Real-time notifications and alerts
+- Chat applications and messaging
+- Event broadcasting and fan-out
+- Log aggregation and monitoring
+- Microservice communication
+
+**Documentation:**
+- [Pub/Sub Guide](docs/pubsub.md)
+
 ### Distributed Lock Pattern
 
 Kore supports both basic and advanced (Redlock) distributed locking patterns.

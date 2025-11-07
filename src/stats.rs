@@ -24,6 +24,20 @@ pub struct Stats {
     pub cmd_geoadd: AtomicU64,
     pub cmd_geosearch: AtomicU64,
 
+    // Pub/Sub command counts
+    pub cmd_publish: AtomicU64,
+    pub cmd_subscribe: AtomicU64,
+    pub cmd_unsubscribe: AtomicU64,
+    pub cmd_psubscribe: AtomicU64,
+    pub cmd_punsubscribe: AtomicU64,
+    pub cmd_pubsub: AtomicU64,
+
+    // Pub/Sub metrics
+    pub pubsub_messages_sent: AtomicU64,
+    pub pubsub_channels_active: AtomicU64,
+    pub pubsub_patterns_active: AtomicU64,
+    pub pubsub_clients_active: AtomicU64,
+
     // Cache hits and misses
     pub hits: AtomicU64,
     pub misses: AtomicU64,
@@ -44,6 +58,12 @@ pub struct Stats {
     // Authentication
     pub auth_cmds: AtomicU64,
     pub auth_errors: AtomicU64,
+
+    // Network statistics
+    pub bytes_sent: AtomicU64,
+    pub bytes_received: AtomicU64,
+    pub total_connections: AtomicU64,
+    pub active_connections: AtomicU64,
 }
 
 impl Stats {
@@ -53,6 +73,23 @@ impl Stats {
 
     pub fn incr(&self, counter: &AtomicU64) {
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn incr_bytes_sent(&self, bytes: usize) {
+        self.bytes_sent.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn incr_bytes_received(&self, bytes: usize) {
+        self.bytes_received.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn incr_connections(&self) {
+        self.total_connections.fetch_add(1, Ordering::Relaxed);
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn decr_active_connections(&self) {
+        self.active_connections.fetch_sub(1, Ordering::Relaxed);
     }
 
     pub fn get_hit_rate(&self) -> f64 {
@@ -82,6 +119,16 @@ impl Stats {
         self.cmd_zrevrank.store(0, Ordering::Relaxed);
         self.cmd_geoadd.store(0, Ordering::Relaxed);
         self.cmd_geosearch.store(0, Ordering::Relaxed);
+        self.cmd_publish.store(0, Ordering::Relaxed);
+        self.cmd_subscribe.store(0, Ordering::Relaxed);
+        self.cmd_unsubscribe.store(0, Ordering::Relaxed);
+        self.cmd_psubscribe.store(0, Ordering::Relaxed);
+        self.cmd_punsubscribe.store(0, Ordering::Relaxed);
+        self.cmd_pubsub.store(0, Ordering::Relaxed);
+        self.pubsub_messages_sent.store(0, Ordering::Relaxed);
+        self.pubsub_channels_active.store(0, Ordering::Relaxed);
+        self.pubsub_patterns_active.store(0, Ordering::Relaxed);
+        self.pubsub_clients_active.store(0, Ordering::Relaxed);
         self.hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);
         self.evicted_expired.store(0, Ordering::Relaxed);
@@ -93,5 +140,9 @@ impl Stats {
         self.store_no_memory.store(0, Ordering::Relaxed);
         self.auth_cmds.store(0, Ordering::Relaxed);
         self.auth_errors.store(0, Ordering::Relaxed);
+        self.bytes_sent.store(0, Ordering::Relaxed);
+        self.bytes_received.store(0, Ordering::Relaxed);
+        self.total_connections.store(0, Ordering::Relaxed);
+        self.active_connections.store(0, Ordering::Relaxed);
     }
 }

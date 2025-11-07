@@ -9,6 +9,12 @@ use tracing_subscriber;
 async fn main() -> anyhow::Result<()> {
     // Parse command line arguments
     let config = Config::parse();
+    
+    // Validate configuration
+    if let Err(e) = config.validate() {
+        eprintln!("Configuration error: {}", e);
+        std::process::exit(1);
+    }
 
     // Initialize tracing/logging
     // verbosity level (higher is more verbose):

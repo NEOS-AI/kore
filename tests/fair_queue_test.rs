@@ -3,7 +3,7 @@ use bytes::Bytes;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 #[test]
 fn test_fair_queue_basic() {
@@ -16,7 +16,7 @@ fn test_fair_queue_basic() {
         .with_fair_queueing(100);
     
     let client1 = Bytes::from("client-1");
-    let client2 = Bytes::from("client-2");
+    let _client2 = Bytes::from("client-2");
     
     // Client 1 acquires lock first
     let _lock1 = redlock.lock("resource-a", client1, 5000).unwrap();

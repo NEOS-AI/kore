@@ -12,6 +12,8 @@ pub mod geospatial;
 pub mod redlock;
 pub mod deadlock;
 pub mod fair_queue;
+pub mod pubsub;
+pub mod memory;
 
 pub use cache::Cache;
 pub use config::Config;
@@ -22,4 +24,6 @@ pub use geospatial::{GeoSet, GeoPoint, DistanceUnit};
 pub use redlock::{Redlock, Lock};
 pub use deadlock::{DeadlockDetector, DeadlockStatus, LockInfo};
 pub use fair_queue::{FairQueue, QueuedClient, FairQueueStats};
+pub use pubsub::{PubSub, ClientId};
+pub use memory::{MemoryTracker, MemoryCategory};
 

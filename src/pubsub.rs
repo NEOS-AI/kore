@@ -1,0 +1,517 @@
+use bytes::Bytes;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use tokio::sync::{broadcast, RwLock};
+use crate::protocol::RespValue;
+
+/// A unique identifier for each client connection
+pub type ClientId = usize;
+
+/// Pattern matching utility for Redis-style glob patterns
+pub struct PatternMatcher;
+
+impl PatternMatcher {
+    /// Check if a channel matches a pattern (Redis-style glob matching)
+    /// Supports: * (any chars), ? (single char), [...] (char class), \x (escape)
+    pub fn matches(pattern: &[u8], channel: &[u8]) -> bool {
+        Self::matches_recursive(pattern, channel, 0, 0)
+    }
+
+    fn matches_recursive(pattern: &[u8], text: &[u8], p_idx: usize, t_idx: usize) -> bool {
+        if p_idx >= pattern.len() {
+            return t_idx >= text.len();
+        }
+
+        match pattern[p_idx] {
+            b'*' => {
+                // Try matching zero or more characters
+                if Self::matches_recursive(pattern, text, p_idx + 1, t_idx) {
+                    return true;
+                }
+                if t_idx < text.len() {
+                    return Self::matches_recursive(pattern, text, p_idx, t_idx + 1);
+                }
+                false
+            }
+            b'?' => {
+                // Match any single character
+                if t_idx >= text.len() {
+                    return false;
+                }
+                Self::matches_recursive(pattern, text, p_idx + 1, t_idx + 1)
+            }
+            b'[' => {
+                // Character class matching
+                if t_idx >= text.len() {
+                    return false;
+                }
+                let (matched, next_p_idx) = Self::match_char_class(pattern, p_idx, text[t_idx]);
+                if !matched {
+                    return false;
+                }
+                Self::matches_recursive(pattern, text, next_p_idx, t_idx + 1)
+            }
+            b'\\' => {
+                // Escape character
+                if p_idx + 1 >= pattern.len() {
+                    return false;
+                }
+                if t_idx >= text.len() || pattern[p_idx + 1] != text[t_idx] {
+                    return false;
+                }
+                Self::matches_recursive(pattern, text, p_idx + 2, t_idx + 1)
+            }
+            c => {
+                // Literal character match
+                if t_idx >= text.len() || c != text[t_idx] {
+                    return false;
+                }
+                Self::matches_recursive(pattern, text, p_idx + 1, t_idx + 1)
+            }
+        }
+    }
+
+    fn match_char_class(pattern: &[u8], start: usize, ch: u8) -> (bool, usize) {
+        let mut idx = start + 1;
+        let mut negated = false;
+        let mut matched = false;
+
+        if idx < pattern.len() && pattern[idx] == b'^' {
+            negated = true;
+            idx += 1;
+        }
+
+        while idx < pattern.len() && pattern[idx] != b']' {
+            if idx + 2 < pattern.len() && pattern[idx + 1] == b'-' {
+                // Range: a-z
+                if ch >= pattern[idx] && ch <= pattern[idx + 2] {
+                    matched = true;
+                }
+                idx += 3;
+            } else {
+                // Single character
+                if pattern[idx] == ch {
+                    matched = true;
+                }
+                idx += 1;
+            }
+        }
+
+        if idx < pattern.len() {
+            idx += 1; // Skip closing ]
+        }
+
+        if negated {
+            matched = !matched;
+        }
+
+        (matched, idx)
+    }
+}
+
+/// Subscriber information
+#[derive(Debug, Clone)]
+pub struct Subscriber {
+    pub client_id: ClientId,
+    pub sender: broadcast::Sender<RespValue>,
+}
+
+/// Pub/Sub system for managing channels and pattern subscriptions
+pub struct PubSub {
+    /// Map of channel names to their subscribers
+    channels: Arc<RwLock<HashMap<Bytes, HashSet<ClientId>>>>,
+    
+    /// Map of patterns to their subscribers
+    patterns: Arc<RwLock<HashMap<Bytes, HashSet<ClientId>>>>,
+    
+    /// Map of client IDs to their broadcast senders
+    clients: Arc<RwLock<HashMap<ClientId, broadcast::Sender<RespValue>>>>,
+    
+    /// Map of client IDs to their subscribed channels
+    client_channels: Arc<RwLock<HashMap<ClientId, HashSet<Bytes>>>>,
+    
+    /// Map of client IDs to their subscribed patterns
+    client_patterns: Arc<RwLock<HashMap<ClientId, HashSet<Bytes>>>>,
+    
+    /// Next client ID to assign
+    next_client_id: Arc<RwLock<ClientId>>,
+}
+
+impl PubSub {
+    /// Create a new PubSub instance
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            channels: Arc::new(RwLock::new(HashMap::new())),
+            patterns: Arc::new(RwLock::new(HashMap::new())),
+            clients: Arc::new(RwLock::new(HashMap::new())),
+            client_channels: Arc::new(RwLock::new(HashMap::new())),
+            client_patterns: Arc::new(RwLock::new(HashMap::new())),
+            next_client_id: Arc::new(RwLock::new(0)),
+        })
+    }
+
+    /// Register a new client and return its ID and receiver
+    pub async fn register_client(&self) -> (ClientId, broadcast::Receiver<RespValue>) {
+        let mut next_id = self.next_client_id.write().await;
+        let client_id = *next_id;
+        *next_id += 1;
+        drop(next_id);
+
+        // Create a broadcast channel for this client
+        let (tx, rx) = broadcast::channel(1024);
+        
+        let mut clients = self.clients.write().await;
+        clients.insert(client_id, tx);
+        
+        (client_id, rx)
+    }
+
+    /// Unregister a client
+    pub async fn unregister_client(&self, client_id: ClientId) {
+        // Remove from all channels
+        if let Some(channels) = self.client_channels.write().await.remove(&client_id) {
+            let mut channel_map = self.channels.write().await;
+            for channel in channels {
+                if let Some(subscribers) = channel_map.get_mut(&channel) {
+                    subscribers.remove(&client_id);
+                    if subscribers.is_empty() {
+                        channel_map.remove(&channel);
+                    }
+                }
+            }
+        }
+
+        // Remove from all patterns
+        if let Some(patterns) = self.client_patterns.write().await.remove(&client_id) {
+            let mut pattern_map = self.patterns.write().await;
+            for pattern in patterns {
+                if let Some(subscribers) = pattern_map.get_mut(&pattern) {
+                    subscribers.remove(&client_id);
+                    if subscribers.is_empty() {
+                        pattern_map.remove(&pattern);
+                    }
+                }
+            }
+        }
+
+        // Remove client
+        self.clients.write().await.remove(&client_id);
+    }
+
+    /// Subscribe a client to a channel
+    pub async fn subscribe(&self, client_id: ClientId, channel: Bytes) -> usize {
+        // Add to channels map
+        let mut channels = self.channels.write().await;
+        channels.entry(channel.clone())
+            .or_insert_with(HashSet::new)
+            .insert(client_id);
+        drop(channels);
+
+        // Add to client_channels map
+        let mut client_channels = self.client_channels.write().await;
+        client_channels.entry(client_id)
+            .or_insert_with(HashSet::new)
+            .insert(channel);
+        
+        // Return total subscription count for this client
+        let channel_count = client_channels.get(&client_id).map(|s| s.len()).unwrap_or(0);
+        let pattern_count = self.client_patterns.read().await
+            .get(&client_id).map(|s| s.len()).unwrap_or(0);
+        
+        channel_count + pattern_count
+    }
+
+    /// Unsubscribe a client from a channel
+    pub async fn unsubscribe(&self, client_id: ClientId, channel: &Bytes) -> usize {
+        // Remove from channels map
+        let mut channels = self.channels.write().await;
+        if let Some(subscribers) = channels.get_mut(channel) {
+            subscribers.remove(&client_id);
+            if subscribers.is_empty() {
+                channels.remove(channel);
+            }
+        }
+        drop(channels);
+
+        // Remove from client_channels map
+        let mut client_channels = self.client_channels.write().await;
+        if let Some(client_chans) = client_channels.get_mut(&client_id) {
+            client_chans.remove(channel);
+        }
+        
+        // Return total subscription count for this client
+        let channel_count = client_channels.get(&client_id).map(|s| s.len()).unwrap_or(0);
+        let pattern_count = self.client_patterns.read().await
+            .get(&client_id).map(|s| s.len()).unwrap_or(0);
+        
+        channel_count + pattern_count
+    }
+
+    /// Unsubscribe a client from all channels
+    pub async fn unsubscribe_all(&self, client_id: ClientId) -> Vec<Bytes> {
+        let mut client_channels = self.client_channels.write().await;
+        let channels_to_remove = client_channels.remove(&client_id).unwrap_or_default();
+        
+        let mut channels = self.channels.write().await;
+        for channel in &channels_to_remove {
+            if let Some(subscribers) = channels.get_mut(channel) {
+                subscribers.remove(&client_id);
+                if subscribers.is_empty() {
+                    channels.remove(channel);
+                }
+            }
+        }
+        
+        channels_to_remove.into_iter().collect()
+    }
+
+    /// Subscribe a client to a pattern
+    pub async fn psubscribe(&self, client_id: ClientId, pattern: Bytes) -> usize {
+        // Add to patterns map
+        let mut patterns = self.patterns.write().await;
+        patterns.entry(pattern.clone())
+            .or_insert_with(HashSet::new)
+            .insert(client_id);
+        drop(patterns);
+
+        // Add to client_patterns map
+        let mut client_patterns = self.client_patterns.write().await;
+        client_patterns.entry(client_id)
+            .or_insert_with(HashSet::new)
+            .insert(pattern);
+        
+        // Return total subscription count for this client
+        let pattern_count = client_patterns.get(&client_id).map(|s| s.len()).unwrap_or(0);
+        let channel_count = self.client_channels.read().await
+            .get(&client_id).map(|s| s.len()).unwrap_or(0);
+        
+        channel_count + pattern_count
+    }
+
+    /// Unsubscribe a client from a pattern
+    pub async fn punsubscribe(&self, client_id: ClientId, pattern: &Bytes) -> usize {
+        // Remove from patterns map
+        let mut patterns = self.patterns.write().await;
+        if let Some(subscribers) = patterns.get_mut(pattern) {
+            subscribers.remove(&client_id);
+            if subscribers.is_empty() {
+                patterns.remove(pattern);
+            }
+        }
+        drop(patterns);
+
+        // Remove from client_patterns map
+        let mut client_patterns = self.client_patterns.write().await;
+        if let Some(client_pats) = client_patterns.get_mut(&client_id) {
+            client_pats.remove(pattern);
+        }
+        
+        // Return total subscription count for this client
+        let pattern_count = client_patterns.get(&client_id).map(|s| s.len()).unwrap_or(0);
+        let channel_count = self.client_channels.read().await
+            .get(&client_id).map(|s| s.len()).unwrap_or(0);
+        
+        channel_count + pattern_count
+    }
+
+    /// Unsubscribe a client from all patterns
+    pub async fn punsubscribe_all(&self, client_id: ClientId) -> Vec<Bytes> {
+        let mut client_patterns = self.client_patterns.write().await;
+        let patterns_to_remove = client_patterns.remove(&client_id).unwrap_or_default();
+        
+        let mut patterns = self.patterns.write().await;
+        for pattern in &patterns_to_remove {
+            if let Some(subscribers) = patterns.get_mut(pattern) {
+                subscribers.remove(&client_id);
+                if subscribers.is_empty() {
+                    patterns.remove(pattern);
+                }
+            }
+        }
+        
+        patterns_to_remove.into_iter().collect()
+    }
+
+    /// Publish a message to a channel
+    /// Returns the number of clients that received the message
+    pub async fn publish(&self, channel: &Bytes, message: &Bytes) -> usize {
+        let mut recipient_count = 0;
+        let clients = self.clients.read().await;
+
+        // Send to direct channel subscribers
+        if let Some(subscribers) = self.channels.read().await.get(channel) {
+            for &client_id in subscribers {
+                if let Some(sender) = clients.get(&client_id) {
+                    let msg = RespValue::Array(vec![
+                        RespValue::BulkString(Some(Bytes::from_static(b"message"))),
+                        RespValue::BulkString(Some(channel.clone())),
+                        RespValue::BulkString(Some(message.clone())),
+                    ]);
+                    let _ = sender.send(msg);
+                    recipient_count += 1;
+                }
+            }
+        }
+
+        // Send to pattern subscribers
+        let patterns = self.patterns.read().await;
+        for (pattern, subscribers) in patterns.iter() {
+            if PatternMatcher::matches(pattern, channel) {
+                for &client_id in subscribers {
+                    if let Some(sender) = clients.get(&client_id) {
+                        let msg = RespValue::Array(vec![
+                            RespValue::BulkString(Some(Bytes::from_static(b"pmessage"))),
+                            RespValue::BulkString(Some(pattern.clone())),
+                            RespValue::BulkString(Some(channel.clone())),
+                            RespValue::BulkString(Some(message.clone())),
+                        ]);
+                        let _ = sender.send(msg);
+                        recipient_count += 1;
+                    }
+                }
+            }
+        }
+
+        recipient_count
+    }
+
+    /// Get the number of active channels (channels with at least one subscriber)
+    pub async fn num_channels(&self) -> usize {
+        self.channels.read().await.len()
+    }
+
+    /// Get the number of subscriptions for patterns
+    pub async fn num_patterns(&self) -> usize {
+        self.patterns.read().await.len()
+    }
+
+    /// Get the number of subscribers for a specific channel
+    pub async fn num_subscribers(&self, channel: &Bytes) -> usize {
+        self.channels.read().await
+            .get(channel)
+            .map(|s| s.len())
+            .unwrap_or(0)
+    }
+
+    /// List all active channels, optionally filtered by pattern
+    pub async fn list_channels(&self, pattern: Option<&Bytes>) -> Vec<Bytes> {
+        let channels = self.channels.read().await;
+        if let Some(pat) = pattern {
+            channels.keys()
+                .filter(|ch| PatternMatcher::matches(pat, ch))
+                .cloned()
+                .collect()
+        } else {
+            channels.keys().cloned().collect()
+        }
+    }
+
+    /// Get subscription count for a client
+    pub async fn client_subscription_count(&self, client_id: ClientId) -> (usize, usize) {
+        let channel_count = self.client_channels.read().await
+            .get(&client_id)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        let pattern_count = self.client_patterns.read().await
+            .get(&client_id)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        (channel_count, pattern_count)
+    }
+}
+
+impl Default for PubSub {
+    fn default() -> Self {
+        Self {
+            channels: Arc::new(RwLock::new(HashMap::new())),
+            patterns: Arc::new(RwLock::new(HashMap::new())),
+            clients: Arc::new(RwLock::new(HashMap::new())),
+            client_channels: Arc::new(RwLock::new(HashMap::new())),
+            client_patterns: Arc::new(RwLock::new(HashMap::new())),
+            next_client_id: Arc::new(RwLock::new(0)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pattern_matcher() {
+        // Simple wildcard tests
+        assert!(PatternMatcher::matches(b"h*llo", b"hello"));
+        assert!(PatternMatcher::matches(b"h*llo", b"hllo"));
+        assert!(PatternMatcher::matches(b"h*llo", b"heeeello"));
+        assert!(!PatternMatcher::matches(b"h*llo", b"helo"));
+
+        // Question mark tests
+        assert!(PatternMatcher::matches(b"h?llo", b"hello"));
+        assert!(PatternMatcher::matches(b"h?llo", b"hallo"));
+        assert!(!PatternMatcher::matches(b"h?llo", b"hllo"));
+
+        // Character class tests
+        assert!(PatternMatcher::matches(b"h[ae]llo", b"hello"));
+        assert!(PatternMatcher::matches(b"h[ae]llo", b"hallo"));
+        assert!(!PatternMatcher::matches(b"h[ae]llo", b"hillo"));
+
+        // Range tests
+        assert!(PatternMatcher::matches(b"h[a-z]llo", b"hello"));
+        assert!(!PatternMatcher::matches(b"h[a-z]llo", b"h1llo"));
+
+        // Complex patterns
+        assert!(PatternMatcher::matches(b"news.*", b"news.tech"));
+        assert!(PatternMatcher::matches(b"news.*", b"news.sports.football"));
+        assert!(!PatternMatcher::matches(b"news.*", b"tech.news"));
+    }
+
+    #[tokio::test]
+    async fn test_pubsub_subscribe_publish() {
+        let pubsub = PubSub::new();
+        let (client_id, mut rx) = pubsub.register_client().await;
+
+        let channel = Bytes::from("test-channel");
+        let count = pubsub.subscribe(client_id, channel.clone()).await;
+        assert_eq!(count, 1);
+
+        let message = Bytes::from("hello world");
+        let recipients = pubsub.publish(&channel, &message).await;
+        assert_eq!(recipients, 1);
+
+        let received = rx.recv().await.unwrap();
+        if let RespValue::Array(arr) = received {
+            assert_eq!(arr.len(), 3);
+            assert_eq!(arr[0].as_bulk_string().unwrap(), &Bytes::from("message"));
+            assert_eq!(arr[1].as_bulk_string().unwrap(), &Bytes::from("test-channel"));
+            assert_eq!(arr[2].as_bulk_string().unwrap(), &Bytes::from("hello world"));
+        } else {
+            panic!("Expected array");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pubsub_pattern_subscribe() {
+        let pubsub = PubSub::new();
+        let (client_id, mut rx) = pubsub.register_client().await;
+
+        let pattern = Bytes::from("news.*");
+        let count = pubsub.psubscribe(client_id, pattern).await;
+        assert_eq!(count, 1);
+
+        let channel = Bytes::from("news.tech");
+        let message = Bytes::from("new article");
+        let recipients = pubsub.publish(&channel, &message).await;
+        assert_eq!(recipients, 1);
+
+        let received = rx.recv().await.unwrap();
+        if let RespValue::Array(arr) = received {
+            assert_eq!(arr.len(), 4);
+            assert_eq!(arr[0].as_bulk_string().unwrap(), &Bytes::from("pmessage"));
+            assert_eq!(arr[1].as_bulk_string().unwrap(), &Bytes::from("news.*"));
+            assert_eq!(arr[2].as_bulk_string().unwrap(), &Bytes::from("news.tech"));
+            assert_eq!(arr[3].as_bulk_string().unwrap(), &Bytes::from("new article"));
+        } else {
+            panic!("Expected array");
+        }
+    }
+}

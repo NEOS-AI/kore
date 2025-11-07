@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
 use crate::protocol::RespValue;
+use crate::memory::MemoryCategory;
 use bytes::Bytes;
 use std::sync::atomic::Ordering;
 use super::CommandHandler;
@@ -49,7 +50,13 @@ impl CommandHandler {
             + stats.cmd_zrank.load(Ordering::Relaxed)
             + stats.cmd_zrevrank.load(Ordering::Relaxed)
             + stats.cmd_geoadd.load(Ordering::Relaxed)
-            + stats.cmd_geosearch.load(Ordering::Relaxed);
+            + stats.cmd_geosearch.load(Ordering::Relaxed)
+            + stats.cmd_publish.load(Ordering::Relaxed)
+            + stats.cmd_subscribe.load(Ordering::Relaxed)
+            + stats.cmd_unsubscribe.load(Ordering::Relaxed)
+            + stats.cmd_psubscribe.load(Ordering::Relaxed)
+            + stats.cmd_punsubscribe.load(Ordering::Relaxed)
+            + stats.cmd_pubsub.load(Ordering::Relaxed);
         
         let info = format!(
             "# Server\r\n\
@@ -72,17 +79,44 @@ impl CommandHandler {
              cmd_zrevrank:{}\r\n\
              cmd_geoadd:{}\r\n\
              cmd_geosearch:{}\r\n\
+             cmd_publish:{}\r\n\
+             cmd_subscribe:{}\r\n\
+             cmd_unsubscribe:{}\r\n\
+             cmd_psubscribe:{}\r\n\
+             cmd_punsubscribe:{}\r\n\
+             cmd_pubsub:{}\r\n\
              keyspace_hits:{}\r\n\
              keyspace_misses:{}\r\n\
              hit_rate:{:.2}\r\n\
              evicted_expired:{}\r\n\
              evicted_lru:{}\r\n\
              \r\n\
+             # Pub/Sub\r\n\
+             pubsub_messages_sent:{}\r\n\
+             pubsub_channels_active:{}\r\n\
+             pubsub_patterns_active:{}\r\n\
+             pubsub_clients_active:{}\r\n\
+             \r\n\
              # Memory\r\n\
              used_memory:{}\r\n\
              maxmemory:{}\r\n\
              maxentrysize:{}\r\n\
              geo_sets_memory:{}\r\n\
+             memory_cache_used:{}\r\n\
+             memory_cache_utilization:{:.2}%\r\n\
+             memory_pubsub_used:{}\r\n\
+             memory_pubsub_utilization:{:.2}%\r\n\
+             memory_sorted_sets_used:{}\r\n\
+             memory_sorted_sets_utilization:{:.2}%\r\n\
+             memory_geo_sets_used:{}\r\n\
+             memory_geo_sets_utilization:{:.2}%\r\n\
+             memory_total_utilization:{:.2}%\r\n\
+             \r\n\
+             # Network\r\n\
+             bytes_sent:{}\r\n\
+             bytes_received:{}\r\n\
+             total_connections:{}\r\n\
+             active_connections:{}\r\n\
              \r\n\
              # Keyspace\r\n\
              db0:keys={},geo_sets={}\r\n",
@@ -103,15 +137,38 @@ impl CommandHandler {
             stats.cmd_zrevrank.load(Ordering::Relaxed),
             stats.cmd_geoadd.load(Ordering::Relaxed),
             stats.cmd_geosearch.load(Ordering::Relaxed),
+            stats.cmd_publish.load(Ordering::Relaxed),
+            stats.cmd_subscribe.load(Ordering::Relaxed),
+            stats.cmd_unsubscribe.load(Ordering::Relaxed),
+            stats.cmd_psubscribe.load(Ordering::Relaxed),
+            stats.cmd_punsubscribe.load(Ordering::Relaxed),
+            stats.cmd_pubsub.load(Ordering::Relaxed),
             stats.hits.load(Ordering::Relaxed),
             stats.misses.load(Ordering::Relaxed),
             stats.get_hit_rate(),
             stats.evicted_expired.load(Ordering::Relaxed),
             stats.evicted_lru.load(Ordering::Relaxed),
+            stats.pubsub_messages_sent.load(Ordering::Relaxed),
+            stats.pubsub_channels_active.load(Ordering::Relaxed),
+            stats.pubsub_patterns_active.load(Ordering::Relaxed),
+            stats.pubsub_clients_active.load(Ordering::Relaxed),
             self.cache.memory_usage(),
             self.cache.max_memory,
             self.cache.get_max_entry_size(),
             self.cache.geo_sets_memory(),
+            self.cache.memory_tracker.category_memory(MemoryCategory::Cache),
+            self.cache.memory_tracker.category_memory(MemoryCategory::Cache) as f64 / self.cache.max_memory as f64 * 100.0,
+            self.cache.memory_tracker.category_memory(MemoryCategory::PubSub),
+            self.cache.memory_tracker.category_memory(MemoryCategory::PubSub) as f64 / self.cache.max_memory as f64 * 100.0,
+            self.cache.memory_tracker.category_memory(MemoryCategory::SortedSets),
+            self.cache.memory_tracker.category_memory(MemoryCategory::SortedSets) as f64 / self.cache.max_memory as f64 * 100.0,
+            self.cache.memory_tracker.category_memory(MemoryCategory::GeoSets),
+            self.cache.memory_tracker.category_memory(MemoryCategory::GeoSets) as f64 / self.cache.max_memory as f64 * 100.0,
+            self.cache.memory_tracker.utilization(),
+            stats.bytes_sent.load(Ordering::Relaxed),
+            stats.bytes_received.load(Ordering::Relaxed),
+            stats.total_connections.load(Ordering::Relaxed),
+            stats.active_connections.load(Ordering::Relaxed),
             self.cache.dbsize(),
             self.cache.geo_set_count(),
         );

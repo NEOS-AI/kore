@@ -106,8 +106,12 @@ impl GeoSet {
             }
         }
 
-        // Sort by distance (ascending)
-        results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+                // Sort results by distance
+        results.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results
     }
 
@@ -310,9 +314,10 @@ mod tests {
 
         let pos = geoset.get_position(&Bytes::from("Seoul"));
         assert!(pos.is_some());
-        let (lon, lat) = pos.unwrap();
-        assert!((lon - 126.9780).abs() < 0.0001);
-        assert!((lat - 37.5665).abs() < 0.0001);
+        if let Some((lon, lat)) = pos {
+            assert!((lon - 126.9780).abs() < 0.0001);
+            assert!((lat - 37.5665).abs() < 0.0001);
+        }
     }
 
     #[test]

@@ -10,6 +10,8 @@ use crate::hashmap::ShardedHashMap;
 use crate::sorted_set::SharedSortedSet;
 use crate::geospatial::GeoSet;
 use crate::stats::Stats;
+use crate::pubsub::PubSub;
+use crate::memory::MemoryTracker;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -23,6 +25,10 @@ pub struct Cache {
     pub(super) sorted_sets: Arc<RwLock<HashMap<Bytes, SharedSortedSet>>>,
     /// HashMap for storing geospatial sets
     pub(super) geo_sets: Arc<RwLock<HashMap<Bytes, Arc<RwLock<GeoSet>>>>>,
+    /// Pub/Sub system
+    pub pubsub: Arc<PubSub>,
+    /// Memory tracker for category-based allocation
+    pub(super) memory_tracker: Arc<MemoryTracker>,
     /// Statistics
     pub stats: Arc<Stats>,
     /// Maximum memory in bytes
@@ -50,10 +56,18 @@ impl Cache {
         max_entry_size: usize,
         start_sweep: bool,
     ) -> Arc<Self> {
+        // Create memory tracker with total memory limit and 1MB max message size
+        let memory_tracker = Arc::new(MemoryTracker::new(
+            max_memory,
+            1024 * 1024, // 1MB max message size
+        ));
+        
         let cache = Arc::new(Self {
             map: ShardedHashMap::new(num_shards, 1024),
             sorted_sets: Arc::new(RwLock::new(HashMap::new())),
             geo_sets: Arc::new(RwLock::new(HashMap::new())),
+            pubsub: PubSub::new(),
+            memory_tracker,
             stats: Arc::new(Stats::new()),
             max_memory,
             memory_usage: AtomicUsize::new(0),

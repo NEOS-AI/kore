@@ -1,4 +1,5 @@
 use clap::Parser;
+use crate::error::{Error, Result};
 use std::net::SocketAddr;
 
 #[derive(Parser, Debug, Clone)]
@@ -107,4 +108,137 @@ impl Config {
                 .collect()
         }
     }
+
+    /// Validate configuration settings
+    pub fn validate(&self) -> Result<()> {
+        // Validate port
+        if self.port == 0 {
+            return Err(Error::ConfigError("Port cannot be 0".to_string()));
+        }
+
+        // Validate shards (must be power of 2)
+        if self.shards == 0 || (self.shards & (self.shards - 1)) != 0 {
+            return Err(Error::ConfigError(
+                format!("Shards must be a power of 2, got {}", self.shards)
+            ));
+        }
+
+        // Validate maxmemory (must be at least 1MB if set)
+        if self.maxmemory > 0 && self.maxmemory < 1024 * 1024 {
+            return Err(Error::ConfigError(
+                format!("Max memory must be at least 1MB, got {} bytes", self.maxmemory)
+            ));
+        }
+
+        // Validate load factor
+        if self.loadfactor < 0.55 || self.loadfactor > 0.95 {
+            return Err(Error::ConfigError(
+                format!("Load factor must be between 0.55 and 0.95, got {}", self.loadfactor)
+            ));
+        }
+
+        // Validate maxconns
+        if self.maxconns == 0 {
+            return Err(Error::ConfigError("Max connections cannot be 0".to_string()));
+        }
+
+        // Validate maxentrysize (must be at least 1KB)
+        if self.maxentrysize < 1024 {
+            return Err(Error::ConfigError(
+                format!("Max entry size must be at least 1KB, got {} bytes", self.maxentrysize)
+            ));
+        }
+
+        // Validate verbosity level
+        if self.verbosity > 3 {
+            return Err(Error::ConfigError(
+                format!("Verbosity level must be 0-3, got {}", self.verbosity)
+            ));
+        }
+
+        // Validate Redlock configuration
+        if self.enable_redlock {
+            let instances = self.redlock_instance_addrs();
+            if instances.len() < 3 {
+                return Err(Error::ConfigError(
+                    format!("Redlock requires at least 3 instances, got {}", instances.len())
+                ));
+            }
+
+            // Validate that all addresses are parseable
+            for addr in instances {
+                if addr.parse::<SocketAddr>().is_err() {
+                    return Err(Error::ConfigError(
+                        format!("Invalid Redlock instance address: {}", addr)
+                    ));
+                }
+            }
+
+            if self.redlock_retry_count == 0 {
+                return Err(Error::ConfigError("Redlock retry count cannot be 0".to_string()));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Update a configuration value at runtime
+    pub fn set(&mut self, key: &str, value: &str) -> Result<String> {
+        match key {
+            "maxmemory" => {
+                let val: usize = value.parse()
+                    .map_err(|_| Error::ConfigError(format!("Invalid maxmemory value: {}", value)))?;
+                
+                if val > 0 && val < 1024 * 1024 {
+                    return Err(Error::ConfigError(
+                        "Max memory must be at least 1MB".to_string()
+                    ));
+                }
+                
+                self.maxmemory = val;
+                Ok(format!("Set maxmemory to {}", val))
+            }
+            "maxentrysize" => {
+                let val: usize = value.parse()
+                    .map_err(|_| Error::ConfigError(format!("Invalid maxentrysize value: {}", value)))?;
+                
+                if val < 1024 {
+                    return Err(Error::ConfigError(
+                        "Max entry size must be at least 1KB".to_string()
+                    ));
+                }
+                
+                self.maxentrysize = val;
+                Ok(format!("Set maxentrysize to {}", val))
+            }
+            "maxconns" => {
+                let val: usize = value.parse()
+                    .map_err(|_| Error::ConfigError(format!("Invalid maxconns value: {}", value)))?;
+                
+                if val == 0 {
+                    return Err(Error::ConfigError(
+                        "Max connections cannot be 0".to_string()
+                    ));
+                }
+                
+                self.maxconns = val;
+                Ok(format!("Set maxconns to {}", val))
+            }
+            "verbosity" => {
+                let val: u8 = value.parse()
+                    .map_err(|_| Error::ConfigError(format!("Invalid verbosity value: {}", value)))?;
+                
+                if val > 3 {
+                    return Err(Error::ConfigError(
+                        "Verbosity level must be 0-3".to_string()
+                    ));
+                }
+                
+                self.verbosity = val;
+                Ok(format!("Set verbosity to {}", val))
+            }
+            _ => Err(Error::ConfigError(format!("Unknown config key: {}", key)))
+        }
+    }
 }
+

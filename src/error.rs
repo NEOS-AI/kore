@@ -43,6 +43,24 @@ pub enum Error {
 
     #[error("Deadlock detected: {0}")]
     DeadlockDetected(String),
+
+    #[error("Pub/Sub error: {0}")]
+    PubSubError(String),
+
+    #[error("Message too large: {size} bytes (max: {max})")]
+    MessageTooLarge { size: usize, max: usize },
+
+    #[error("Slow client timeout")]
+    SlowClientTimeout,
+
+    #[error("Network error: {0}")]
+    NetworkError(String),
+
+    #[error("Comparison error: cannot compare NaN values")]
+    ComparisonError,
+
+    #[error("Configuration error: {0}")]
+    ConfigError(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
