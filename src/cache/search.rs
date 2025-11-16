@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn test_create_and_list_indices() {
-        let cache = Cache::new(16, 1024 * 1024);
+        let cache = Cache::new_with_sweep(16, 1024 * 1024, 500 * 1024 * 1024, false);
 
         let definition = IndexDefinition::new(
             "test_idx".to_string(),
@@ -239,7 +239,7 @@ mod tests {
 
     #[test]
     fn test_index_and_search() {
-        let cache = Cache::new(16, 1024 * 1024);
+        let cache = Cache::new_with_sweep(16, 1024 * 1024, 500 * 1024 * 1024, false);
 
         let definition = IndexDefinition::new(
             "test_idx".to_string(),
