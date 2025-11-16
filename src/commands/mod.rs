@@ -6,6 +6,7 @@ mod admin;
 mod sorted_set;
 mod geospatial;
 mod pubsub;
+mod search;
 
 use crate::cache::Cache;
 use crate::config::Config;
@@ -126,7 +127,14 @@ impl CommandHandler {
             "PSUBSCRIBE" => self.handle_psubscribe(&args[1..]),
             "PUNSUBSCRIBE" => self.handle_punsubscribe(&args[1..]),
             "PUBSUB" => self.handle_pubsub(&args[1..]),
-            
+
+            // Search commands
+            "FT.CREATE" => self.handle_ft_create(&args[1..]),
+            "FT.DROPINDEX" => self.handle_ft_dropindex(&args[1..]),
+            "FT._LIST" => self.handle_ft_list(&args[1..]),
+            "FT.INFO" => self.handle_ft_info(&args[1..]),
+            "FT.SEARCH" => self.handle_ft_search(&args[1..]),
+
             _ => Ok(RespValue::error(format!("ERR unknown command '{}'", cmd_upper))),
         }
     }

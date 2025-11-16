@@ -250,6 +250,100 @@ PUBSUB NUMPAT
 **Documentation:**
 - [Pub/Sub Guide](docs/pubsub.md)
 
+### Search Operations (Full-Text & Vector Search)
+
+Kore supports Redis-like search capabilities including full-text search and vector similarity search:
+
+**Index Management:**
+- `FT.CREATE index [PREFIX count prefix ...] SCHEMA field_name field_type [options ...]` - Create a search index
+- `FT.DROPINDEX index` - Drop a search index
+- `FT._LIST` - List all search indices
+- `FT.INFO index` - Get index information
+
+**Search:**
+- `FT.SEARCH index query [LIMIT offset count] [RETURN count field ...]` - Search for documents
+
+**Supported Field Types:**
+- **TEXT** - Full-text search with tokenization
+  - Options: `WEIGHT weight` (default: 1.0), `SORTABLE`
+- **NUMERIC** - Numeric range queries
+  - Options: `SORTABLE`
+- **TAG** - Exact matching with tags
+  - Options: `SEPARATOR separator` (default: ","), `SORTABLE`
+- **VECTOR** - Vector similarity search (KNN/ANN)
+  - Algorithms: `FLAT` (brute-force), `HNSW` (approximate)
+  - Distance metrics: `COSINE`, `L2`, `IP` (inner product)
+  - Options: `DIM dimensions`, `DISTANCE_METRIC metric`
+
+**Implementation Details:**
+- Inverted index for full-text search
+- Range indices for numeric queries
+- Tag indices for exact matching
+- Vector indices with multiple similarity metrics
+- Flat (brute-force) and HNSW algorithms for vector search
+- Thread-safe with RwLock for concurrent access
+
+**Example - Full-Text Search:**
+```bash
+# Create an index for articles
+FT.CREATE articles PREFIX 1 article: SCHEMA title TEXT WEIGHT 2.0 body TEXT
+
+# Index a document (programmatically)
+# cache.index_document("articles", "article:1", {
+#   "title": "Introduction to Rust",
+#   "body": "Rust is a systems programming language..."
+# })
+
+# Search for articles
+FT.SEARCH articles "rust programming" LIMIT 0 10
+
+# Get index info
+FT.INFO articles
+
+# List all indices
+FT._LIST
+
+# Drop an index
+FT.DROPINDEX articles
+```
+
+**Example - Vector Search:**
+```bash
+# Create a vector index for embeddings
+FT.CREATE embeddings SCHEMA
+  text TEXT
+  embedding VECTOR FLAT TYPE FLOAT32 DIM 128 DISTANCE_METRIC COSINE
+
+# Index documents with vectors (programmatically)
+# cache.index_document("embeddings", "doc1", {
+#   "text": "document content",
+#   "embedding": [0.1, 0.2, 0.3, ...]
+# })
+
+# Search for similar documents (programmatically via QueryFilter::Vector)
+```
+
+**Example - Numeric Range Search:**
+```bash
+# Create an index with numeric fields
+FT.CREATE products SCHEMA name TEXT price NUMERIC SORTABLE
+
+# Index products (programmatically)
+# cache.index_document("products", "prod1", {
+#   "name": "Laptop",
+#   "price": 999.99
+# })
+
+# Search with numeric filters (programmatically via QueryFilter::NumericRange)
+```
+
+**Use Cases:**
+- Full-text search for articles, documents, logs
+- Vector similarity search for semantic search, recommendations
+- Product search with filters and ranges
+- Real-time search and indexing
+- Multi-field search and ranking
+
 ### Distributed Lock Pattern
 
 Kore supports both basic and advanced (Redlock) distributed locking patterns.

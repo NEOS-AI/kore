@@ -14,6 +14,9 @@ pub mod deadlock;
 pub mod fair_queue;
 pub mod pubsub;
 pub mod memory;
+pub mod search_index;
+pub mod query_engine;
+pub mod vector_search;
 
 pub use cache::Cache;
 pub use config::Config;
@@ -26,4 +29,7 @@ pub use deadlock::{DeadlockDetector, DeadlockStatus, LockInfo};
 pub use fair_queue::{FairQueue, QueuedClient, FairQueueStats};
 pub use pubsub::{PubSub, ClientId};
 pub use memory::{MemoryTracker, MemoryCategory};
+pub use search_index::{SearchIndexManager, IndexDefinition, FieldDefinition, FieldType, DocumentField, DistanceMetric, VectorAlgorithm};
+pub use query_engine::{Query, QueryFilter, QueryExecutor};
+pub use vector_search::{VectorIndex, VectorSearchResult};
 

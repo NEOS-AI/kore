@@ -5,6 +5,7 @@ mod eviction;
 mod sorted_sets;
 mod geo_sets;
 mod config;
+mod search;
 
 use crate::hashmap::ShardedHashMap;
 use crate::sorted_set::SharedSortedSet;
@@ -12,6 +13,7 @@ use crate::geospatial::GeoSet;
 use crate::stats::Stats;
 use crate::pubsub::PubSub;
 use crate::memory::MemoryTracker;
+use crate::search_index::SearchIndexManager;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
@@ -27,6 +29,8 @@ pub struct Cache {
     pub(super) geo_sets: Arc<RwLock<HashMap<Bytes, Arc<RwLock<GeoSet>>>>>,
     /// Pub/Sub system
     pub pubsub: Arc<PubSub>,
+    /// Search index manager
+    pub(super) search_index_manager: Arc<SearchIndexManager>,
     /// Memory tracker for category-based allocation
     pub(super) memory_tracker: Arc<MemoryTracker>,
     /// Statistics
@@ -67,6 +71,7 @@ impl Cache {
             sorted_sets: Arc::new(RwLock::new(HashMap::new())),
             geo_sets: Arc::new(RwLock::new(HashMap::new())),
             pubsub: PubSub::new(),
+            search_index_manager: Arc::new(SearchIndexManager::new()),
             memory_tracker,
             stats: Arc::new(Stats::new()),
             max_memory,
