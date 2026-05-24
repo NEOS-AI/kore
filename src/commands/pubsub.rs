@@ -273,10 +273,130 @@ impl Cache {
                 let count = self.pubsub.num_patterns().await;
                 Ok(RespValue::Integer(count as i64))
             }
+            "SHARDCHANNELS" => {
+                // PUBSUB SHARDCHANNELS [pattern]
+                let pattern = if args.len() > 1 {
+                    match args[1].as_bulk_string() {
+                        Some(s) => Some(Bytes::from(s.to_vec())),
+                        None => return Ok(RespValue::error("ERR invalid pattern")),
+                    }
+                } else {
+                    None
+                };
+                let channels = self.pubsub.list_shard_channels(pattern.as_ref()).await;
+                let result: Vec<RespValue> = channels
+                    .into_iter()
+                    .map(|ch| RespValue::BulkString(Some(ch)))
+                    .collect();
+                Ok(RespValue::Array(result))
+            }
+            "SHARDNUMSUB" => {
+                // PUBSUB SHARDNUMSUB [shardchannel [shardchannel ...]]
+                let mut result = Vec::new();
+                for arg in &args[1..] {
+                    let channel = match arg.as_bulk_string() {
+                        Some(s) => Bytes::from(s.to_vec()),
+                        None => continue,
+                    };
+                    let count = self.pubsub.num_shard_subscribers(&channel).await;
+                    result.push(RespValue::BulkString(Some(channel)));
+                    result.push(RespValue::Integer(count as i64));
+                }
+                Ok(RespValue::Array(result))
+            }
             _ => Ok(RespValue::error(format!(
                 "ERR unknown subcommand '{}'",
                 subcommand
             ))),
         }
+    }
+
+    /// Handle SSUBSCRIBE command (Redis 7.0+ Shard Pub/Sub)
+    /// SSUBSCRIBE shardchannel [shardchannel ...]
+    pub async fn cmd_ssubscribe(&self, client_id: ClientId, args: &[RespValue]) -> Result<Vec<RespValue>> {
+        if args.is_empty() {
+            return Ok(vec![RespValue::error("ERR wrong number of arguments for 'ssubscribe' command")]);
+        }
+
+        let mut responses = Vec::new();
+        for arg in args {
+            let channel = match arg.as_bulk_string() {
+                Some(s) => Bytes::from(s.to_vec()),
+                None => {
+                    responses.push(RespValue::error("ERR invalid channel"));
+                    continue;
+                }
+            };
+            let count = self.pubsub.ssubscribe(client_id, channel.clone()).await;
+            responses.push(RespValue::Array(vec![
+                RespValue::BulkString(Some(Bytes::from_static(b"ssubscribe"))),
+                RespValue::BulkString(Some(channel)),
+                RespValue::Integer(count as i64),
+            ]));
+        }
+        Ok(responses)
+    }
+
+    /// Handle SUNSUBSCRIBE command (Redis 7.0+ Shard Pub/Sub)
+    /// SUNSUBSCRIBE [shardchannel [shardchannel ...]]
+    pub async fn cmd_sunsubscribe(&self, client_id: ClientId, args: &[RespValue]) -> Result<Vec<RespValue>> {
+        let mut responses = Vec::new();
+
+        if args.is_empty() {
+            let channels = self.pubsub.sunsubscribe_all(client_id).await;
+            if channels.is_empty() {
+                responses.push(RespValue::Array(vec![
+                    RespValue::BulkString(Some(Bytes::from_static(b"sunsubscribe"))),
+                    RespValue::null(),
+                    RespValue::Integer(0),
+                ]));
+            } else {
+                for channel in channels {
+                    let count = self.pubsub.num_shard_subscribers(&channel).await;
+                    responses.push(RespValue::Array(vec![
+                        RespValue::BulkString(Some(Bytes::from_static(b"sunsubscribe"))),
+                        RespValue::BulkString(Some(channel)),
+                        RespValue::Integer(count as i64),
+                    ]));
+                }
+            }
+        } else {
+            for arg in args {
+                let channel = match arg.as_bulk_string() {
+                    Some(s) => Bytes::from(s.to_vec()),
+                    None => {
+                        responses.push(RespValue::error("ERR invalid channel"));
+                        continue;
+                    }
+                };
+                let count = self.pubsub.sunsubscribe(client_id, &channel).await;
+                responses.push(RespValue::Array(vec![
+                    RespValue::BulkString(Some(Bytes::from_static(b"sunsubscribe"))),
+                    RespValue::BulkString(Some(channel)),
+                    RespValue::Integer(count as i64),
+                ]));
+            }
+        }
+        Ok(responses)
+    }
+
+    /// Handle SPUBLISH command (Redis 7.0+ Shard Pub/Sub)
+    /// SPUBLISH shardchannel message
+    pub async fn cmd_spublish(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 2 {
+            return Ok(RespValue::error("ERR wrong number of arguments for 'spublish' command"));
+        }
+
+        let channel = match args[0].as_bulk_string() {
+            Some(s) => Bytes::from(s.to_vec()),
+            None => return Ok(RespValue::error("ERR invalid channel")),
+        };
+        let message = match args[1].as_bulk_string() {
+            Some(s) => Bytes::from(s.to_vec()),
+            None => return Ok(RespValue::error("ERR invalid message")),
+        };
+
+        let count = self.pubsub.spublish(&channel, &message).await;
+        Ok(RespValue::Integer(count as i64))
     }
 }

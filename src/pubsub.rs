@@ -132,6 +132,12 @@ pub struct PubSub {
     
     /// Map of client IDs to their subscribed patterns
     client_patterns: Arc<RwLock<HashMap<ClientId, HashSet<Bytes>>>>,
+
+    /// Map of shard channel names to their subscribers (Redis 7.0+ Shard Pub/Sub)
+    shard_channels: Arc<RwLock<HashMap<Bytes, HashSet<ClientId>>>>,
+
+    /// Map of client IDs to their subscribed shard channels
+    client_shard_channels: Arc<RwLock<HashMap<ClientId, HashSet<Bytes>>>>,
     
     /// Next client ID to assign
     next_client_id: Arc<RwLock<ClientId>>,
@@ -146,6 +152,8 @@ impl PubSub {
             clients: Arc::new(RwLock::new(HashMap::new())),
             client_channels: Arc::new(RwLock::new(HashMap::new())),
             client_patterns: Arc::new(RwLock::new(HashMap::new())),
+            shard_channels: Arc::new(RwLock::new(HashMap::new())),
+            client_shard_channels: Arc::new(RwLock::new(HashMap::new())),
             next_client_id: Arc::new(RwLock::new(0)),
         })
     }
@@ -168,27 +176,53 @@ impl PubSub {
 
     /// Unregister a client
     pub async fn unregister_client(&self, client_id: ClientId) {
-        // Remove from all channels
-        if let Some(channels) = self.client_channels.write().await.remove(&client_id) {
+        // Remove from all channels - release client_channels lock before acquiring channels lock
+        // to maintain consistent lock ordering (channels → client_channels) and prevent deadlock.
+        let channels_to_remove = {
+            let mut client_channels = self.client_channels.write().await;
+            client_channels.remove(&client_id).unwrap_or_default()
+        };
+        {
             let mut channel_map = self.channels.write().await;
-            for channel in channels {
-                if let Some(subscribers) = channel_map.get_mut(&channel) {
+            for channel in &channels_to_remove {
+                if let Some(subscribers) = channel_map.get_mut(channel) {
                     subscribers.remove(&client_id);
                     if subscribers.is_empty() {
-                        channel_map.remove(&channel);
+                        channel_map.remove(channel);
                     }
                 }
             }
         }
 
-        // Remove from all patterns
-        if let Some(patterns) = self.client_patterns.write().await.remove(&client_id) {
+        // Remove from all patterns - same lock-order fix
+        let patterns_to_remove = {
+            let mut client_patterns = self.client_patterns.write().await;
+            client_patterns.remove(&client_id).unwrap_or_default()
+        };
+        {
             let mut pattern_map = self.patterns.write().await;
-            for pattern in patterns {
-                if let Some(subscribers) = pattern_map.get_mut(&pattern) {
+            for pattern in &patterns_to_remove {
+                if let Some(subscribers) = pattern_map.get_mut(pattern) {
                     subscribers.remove(&client_id);
                     if subscribers.is_empty() {
-                        pattern_map.remove(&pattern);
+                        pattern_map.remove(pattern);
+                    }
+                }
+            }
+        }
+
+        // Remove from all shard channels - same lock-order discipline
+        let shard_channels_to_remove = {
+            let mut client_shard_channels = self.client_shard_channels.write().await;
+            client_shard_channels.remove(&client_id).unwrap_or_default()
+        };
+        {
+            let mut shard_channel_map = self.shard_channels.write().await;
+            for ch in &shard_channels_to_remove {
+                if let Some(subscribers) = shard_channel_map.get_mut(ch) {
+                    subscribers.remove(&client_id);
+                    if subscribers.is_empty() {
+                        shard_channel_map.remove(ch);
                     }
                 }
             }
@@ -207,17 +241,22 @@ impl PubSub {
             .insert(client_id);
         drop(channels);
 
-        // Add to client_channels map
-        let mut client_channels = self.client_channels.write().await;
-        client_channels.entry(client_id)
-            .or_insert_with(HashSet::new)
-            .insert(channel);
-        
-        // Return total subscription count for this client
-        let channel_count = client_channels.get(&client_id).map(|s| s.len()).unwrap_or(0);
+        // Add to client_channels map.
+        // Release client_channels lock before acquiring client_patterns lock to maintain
+        // consistent lock ordering (client_channels → client_patterns) and prevent deadlock
+        // with concurrent psubscribe (which holds client_patterns then reads client_channels).
+        let channel_count = {
+            let mut client_channels = self.client_channels.write().await;
+            client_channels.entry(client_id)
+                .or_insert_with(HashSet::new)
+                .insert(channel);
+            client_channels.get(&client_id).map(|s| s.len()).unwrap_or(0)
+        };
+
+        // client_channels lock is now released; safe to acquire client_patterns
         let pattern_count = self.client_patterns.read().await
             .get(&client_id).map(|s| s.len()).unwrap_or(0);
-        
+
         channel_count + pattern_count
     }
 
@@ -233,35 +272,42 @@ impl PubSub {
         }
         drop(channels);
 
-        // Remove from client_channels map
-        let mut client_channels = self.client_channels.write().await;
-        if let Some(client_chans) = client_channels.get_mut(&client_id) {
-            client_chans.remove(channel);
-        }
-        
-        // Return total subscription count for this client
-        let channel_count = client_channels.get(&client_id).map(|s| s.len()).unwrap_or(0);
+        // Remove from client_channels map.
+        // Release client_channels lock before acquiring client_patterns lock (CR-1 fix).
+        let channel_count = {
+            let mut client_channels = self.client_channels.write().await;
+            if let Some(client_chans) = client_channels.get_mut(&client_id) {
+                client_chans.remove(channel);
+            }
+            client_channels.get(&client_id).map(|s| s.len()).unwrap_or(0)
+        };
+
         let pattern_count = self.client_patterns.read().await
             .get(&client_id).map(|s| s.len()).unwrap_or(0);
-        
+
         channel_count + pattern_count
     }
 
     /// Unsubscribe a client from all channels
     pub async fn unsubscribe_all(&self, client_id: ClientId) -> Vec<Bytes> {
-        let mut client_channels = self.client_channels.write().await;
-        let channels_to_remove = client_channels.remove(&client_id).unwrap_or_default();
-        
-        let mut channels = self.channels.write().await;
-        for channel in &channels_to_remove {
-            if let Some(subscribers) = channels.get_mut(channel) {
-                subscribers.remove(&client_id);
-                if subscribers.is_empty() {
-                    channels.remove(channel);
+        // Release client_channels lock before acquiring channels lock to prevent deadlock.
+        let channels_to_remove = {
+            let mut client_channels = self.client_channels.write().await;
+            client_channels.remove(&client_id).unwrap_or_default()
+        };
+
+        {
+            let mut channels = self.channels.write().await;
+            for channel in &channels_to_remove {
+                if let Some(subscribers) = channels.get_mut(channel) {
+                    subscribers.remove(&client_id);
+                    if subscribers.is_empty() {
+                        channels.remove(channel);
+                    }
                 }
             }
         }
-        
+
         channels_to_remove.into_iter().collect()
     }
 
@@ -274,17 +320,22 @@ impl PubSub {
             .insert(client_id);
         drop(patterns);
 
-        // Add to client_patterns map
-        let mut client_patterns = self.client_patterns.write().await;
-        client_patterns.entry(client_id)
-            .or_insert_with(HashSet::new)
-            .insert(pattern);
-        
-        // Return total subscription count for this client
-        let pattern_count = client_patterns.get(&client_id).map(|s| s.len()).unwrap_or(0);
+        // Add to client_patterns map.
+        // Release client_patterns lock before acquiring client_channels lock to maintain
+        // consistent lock ordering and prevent deadlock with concurrent subscribe
+        // (which holds client_channels then reads client_patterns).
+        let pattern_count = {
+            let mut client_patterns = self.client_patterns.write().await;
+            client_patterns.entry(client_id)
+                .or_insert_with(HashSet::new)
+                .insert(pattern);
+            client_patterns.get(&client_id).map(|s| s.len()).unwrap_or(0)
+        };
+
+        // client_patterns lock is now released; safe to acquire client_channels
         let channel_count = self.client_channels.read().await
             .get(&client_id).map(|s| s.len()).unwrap_or(0);
-        
+
         channel_count + pattern_count
     }
 
@@ -300,36 +351,150 @@ impl PubSub {
         }
         drop(patterns);
 
-        // Remove from client_patterns map
-        let mut client_patterns = self.client_patterns.write().await;
-        if let Some(client_pats) = client_patterns.get_mut(&client_id) {
-            client_pats.remove(pattern);
-        }
-        
-        // Return total subscription count for this client
-        let pattern_count = client_patterns.get(&client_id).map(|s| s.len()).unwrap_or(0);
+        // Remove from client_patterns map.
+        // Release client_patterns lock before acquiring client_channels lock (CR-1 fix).
+        let pattern_count = {
+            let mut client_patterns = self.client_patterns.write().await;
+            if let Some(client_pats) = client_patterns.get_mut(&client_id) {
+                client_pats.remove(pattern);
+            }
+            client_patterns.get(&client_id).map(|s| s.len()).unwrap_or(0)
+        };
+
         let channel_count = self.client_channels.read().await
             .get(&client_id).map(|s| s.len()).unwrap_or(0);
-        
+
         channel_count + pattern_count
     }
 
     /// Unsubscribe a client from all patterns
     pub async fn punsubscribe_all(&self, client_id: ClientId) -> Vec<Bytes> {
-        let mut client_patterns = self.client_patterns.write().await;
-        let patterns_to_remove = client_patterns.remove(&client_id).unwrap_or_default();
-        
-        let mut patterns = self.patterns.write().await;
-        for pattern in &patterns_to_remove {
-            if let Some(subscribers) = patterns.get_mut(pattern) {
-                subscribers.remove(&client_id);
-                if subscribers.is_empty() {
-                    patterns.remove(pattern);
+        // Release client_patterns lock before acquiring patterns lock to prevent deadlock.
+        let patterns_to_remove = {
+            let mut client_patterns = self.client_patterns.write().await;
+            client_patterns.remove(&client_id).unwrap_or_default()
+        };
+
+        {
+            let mut patterns = self.patterns.write().await;
+            for pattern in &patterns_to_remove {
+                if let Some(subscribers) = patterns.get_mut(pattern) {
+                    subscribers.remove(&client_id);
+                    if subscribers.is_empty() {
+                        patterns.remove(pattern);
+                    }
                 }
             }
         }
-        
+
         patterns_to_remove.into_iter().collect()
+    }
+
+    /// Subscribe a client to a shard channel (Redis 7.0+ Shard Pub/Sub)
+    /// SSUBSCRIBE shardchannel [shardchannel ...]
+    pub async fn ssubscribe(&self, client_id: ClientId, channel: Bytes) -> usize {
+        let mut shard_channels = self.shard_channels.write().await;
+        shard_channels.entry(channel.clone())
+            .or_insert_with(HashSet::new)
+            .insert(client_id);
+        drop(shard_channels);
+
+        let mut client_shard_channels = self.client_shard_channels.write().await;
+        client_shard_channels.entry(client_id)
+            .or_insert_with(HashSet::new)
+            .insert(channel);
+
+        client_shard_channels.get(&client_id).map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Unsubscribe a client from a shard channel
+    pub async fn sunsubscribe(&self, client_id: ClientId, channel: &Bytes) -> usize {
+        let mut shard_channels = self.shard_channels.write().await;
+        if let Some(subscribers) = shard_channels.get_mut(channel) {
+            subscribers.remove(&client_id);
+            if subscribers.is_empty() {
+                shard_channels.remove(channel);
+            }
+        }
+        drop(shard_channels);
+
+        let mut client_shard_channels = self.client_shard_channels.write().await;
+        if let Some(chans) = client_shard_channels.get_mut(&client_id) {
+            chans.remove(channel);
+        }
+
+        client_shard_channels.get(&client_id).map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Unsubscribe a client from all shard channels
+    pub async fn sunsubscribe_all(&self, client_id: ClientId) -> Vec<Bytes> {
+        let channels_to_remove = {
+            let mut client_shard_channels = self.client_shard_channels.write().await;
+            client_shard_channels.remove(&client_id).unwrap_or_default()
+        };
+
+        {
+            let mut shard_channels = self.shard_channels.write().await;
+            for channel in &channels_to_remove {
+                if let Some(subscribers) = shard_channels.get_mut(channel) {
+                    subscribers.remove(&client_id);
+                    if subscribers.is_empty() {
+                        shard_channels.remove(channel);
+                    }
+                }
+            }
+        }
+
+        channels_to_remove.into_iter().collect()
+    }
+
+    /// Publish a message to a shard channel
+    /// Returns number of clients that received the message
+    pub async fn spublish(&self, channel: &Bytes, message: &Bytes) -> usize {
+        let clients = self.clients.read().await;
+        let mut recipient_count = 0;
+
+        if let Some(subscribers) = self.shard_channels.read().await.get(channel) {
+            for &client_id in subscribers {
+                if let Some(sender) = clients.get(&client_id) {
+                    let msg = RespValue::Array(vec![
+                        RespValue::BulkString(Some(Bytes::from_static(b"smessage"))),
+                        RespValue::BulkString(Some(channel.clone())),
+                        RespValue::BulkString(Some(message.clone())),
+                    ]);
+                    let _ = sender.send(msg);
+                    recipient_count += 1;
+                }
+            }
+        }
+
+        recipient_count
+    }
+
+    /// Get the number of active shard channels
+    pub async fn num_shard_channels(&self) -> usize {
+        self.shard_channels.read().await.len()
+    }
+
+    /// Get the number of subscribers for a specific shard channel
+    pub async fn num_shard_subscribers(&self, channel: &Bytes) -> usize {
+        self.shard_channels.read().await
+            .get(channel)
+            .map(|s| s.len())
+            .unwrap_or(0)
+    }
+
+    /// List all active shard channels, optionally filtered by pattern
+    pub async fn list_shard_channels(&self, pattern: Option<&Bytes>) -> Vec<Bytes> {
+        let shard_channels = self.shard_channels.read().await;
+        if let Some(pat) = pattern {
+            shard_channels.keys()
+                .filter(|ch| PatternMatcher::matches(pat, ch))
+                .cloned()
+                .collect()
+        } else {
+            shard_channels.keys().cloned().collect()
+        }
     }
 
     /// Publish a message to a channel
@@ -428,6 +593,8 @@ impl Default for PubSub {
             clients: Arc::new(RwLock::new(HashMap::new())),
             client_channels: Arc::new(RwLock::new(HashMap::new())),
             client_patterns: Arc::new(RwLock::new(HashMap::new())),
+            shard_channels: Arc::new(RwLock::new(HashMap::new())),
+            client_shard_channels: Arc::new(RwLock::new(HashMap::new())),
             next_client_id: Arc::new(RwLock::new(0)),
         }
     }

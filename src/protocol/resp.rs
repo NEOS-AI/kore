@@ -14,6 +14,9 @@ pub enum RespValue {
     BulkString(Option<Bytes>),
     /// Array: *2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n
     Array(Vec<RespValue>),
+    /// Multiple top-level RESP messages concatenated (used for Pub/Sub multi-channel responses).
+    /// Each element is serialized as its own independent top-level frame — NOT wrapped in an array.
+    Multiple(Vec<RespValue>),
 }
 
 impl RespValue {
@@ -58,6 +61,12 @@ impl RespValue {
                 buf.extend_from_slice(arr.len().to_string().as_bytes());
                 buf.put_slice(b"\r\n");
                 for val in arr {
+                    val.write_to(buf);
+                }
+            }
+            RespValue::Multiple(values) => {
+                // Serialize each value as an independent top-level RESP frame.
+                for val in values {
                     val.write_to(buf);
                 }
             }

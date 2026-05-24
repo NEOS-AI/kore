@@ -2,6 +2,49 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use std::f64::consts::PI;
 
+// Redis-compatible geographic bounds (WGS84 Mercator limits)
+const GEO_LAT_MIN: f64 = -85.05112878;
+const GEO_LAT_MAX: f64 = 85.05112878;
+const GEO_LONG_MIN: f64 = -180.0;
+const GEO_LONG_MAX: f64 = 180.0;
+
+/// Base32 alphabet used by Redis for GEOHASH strings
+const GEO_ALPHABET: &[u8] = b"0123456789bcdefghjkmnpqrstuvwxyz";
+
+/// Sort order for geospatial search results
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortOrder {
+    Asc,
+    Desc,
+    None,
+}
+
+/// Options for GEOADD
+#[derive(Debug, Default)]
+pub struct GeoAddOptions {
+    /// Only add new members (skip existing)
+    pub nx: bool,
+    /// Only update existing members (skip new)
+    pub xx: bool,
+    /// Return old position before update
+    pub get: bool,
+    /// Count changed (added + updated) instead of only added
+    pub ch: bool,
+}
+
+/// Result of a single GEOADD operation for one member
+#[derive(Debug)]
+pub enum GeoAddResult {
+    /// Member was newly added; no previous position
+    Added,
+    /// Member already existed and was updated; contains old (lon, lat)
+    Updated(f64, f64),
+    /// Skipped due to NX / XX constraint
+    Skipped,
+    /// Invalid coordinates
+    InvalidCoords,
+}
+
 /// A geographic point with longitude and latitude
 #[derive(Debug, Clone, PartialEq)]
 pub struct GeoPoint {
@@ -25,7 +68,10 @@ impl GeoPoint {
 
     /// Validate longitude and latitude
     pub fn is_valid_coordinates(longitude: f64, latitude: f64) -> bool {
-        longitude >= -180.0 && longitude <= 180.0 && latitude >= -85.05112878 && latitude <= 85.05112878
+        longitude >= GEO_LONG_MIN
+            && longitude <= GEO_LONG_MAX
+            && latitude >= GEO_LAT_MIN
+            && latitude <= GEO_LAT_MAX
     }
 
     /// Calculate geohash for this point
@@ -62,6 +108,50 @@ impl GeoSet {
         Some(is_new)
     }
 
+    /// Add a member with NX/XX/GET/CH options.
+    pub fn add_with_opts(
+        &mut self,
+        member: Bytes,
+        longitude: f64,
+        latitude: f64,
+        opts: &GeoAddOptions,
+    ) -> GeoAddResult {
+        if !GeoPoint::is_valid_coordinates(longitude, latitude) {
+            return GeoAddResult::InvalidCoords;
+        }
+
+        let existing = self.members.get(&member).map(|p| (p.longitude, p.latitude));
+
+        match existing {
+            Some(old) => {
+                // Member exists
+                if opts.nx {
+                    return GeoAddResult::Skipped;
+                }
+                let point = GeoPoint { member: member.clone(), longitude, latitude };
+                self.members.insert(member, point);
+                GeoAddResult::Updated(old.0, old.1)
+            }
+            None => {
+                // New member
+                if opts.xx {
+                    return GeoAddResult::Skipped;
+                }
+                let point = GeoPoint { member: member.clone(), longitude, latitude };
+                self.members.insert(member, point);
+                GeoAddResult::Added
+            }
+        }
+    }
+
+    /// Calculate the distance between two members in the given unit.
+    /// Returns None if either member does not exist.
+    pub fn distance_between(&self, member1: &Bytes, member2: &Bytes) -> Option<f64> {
+        let p1 = self.members.get(member1)?;
+        let p2 = self.members.get(member2)?;
+        Some(haversine_distance(p1.longitude, p1.latitude, p2.longitude, p2.latitude))
+    }
+
     /// Get the position (longitude, latitude) of a member
     pub fn get_position(&self, member: &Bytes) -> Option<(f64, f64)> {
         self.members
@@ -87,6 +177,18 @@ impl GeoSet {
         radius_m: f64,
         unit: DistanceUnit,
     ) -> Vec<GeoSearchResult> {
+        self.search_radius_sorted(center_lon, center_lat, radius_m, unit, SortOrder::Asc)
+    }
+
+    /// Search for members within a radius from a center point with configurable sort order
+    pub fn search_radius_sorted(
+        &self,
+        center_lon: f64,
+        center_lat: f64,
+        radius_m: f64,
+        unit: DistanceUnit,
+        sort: SortOrder,
+    ) -> Vec<GeoSearchResult> {
         if !GeoPoint::is_valid_coordinates(center_lon, center_lat) {
             return vec![];
         }
@@ -106,13 +208,67 @@ impl GeoSet {
             }
         }
 
-                // Sort results by distance
-        results.sort_by(|a, b| {
-            a.distance
-                .partial_cmp(&b.distance)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        Self::sort_results(&mut results, sort);
         results
+    }
+
+    /// Search for members within an axis-aligned bounding box
+    pub fn search_box(
+        &self,
+        center_lon: f64,
+        center_lat: f64,
+        width_m: f64,
+        height_m: f64,
+        sort: SortOrder,
+    ) -> Vec<GeoSearchResult> {
+        if !GeoPoint::is_valid_coordinates(center_lon, center_lat) {
+            return vec![];
+        }
+
+        // Convert half-dimensions to approximate degree offsets
+        let half_h = height_m / 2.0;
+        let half_w = width_m / 2.0;
+        let lat_rad = center_lat * PI / 180.0;
+        let lat_delta = half_h / 111320.0;
+        let lon_delta = half_w / (111320.0 * lat_rad.cos().max(1e-10));
+
+        let mut results = Vec::new();
+        for point in self.members.values() {
+            if (point.latitude - center_lat).abs() <= lat_delta
+                && (point.longitude - center_lon).abs() <= lon_delta
+            {
+                let distance =
+                    haversine_distance(center_lon, center_lat, point.longitude, point.latitude);
+                results.push(GeoSearchResult {
+                    member: point.member.clone(),
+                    longitude: point.longitude,
+                    latitude: point.latitude,
+                    distance,
+                });
+            }
+        }
+
+        Self::sort_results(&mut results, sort);
+        results
+    }
+
+    fn sort_results(results: &mut Vec<GeoSearchResult>, sort: SortOrder) {
+        match sort {
+            SortOrder::Asc | SortOrder::None => {
+                results.sort_by(|a, b| {
+                    a.distance
+                        .partial_cmp(&b.distance)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+            SortOrder::Desc => {
+                results.sort_by(|a, b| {
+                    b.distance
+                        .partial_cmp(&a.distance)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+        }
     }
 
     /// Search for members from a member position within a radius
@@ -228,14 +384,13 @@ pub fn haversine_distance(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
     EARTH_RADIUS_METERS * c
 }
 
-/// Encode longitude and latitude to geohash (52-bit precision)
-/// This is a simplified geohash implementation for internal use
+/// Encode longitude and latitude to geohash (52-bit precision, Redis-compatible)
+/// Uses the Mercator latitude range (-85.05112878 … +85.05112878) to match Redis's
+/// internal geohash representation exactly.
 pub fn geohash_encode(longitude: f64, latitude: f64) -> u64 {
-    // Normalize longitude and latitude to 0-1 range
-    let lon_norm = (longitude + 180.0) / 360.0;
-    let lat_norm = (latitude + 90.0) / 180.0;
+    let lon_norm = (longitude - GEO_LONG_MIN) / (GEO_LONG_MAX - GEO_LONG_MIN);
+    let lat_norm = (latitude - GEO_LAT_MIN) / (GEO_LAT_MAX - GEO_LAT_MIN);
 
-    // Interleave bits of longitude and latitude
     let lon_bits = (lon_norm * ((1u64 << 26) as f64)) as u64;
     let lat_bits = (lat_norm * ((1u64 << 26) as f64)) as u64;
 
@@ -249,10 +404,26 @@ pub fn geohash_decode(hash: u64) -> (f64, f64) {
     let lon_norm = lon_bits as f64 / ((1u64 << 26) as f64);
     let lat_norm = lat_bits as f64 / ((1u64 << 26) as f64);
 
-    let longitude = lon_norm * 360.0 - 180.0;
-    let latitude = lat_norm * 180.0 - 90.0;
+    let longitude = lon_norm * (GEO_LONG_MAX - GEO_LONG_MIN) + GEO_LONG_MIN;
+    let latitude = lat_norm * (GEO_LAT_MAX - GEO_LAT_MIN) + GEO_LAT_MIN;
 
     (longitude, latitude)
+}
+
+/// Encode a 52-bit geohash integer as the 11-character Redis-compatible base32 string.
+///
+/// Redis left-shifts the 52-bit value by 3 (padding to 55 bits = 11 × 5) and then
+/// maps each 5-bit group from MSB to LSB through the standard geohash alphabet.
+pub fn geohash_to_string(hash: u64) -> [u8; 11] {
+    let mut result = [0u8; 11];
+    // Shift left by 3 so the 52 useful bits occupy positions [54..3]
+    let bits: u64 = hash << 3;
+    for i in 0..11usize {
+        let shift = 55 - 5 * (i + 1);
+        let idx = ((bits >> shift) & 0x1f) as usize;
+        result[i] = GEO_ALPHABET[idx];
+    }
+    result
 }
 
 /// Interleave bits of two 26-bit numbers into a 52-bit number
