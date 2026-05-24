@@ -28,3 +28,9 @@ target
 # Added by cargo
 
 /target
+
+# MacOS
+.DS_Store
+
+# vscode
+.vscode/
