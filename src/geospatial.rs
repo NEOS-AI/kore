@@ -169,6 +169,13 @@ impl GeoSet {
         self.members.remove(member).is_some()
     }
 
+    /// Iterate all geo members (for persistence / snapshot).
+    pub fn iter_members(&self) -> impl Iterator<Item = (Bytes, f64, f64)> + '_ {
+        self.members
+            .values()
+            .map(|p| (p.member.clone(), p.longitude, p.latitude))
+    }
+
     /// Search for members within a radius from a center point
     pub fn search_radius(
         &self,

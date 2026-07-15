@@ -1,11 +1,28 @@
 use bytes::Bytes;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use crate::protocol::RespValue;
 
 /// A unique identifier for each client connection
 pub type ClientId = usize;
+
+/// Default per-client broadcast buffer capacity (messages).
+pub const DEFAULT_CLIENT_BUFFER_CAPACITY: usize = 1024;
+
+/// Outcome of a publish attempt, including fan-out memory accounting hints.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PublishOutcome {
+    /// Number of clients that accepted the message into their buffer.
+    pub recipients: usize,
+    /// Bytes newly enqueued into client pending buffers.
+    pub bytes_enqueued: usize,
+    /// Bytes dropped from full client buffers (oldest overwritten).
+    pub bytes_overwritten: usize,
+    /// Messages skipped (no sender / closed) or overwritten due to full buffers.
+    pub messages_dropped: usize,
+}
 
 /// Pattern matching utility for Redis-style glob patterns
 pub struct PatternMatcher;
@@ -138,14 +155,30 @@ pub struct PubSub {
 
     /// Map of client IDs to their subscribed shard channels
     client_shard_channels: Arc<RwLock<HashMap<ClientId, HashSet<Bytes>>>>,
+
+    /// Per-client FIFO of pending message sizes still buffered for delivery.
+    /// Mirrors broadcast buffer occupancy for fan-out memory accounting.
+    pending_by_client: Arc<RwLock<HashMap<ClientId, VecDeque<usize>>>>,
     
     /// Next client ID to assign
     next_client_id: Arc<RwLock<ClientId>>,
+
+    /// Per-client broadcast channel capacity (messages). Applied at `register_client`.
+    client_buffer_capacity: AtomicUsize,
+
+    /// Messages dropped due to full buffers (overwrites) or failed sends.
+    messages_dropped: AtomicU64,
 }
 
 impl PubSub {
-    /// Create a new PubSub instance
+    /// Create a new PubSub instance with the default client buffer capacity.
     pub fn new() -> Arc<Self> {
+        Self::with_client_buffer_capacity(DEFAULT_CLIENT_BUFFER_CAPACITY)
+    }
+
+    /// Create a PubSub instance with a custom per-client broadcast buffer capacity.
+    /// Capacity is clamped to at least 1 (tokio broadcast requirement).
+    pub fn with_client_buffer_capacity(capacity: usize) -> Arc<Self> {
         Arc::new(Self {
             channels: Arc::new(RwLock::new(HashMap::new())),
             patterns: Arc::new(RwLock::new(HashMap::new())),
@@ -154,8 +187,108 @@ impl PubSub {
             client_patterns: Arc::new(RwLock::new(HashMap::new())),
             shard_channels: Arc::new(RwLock::new(HashMap::new())),
             client_shard_channels: Arc::new(RwLock::new(HashMap::new())),
+            pending_by_client: Arc::new(RwLock::new(HashMap::new())),
             next_client_id: Arc::new(RwLock::new(0)),
+            client_buffer_capacity: AtomicUsize::new(capacity.max(1)),
+            messages_dropped: AtomicU64::new(0),
         })
+    }
+
+    /// Current per-client broadcast buffer capacity (messages).
+    pub fn client_buffer_capacity(&self) -> usize {
+        self.client_buffer_capacity.load(Ordering::Relaxed).max(1)
+    }
+
+    /// Set per-client broadcast buffer capacity used for subsequent `register_client` calls.
+    /// Existing clients keep the capacity they were registered with.
+    pub fn set_client_buffer_capacity(&self, capacity: usize) {
+        self.client_buffer_capacity
+            .store(capacity.max(1), Ordering::Relaxed);
+    }
+
+    /// Total messages dropped (full-buffer overwrites + failed sends) since creation / reset.
+    pub fn messages_dropped(&self) -> u64 {
+        self.messages_dropped.load(Ordering::Relaxed)
+    }
+
+    /// Total bytes currently tracked as pending in client pub/sub buffers.
+    pub async fn pending_memory(&self) -> usize {
+        self.pending_by_client
+            .read()
+            .await
+            .values()
+            .map(|q| q.iter().sum::<usize>())
+            .sum()
+    }
+
+    /// Pending buffered bytes for a single client.
+    pub async fn client_pending_memory(&self, client_id: ClientId) -> usize {
+        self.pending_by_client
+            .read()
+            .await
+            .get(&client_id)
+            .map(|q| q.iter().sum())
+            .unwrap_or(0)
+    }
+
+    /// Estimate how many deliveries a publish to `channel` would perform
+    /// (channel subscribers + matching pattern subscribers; dual subs count twice).
+    pub async fn estimate_delivery_count(&self, channel: &Bytes) -> usize {
+        let mut count = 0usize;
+
+        if let Some(subscribers) = self.channels.read().await.get(channel) {
+            count = count.saturating_add(subscribers.len());
+        }
+
+        let patterns = self.patterns.read().await;
+        for (pattern, subscribers) in patterns.iter() {
+            if PatternMatcher::matches(pattern, channel) {
+                count = count.saturating_add(subscribers.len());
+            }
+        }
+
+        count
+    }
+
+    /// Fan-out memory cost for admission control: `message_size * max(1, delivery_count)`.
+    pub async fn fanout_memory_cost(&self, channel: &Bytes, message_size: usize) -> usize {
+        let deliveries = self.estimate_delivery_count(channel).await;
+        message_size.saturating_mul(deliveries.max(1))
+    }
+
+    /// Record that the network path successfully took one buffered message for `client_id`.
+    /// Returns the message size to deallocate from the memory tracker.
+    pub async fn note_delivered(&self, client_id: ClientId) -> usize {
+        let mut pending = self.pending_by_client.write().await;
+        if let Some(q) = pending.get_mut(&client_id) {
+            let size = q.pop_front().unwrap_or(0);
+            if q.is_empty() {
+                pending.remove(&client_id);
+            }
+            size
+        } else {
+            0
+        }
+    }
+
+    /// Record that a receiver lagged and lost `n` messages. Returns bytes to deallocate.
+    pub async fn note_lagged(&self, client_id: ClientId, n: u64) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        let mut pending = self.pending_by_client.write().await;
+        let mut freed = 0usize;
+        if let Some(q) = pending.get_mut(&client_id) {
+            let drop_n = (n as usize).min(q.len());
+            for _ in 0..drop_n {
+                freed = freed.saturating_add(q.pop_front().unwrap_or(0));
+            }
+            if q.is_empty() {
+                pending.remove(&client_id);
+            }
+        }
+        // Drops were already counted at publish-time overwrite; only free accounting here.
+        freed
     }
 
     /// Register a new client and return its ID and receiver
@@ -165,8 +298,9 @@ impl PubSub {
         *next_id += 1;
         drop(next_id);
 
-        // Create a broadcast channel for this client
-        let (tx, rx) = broadcast::channel(1024);
+        // Create a broadcast channel for this client with configured capacity
+        let capacity = self.client_buffer_capacity();
+        let (tx, rx) = broadcast::channel(capacity);
         
         let mut clients = self.clients.write().await;
         clients.insert(client_id, tx);
@@ -174,8 +308,11 @@ impl PubSub {
         (client_id, rx)
     }
 
-    /// Unregister a client
-    pub async fn unregister_client(&self, client_id: ClientId) {
+    /// Unregister a client.
+    ///
+    /// Returns the total pending buffer bytes that were still accounted for this client
+    /// (caller should release that amount from the Pub/Sub memory tracker).
+    pub async fn unregister_client(&self, client_id: ClientId) -> usize {
         // Remove from all channels - release client_channels lock before acquiring channels lock
         // to maintain consistent lock ordering (channels → client_channels) and prevent deadlock.
         let channels_to_remove = {
@@ -228,8 +365,18 @@ impl PubSub {
             }
         }
 
-        // Remove client
+        // Remove client sender
         self.clients.write().await.remove(&client_id);
+
+        // Take remaining pending buffer accounting for this client
+        let pending = self
+            .pending_by_client
+            .write()
+            .await
+            .remove(&client_id)
+            .map(|q| q.into_iter().sum())
+            .unwrap_or(0);
+        pending
     }
 
     /// Subscribe a client to a channel
@@ -451,8 +598,19 @@ impl PubSub {
     /// Publish a message to a shard channel
     /// Returns number of clients that received the message
     pub async fn spublish(&self, channel: &Bytes, message: &Bytes) -> usize {
+        self.spublish_with_outcome(channel, message).await.recipients
+    }
+
+    /// Publish to a shard channel with fan-out buffer accounting.
+    pub async fn spublish_with_outcome(
+        &self,
+        channel: &Bytes,
+        message: &Bytes,
+    ) -> PublishOutcome {
+        let message_size = message.len();
         let clients = self.clients.read().await;
-        let mut recipient_count = 0;
+        let mut delivered: Vec<ClientId> = Vec::new();
+        let mut messages_dropped = 0usize;
 
         if let Some(subscribers) = self.shard_channels.read().await.get(channel) {
             for &client_id in subscribers {
@@ -462,13 +620,17 @@ impl PubSub {
                         RespValue::BulkString(Some(channel.clone())),
                         RespValue::BulkString(Some(message.clone())),
                     ]);
-                    let _ = sender.send(msg);
-                    recipient_count += 1;
+                    match sender.send(msg) {
+                        Ok(_) => delivered.push(client_id),
+                        Err(_) => messages_dropped += 1,
+                    }
                 }
             }
         }
+        drop(clients);
 
-        recipient_count
+        self.account_deliveries(&delivered, message_size, messages_dropped)
+            .await
     }
 
     /// Get the number of active shard channels
@@ -497,11 +659,25 @@ impl PubSub {
         }
     }
 
-    /// Publish a message to a channel
-    /// Returns the number of clients that received the message
+    /// Publish a message to a channel.
+    /// Returns the number of clients that received the message.
     pub async fn publish(&self, channel: &Bytes, message: &Bytes) -> usize {
-        let mut recipient_count = 0;
+        self.publish_with_outcome(channel, message).await.recipients
+    }
+
+    /// Publish a message with detailed fan-out / buffer accounting.
+    ///
+    /// Never panics on a full client buffer: tokio broadcast overwrites the oldest
+    /// message, and we mirror that in pending-size tracking (`bytes_overwritten`).
+    pub async fn publish_with_outcome(
+        &self,
+        channel: &Bytes,
+        message: &Bytes,
+    ) -> PublishOutcome {
+        let message_size = message.len();
         let clients = self.clients.read().await;
+        let mut delivered: Vec<ClientId> = Vec::new();
+        let mut messages_dropped = 0usize;
 
         // Send to direct channel subscribers
         if let Some(subscribers) = self.channels.read().await.get(channel) {
@@ -512,8 +688,11 @@ impl PubSub {
                         RespValue::BulkString(Some(channel.clone())),
                         RespValue::BulkString(Some(message.clone())),
                     ]);
-                    let _ = sender.send(msg);
-                    recipient_count += 1;
+                    // Full buffers do not panic: send overwrites the oldest slot.
+                    match sender.send(msg) {
+                        Ok(_) => delivered.push(client_id),
+                        Err(_) => messages_dropped += 1,
+                    }
                 }
             }
         }
@@ -530,14 +709,61 @@ impl PubSub {
                             RespValue::BulkString(Some(channel.clone())),
                             RespValue::BulkString(Some(message.clone())),
                         ]);
-                        let _ = sender.send(msg);
-                        recipient_count += 1;
+                        match sender.send(msg) {
+                            Ok(_) => delivered.push(client_id),
+                            Err(_) => messages_dropped += 1,
+                        }
                     }
                 }
             }
         }
+        drop(patterns);
+        drop(clients);
 
-        recipient_count
+        self.account_deliveries(&delivered, message_size, messages_dropped)
+            .await
+    }
+
+    /// Update per-client pending size queues after a fan-out send pass.
+    async fn account_deliveries(
+        &self,
+        delivered: &[ClientId],
+        message_size: usize,
+        mut messages_dropped: usize,
+    ) -> PublishOutcome {
+        let capacity = self.client_buffer_capacity();
+        let mut bytes_enqueued = 0usize;
+        let mut bytes_overwritten = 0usize;
+
+        {
+            let mut pending = self.pending_by_client.write().await;
+            for &client_id in delivered {
+                let q = pending.entry(client_id).or_default();
+                // Mirror broadcast ring-buffer: at capacity, oldest is dropped.
+                while q.len() >= capacity {
+                    if let Some(old) = q.pop_front() {
+                        bytes_overwritten = bytes_overwritten.saturating_add(old);
+                        messages_dropped = messages_dropped.saturating_add(1);
+                    } else {
+                        break;
+                    }
+                }
+                q.push_back(message_size);
+                bytes_enqueued = bytes_enqueued.saturating_add(message_size);
+            }
+        }
+
+        if messages_dropped > 0 {
+            self.messages_dropped
+                .fetch_add(messages_dropped as u64, Ordering::Relaxed);
+        }
+
+        PublishOutcome {
+            recipients: delivered.len(),
+            bytes_enqueued,
+            bytes_overwritten,
+            messages_dropped,
+        }
     }
 
     /// Get the number of active channels (channels with at least one subscriber)
@@ -595,7 +821,10 @@ impl Default for PubSub {
             client_patterns: Arc::new(RwLock::new(HashMap::new())),
             shard_channels: Arc::new(RwLock::new(HashMap::new())),
             client_shard_channels: Arc::new(RwLock::new(HashMap::new())),
+            pending_by_client: Arc::new(RwLock::new(HashMap::new())),
             next_client_id: Arc::new(RwLock::new(0)),
+            client_buffer_capacity: AtomicUsize::new(DEFAULT_CLIENT_BUFFER_CAPACITY),
+            messages_dropped: AtomicU64::new(0),
         }
     }
 }

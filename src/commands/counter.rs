@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::protocol::RespValue;
 use super::CommandHandler;
 
@@ -13,9 +13,13 @@ impl CommandHandler {
             None => return Ok(RespValue::error("ERR invalid key")),
         };
 
+        if let Err(Error::WrongType) = self.cache.ensure_string_or_absent(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+
         match self.cache.incr(key, 1) {
             Ok(new_value) => Ok(RespValue::Integer(new_value)),
-            Err(e) => Ok(RespValue::error(format!("ERR {}", e))),
+            Err(e) => Ok(RespValue::error(e.to_resp_string())),
         }
     }
 
@@ -29,9 +33,13 @@ impl CommandHandler {
             None => return Ok(RespValue::error("ERR invalid key")),
         };
 
+        if let Err(Error::WrongType) = self.cache.ensure_string_or_absent(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+
         match self.cache.decr(key, 1) {
             Ok(new_value) => Ok(RespValue::Integer(new_value)),
-            Err(e) => Ok(RespValue::error(format!("ERR {}", e))),
+            Err(e) => Ok(RespValue::error(e.to_resp_string())),
         }
     }
 
@@ -45,11 +53,15 @@ impl CommandHandler {
             None => return Ok(RespValue::error("ERR invalid key")),
         };
 
+        if let Err(Error::WrongType) = self.cache.ensure_string_or_absent(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+
         let delta = self.parse_integer(&args[1])?;
 
         match self.cache.incr(key, delta) {
             Ok(new_value) => Ok(RespValue::Integer(new_value)),
-            Err(e) => Ok(RespValue::error(format!("ERR {}", e))),
+            Err(e) => Ok(RespValue::error(e.to_resp_string())),
         }
     }
 
@@ -63,11 +75,15 @@ impl CommandHandler {
             None => return Ok(RespValue::error("ERR invalid key")),
         };
 
+        if let Err(Error::WrongType) = self.cache.ensure_string_or_absent(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+
         let delta = self.parse_integer(&args[1])?;
 
         match self.cache.decr(key, delta) {
             Ok(new_value) => Ok(RespValue::Integer(new_value)),
-            Err(e) => Ok(RespValue::error(format!("ERR {}", e))),
+            Err(e) => Ok(RespValue::error(e.to_resp_string())),
         }
     }
 }

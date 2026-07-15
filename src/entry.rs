@@ -14,6 +14,8 @@ pub struct Entry {
     pub created_at: Instant,
     /// Last access time (for LRU eviction) - stored as micros since creation
     last_access_micros: AtomicU64,
+    /// Access frequency counter for LFU eviction (incremented on touch).
+    lfu_freq: AtomicU64,
     /// Expiration time (None = no expiration)
     pub expires_at: Option<Instant>,
     /// User-defined flags (for Memcache compatibility)
@@ -29,6 +31,7 @@ impl Entry {
             value,
             created_at: Instant::now(),
             last_access_micros: AtomicU64::new(0),
+            lfu_freq: AtomicU64::new(0),
             expires_at: None,
             flags: 0,
             cas: 0,
@@ -79,10 +82,15 @@ impl Entry {
         self.key.len() + self.value.len() + std::mem::size_of::<Self>()
     }
 
-    /// Update the last access time to now
+    /// Update the last access time to now and bump LFU frequency.
     pub fn touch(&self) {
         let micros_since_creation = self.created_at.elapsed().as_micros() as u64;
-        self.last_access_micros.store(micros_since_creation, Ordering::Relaxed);
+        self.last_access_micros
+            .store(micros_since_creation, Ordering::Relaxed);
+        // Saturating-ish: cap so counters stay comparable under long uptime
+        let _ = self.lfu_freq.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |f| {
+            Some(f.saturating_add(1).min(u32::MAX as u64))
+        });
     }
 
     /// Get the last access time as an Instant
@@ -95,6 +103,11 @@ impl Entry {
             self.created_at + Duration::from_micros(micros)
         }
     }
+
+    /// LFU frequency (higher = more frequently accessed).
+    pub fn lfu_freq(&self) -> u64 {
+        self.lfu_freq.load(Ordering::Relaxed)
+    }
 }
 
 impl Clone for Entry {
@@ -104,6 +117,7 @@ impl Clone for Entry {
             value: self.value.clone(),
             created_at: self.created_at,
             last_access_micros: AtomicU64::new(self.last_access_micros.load(Ordering::Relaxed)),
+            lfu_freq: AtomicU64::new(self.lfu_freq.load(Ordering::Relaxed)),
             expires_at: self.expires_at,
             flags: self.flags,
             cas: self.cas,

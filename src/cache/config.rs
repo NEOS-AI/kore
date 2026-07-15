@@ -18,12 +18,44 @@ impl Cache {
             ));
         }
         // Cannot exceed max memory
-        if size > self.max_memory {
+        if size > self.max_memory() {
             return Err(Error::InvalidArgument(
                 "max entry size cannot exceed max memory".into(),
             ));
         }
         self.max_entry_size.store(size, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Set maximum memory limit (live). Updates both the cache limit and MemoryTracker.
+    /// If current usage exceeds the new limit and eviction is enabled, attempts to free space.
+    pub fn set_max_memory(&self, size: usize) -> Result<()> {
+        // 0 means unlimited; otherwise require at least 1MB (matches CLI validation)
+        if size > 0 && size < 1024 * 1024 {
+            return Err(Error::InvalidArgument(
+                "max memory must be at least 1MB (or 0 for unlimited)".into(),
+            ));
+        }
+
+        self.max_memory.store(size, Ordering::Relaxed);
+        self.memory_tracker.set_max_memory(size);
+
+        // If max entry size now exceeds the limit, clamp it
+        let entry_max = self.max_entry_size.load(Ordering::Relaxed);
+        if size > 0 && entry_max > size {
+            self.max_entry_size.store(size, Ordering::Relaxed);
+        }
+
+        // Best-effort: free memory if we're over the new limit
+        if size > 0 {
+            let current = self.memory_usage.load(Ordering::Relaxed);
+            let tracked = self.memory_tracker.total_memory();
+            let over = current.max(tracked).saturating_sub(size);
+            if over > 0 && self.eviction_allowed() {
+                let _ = self.evict_memory(over);
+            }
+        }
+
         Ok(())
     }
 

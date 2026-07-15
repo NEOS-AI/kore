@@ -1,6 +1,7 @@
 use crate::cache::Cache;
-use crate::search_index::{IndexDefinition, DocumentField};
-use crate::query_engine::{Query, QueryParser, QueryExecutor};
+use crate::memory::MemoryCategory;
+use crate::search_index::{IndexDefinition, DocumentField, SearchIndex};
+use crate::query_engine::{QueryParser, QueryExecutor};
 use bytes::Bytes;
 use std::collections::HashMap;
 
@@ -34,9 +35,21 @@ impl Cache {
         self.search_index_manager.create_index(definition)
     }
 
-    /// Drop a search index
+    /// Drop a search index and free its tracked memory
     pub fn drop_search_index(&self, name: &str) -> Result<(), String> {
-        self.search_index_manager.drop_index(name)
+        let size = self
+            .search_index_manager
+            .get_index(name)
+            .map(|idx| idx.read().unwrap().approx_memory())
+            .unwrap_or(0);
+
+        self.search_index_manager.drop_index(name)?;
+
+        if size > 0 {
+            self.memory_tracker
+                .deallocate(size, MemoryCategory::Search);
+        }
+        Ok(())
     }
 
     /// List all search indices
@@ -60,6 +73,40 @@ impl Cache {
         })
     }
 
+    /// Account search memory for indexing `doc_id` with `fields` into an index
+    /// that currently holds `old_fields` (if any). Returns Err on maxmemory.
+    fn account_search_index_write(
+        &self,
+        doc_id: &Bytes,
+        old_fields: Option<&HashMap<String, DocumentField>>,
+        fields: &HashMap<String, DocumentField>,
+    ) -> Result<(), String> {
+        let old_size = old_fields
+            .map(|f| SearchIndex::document_approx_size(doc_id, f))
+            .unwrap_or(0);
+        let new_size = SearchIndex::document_approx_size(doc_id, fields);
+
+        if new_size > old_size {
+            let delta = new_size - old_size;
+            if !self
+                .memory_tracker
+                .can_allocate(delta, MemoryCategory::Search)
+            {
+                return Err("OOM: cannot allocate search index memory".into());
+            }
+        }
+
+        if old_size > 0 {
+            self.memory_tracker
+                .deallocate(old_size, MemoryCategory::Search);
+        }
+        if new_size > 0 {
+            self.memory_tracker
+                .account(new_size, MemoryCategory::Search);
+        }
+        Ok(())
+    }
+
     /// Index a document
     pub fn index_document(
         &self,
@@ -72,6 +119,8 @@ impl Cache {
             .ok_or_else(|| format!("Index '{}' not found", index_name))?;
 
         let mut index_guard = index.write().unwrap();
+        let old_fields = index_guard.get_document_data(&doc_id).cloned();
+        self.account_search_index_write(&doc_id, old_fields.as_ref(), &fields)?;
         index_guard.index_document(doc_id, fields);
         Ok(())
     }
@@ -83,6 +132,11 @@ impl Cache {
             .ok_or_else(|| format!("Index '{}' not found", index_name))?;
 
         let mut index_guard = index.write().unwrap();
+        if let Some(fields) = index_guard.get_document_data(doc_id) {
+            let size = SearchIndex::document_approx_size(doc_id, fields);
+            self.memory_tracker
+                .deallocate(size, MemoryCategory::Search);
+        }
         index_guard.remove_document(doc_id);
         Ok(())
     }
@@ -180,25 +234,39 @@ impl Cache {
         Ok(SearchResult { total, documents })
     }
 
-    /// Auto-index documents based on key prefix
-    /// This is called when a key is set/updated
+    /// Auto-index documents based on key prefix.
+    /// Called after successful HSET when the key matches an index PREFIX.
+    /// Skips an index (best-effort) when search memory cannot be allocated.
     pub fn auto_index_key(&self, key: &Bytes, fields: HashMap<String, DocumentField>) {
         let key_str = String::from_utf8_lossy(key);
         let matching_indices = self.search_index_manager.find_matching_indices(&key_str);
 
         for index_arc in matching_indices {
             let mut index = index_arc.write().unwrap();
+            let old_fields = index.get_document_data(key).cloned();
+            if self
+                .account_search_index_write(key, old_fields.as_ref(), &fields)
+                .is_err()
+            {
+                // Leave prior index entry in place if update would OOM; for new docs, skip.
+                continue;
+            }
             index.index_document(key.clone(), fields.clone());
         }
     }
 
-    /// Auto-remove document from indices when key is deleted
+    /// Auto-remove document from indices when key is deleted (DEL/UNLINK).
     pub fn auto_remove_from_indices(&self, key: &Bytes) {
         let key_str = String::from_utf8_lossy(key);
         let matching_indices = self.search_index_manager.find_matching_indices(&key_str);
 
         for index_arc in matching_indices {
             let mut index = index_arc.write().unwrap();
+            if let Some(fields) = index.get_document_data(key) {
+                let size = SearchIndex::document_approx_size(key, fields);
+                self.memory_tracker
+                    .deallocate(size, MemoryCategory::Search);
+            }
             index.remove_document(key);
         }
     }

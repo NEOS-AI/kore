@@ -26,24 +26,47 @@ impl Cache {
             None => return Ok(RespValue::error("ERR invalid message")),
         };
 
-        // Check message size limit
+        // Per-message size cap (independent of fan-out).
         let message_size = message.len();
-        if !self.memory_tracker.can_allocate(message_size, MemoryCategory::PubSub) {
-            return Err(Error::MessageTooLarge { size: message_size, max: 1024 * 1024 });
+        let max_message = self.memory_tracker.max_message_size();
+        if message_size > max_message {
+            return Err(Error::MessageTooLarge {
+                size: message_size,
+                max: max_message,
+            });
         }
 
-        // Allocate memory for the message
-        if !self.memory_tracker.allocate(message_size, MemoryCategory::PubSub) {
+        // Fan-out admission: cost ≈ message_size * max(1, subscriber deliveries).
+        // Pending buffer memory stays allocated until clients receive or disconnect.
+        let fanout_cost = self.pubsub.fanout_memory_cost(&channel, message_size).await;
+        if !self
+            .memory_tracker
+            .allocate(fanout_cost, MemoryCategory::PubSub)
+        {
             return Err(Error::OutOfMemory);
         }
 
-        let count = self.pubsub.publish(&channel, &message).await;
-        self.stats.pubsub_messages_sent.fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
-        
-        // Deallocate memory after publishing
-        self.memory_tracker.deallocate(message_size, MemoryCategory::PubSub);
-        
-        Ok(RespValue::Integer(count as i64))
+        let outcome = self.pubsub.publish_with_outcome(&channel, &message).await;
+        self.stats
+            .pubsub_messages_sent
+            .fetch_add(outcome.recipients as u64, std::sync::atomic::Ordering::Relaxed);
+
+        // Adjust for unused admission headroom and buffer overwrites of older messages.
+        // - Pre-allocated `fanout_cost` for this publish's new enqueues.
+        // - Free any unused portion when fewer bytes were enqueued (e.g. 0 subscribers).
+        // - Free overwritten older pending bytes (accounted by prior publishes).
+        if fanout_cost > outcome.bytes_enqueued {
+            self.memory_tracker.deallocate(
+                fanout_cost - outcome.bytes_enqueued,
+                MemoryCategory::PubSub,
+            );
+        }
+        if outcome.bytes_overwritten > 0 {
+            self.memory_tracker
+                .deallocate(outcome.bytes_overwritten, MemoryCategory::PubSub);
+        }
+
+        Ok(RespValue::Integer(outcome.recipients as i64))
     }
 
     /// Handle SUBSCRIBE command
@@ -396,7 +419,37 @@ impl Cache {
             None => return Ok(RespValue::error("ERR invalid message")),
         };
 
-        let count = self.pubsub.spublish(&channel, &message).await;
-        Ok(RespValue::Integer(count as i64))
+        let message_size = message.len();
+        let max_message = self.memory_tracker.max_message_size();
+        if message_size > max_message {
+            return Err(Error::MessageTooLarge {
+                size: message_size,
+                max: max_message,
+            });
+        }
+
+        // Approximate shard fan-out from shard subscriber count.
+        let shard_subs = self.pubsub.num_shard_subscribers(&channel).await;
+        let fanout_cost = message_size.saturating_mul(shard_subs.max(1));
+        if !self
+            .memory_tracker
+            .allocate(fanout_cost, MemoryCategory::PubSub)
+        {
+            return Err(Error::OutOfMemory);
+        }
+
+        let outcome = self.pubsub.spublish_with_outcome(&channel, &message).await;
+        if fanout_cost > outcome.bytes_enqueued {
+            self.memory_tracker.deallocate(
+                fanout_cost - outcome.bytes_enqueued,
+                MemoryCategory::PubSub,
+            );
+        }
+        if outcome.bytes_overwritten > 0 {
+            self.memory_tracker
+                .deallocate(outcome.bytes_overwritten, MemoryCategory::PubSub);
+        }
+
+        Ok(RespValue::Integer(outcome.recipients as i64))
     }
 }

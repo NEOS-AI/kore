@@ -124,19 +124,57 @@ for i in 0..10 {
 ### Command Line
 
 ```bash
-# Enable Redlock
+# Enable Redlock (requires ≥3 instance addresses)
 kore --enable-redlock \
-     --redlock-instances "host1:6379,host2:6379,host3:6379" \
+     --redlock-instances "127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003" \
      --redlock-retry-count 3 \
      --redlock-retry-delay-ms 200
+```
+
+Flags are validated at startup and wired into the running `Server` via
+`Redlock::from_config` → `Server::with_redlock`. When enabled, `INFO` reports:
+
+```
+redlock_enabled:1
+redlock_instances:3
+redlock_retry_count:3
+redlock_retry_delay_ms:200
 ```
 
 ### Options
 
 - `--enable-redlock`: Enable Redlock distributed locking
-- `--redlock-instances`: Comma-separated instance addresses
+- `--redlock-instances`: Comma-separated instance addresses (must parse as `host:port`; ≥3 when enabled)
 - `--redlock-retry-count`: Number of retry attempts (default: 3)
 - `--redlock-retry-delay-ms`: Delay between retries (default: 200ms)
+
+### MVP backend wiring
+
+**Remote RESP backends are deferred.** For this release, Kore creates **N
+in-process `Cache` backends** matching the number of listed addresses so the
+Redlock algorithm is fully wired end-to-end (quorum, retry, TTL). Addresses are
+used for count/validation and logging only—they do not open network connections
+to remote Redis/Kore processes yet.
+
+Programmatic / test usage can inject backends:
+
+```rust
+use kore::{Config, Redlock, Cache};
+use std::sync::Arc;
+
+let mut config = Config::default();
+config.enable_redlock = true;
+config.redlock_instances = "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3".into();
+config.redlock_retry_count = 5;
+
+let backends = vec![
+    Cache::new_with_sweep(16, 16 << 20, 1 << 20, false),
+    Cache::new_with_sweep(16, 16 << 20, 1 << 20, false),
+    Cache::new_with_sweep(16, 16 << 20, 1 << 20, false),
+];
+let redlock = Redlock::from_config(&config, Some(backends))?.unwrap();
+// Or None → auto-create N local caches from address count
+```
 
 ## Architecture
 
@@ -211,6 +249,7 @@ Run the Redlock tests:
 
 ```bash
 cargo test --test redlock_test
+cargo test --test redlock_wiring_test
 ```
 
 Available tests:
@@ -221,6 +260,7 @@ Available tests:
 - `test_redlock_concurrent_access`: Concurrent access patterns
 - `test_redlock_quorum_requirement`: Verifies quorum logic
 - `test_redlock_ttl_expiration`: Tests TTL expiration
+- Wiring (`redlock_wiring_test`): `from_config` disabled/retry params, Server exposure, INFO fields
 
 ## Comparison: Basic vs Redlock
 

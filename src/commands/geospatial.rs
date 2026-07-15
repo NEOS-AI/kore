@@ -1,4 +1,5 @@
-use crate::error::Result;
+use crate::cache::KeyType;
+use crate::error::{Error, Result};
 use crate::protocol::RespValue;
 use crate::geospatial::{DistanceUnit, GeoAddOptions, GeoAddResult, GeoSearchResult, SortOrder, geohash_encode, geohash_to_string};
 use bytes::Bytes;
@@ -6,6 +7,15 @@ use super::CommandHandler;
 use std::str;
 
 impl CommandHandler {
+    /// Return WRONGTYPE if key exists but is not a geo set.
+    fn ensure_geo_key(&self, key: &Bytes) -> Result<Option<()>> {
+        match self.cache.key_type(key) {
+            KeyType::None => Ok(None),
+            KeyType::Geo => Ok(Some(())),
+            _ => Err(Error::WrongType),
+        }
+    }
+
     /// Handle GEOADD command
     /// GEOADD key [NX|XX] [GET] [CH] longitude latitude member [longitude latitude member ...]
     pub(super) fn handle_geoadd(&self, args: &[RespValue]) -> Result<RespValue> {
@@ -69,8 +79,20 @@ impl CommandHandler {
 
         self.cache.stats.incr(&self.cache.stats.cmd_geoadd);
 
-        let geoset = self.cache.get_or_create_geo_set(&key);
+        let est_growth: usize = triplets.iter().map(|(_, _, m)| m.len() + 64).sum();
+        if let Err(e) = self.cache.ensure_non_string_capacity(est_growth) {
+            return Ok(RespValue::error(e.to_resp_string()));
+        }
+
+        let geoset = match self.cache.get_or_create_geo_set(&key) {
+            Ok(g) => g,
+            Err(Error::WrongType) => {
+                return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+            }
+            Err(e) => return Ok(RespValue::error(e.to_resp_string())),
+        };
         let mut set = geoset.write().unwrap();
+        let before = key.len() + set.memory_usage();
 
         let mut count = 0i64;
         let mut old_positions: Vec<RespValue> = Vec::new();
@@ -104,6 +126,10 @@ impl CommandHandler {
             }
         }
 
+        let after = key.len() + set.memory_usage();
+        drop(set);
+        self.cache.account_geo_set_delta(before, after);
+
         if opts.get {
             Ok(RespValue::Array(old_positions))
         } else {
@@ -124,6 +150,10 @@ impl CommandHandler {
             Some(k) => k,
             None => return Ok(RespValue::error("ERR invalid key")),
         };
+
+        if let Err(Error::WrongType) = self.ensure_geo_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
 
         let member1 = match args[1].as_bulk_string() {
             Some(m) => m.clone(),
@@ -177,6 +207,10 @@ impl CommandHandler {
             None => return Ok(RespValue::error("ERR invalid key")),
         };
 
+        if let Err(Error::WrongType) = self.ensure_geo_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+
         let geoset_opt = self.cache.get_geo_set(key);
 
         let results: Vec<RespValue> = args[1..]
@@ -212,6 +246,10 @@ impl CommandHandler {
             Some(k) => k,
             None => return Ok(RespValue::error("ERR invalid key")),
         };
+
+        if let Err(Error::WrongType) = self.ensure_geo_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
 
         let geoset_opt = self.cache.get_geo_set(key);
 
@@ -256,6 +294,10 @@ impl CommandHandler {
             Some(k) => k,
             None => return Ok(RespValue::error("ERR invalid key")),
         };
+
+        if let Err(Error::WrongType) = self.ensure_geo_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
 
         // Parse FROM clause
         let from_clause = match args[1].as_bulk_string() {
@@ -481,7 +523,13 @@ impl CommandHandler {
             let dest_key_for_store = dest_key.clone();
             // Ensure we don't hold the source geoset lock while writing to dest
             // (source and dest may be the same key)
-            let dest_sorted = self.cache.get_or_create_sorted_set(&dest_key_for_store);
+            let dest_sorted = match self.cache.get_or_create_sorted_set(&dest_key_for_store) {
+                Ok(z) => z,
+                Err(Error::WrongType) => {
+                    return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+                }
+                Err(e) => return Ok(RespValue::error(e.to_resp_string())),
+            };
             let mut zset = dest_sorted.write().unwrap();
             let _ = source_key; // consumed above
 
@@ -548,7 +596,13 @@ impl CommandHandler {
         }
 
         // Write results to destination geoset
-        let dest_geoset = self.cache.get_or_create_geo_set(&dest_key);
+        let dest_geoset = match self.cache.get_or_create_geo_set(&dest_key) {
+            Ok(g) => g,
+            Err(Error::WrongType) => {
+                return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+            }
+            Err(e) => return Ok(RespValue::error(e.to_resp_string())),
+        };
         let mut dest = dest_geoset.write().unwrap();
         let src = source_geoset.read().unwrap();
 

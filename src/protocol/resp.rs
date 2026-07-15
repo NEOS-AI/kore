@@ -14,6 +14,8 @@ pub enum RespValue {
     BulkString(Option<Bytes>),
     /// Array: *2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n
     Array(Vec<RespValue>),
+    /// Null array: *-1\r\n (BLPOP/BRPOP/XREAD timeout in RESP2)
+    NullArray,
     /// Multiple top-level RESP messages concatenated (used for Pub/Sub multi-channel responses).
     /// Each element is serialized as its own independent top-level frame — NOT wrapped in an array.
     Multiple(Vec<RespValue>),
@@ -64,6 +66,9 @@ impl RespValue {
                     val.write_to(buf);
                 }
             }
+            RespValue::NullArray => {
+                buf.put_slice(b"*-1\r\n");
+            }
             RespValue::Multiple(values) => {
                 // Serialize each value as an independent top-level RESP frame.
                 for val in values {
@@ -86,6 +91,11 @@ impl RespValue {
     /// Create a null bulk string
     pub fn null() -> Self {
         RespValue::BulkString(None)
+    }
+
+    /// Create a null multi-bulk (array) reply — BLPOP/BRPOP timeout.
+    pub fn null_array() -> Self {
+        RespValue::NullArray
     }
 
     /// Convert to array if possible
@@ -245,6 +255,11 @@ impl RespParser {
             .parse::<i64>()
             .map_err(|_| Error::ParseError("invalid array length".into()))?;
 
+        // RESP2 null multi-bulk (BLPOP/BRPOP/XREAD timeout): *-1\r\n
+        if len == -1 {
+            return Ok(RespValue::NullArray);
+        }
+
         if len < 0 {
             return Err(Error::ParseError("negative array length".into()));
         }
@@ -359,5 +374,36 @@ mod tests {
 
         let value = RespValue::BulkString(Some(Bytes::from("hello")));
         assert_eq!(value.serialize(), Bytes::from("$5\r\nhello\r\n"));
+    }
+
+    #[test]
+    fn test_null_array_serialize_and_parse() {
+        let value = RespValue::null_array();
+        assert_eq!(value.serialize(), Bytes::from("*-1\r\n"));
+
+        let mut parser = RespParser::new();
+        parser.feed(b"*-1\r\n");
+        let parsed = parser.parse().unwrap().unwrap();
+        assert_eq!(parsed, RespValue::NullArray);
+    }
+
+    #[test]
+    fn test_fullresync_simple_string_then_bulk() {
+        // PSYNC full handshake shape: +FULLRESYNC …\r\n$n\r\n…\r\n
+        let mut parser = RespParser::new();
+        let payload = b"+FULLRESYNC abcdef 42\r\n$3\r\nRDB\r\n";
+        parser.feed(payload);
+        let first = parser.parse().unwrap().unwrap();
+        match first {
+            RespValue::SimpleString(s) => {
+                assert!(String::from_utf8_lossy(&s).starts_with("FULLRESYNC "));
+            }
+            other => panic!("expected simple string, {:?}", other),
+        }
+        let second = parser.parse().unwrap().unwrap();
+        assert_eq!(
+            second,
+            RespValue::BulkString(Some(Bytes::from_static(b"RDB")))
+        );
     }
 }

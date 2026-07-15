@@ -103,6 +103,31 @@ impl Stats {
         }
     }
 
+    /// Sum of tracked command counters (INFO / Prometheus).
+    pub fn total_commands_processed(&self) -> u64 {
+        self.cmd_get.load(Ordering::Relaxed)
+            + self.cmd_set.load(Ordering::Relaxed)
+            + self.cmd_del.load(Ordering::Relaxed)
+            + self.cmd_incr.load(Ordering::Relaxed)
+            + self.cmd_decr.load(Ordering::Relaxed)
+            + self.cmd_zadd.load(Ordering::Relaxed)
+            + self.cmd_zrange.load(Ordering::Relaxed)
+            + self.cmd_zrevrange.load(Ordering::Relaxed)
+            + self.cmd_zcard.load(Ordering::Relaxed)
+            + self.cmd_zscore.load(Ordering::Relaxed)
+            + self.cmd_zrem.load(Ordering::Relaxed)
+            + self.cmd_zrank.load(Ordering::Relaxed)
+            + self.cmd_zrevrank.load(Ordering::Relaxed)
+            + self.cmd_geoadd.load(Ordering::Relaxed)
+            + self.cmd_geosearch.load(Ordering::Relaxed)
+            + self.cmd_publish.load(Ordering::Relaxed)
+            + self.cmd_subscribe.load(Ordering::Relaxed)
+            + self.cmd_unsubscribe.load(Ordering::Relaxed)
+            + self.cmd_psubscribe.load(Ordering::Relaxed)
+            + self.cmd_punsubscribe.load(Ordering::Relaxed)
+            + self.cmd_pubsub.load(Ordering::Relaxed)
+    }
+
     pub fn reset(&self) {
         self.cmd_get.store(0, Ordering::Relaxed);
         self.cmd_set.store(0, Ordering::Relaxed);

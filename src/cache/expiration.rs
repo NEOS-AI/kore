@@ -22,11 +22,19 @@ impl Cache {
         }
     }
 
-    /// Get TTL in milliseconds (-1 = no expiration, -2 = expired/not found)
+    /// Get TTL in milliseconds (-1 = no expiration, -2 = expired/not found).
+    /// ZSet/Geo keys currently have no TTL support and report -1 when present.
     pub fn ttl(&self, key: &Bytes) -> i64 {
         match self.map.get(key) {
             Some(entry) if !entry.is_expired() => entry.ttl_millis().unwrap_or(-1),
-            _ => -2,
+            _ => {
+                // Non-string keys exist without expiration support.
+                if self.sorted_sets.contains_key(key) || self.geo_sets.contains_key(key) {
+                    -1
+                } else {
+                    -2
+                }
+            }
         }
     }
 }

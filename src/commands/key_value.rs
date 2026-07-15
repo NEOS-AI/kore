@@ -1,3 +1,4 @@
+use crate::cache::KeyType;
 use crate::entry::StoreOptions;
 use crate::entry::LoadOptions;
 use crate::error::{Error, Result};
@@ -20,6 +21,11 @@ impl CommandHandler {
             Some(v) => v.clone(),
             None => return Ok(RespValue::error("ERR invalid value")),
         };
+
+        // Type safety: refuse to overwrite zset/geo keys as strings
+        if let Err(Error::WrongType) = self.cache.ensure_string_or_absent(&key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
 
         let mut opts = StoreOptions::default();
         let mut i = 2;
@@ -93,8 +99,7 @@ impl CommandHandler {
                     Ok(RespValue::ok())
                 }
             }
-            Err(Error::OutOfMemory) => Ok(RespValue::error("OOM command not allowed when used memory > 'maxmemory'")),
-            Err(e) => Ok(RespValue::error(format!("ERR {}", e))),
+            Err(e) => Ok(RespValue::error(e.to_resp_string())),
         }
     }
 
@@ -107,6 +112,14 @@ impl CommandHandler {
             Some(k) => k,
             None => return Ok(RespValue::error("ERR invalid key")),
         };
+
+        // GET on non-string keys is WRONGTYPE (not null)
+        match self.cache.key_type(key) {
+            KeyType::None | KeyType::String => {}
+            _ => {
+                return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+            }
+        }
 
         match self.cache.load(key, LoadOptions::default())? {
             Some(entry) => Ok(RespValue::BulkString(Some(entry.value.clone()))),
@@ -188,6 +201,10 @@ impl CommandHandler {
                 None => return Ok(RespValue::error("ERR invalid value")),
             };
 
+            if let Err(Error::WrongType) = self.cache.ensure_string_or_absent(&key) {
+                return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+            }
+
             self.cache.store(key, value, StoreOptions::default())?;
         }
 
@@ -211,6 +228,10 @@ impl CommandHandler {
             None => return Ok(RespValue::error("ERR invalid value")),
         };
 
+        if let Err(Error::WrongType) = self.cache.ensure_string_or_absent(&key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+
         let opts = StoreOptions {
             nx: true,
             ..Default::default()
@@ -221,8 +242,7 @@ impl CommandHandler {
                 // If old_value is None, the key didn't exist and was set successfully
                 Ok(RespValue::Integer(if old_value.is_none() { 1 } else { 0 }))
             }
-            Err(Error::OutOfMemory) => Ok(RespValue::error("OOM command not allowed when used memory > 'maxmemory'")),
-            Err(e) => Ok(RespValue::error(format!("ERR {}", e))),
+            Err(e) => Ok(RespValue::error(e.to_resp_string())),
         }
     }
 
@@ -237,6 +257,13 @@ impl CommandHandler {
             Some(k) => k,
             None => return Ok(RespValue::error("ERR invalid key")),
         };
+
+        match self.cache.key_type(key) {
+            KeyType::None | KeyType::String => {}
+            _ => {
+                return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+            }
+        }
 
         // Get the value first
         match self.cache.load(key, LoadOptions::default())? {
@@ -316,6 +343,13 @@ impl CommandHandler {
             i += 1;
         }
 
+        match self.cache.key_type(key) {
+            KeyType::None | KeyType::String => {}
+            _ => {
+                return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+            }
+        }
+
         // Get the current value
         match self.cache.load(key, LoadOptions::default())? {
             Some(entry) => {
@@ -343,6 +377,204 @@ impl CommandHandler {
                 Ok(RespValue::BulkString(Some(value)))
             }
             None => Ok(RespValue::null()),
+        }
+    }
+
+    /// TYPE - return the type of value stored at key
+    pub(super) fn handle_type(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 1 {
+            return Ok(RespValue::error("ERR wrong number of arguments for 'type'"));
+        }
+
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+
+        let type_str = self.cache.key_type(key).as_redis_str();
+        Ok(RespValue::SimpleString(Bytes::from_static(match type_str {
+            "string" => b"string",
+            "zset" => b"zset",
+            "hash" => b"hash",
+            "list" => b"list",
+            "set" => b"set",
+            "stream" => b"stream",
+            _ => b"none",
+        })))
+    }
+
+    /// APPEND key value — append to string; create if missing. Returns new length.
+    pub(super) fn handle_append(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'append' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        let value = match args[1].as_bulk_string() {
+            Some(v) => v,
+            None => return Ok(RespValue::error("ERR invalid value")),
+        };
+
+        match self.cache.append(key, value) {
+            Ok(len) => Ok(RespValue::Integer(len as i64)),
+            Err(e) => Ok(RespValue::error(e.to_resp_string())),
+        }
+    }
+
+    /// STRLEN key — length of string value (0 if missing).
+    pub(super) fn handle_strlen(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 1 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'strlen' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+
+        match self.cache.key_type(key) {
+            KeyType::None => return Ok(RespValue::Integer(0)),
+            KeyType::String => {}
+            _ => return Ok(RespValue::error(Error::WrongType.to_resp_string())),
+        }
+
+        match self.cache.load(key, LoadOptions::default())? {
+            Some(entry) => Ok(RespValue::Integer(entry.value.len() as i64)),
+            None => Ok(RespValue::Integer(0)),
+        }
+    }
+
+    /// SETEX key seconds value — SET with EX seconds.
+    pub(super) fn handle_setex(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 3 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'setex' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        let seconds = match self.parse_integer(&args[1]) {
+            Ok(s) if s > 0 => s,
+            Ok(_) => {
+                return Ok(RespValue::error(
+                    "ERR invalid expire time in 'setex' command",
+                ));
+            }
+            Err(_) => {
+                return Ok(RespValue::error(
+                    "ERR value is not an integer or out of range",
+                ));
+            }
+        };
+        let value = match args[2].as_bulk_string() {
+            Some(v) => v.clone(),
+            None => return Ok(RespValue::error("ERR invalid value")),
+        };
+
+        if let Err(Error::WrongType) = self.cache.ensure_string_or_absent(&key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+
+        let opts = StoreOptions {
+            ttl_ms: Some((seconds as u64) * 1000),
+            ..Default::default()
+        };
+        match self.cache.store(key, value, opts) {
+            Ok(_) => Ok(RespValue::ok()),
+            Err(e) => Ok(RespValue::error(e.to_resp_string())),
+        }
+    }
+
+    /// GETSET key value — set new value, return old (or null).
+    pub(super) fn handle_getset(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'getset' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        let value = match args[1].as_bulk_string() {
+            Some(v) => v.clone(),
+            None => return Ok(RespValue::error("ERR invalid value")),
+        };
+
+        if let Err(Error::WrongType) = self.cache.ensure_string_or_absent(&key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+
+        let opts = StoreOptions {
+            get: true,
+            ..Default::default()
+        };
+        match self.cache.store(key, value, opts) {
+            Ok(Some(old)) => Ok(RespValue::BulkString(Some(old.value.clone()))),
+            Ok(None) => Ok(RespValue::null()),
+            Err(e) => Ok(RespValue::error(e.to_resp_string())),
+        }
+    }
+
+    /// UNLINK key [key ...] — same as DEL for now (sync delete).
+    pub(super) fn handle_unlink(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'unlink' command",
+            ));
+        }
+        self.handle_del(args)
+    }
+
+    /// RENAME key newkey
+    pub(super) fn handle_rename(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'rename' command",
+            ));
+        }
+        let src = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        let dst = match args[1].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+
+        match self.cache.rename(src, dst, false) {
+            Ok(_) => Ok(RespValue::ok()),
+            Err(e) => Ok(RespValue::error(e.to_resp_string())),
+        }
+    }
+
+    /// RENAMENX key newkey — rename only if newkey does not exist.
+    pub(super) fn handle_renamenx(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'renamenx' command",
+            ));
+        }
+        let src = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        let dst = match args[1].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+
+        match self.cache.rename(src, dst, true) {
+            Ok(true) => Ok(RespValue::Integer(1)),
+            Ok(false) => Ok(RespValue::Integer(0)),
+            Err(e) => Ok(RespValue::error(e.to_resp_string())),
         }
     }
 }

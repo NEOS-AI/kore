@@ -1,9 +1,19 @@
+use crate::cache::KeyType;
 use crate::error::{Error, Result};
 use crate::protocol::RespValue;
 use bytes::Bytes;
 use super::CommandHandler;
 
 impl CommandHandler {
+    /// Return WRONGTYPE if key exists but is not a sorted set.
+    fn ensure_zset_key(&self, key: &Bytes) -> Result<Option<()>> {
+        match self.cache.key_type(key) {
+            KeyType::None => Ok(None),
+            KeyType::ZSet => Ok(Some(())),
+            _ => Err(Error::WrongType),
+        }
+    }
+
     pub(super) fn handle_zadd(&self, args: &[RespValue]) -> Result<RespValue> {
         self.cache.stats.incr(&self.cache.stats.cmd_zadd);
         
@@ -39,15 +49,32 @@ impl CommandHandler {
             return Ok(RespValue::error("ERR wrong number of arguments for 'zadd'"));
         }
 
-        let zset = self.cache.get_or_create_sorted_set(&key);
+        // Rough pre-check for member growth against maxmemory
+        let est_growth: usize = pairs.iter().map(|(_, m)| m.len() + 64).sum();
+        if let Err(e) = self.cache.ensure_non_string_capacity(est_growth) {
+            return Ok(RespValue::error(e.to_resp_string()));
+        }
+
+        let zset = match self.cache.get_or_create_sorted_set(&key) {
+            Ok(z) => z,
+            Err(Error::WrongType) => {
+                return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+            }
+            Err(e) => return Ok(RespValue::error(e.to_resp_string())),
+        };
         let mut set = zset.write().unwrap();
-        
+        let before = key.len() + set.memory_size();
+
         let mut added = 0;
         for (score, member) in pairs {
             if set.add(member, score) {
                 added += 1;
             }
         }
+
+        let after = key.len() + set.memory_size();
+        drop(set);
+        self.cache.account_sorted_set_delta(before, after);
 
         Ok(RespValue::Integer(added as i64))
     }
@@ -63,6 +90,10 @@ impl CommandHandler {
             Some(k) => k,
             None => return Ok(RespValue::error("ERR invalid key")),
         };
+
+        if let Err(Error::WrongType) = self.ensure_zset_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
 
         let start = match self.parse_integer(&args[1]) {
             Ok(s) => s as isize,
@@ -122,6 +153,10 @@ impl CommandHandler {
             None => return Ok(RespValue::error("ERR invalid key")),
         };
 
+        if let Err(Error::WrongType) = self.ensure_zset_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+
         let start = match self.parse_integer(&args[1]) {
             Ok(s) => s as isize,
             Err(_) => return Ok(RespValue::error("ERR value is not an integer or out of range")),
@@ -180,6 +215,10 @@ impl CommandHandler {
             None => return Ok(RespValue::error("ERR invalid key")),
         };
 
+        if let Err(Error::WrongType) = self.ensure_zset_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+
         let count = match self.cache.get_sorted_set(key) {
             Some(zset) => {
                 let set = zset.read().unwrap();
@@ -202,6 +241,10 @@ impl CommandHandler {
             Some(k) => k,
             None => return Ok(RespValue::error("ERR invalid key")),
         };
+
+        if let Err(Error::WrongType) = self.ensure_zset_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
 
         let member = match args[1].as_bulk_string() {
             Some(m) => m,
@@ -232,12 +275,17 @@ impl CommandHandler {
             None => return Ok(RespValue::error("ERR invalid key")),
         };
 
+        if let Err(Error::WrongType) = self.ensure_zset_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+
         let zset = match self.cache.get_sorted_set(key) {
             Some(z) => z,
             None => return Ok(RespValue::Integer(0)),
         };
 
         let mut set = zset.write().unwrap();
+        let before = key.len() + set.memory_size();
         let mut removed = 0;
 
         for i in 1..args.len() {
@@ -250,6 +298,10 @@ impl CommandHandler {
                 removed += 1;
             }
         }
+
+        let after = key.len() + set.memory_size();
+        drop(set);
+        self.cache.account_sorted_set_delta(before, after);
 
         Ok(RespValue::Integer(removed as i64))
     }
@@ -265,6 +317,10 @@ impl CommandHandler {
             Some(k) => k,
             None => return Ok(RespValue::error("ERR invalid key")),
         };
+
+        if let Err(Error::WrongType) = self.ensure_zset_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
 
         let member = match args[1].as_bulk_string() {
             Some(m) => m,
@@ -294,6 +350,10 @@ impl CommandHandler {
             Some(k) => k,
             None => return Ok(RespValue::error("ERR invalid key")),
         };
+
+        if let Err(Error::WrongType) = self.ensure_zset_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
 
         let member = match args[1].as_bulk_string() {
             Some(m) => m,

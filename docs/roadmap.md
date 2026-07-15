@@ -6,13 +6,27 @@
 
 ## Plans
 
-- [ ] Cluster (kore cluster)
+- [x] Cluster (kore cluster) — MVP: hash slots + MOVED/CROSSSLOT/ASK + CLUSTER/ASKING stubs (single-node)
+- [x] Cluster gossip / membership + thin failover (RESP MEET/PING, single-observer fail, replica claim slots)
+- [x] Cluster thin slot reshard (`CLUSTER MIGRATEKEYS` string keys + SETSLOT operator flow)
+- [ ] Cluster automatic reshard / full multi-type MIGRATE orchestration
 - [ ] 데드락 감지 고급 기능
     - [ ] 크로스 프로세스 감지
     - [ ] 비동기(async) 지원
     - [ ] 커스텀 희생자 선택 전략
     - [ ] 웹 UI 모니터링
-- [ ] Export data to file
-    - [ ] Export to 'RDB' file
-    - [ ] Export to 'AOF' file
-- [ ] Load data from file (init with file)
+- [x] Export data to file
+    - [x] Export to 'RDB' file (Kore `KORDB` format; `SAVE` / `BGSAVE`)
+    - [x] Export to 'AOF' file (RESP log; `BGREWRITEAOF`)
+- [x] Load data from file (init with file)
+- [x] Async replication (`SYNC` + `REPLICAOF` / `--replicaof`)
+- [x] PSYNC partial resync + backlog; replica read path (`ROLE` / `INFO replication`)
+- [x] Multi-DB + streams RDB/AOF persistence (KORDB v3)
+- [x] Minimal failover promote (`REPLICAOF NO ONE` / `FAILOVER`)
+- [x] Blocking `XREAD` / `XREADGROUP` (`BLOCK`)
+- [x] Multi-DB replication parity (SYNC/PSYNC all DBs + SELECT apply)
+- [x] AOF SELECT concurrency fix + atomic SELECT+cmd replication
+- [x] CI (GitHub Actions) + benchmarks runbook
+- [x] ACL MVP + TLS + metrics/HEALTH
+- [x] Coordinated `FAILOVER TO`
+- [x] Redlock CLI wiring; FT.SEARCH RESP + search memory; pub/sub fan-out limits

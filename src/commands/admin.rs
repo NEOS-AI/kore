@@ -29,38 +29,143 @@ impl CommandHandler {
         Ok(RespValue::Array(resp_keys))
     }
 
-    pub(super) fn handle_flush(&self, _args: &[RespValue]) -> Result<RespValue> {
+    /// SCAN cursor [MATCH pattern] [COUNT count]
+    pub(super) fn handle_scan(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'scan' command",
+            ));
+        }
+
+        let cursor = match self.parse_integer(&args[0]) {
+            Ok(c) if c >= 0 => c as u64,
+            _ => {
+                return Ok(RespValue::error("ERR invalid cursor"));
+            }
+        };
+
+        let mut pattern: Option<String> = None;
+        let mut count: usize = 10; // Redis-compatible default
+
+        let mut i = 1;
+        while i < args.len() {
+            let opt = match args[i].as_bulk_string() {
+                Some(s) => String::from_utf8_lossy(s).to_uppercase(),
+                None => {
+                    return Ok(RespValue::error("ERR syntax error"));
+                }
+            };
+
+            match opt.as_str() {
+                "MATCH" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    match args[i].as_bulk_string() {
+                        Some(s) => {
+                            pattern = Some(String::from_utf8_lossy(s).into_owned());
+                        }
+                        None => return Ok(RespValue::error("ERR syntax error")),
+                    }
+                }
+                "COUNT" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    match self.parse_integer(&args[i]) {
+                        Ok(c) if c > 0 => count = c as usize,
+                        _ => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ));
+                        }
+                    }
+                }
+                _ => {
+                    return Ok(RespValue::error("ERR syntax error"));
+                }
+            }
+            i += 1;
+        }
+
+        let pattern_ref = pattern.as_deref();
+        let (next_cursor, keys) = self.cache.scan(cursor, pattern_ref, count);
+
+        let resp_keys: Vec<RespValue> = keys
+            .into_iter()
+            .map(|k| RespValue::BulkString(Some(k)))
+            .collect();
+
+        Ok(RespValue::Array(vec![
+            RespValue::BulkString(Some(Bytes::from(next_cursor.to_string()))),
+            RespValue::Array(resp_keys),
+        ]))
+    }
+
+    /// SELECT index — switch the connection to another logical database.
+    pub(super) fn handle_select(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        // Defense-in-depth: cluster gate also rejects SELECT.
+        if self.cluster.is_some() {
+            return Ok(RespValue::error(
+                "ERR SELECT is not allowed in cluster mode",
+            ));
+        }
+        if args.len() != 1 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'select' command",
+            ));
+        }
+        let index = match self.parse_integer(&args[0]) {
+            Ok(i) if i >= 0 => i as usize,
+            _ => {
+                return Ok(RespValue::error("ERR DB index is out of range"));
+            }
+        };
+        let Some(db) = self.databases.get(index) else {
+            return Ok(RespValue::error("ERR DB index is out of range"));
+        };
+        if index != self.selected_db {
+            // Drop watches on the previous keyspace (safe; keys are DB-scoped).
+            self.clear_watches();
+            self.selected_db = index;
+            self.cache = db;
+        }
+        Ok(RespValue::ok())
+    }
+
+    /// FLUSHDB — clear only the currently selected database.
+    pub(super) fn handle_flushdb(&self, _args: &[RespValue]) -> Result<RespValue> {
         self.cache.flush();
+        Ok(RespValue::ok())
+    }
+
+    /// FLUSHALL — clear every logical database.
+    pub(super) fn handle_flushall(&self, _args: &[RespValue]) -> Result<RespValue> {
+        self.databases.flush_all();
         Ok(RespValue::ok())
     }
 
     pub(super) fn handle_info(&self, _args: &[RespValue]) -> Result<RespValue> {
         let stats = &self.cache.stats;
-        let total_cmds = stats.cmd_get.load(Ordering::Relaxed)
-            + stats.cmd_set.load(Ordering::Relaxed)
-            + stats.cmd_del.load(Ordering::Relaxed)
-            + stats.cmd_incr.load(Ordering::Relaxed)
-            + stats.cmd_decr.load(Ordering::Relaxed)
-            + stats.cmd_zadd.load(Ordering::Relaxed)
-            + stats.cmd_zrange.load(Ordering::Relaxed)
-            + stats.cmd_zrevrange.load(Ordering::Relaxed)
-            + stats.cmd_zcard.load(Ordering::Relaxed)
-            + stats.cmd_zscore.load(Ordering::Relaxed)
-            + stats.cmd_zrem.load(Ordering::Relaxed)
-            + stats.cmd_zrank.load(Ordering::Relaxed)
-            + stats.cmd_zrevrank.load(Ordering::Relaxed)
-            + stats.cmd_geoadd.load(Ordering::Relaxed)
-            + stats.cmd_geosearch.load(Ordering::Relaxed)
-            + stats.cmd_publish.load(Ordering::Relaxed)
-            + stats.cmd_subscribe.load(Ordering::Relaxed)
-            + stats.cmd_unsubscribe.load(Ordering::Relaxed)
-            + stats.cmd_psubscribe.load(Ordering::Relaxed)
-            + stats.cmd_punsubscribe.load(Ordering::Relaxed)
-            + stats.cmd_pubsub.load(Ordering::Relaxed);
-        
+        let total_cmds = stats.total_commands_processed();
+        let health = self.health_status();
+
+        let redlock_enabled = if self.config.enable_redlock { 1 } else { 0 };
+        let redlock_instances = if self.config.enable_redlock {
+            self.config.redlock_instance_addrs().len()
+        } else {
+            0
+        };
+
         let info = format!(
             "# Server\r\n\
              kore_version:{}\r\n\
+             redlock_enabled:{}\r\n\
+             redlock_instances:{}\r\n\
+             redlock_retry_count:{}\r\n\
+             redlock_retry_delay_ms:{}\r\n\
              \r\n\
              # Stats\r\n\
              total_commands_processed:{}\r\n\
@@ -100,6 +205,7 @@ impl CommandHandler {
              # Memory\r\n\
              used_memory:{}\r\n\
              maxmemory:{}\r\n\
+             maxmemory_policy:{}\r\n\
              maxentrysize:{}\r\n\
              geo_sets_memory:{}\r\n\
              memory_cache_used:{}\r\n\
@@ -118,9 +224,19 @@ impl CommandHandler {
              total_connections:{}\r\n\
              active_connections:{}\r\n\
              \r\n\
+             # Replication\r\n\
+             {}\
+             \r\n\
+             # Health\r\n\
+             {}\
+             \r\n\
              # Keyspace\r\n\
              db0:keys={},geo_sets={}\r\n",
             env!("CARGO_PKG_VERSION"),
+            redlock_enabled,
+            redlock_instances,
+            self.config.redlock_retry_count,
+            self.config.redlock_retry_delay_ms,
             total_cmds,
             stats.cmd_get.load(Ordering::Relaxed),
             stats.cmd_set.load(Ordering::Relaxed),
@@ -153,27 +269,72 @@ impl CommandHandler {
             stats.pubsub_patterns_active.load(Ordering::Relaxed),
             stats.pubsub_clients_active.load(Ordering::Relaxed),
             self.cache.memory_usage(),
-            self.cache.max_memory,
+            self.cache.max_memory(),
+            self.cache.eviction_policy().as_str(),
             self.cache.get_max_entry_size(),
             self.cache.geo_sets_memory(),
             self.cache.memory_tracker.category_memory(MemoryCategory::Cache),
-            self.cache.memory_tracker.category_memory(MemoryCategory::Cache) as f64 / self.cache.max_memory as f64 * 100.0,
+            self.cache.memory_tracker.category_memory(MemoryCategory::Cache) as f64 / self.cache.max_memory() as f64 * 100.0,
             self.cache.memory_tracker.category_memory(MemoryCategory::PubSub),
-            self.cache.memory_tracker.category_memory(MemoryCategory::PubSub) as f64 / self.cache.max_memory as f64 * 100.0,
+            self.cache.memory_tracker.category_memory(MemoryCategory::PubSub) as f64 / self.cache.max_memory() as f64 * 100.0,
             self.cache.memory_tracker.category_memory(MemoryCategory::SortedSets),
-            self.cache.memory_tracker.category_memory(MemoryCategory::SortedSets) as f64 / self.cache.max_memory as f64 * 100.0,
+            self.cache.memory_tracker.category_memory(MemoryCategory::SortedSets) as f64 / self.cache.max_memory() as f64 * 100.0,
             self.cache.memory_tracker.category_memory(MemoryCategory::GeoSets),
-            self.cache.memory_tracker.category_memory(MemoryCategory::GeoSets) as f64 / self.cache.max_memory as f64 * 100.0,
+            self.cache.memory_tracker.category_memory(MemoryCategory::GeoSets) as f64 / self.cache.max_memory() as f64 * 100.0,
             self.cache.memory_tracker.utilization(),
             stats.bytes_sent.load(Ordering::Relaxed),
             stats.bytes_received.load(Ordering::Relaxed),
             stats.total_connections.load(Ordering::Relaxed),
             stats.active_connections.load(Ordering::Relaxed),
+            self.replication_info_section(),
+            health.to_info_lines(),
             self.cache.dbsize(),
             self.cache.geo_set_count(),
         );
 
         Ok(RespValue::BulkString(Some(Bytes::from(info))))
+    }
+
+    /// HEALTH [PING|FULL] — liveness / structured readiness.
+    ///
+    /// - `HEALTH` / `HEALTH PING` → simple OK / PONG
+    /// - `HEALTH FULL` → bulk string with ready, role, memory, master_link, rdb_last_save, aof
+    pub(super) fn handle_health(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            return Ok(RespValue::SimpleString(Bytes::from_static(b"OK")));
+        }
+
+        let sub = match args[0].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_uppercase(),
+            None => return Ok(RespValue::error("ERR invalid HEALTH argument")),
+        };
+
+        match sub.as_str() {
+            "PING" => Ok(RespValue::SimpleString(Bytes::from_static(b"PONG"))),
+            "FULL" => {
+                let status = self.health_status();
+                Ok(RespValue::BulkString(Some(Bytes::from(
+                    status.to_info_lines(),
+                ))))
+            }
+            _ => Ok(RespValue::error(
+                "ERR unknown HEALTH subcommand. Try HEALTH, HEALTH PING, or HEALTH FULL",
+            )),
+        }
+    }
+
+    fn health_status(&self) -> crate::metrics::HealthStatus {
+        crate::metrics::collect_health(
+            &self.cache,
+            self.persistence.as_ref().map(|p| p.as_ref()),
+        )
+    }
+
+    fn replication_info_section(&self) -> String {
+        match self.persistence.as_ref() {
+            Some(p) => p.replication.info_replication(),
+            None => "role:master\r\nconnected_slaves:0\r\n".to_string(),
+        }
     }
 
     pub(super) fn handle_sweep(&self, _args: &[RespValue]) -> Result<RespValue> {
@@ -210,6 +371,37 @@ impl CommandHandler {
                             RespValue::BulkString(Some(Bytes::from(value.to_string()))),
                         ]))
                     }
+                    "maxmemory" | "max-memory" => {
+                        let value = self.cache.max_memory();
+                        Ok(RespValue::Array(vec![
+                            RespValue::BulkString(Some(Bytes::from("maxmemory"))),
+                            RespValue::BulkString(Some(Bytes::from(value.to_string()))),
+                        ]))
+                    }
+                    "save" => {
+                        let value = self
+                            .persistence
+                            .as_ref()
+                            .map(|p| p.save_rules_string())
+                            .unwrap_or_default();
+                        Ok(RespValue::Array(vec![
+                            RespValue::BulkString(Some(Bytes::from("save"))),
+                            RespValue::BulkString(Some(Bytes::from(value))),
+                        ]))
+                    }
+                    "maxmemory-policy" | "maxmemory_policy" => {
+                        let value = self.cache.eviction_policy().as_str();
+                        Ok(RespValue::Array(vec![
+                            RespValue::BulkString(Some(Bytes::from("maxmemory-policy"))),
+                            RespValue::BulkString(Some(Bytes::from(value))),
+                        ]))
+                    }
+                    "databases" => Ok(RespValue::Array(vec![
+                        RespValue::BulkString(Some(Bytes::from("databases"))),
+                        RespValue::BulkString(Some(Bytes::from(
+                            self.databases.len().to_string(),
+                        ))),
+                    ])),
                     _ => {
                         // Return empty array for unknown parameters (Redis behavior)
                         Ok(RespValue::Array(vec![]))
@@ -240,6 +432,48 @@ impl CommandHandler {
                             Ok(_) => Ok(RespValue::ok()),
                             Err(e) => Ok(RespValue::error(format!("ERR {}", e))),
                         }
+                    }
+                    "maxmemory" | "max-memory" => {
+                        let size: usize = value_str.parse()
+                            .map_err(|_| Error::InvalidArgument("invalid size".into()))?;
+
+                        // Apply to every logical DB so SELECT'd keyspaces honor the limit
+                        match self.cache.set_max_memory(size) {
+                            Ok(_) => {
+                                for db in self.databases.iter() {
+                                    if !std::sync::Arc::ptr_eq(db, &self.cache) {
+                                        let _ = db.set_max_memory(size);
+                                    }
+                                }
+                                Ok(RespValue::ok())
+                            }
+                            Err(e) => Ok(RespValue::error(format!("ERR {}", e))),
+                        }
+                    }
+                    "save" => {
+                        let Some(p) = self.persistence.as_ref() else {
+                            return Ok(RespValue::error("ERR persistence not configured"));
+                        };
+                        match p.set_save_rules_from_str(&value_str) {
+                            Ok(()) => Ok(RespValue::ok()),
+                            Err(e) => Ok(RespValue::error(e.to_resp_string())),
+                        }
+                    }
+                    "maxmemory-policy" | "maxmemory_policy" => {
+                        match self.cache.set_eviction_policy_str(&value_str) {
+                            Ok(()) => {
+                                let policy = self.cache.eviction_policy();
+                                self.databases.set_eviction_policy_all(policy);
+                                Ok(RespValue::ok())
+                            }
+                            Err(e) => Ok(RespValue::error(e.to_resp_string())),
+                        }
+                    }
+                    "databases" => {
+                        // Redis treats `databases` as read-only at runtime
+                        Ok(RespValue::error(
+                            "ERR CONFIG SET failed: unsupported config parameter for set: databases",
+                        ))
                     }
                     _ => Ok(RespValue::error("ERR Unsupported CONFIG parameter")),
                 }

@@ -26,9 +26,15 @@ pub struct Config {
     #[arg(long, default_value = "0")]
     pub maxmemory: usize,
 
-    /// Enable eviction when memory is full
+    /// Enable eviction when memory is full (false forces maxmemory-policy=noeviction)
     #[arg(long, default_value = "true")]
     pub evict: bool,
+
+    /// Maxmemory eviction policy (Redis-compatible).
+    /// One of: noeviction, allkeys-lru, volatile-lru, allkeys-lfu, volatile-lfu,
+    /// allkeys-random, volatile-random, volatile-ttl
+    #[arg(long, default_value = "allkeys-lru")]
+    pub maxmemory_policy: String,
 
     /// Enable automatic sweeping of expired entries
     #[arg(long, default_value = "true")]
@@ -69,6 +75,91 @@ pub struct Config {
     /// Redlock retry delay in milliseconds (default: 200)
     #[arg(long, default_value = "200")]
     pub redlock_retry_delay_ms: u64,
+
+    /// Working directory for RDB/AOF files
+    #[arg(long, default_value = "./data")]
+    pub dir: String,
+
+    /// RDB filename (relative to --dir)
+    #[arg(long, default_value = "dump.rdb")]
+    pub dbfilename: String,
+
+    /// Enable AOF (append-only file) persistence
+    #[arg(long, default_value = "false")]
+    pub appendonly: bool,
+
+    /// AOF filename (relative to --dir)
+    #[arg(long, default_value = "appendonly.aof")]
+    pub appendfilename: String,
+
+    /// Replicate from this primary (host:port). Empty = act as primary.
+    #[arg(long, default_value = "")]
+    pub replicaof: String,
+
+    /// RDB auto-save policies: `"900,1 300,10 60,10000"` (seconds,changes).
+    /// Empty string disables timed SAVE. Redis pair form `"900 1 300 10"` also accepted.
+    #[arg(long, default_value = "900,1 300,10 60,10000")]
+    pub save: String,
+
+    /// Number of logical databases (SELECT 0 .. databases-1). Redis default is 16.
+    #[arg(long, default_value = "16")]
+    pub databases: usize,
+
+    /// Prometheus metrics HTTP port bound to 127.0.0.1 (0 = disabled).
+    #[arg(long, default_value = "0")]
+    pub metrics_port: u16,
+
+    /// Enable TLS for client connections (default: false).
+    #[arg(long, default_value = "false")]
+    pub tls: bool,
+
+    /// Path to TLS certificate PEM file (required when --tls is set).
+    #[arg(long, default_value = "")]
+    pub tls_cert: String,
+
+    /// Path to TLS private key PEM file (required when --tls is set).
+    #[arg(long, default_value = "")]
+    pub tls_key: String,
+
+    /// Enable Redis Cluster mode (hash slots, MOVED/ASK redirects). Default: false.
+    #[arg(long, default_value = "false")]
+    pub cluster_enabled: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 6379,
+            threads: 0,
+            shards: 4096,
+            maxmemory: 0,
+            evict: true,
+            maxmemory_policy: "allkeys-lru".to_string(),
+            autosweep: true,
+            loadfactor: 0.75,
+            maxconns: 1024,
+            auth: String::new(),
+            maxentrysize: 524288000,
+            verbosity: 1,
+            enable_redlock: false,
+            redlock_instances: String::new(),
+            redlock_retry_count: 3,
+            redlock_retry_delay_ms: 200,
+            dir: "./data".to_string(),
+            dbfilename: "dump.rdb".to_string(),
+            appendonly: false,
+            appendfilename: "appendonly.aof".to_string(),
+            replicaof: String::new(),
+            save: "900,1 300,10 60,10000".to_string(),
+            databases: 16,
+            metrics_port: 0,
+            tls: false,
+            tls_cert: String::new(),
+            tls_key: String::new(),
+            cluster_enabled: false,
+        }
+    }
 }
 
 impl Config {
@@ -156,6 +247,28 @@ impl Config {
             ));
         }
 
+        // Validate save policies
+        if let Err(e) = crate::persistence::parse_save_rules(&self.save) {
+            return Err(Error::ConfigError(format!("Invalid --save: {}", e)));
+        }
+
+        // Validate maxmemory-policy
+        if let Err(e) = crate::cache::EvictionPolicy::parse(&self.maxmemory_policy) {
+            return Err(Error::ConfigError(e));
+        }
+
+        // Validate databases (at least 1, cap to avoid runaway memory)
+        if self.databases == 0 {
+            return Err(Error::ConfigError(
+                "databases must be at least 1".to_string(),
+            ));
+        }
+        if self.databases > 1024 {
+            return Err(Error::ConfigError(
+                "databases cannot exceed 1024".to_string(),
+            ));
+        }
+
         // Validate Redlock configuration
         if self.enable_redlock {
             let instances = self.redlock_instance_addrs();
@@ -176,6 +289,32 @@ impl Config {
 
             if self.redlock_retry_count == 0 {
                 return Err(Error::ConfigError("Redlock retry count cannot be 0".to_string()));
+            }
+        }
+
+        // Validate TLS configuration
+        if self.tls {
+            if self.tls_cert.is_empty() {
+                return Err(Error::ConfigError(
+                    "TLS enabled but --tls-cert is missing".to_string(),
+                ));
+            }
+            if self.tls_key.is_empty() {
+                return Err(Error::ConfigError(
+                    "TLS enabled but --tls-key is missing".to_string(),
+                ));
+            }
+            if !std::path::Path::new(&self.tls_cert).is_file() {
+                return Err(Error::ConfigError(format!(
+                    "TLS certificate file not found: {}",
+                    self.tls_cert
+                )));
+            }
+            if !std::path::Path::new(&self.tls_key).is_file() {
+                return Err(Error::ConfigError(format!(
+                    "TLS private key file not found: {}",
+                    self.tls_key
+                )));
             }
         }
 

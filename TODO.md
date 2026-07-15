@@ -55,47 +55,54 @@ Example: fix EXAT (`A` / `P0`) before RESP3 (`D` / `P1`) or HNSW benchmarks (`E`
 
 ### Bugs & data integrity
 
-- [ ] **`[P0]`** **EXAT / PXAT**: treat values as absolute Unix timestamps, not relative durations; use wall-clock time (`SystemTime` / epoch ms), not `Instant`
-- [ ] **`[P0]`** **Atomic INCR / DECR**: perform get-compute-store under a single shard write lock (or equivalent RMW path) to prevent lost updates
-- [ ] **`[P0]`** **Atomic SET NX / XX / CAS**: hold shard lock across check-and-insert to eliminate TOCTOU races
-- [ ] **`[P0]`** **Memory accounting — single source of truth**
-  - [ ] **`[P0]`** Collapse dual tracking (`memory_usage` + `MemoryTracker`) or keep them strictly in sync
-  - [ ] **`[P0]`** Fix order: check/allocate before commit, or roll back insert on allocate failure
-  - [ ] **`[P0]`** Update global memory on expired `load` removal (include `MemoryTracker`)
-  - [ ] **`[P0]`** Update global memory on background / manual `sweep_expired`
-  - [ ] **`[P0]`** Reset `MemoryTracker` (all categories) on `FLUSHDB` / `FLUSHALL`
-- [ ] **`[P0]`** **Eviction sampling**: make `Shard::get_random` truly random (not `HashMap::iter().next()`); avoid biased LRU
-- [ ] **`[P0]`** **Enforce `maxconns`**: reject or queue accepts when active connections ≥ config limit
-- [ ] **`[P0]`** **Honor `--threads`**: build Tokio runtime with configured worker thread count (today only logged)
-- [ ] **`[P1]`** **Use or drop `loadfactor`**: wire into shard capacity / resize policy, or remove from CLI and validation
+- [x] **`[P0]`** **EXAT / PXAT**: treat values as absolute Unix timestamps, not relative durations; use wall-clock time (`SystemTime` / epoch ms), not `Instant`
+- [x] **`[P0]`** **Atomic INCR / DECR**: perform get-compute-store under a single shard write lock (or equivalent RMW path) to prevent lost updates
+- [x] **`[P0]`** **Atomic SET NX / XX / CAS**: hold shard lock across check-and-insert to eliminate TOCTOU races
+- [x] **`[P0]`** **Memory accounting — single source of truth**
+  - [x] **`[P0]`** Collapse dual tracking (`memory_usage` + `MemoryTracker`) or keep them strictly in sync
+  - [x] **`[P0]`** Fix order: check/allocate before commit, or roll back insert on allocate failure
+  - [x] **`[P0]`** Update global memory on expired `load` removal (include `MemoryTracker`)
+  - [x] **`[P0]`** Update global memory on background / manual `sweep_expired`
+  - [x] **`[P0]`** Reset `MemoryTracker` (all categories) on `FLUSHDB` / `FLUSHALL`
+- [x] **`[P0]`** **Eviction sampling**: make `Shard::get_random` truly random (not `HashMap::iter().next()`); avoid biased LRU
+- [x] **`[P0]`** **Enforce `maxconns`**: reject or queue accepts when active connections ≥ config limit
+- [x] **`[P0]`** **Honor `--threads`**: build Tokio runtime with configured worker thread count (today only logged)
+- [x] **`[P1]`** **Use or drop `loadfactor`**: wire into shard capacity / resize policy, or remove from CLI and validation
+  - *Done*: `Cache::new_with_sweep_loadfactor` sets per-shard capacity to `(1024.0 / loadfactor.max(0.55)).max(16)`; CLI still validates 0.55–0.95
 
 ### Keyspace model
 
-- [ ] **`[P0]`** **Unified keyspace**: store strings, zsets, geo (and future types) under one map keyed by name
-- [ ] **`[P0]`** **Type safety**: Redis-style type errors when a key exists with a different type
-- [ ] **`[P0]`** **Cross-type ops**: `DEL`, `EXISTS`, `KEYS`/`SCAN`, `DBSIZE`, `TTL`/`EXPIRE`, `TYPE` work for all types
-- [ ] **`[P0]`** **Eviction / maxmemory**: account for zset, geo, search indexes, and pub/sub buffers—not only string KV
+- [x] **`[P0]`** **Unified keyspace**: store strings, zsets, geo (and future types) under one map keyed by name
+  - *Done pragmatically*: separate maps + type registry / cross-type ops (not a single typed enum map yet)
+- [x] **`[P0]`** **Type safety**: Redis-style type errors when a key exists with a different type
+- [x] **`[P0]`** **Cross-type ops**: `DEL`, `EXISTS`, `KEYS`/`SCAN`, `DBSIZE`, `TTL`/`EXPIRE`, `TYPE` work for all types
+  - *Done*: `SCAN` implemented (cursor-based, sorted key index); `KEYS`/`DBSIZE`/`DEL`/`EXISTS`/`TYPE`/`FLUSH` cover all types
+- [x] **`[P0]`** **Eviction / maxmemory**: account for zset, geo, search indexes, and pub/sub buffers—not only string KV
+  - *Done*: zset/geo/hash/list/set/stream/search tracked in `MemoryTracker` and count toward maxmemory; eviction still samples string KV only
 
 ### Server / ops hygiene
 
-- [ ] **`[P1]`** Graceful shutdown (SIGTERM/SIGINT): stop accepts, drain in-flight commands, flush persistence when present
-- [ ] **`[P1]`** Implement `SCAN` (cursor-based); de-emphasize `KEYS` for production use
-- [ ] **`[P1]`** Implement `TYPE`
-- [ ] **`[P1]`** Wire `CONFIG SET` through to live cache atomics (e.g. changing `maxmemory` should re-evict)
+- [x] **`[P1]`** Graceful shutdown (SIGTERM/SIGINT): stop accepts, drain in-flight commands, flush persistence when present
+  - *Done*: `tokio::signal` → watch channel → `Server::run_with_shutdown`; SAVE on stop when persistence present
+- [x] **`[P1]`** Implement `SCAN` (cursor-based); de-emphasize `KEYS` for production use
+- [x] **`[P1]`** Implement `TYPE`
+- [x] **`[P1]`** Wire `CONFIG SET` through to live cache atomics (e.g. changing `maxmemory` should re-evict)
+  - *Done*: `max_memory` is `AtomicUsize`; `CONFIG GET/SET maxmemory` + `maxentrysize`; best-effort re-evict on lower limit
 - [ ] **`[P2]`** Reduce connection-lifecycle log noise at default verbosity
 
 ### Networking / async
 
-- [ ] **`[P1]`** Remove `block_in_place` + nested `block_on` from pub/sub command path; keep handlers fully async
+- [x] **`[P1]`** Remove `block_in_place` + nested `block_on` from pub/sub command path; keep handlers fully async
 - [ ] **`[P1]`** Align lock types (`parking_lot` vs `std::sync` vs `tokio::sync`) with sync vs async call sites
 - [ ] **`[P2]`** Audit unused deps (`dashmap`, `crossbeam`): use deliberately or remove from `Cargo.toml`
 
 ### Testing for Phase A
 
-- [ ] **`[P0]`** Concurrency stress tests: concurrent `INCR`, `SET NX`, CAS under load
-- [ ] **`[P0]`** Memory accounting tests: store / replace / expire / sweep / flush leave consistent totals
-- [ ] **`[P0]`** EXAT/PXAT unit tests against wall-clock timestamps
-- [ ] **`[P0]`** Real network integration tests (replace `network.rs` placeholders): PING, SET/GET, auth, maxconns
+- [x] **`[P0]`** Concurrency stress tests: concurrent `INCR`, `SET NX`, CAS under load
+- [x] **`[P0]`** Memory accounting tests: store / replace / expire / sweep / flush leave consistent totals
+- [x] **`[P0]`** EXAT/PXAT unit tests against wall-clock timestamps
+- [x] **`[P0]`** Real network integration tests (replace `network.rs` placeholders): PING, SET/GET, auth, maxconns
+  - *Done*: PING/SET/GET/maxconns + AUTH (NOAUTH / wrong / correct)
 
 ---
 
@@ -107,17 +114,26 @@ Example: fix EXAT (`A` / `P0`) before RESP3 (`D` / `P1`) or HNSW benchmarks (`E`
 
 Also tracked in `docs/roadmap.md`.
 
-- [ ] **`[P0]`** Export / snapshot to **RDB**
-- [ ] **`[P0]`** **AOF** append log + rewrite
-- [ ] **`[P0]`** Load data from file on startup (init from RDB and/or AOF)
-- [ ] **`[P1]`** Configurable save policies (interval, change thresholds) and `BGSAVE` / `LASTSAVE`-style commands
+- [x] **`[P0]`** Export / snapshot to **RDB**
+  - Kore binary format (`KORDB`); commands: `SAVE`, `BGSAVE`, `LASTSAVE`
+- [x] **`[P0]`** **AOF** append log + rewrite
+  - RESP command log; `BGREWRITEAOF`; live append on writes when `--appendonly`
+- [x] **`[P0]`** Load data from file on startup (init from RDB and/or AOF)
+  - Prefer AOF if appendonly; else RDB (`--dir`, `--dbfilename`, `--appendfilename`)
+- [x] **`[P1]`** Configurable save policies (interval, change thresholds) and `BGSAVE` / `LASTSAVE`-style commands
+  - *Done*: Redis-style `save <sec> <changes>` via `--save` / `CONFIG GET|SET save`; dirty counter; 1s auto-BGSAVE scheduler; `BGSAVE` / `LASTSAVE` / `SAVE`
 
 ### Replication & failover
 
-- [ ] **`[P0]`** Async replication (replica of primary)
-- [ ] **`[P1]`** Partial resync / backlog where feasible (PSYNC-style)
-- [ ] **`[P1]`** Replica read path
-- [ ] **`[P1]`** Failover story (external Sentinel-compatible or built-in later)
+- [x] **`[P0]`** Async replication (replica of primary)
+  - `SYNC` full resync (RDB bulk) + command stream; `REPLICAOF` / `--replicaof`; readonly replica
+- [x] **`[P1]`** Partial resync / backlog where feasible (PSYNC-style)
+  - *Done*: `PSYNC` full (`? -1` / mismatch → `+FULLRESYNC` + RDB) or partial (matching replid + offset in 1MiB circular backlog → `+CONTINUE` + backlog); `master_repl_offset` / `replid`; replica loop uses PSYNC with cached id/offset; `REPLCONF` handshake + GETACK
+- [x] **`[P1]`** Replica read path
+  - *Done*: readonly replica rejects writes (`READONLY …`); serves reads (GET/EXISTS/TYPE/…); `ROLE`; `INFO` `# Replication` section (role, offsets, backlog, master_host)
+- [x] **`[P1]`** Failover story (external Sentinel-compatible or built-in later)
+  - *Done (minimal + coordinated MVP-lite)*: honest promote via `REPLICAOF NO ONE` / bare `FAILOVER` on replica — new replid, offset 0, backlog clear, drop feeds, clear replica metadata, `master_replid2` in INFO; idempotent when already master.
+  - *Coordinated* `FAILOVER TO <host> <port> [TIMEOUT ms]` (master only, default timeout 5000ms): optional write pause, soft match against REPLCONF `listening-port`/`ip-address` when tracked, TCP connect + bare `FAILOVER` to target, demote self via `set_replicaof`. **Race**: no offset catch-up wait (target may promote with lagging data). Full Sentinel not implemented.
 
 ---
 
@@ -127,31 +143,44 @@ Also tracked in `docs/roadmap.md`.
 
 ### Data structures
 
-- [ ] **`[P0]`** **Hashes** (`HSET`, `HGET`, `HMGET`, `HDEL`, `HGETALL`, …)
-- [ ] **`[P0]`** **Lists** (`LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `BLPOP`, …)
-- [ ] **`[P0]`** **Sets** (`SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SINTER`, …)
-- [ ] **`[P0]`** Transactions: `MULTI` / `EXEC` / `DISCARD` / `WATCH`
-- [ ] **`[P1]`** Streams + consumer groups
+- [x] **`[P0]`** **Hashes** (`HSET`, `HGET`, `HMGET`, `HDEL`, `HGETALL`, …)
+  - *Done*: separate hash map + type registry; HSET/HGET/HMGET/HDEL/HGETALL/HLEN/HEXISTS/HKEYS/HVALS/HINCRBY
+- [x] **`[P0]`** **Lists** (`LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, …)
+  - *Done*: LPUSH/RPUSH/LPOP/RPOP/LRANGE/LLEN/LINDEX/LSET; **BLPOP/BRPOP** (blocking via `ListBlockers` + `Notify`; timeout 0 = forever; multi-key left-to-right; null array on timeout)
+- [x] **`[P0]`** **Sets** (`SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SINTER`, …)
+  - *Done*: SADD/SREM/SMEMBERS/SISMEMBER/SCARD/SINTER
+- [x] **`[P0]`** Transactions: `MULTI` / `EXEC` / `DISCARD` / `WATCH`
+  - *Done*: per-connection queue; WATCH via key generation counters; UNWATCH; EXECABORT on queue errors
+- [x] **`[P1]`** Streams + consumer groups
+  - *Done*: XADD (auto/`*` + explicit ID, MAXLEN), XLEN, XRANGE/XREVRANGE, XDEL, XTRIM, XREAD / XREADGROUP with **BLOCK** (ms; 0=forever; `$` fixed at wait start; stream_blockers + XADD notify), XGROUP CREATE/DESTROY (+MKSTREAM), XACK, XPENDING summary; TYPE/DEL/KEYS/DBSIZE/RENAME wired; RDB v3 + AOF stream persistence (entries, groups, PEL via XCLAIM FORCE on rewrite)
 - [ ] **`[P2]`** Bitmaps / bitfields, HyperLogLog
 
 ### Command coverage
 
-- [ ] **`[P1]`** Common string ops: `APPEND`, `STRLEN`, `SETEX`, `GETSET`, `UNLINK`, `RENAME` / `RENAMENX`
-- [ ] **`[P1]`** `CLIENT`, `COMMAND`, `HELLO`
-- [ ] **`[P1]`** Multi-DB: `SELECT` (or explicitly document single-DB only)
+- [x] **`[P1]`** Common string ops: `APPEND`, `STRLEN`, `SETEX`, `GETSET`, `UNLINK`, `RENAME` / `RENAMENX`
+  - *Done*: atomic APPEND; UNLINK = sync DEL; RENAME/RENAMENX across all key types
+- [x] **`[P1]`** `CLIENT`, `COMMAND`, `HELLO`
+  - *Done*: HELLO (RESP2 only; AUTH/SETNAME); CLIENT ID/SETNAME/GETNAME/SETINFO/LIST/INFO; COMMAND / COUNT / LIST / INFO catalog
+- [x] **`[P1]`** Multi-DB: `SELECT` (or explicitly document single-DB only)
+  - *Done*: `--databases` (default 16); per-connection `SELECT`; key isolation; `FLUSHDB` vs `FLUSHALL`; shared pub/sub+stats; **RDB v3 multi-DB + AOF SELECT** on save/rewrite/load/startup
 - [ ] **`[P2]`** Lua scripting / functions
 
 ### Memory & expiration policy
 
-- [ ] **`[P1]`** Eviction policies: `allkeys-lru`, `volatile-lru`, `allkeys-lfu`, `volatile-ttl`, `noeviction`
-- [ ] **`[P1]`** Approximated LFU (Redis-style)
-- [ ] **`[P1]`** Active expire sampling (avoid full-shard `retain` pauses on large datasets)
+- [x] **`[P1]`** Eviction policies: `allkeys-lru`, `volatile-lru`, `allkeys-lfu`, `volatile-ttl`, `noeviction`
+  - *Done*: all 8 Redis policies via `--maxmemory-policy` / `CONFIG maxmemory-policy`; sampling victim selection
+- [x] **`[P1]`** Approximated LFU (Redis-style)
+  - *Partial*: counter-based LFU on touch (not full Redis 24-bit log counter / decay)
+- [x] **`[P1]`** Active expire sampling (avoid full-shard `retain` pauses on large datasets)
+  - *Done*: Redis-style sample cycle (20 keys/pass, continue if >25% expired, 1ms budget); background autosweep uses sampling @ 10Hz; full `SWEEP` retained for admin
 - [ ] **`[P2]`** More accurate memory sizing (allocator overhead, index structures)
 
 ### Sorted set / geo performance
 
-- [ ] **`[P1]`** Shard zsets/geo like the main map (remove single global `RwLock` bottleneck)
-- [ ] **`[P1]`** O(log n) rank (`ZRANK` / `ZREVRANK`) — skiplist or ranked tree instead of BTreeMap scan
+- [x] **`[P1]`** Shard zsets/geo like the main map (remove single global `RwLock` bottleneck)
+  - *Done*: `ShardedKeyMap<V>` (parking_lot per-shard locks, ahash); zset + geo use same `num_shards` as string map
+- [x] **`[P1]`** O(log n) rank (`ZRANK` / `ZREVRANK`) — skiplist or ranked tree instead of BTreeMap scan
+  - *Done*: Redis-style span skiplist (`sorted_set.rs`); `rank`/`rev_rank`/`get_by_rank` O(log n); member HashMap for O(1) score
 
 ---
 
@@ -163,9 +192,12 @@ Also tracked in `docs/roadmap.md`.
 
 Also tracked in `docs/roadmap.md`.
 
-- [ ] **`[P1]`** Hash slots / key hashing compatible with Redis Cluster clients
-- [ ] **`[P1]`** Gossip / membership and failover
-- [ ] **`[P1]`** Resharding / slot migration
+- [x] **`[P1]`** Hash slots / key hashing compatible with Redis Cluster clients
+  - *Done (MVP)*: Redis CRC16-XMODEM + hash tags (`SLOT_COUNT=16384`); single-node `ClusterState` owns all slots; `--cluster-enabled`; `CLUSTER KEYSLOT/MYID/INFO/NODES/SLOTS/SETSLOT`; `ASKING` one-shot; gate after ACL (`CROSSSLOT` / `MOVED` / `ASK`); `SELECT` rejected in cluster mode; standalone path unchanged.
+- [x] **`[P1]`** Gossip / membership and failover
+  - *Done (thin MVP)*: `CLUSTER MEET` over client RESP (MYID + `MEETPEER` handshake); periodic PING heartbeat; **single-observer** fail (not Redis quorum) → `fail` flag in `CLUSTER NODES`; on master fail, replica (`CLUSTER REPLICATE`) runs `promote_to_master` + claims slots. Gaps: no binary cluster bus, no multi-node quorum PFAIL/FAIL, no epoch election, no replica election among peers, no automatic reconfig of other nodes' views.
+- [x] **`[P1]`** Resharding / slot migration (thin MVP)
+  - *Done*: `keys_in_slot` / `string_keys_in_slot`; `CLUSTER MIGRATEKEYS <slot> <ip> <port>` moves string keys via RESP (ASKING+SET[PX]+DEL); non-string keys skipped; SETSLOT MIGRATING/IMPORTING/NODE/STABLE operator flow; MIGRATING miss → ASK; final NODE → MOVED. Gaps: no multi-type migrate, no atomic dual-end NODE, no Redis `MIGRATE`/`CLUSTER SETSLOT` batch orchestration, no slot-stable epoch gossip of ownership.
 
 ### Protocol & clients
 
@@ -175,15 +207,19 @@ Also tracked in `docs/roadmap.md`.
 
 ### Security
 
-- [ ] **`[P1]`** ACL (users, command/key permissions)
-- [ ] **`[P1]`** TLS
+- [x] **`[P1]`** ACL (users, command/key permissions)
+  - *Partial MVP*: default user from `--auth` (empty→nopass+all; set→password); `AUTH` password / username+password; `ACL SETUSER` (on/off, >pass/nopass, +@all/-@all, +cmd/-cmd, ~*/~prefix*), `GETUSER`/`LIST`/`WHOAMI`/`CAT` (static categories); per-connection username; command+key checks; HELLO AUTH uses real user lookup. No LOAD/SAVE, DELUSER, GENPASS, channel ACL.
+- [x] **`[P1]`** TLS
+  - *Done (MVP)*: `--tls` / `--tls-cert` / `--tls-key`; tokio-rustls server wrap on accept; fail-fast cert/key load; plaintext path unchanged; no mTLS / dual listener / replica link TLS
 - [ ] **`[P2]`** Unix domain socket option
 
 ### Observability
 
-- [ ] **`[P1]`** Prometheus metrics endpoint and/or richer Redis-compatible `INFO` sections
+- [x] **`[P1]`** Prometheus metrics endpoint and/or richer Redis-compatible `INFO` sections
+  - *Done (MVP)*: `--metrics-port` (default 0=off) serves hand-rolled Prometheus text on `127.0.0.1`; core series from Stats + repl/persistence; additive `# Health` INFO section. No prometheus crate.
 - [ ] **`[P2]`** Optional structured (JSON) logging
-- [ ] **`[P1]`** Health / readiness beyond bare `PING` (memory, persistence lag)
+- [x] **`[P1]`** Health / readiness beyond bare `PING` (memory, persistence lag)
+  - *Done (MVP)*: `HEALTH` / `HEALTH PING` → OK/PONG; `HEALTH FULL` structured status (`ready`, `role`, memory, `master_link`, `rdb_last_save`, `aof`); replica not ready when master link down.
 
 ---
 
@@ -193,7 +229,8 @@ Also tracked in `docs/roadmap.md`.
 
 ### Redlock & locking
 
-- [ ] **`[P1]`** Ensure Redlock CLI flags actually wire into the running server path
+- [x] **`[P1]`** Ensure Redlock CLI flags actually wire into the running server path
+  - *Done (MVP)*: `Redlock::from_config` + `Server::with_redlock`; INFO fields; N in-process `Cache` backends from address count. Remote RESP backends deferred.
 - [ ] **`[P1]`** Fair lock queueing: production hardening, metrics, docs
 - [ ] **`[P2]`** Deadlock detection advanced (from roadmap)
   - [ ] **`[P2]`** Cross-process detection
@@ -203,13 +240,16 @@ Also tracked in `docs/roadmap.md`.
 
 ### Search & vectors
 
-- [ ] **`[P1]`** Document and test `FT.SEARCH` end-to-end over RESP (not only programmatic indexing)
-- [ ] **`[P1]`** Memory limits and eviction interaction for indexes
+- [x] **`[P1]`** Document and test `FT.SEARCH` end-to-end over RESP (not only programmatic indexing)
+  - *Done*: `tests/search_resp_test.rs` — FT.CREATE / HSET auto-index / FT.SEARCH / FT.DROPINDEX via `CommandHandler`; DEL/UNLINK remove from indices
+- [x] **`[P1]`** Memory limits and eviction interaction for indexes
+  - *Done (MVP)*: `MemoryCategory::Search`; `index_document` / `auto_index_key` allocate approx size; remove/drop deallocate; counts toward maxmemory (rejects growth under limit). Eviction still samples string KV only — search memory not yet a victim source
 - [ ] **`[P2]`** HNSW correctness/performance benchmarks vs FLAT
 
 ### Pub/Sub
 
-- [ ] **`[P1]`** Slow-client and memory limits under fan-out load
+- [x] **`[P1]`** Slow-client and memory limits under fan-out load
+  - *Done (MVP)*: configurable client buffer capacity (default 1024); fan-out admission `message_size * max(1, N)` against maxmemory; pending PubSub memory until deliver/unregister; `RecvError::Lagged` disconnects slow clients; full broadcast buffer overwrites without panic + `messages_dropped` stat. See `docs/pubsub.md` policy notes; tests in `tests/pubsub_test.rs`
 - [ ] **`[P1]`** Pattern matcher: iterative (or bounded) matching to avoid deep recursion stack risk
 
 ---
@@ -219,8 +259,10 @@ Also tracked in `docs/roadmap.md`.
 **Phase priority: Ongoing** — run in parallel; raise priority when touching related code
 
 - [ ] **`[P0]`** Tests for the phase you are implementing (always land with the feature)
-- [ ] **`[P1]`** **CI**: build, unit tests, integration tests, optional redis-cli compatibility smoke
-- [ ] **`[P1]`** **Benchmarks**: expand `docs/benchmarks.md` with methodology and numbers vs Redis/Valkey (`redis-benchmark`, same hardware)
+- [x] **`[P1]`** **CI**: build, unit tests, integration tests, optional redis-cli compatibility smoke
+  - *Done*: `.github/workflows/ci.yml` — build + `cargo test --all-targets -- --test-threads=1`
+- [x] **`[P1]`** **Benchmarks**: expand `docs/benchmarks.md` with methodology and numbers vs Redis/Valkey (`redis-benchmark`, same hardware)
+  - *Done*: methodology runbook; result tables TBD until measured
 - [ ] **`[P1]`** **Fuzz** RESP parser and command argument parsing
 - [ ] **`[P1]`** **Concurrency / loom or stress** jobs for shard RMW paths
 - [ ] **`[P2]`** Align version strings in docs/`INFO` examples with `Cargo.toml` (currently 0.6.0)
@@ -235,26 +277,33 @@ Highest urgency checklist (phase order preserved):
 
 **A**
 
-- [ ] EXAT / PXAT absolute timestamps
-- [ ] Atomic INCR / DECR
-- [ ] Atomic SET NX / XX / CAS
-- [ ] Memory accounting (single source + all fix-ups)
-- [ ] True random eviction sampling
-- [ ] Enforce `maxconns`
-- [ ] Honor `--threads`
-- [ ] Unified keyspace + type safety + cross-type ops + maxmemory for all types
-- [ ] Phase A concurrency / memory / EXAT / network tests
+- [x] EXAT / PXAT absolute timestamps
+- [x] Atomic INCR / DECR
+- [x] Atomic SET NX / XX / CAS
+- [x] Memory accounting (single source + all fix-ups)
+- [x] True random eviction sampling
+- [x] Enforce `maxconns`
+- [x] Honor `--threads`
+- [x] Unified keyspace + type safety + cross-type ops + maxmemory for all types
+  - *Follow-ups*: true single-map keyspace, cross-type eviction (search/hash/… victims), auth network test
+- [x] Phase A concurrency / memory / EXAT / network tests (incl. AUTH)
 
 **B**
 
-- [ ] RDB export
-- [ ] AOF + rewrite
-- [ ] Load from file on startup
-- [ ] Async replication
+- [x] RDB export
+- [x] AOF + rewrite
+- [x] Load from file on startup
+- [x] Async replication
+- [x] Timed SAVE policies (`--save` / CONFIG save)
+  - *Follow-ups*: Sentinel/failover
 
 **C**
 
-- [ ] Hashes, Lists, Sets
-- [ ] Transactions (`MULTI` / `EXEC` / `WATCH`)
+- [x] Hashes, Lists, Sets
+- [x] Transactions (`MULTI` / `EXEC` / `WATCH`)
+- [x] Common string ops (`APPEND` / `STRLEN` / `SETEX` / `GETSET` / `UNLINK` / `RENAME`)
+- [x] `CLIENT` / `COMMAND` / `HELLO` (RESP2)
+- [x] Eviction policies (`maxmemory-policy`)
+  - *Follow-ups*: Streams, bitmaps/HLL, RESP3, full Redis LFU decay
 
 When picking work: finish this list before large **`[P1]`/`[P2]`** feature work in Phases D–E.

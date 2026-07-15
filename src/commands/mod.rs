@@ -5,39 +5,162 @@ mod expiration;
 mod admin;
 mod sorted_set;
 mod geospatial;
+mod hash;
+mod list;
+mod set_cmds;
+mod stream;
 mod pubsub;
 mod search;
+mod persistence;
+mod transaction;
+mod meta;
+mod acl;
+mod cluster;
 
+use crate::acl::AclStore;
 use crate::cache::Cache;
+use crate::cluster::{key_hash_slot, ClusterState};
 use crate::config::Config;
+use crate::databases::Databases;
 use crate::error::{Error, Result};
+use crate::persistence::PersistenceManager;
 use crate::protocol::RespValue;
 use crate::pubsub::ClientId;
+use bytes::Bytes;
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 pub struct CommandHandler {
+    /// Currently selected logical database keyspace.
     cache: Arc<Cache>,
+    /// All logical databases (SELECT target).
+    databases: Arc<Databases>,
+    /// Index of the currently selected DB (0-based).
+    selected_db: usize,
     config: Arc<Config>,
+    persistence: Option<Arc<PersistenceManager>>,
+    /// Shared ACL user store (server-wide).
+    acl: Arc<AclStore>,
     authenticated: bool,
+    /// Authenticated ACL username (e.g. "default").
+    username: Option<String>,
     client_id: Option<ClientId>,
     /// Number of active regular pub/sub subscriptions (channels + patterns).
     pubsub_subscriptions: usize,
     /// Number of active shard channel subscriptions (Redis 7.0+ Shard Pub/Sub).
     /// Tracked separately to avoid the double-counting bug (CR-2).
     shard_subscriptions: usize,
+    /// After SYNC: network drains this channel to the replica socket.
+    pub pending_replica_feed: Option<mpsc::Receiver<Bytes>>,
+    /// After SYNC: pre-serialized RESP response (RDB bulk string).
+    pub pending_raw_response: Option<Bytes>,
+    /// Inside MULTI … EXEC block.
+    in_multi: bool,
+    /// True while EXEC is replaying the queue (bypass re-queue).
+    executing_multi: bool,
+    /// Queue-time error occurred; EXEC will EXECABORT.
+    multi_aborted: bool,
+    /// Queued full command arrays while in MULTI.
+    multi_queue: Vec<RespValue>,
+    /// WATCH'd keys → generation at WATCH time (current DB only).
+    watched: HashMap<Bytes, u64>,
+    /// CLIENT SETNAME / HELLO SETNAME connection name.
+    client_name: Option<Bytes>,
+    /// Pending REPLCONF ip-address for the next SYNC/PSYNC on this connection.
+    replica_announce_ip: Option<String>,
+    /// Pending REPLCONF listening-port for the next SYNC/PSYNC on this connection.
+    replica_announce_port: Option<u16>,
+    /// Cluster topology when `--cluster-enabled` (shared across connections).
+    cluster: Option<Arc<ClusterState>>,
+    /// ASKING one-shot flag (allows next command against IMPORTING slots).
+    asking: bool,
 }
 
 impl CommandHandler {
     pub fn new(cache: Arc<Cache>, config: Arc<Config>) -> Self {
-        let authenticated = config.auth.is_empty(); // Auto-auth if no password set
+        Self::with_persistence(cache, config, None)
+    }
+
+    pub fn with_persistence(
+        cache: Arc<Cache>,
+        config: Arc<Config>,
+        persistence: Option<Arc<PersistenceManager>>,
+    ) -> Self {
+        Self::with_databases(Databases::single(cache), config, persistence)
+    }
+
+    /// Build a handler over a multi-DB set (starts on DB 0).
+    pub fn with_databases(
+        databases: Arc<Databases>,
+        config: Arc<Config>,
+        persistence: Option<Arc<PersistenceManager>>,
+    ) -> Self {
+        let acl = AclStore::from_auth_arc(&config.auth);
+        Self::with_databases_and_acl(databases, config, persistence, acl)
+    }
+
+    /// Build a handler with a shared ACL store (all connections on a server).
+    pub fn with_databases_and_acl(
+        databases: Arc<Databases>,
+        config: Arc<Config>,
+        persistence: Option<Arc<PersistenceManager>>,
+        acl: Arc<AclStore>,
+    ) -> Self {
+        // Auto-auth as default only when live ACL allows nopass (not just startup --auth).
+        let authenticated = acl.default_allows_nopass();
+        let username = if authenticated {
+            Some("default".to_string())
+        } else {
+            None
+        };
+        let cache = databases.db0();
         Self {
             cache,
+            databases,
+            selected_db: 0,
             config,
+            persistence,
+            acl,
             authenticated,
+            username,
             client_id: None,
             pubsub_subscriptions: 0,
             shard_subscriptions: 0,
+            pending_replica_feed: None,
+            pending_raw_response: None,
+            in_multi: false,
+            executing_multi: false,
+            multi_aborted: false,
+            multi_queue: Vec::new(),
+            watched: HashMap::new(),
+            client_name: None,
+            replica_announce_ip: None,
+            replica_announce_port: None,
+            cluster: None,
+            asking: false,
         }
+    }
+
+    /// Attach cluster state (server path when `--cluster-enabled`).
+    pub fn with_cluster(mut self, cluster: Option<Arc<ClusterState>>) -> Self {
+        self.cluster = cluster;
+        self
+    }
+
+    /// Shared cluster state, if any.
+    pub fn cluster(&self) -> Option<&Arc<ClusterState>> {
+        self.cluster.as_ref()
+    }
+
+    /// Currently selected database index.
+    pub fn selected_db(&self) -> usize {
+        self.selected_db
+    }
+
+    /// Access the multi-DB collection.
+    pub fn databases(&self) -> &Arc<Databases> {
+        &self.databases
     }
 
     pub fn set_client_id(&mut self, client_id: ClientId) {
@@ -46,6 +169,42 @@ impl CommandHandler {
 
     pub fn client_id(&self) -> Option<ClientId> {
         self.client_id
+    }
+
+    /// Take pending raw response (SYNC).
+    pub fn take_raw_response(&mut self) -> Option<Bytes> {
+        self.pending_raw_response.take()
+    }
+
+    /// Take pending replica feed receiver (SYNC).
+    pub fn take_replica_feed(&mut self) -> Option<mpsc::Receiver<Bytes>> {
+        self.pending_replica_feed.take()
+    }
+
+    /// Log write to AOF + replicas when the command mutated data successfully.
+    fn maybe_persist_write(&self, cmd: &str, args: &[RespValue], response: &RespValue) {
+        if !is_write_command(cmd) {
+            return;
+        }
+        if !response_indicates_success(response) {
+            return;
+        }
+        // Replicas should not re-persist/re-propagate (avoid loops)
+        if let Some(p) = self.persistence.as_ref() {
+            if p.replication.is_replica() {
+                return;
+            }
+            let mut argv = Vec::with_capacity(args.len() + 1);
+            argv.push(Bytes::from(cmd.to_string()));
+            for a in args {
+                if let Some(b) = a.as_bulk_string() {
+                    argv.push(b.clone());
+                } else if let Some(i) = a.as_integer() {
+                    argv.push(Bytes::from(i.to_string()));
+                }
+            }
+            p.on_write_command(self.selected_db, &argv);
+        }
     }
 
     /// Returns true when the client is in Pub/Sub mode (regular or shard subscriptions).
@@ -70,14 +229,61 @@ impl CommandHandler {
 
         let cmd_upper = String::from_utf8_lossy(cmd).to_uppercase();
 
-        // AUTH command doesn't require authentication
+        // AUTH / HELLO don't require prior authentication (HELLO may AUTH inline)
         if cmd_upper == "AUTH" {
             return self.handle_auth(&args[1..]);
+        }
+        if cmd_upper == "HELLO" {
+            return self.handle_hello(&args[1..]);
         }
 
         // Check authentication
         if !self.authenticated {
             return Ok(RespValue::error("NOAUTH Authentication required"));
+        }
+
+        // ACL: command + key permission checks (after auth)
+        if let Some(deny) = self.check_acl_permission(&cmd_upper, &args[1..]) {
+            return Ok(deny);
+        }
+
+        // ASKING one-shot: capture flag for this command, then clear (except ASKING itself).
+        let asking_flag = self.asking;
+        if cmd_upper != "ASKING" {
+            self.asking = false;
+        }
+
+        // Cluster gate (after ACL): CROSSSLOT / MOVED / ASK
+        if let Some(redir) =
+            self.check_cluster_redirect(&cmd_upper, &args[1..], asking_flag)
+        {
+            return Ok(redir);
+        }
+
+        // ── Transaction control (always immediate; never queued) ───────────────
+        match cmd_upper.as_str() {
+            "MULTI" => return self.handle_multi(),
+            "EXEC" => return self.handle_exec().await,
+            "DISCARD" => return self.handle_discard(),
+            "WATCH" => return self.handle_watch(&args[1..]),
+            "UNWATCH" => return self.handle_unwatch(),
+            _ => {}
+        }
+
+        // Reject writes on readonly replica (except SYNC is primary-only)
+        if is_write_command(&cmd_upper) {
+            if let Some(p) = self.persistence.as_ref() {
+                if p.replication.readonly() {
+                    return Ok(RespValue::error(
+                        "READONLY You can't write against a read only replica.",
+                    ));
+                }
+            }
+        }
+
+        // Queue non-control commands while inside MULTI (unless replaying EXEC).
+        if self.in_multi && !self.executing_multi {
+            return self.queue_multi_command(&cmd_upper, value);
         }
 
         // ── Pub/Sub mode enforcement (Redis spec) ──────────────────────────────
@@ -108,16 +314,33 @@ impl CommandHandler {
             }
         }
 
-        match cmd_upper.as_str() {
+        let result = match cmd_upper.as_str() {
             // Basic commands
             "PING" => self.handle_ping(&args[1..]),
             "ECHO" => self.handle_echo(&args[1..]),
             "QUIT" => Ok(RespValue::ok()),
 
-            // RESET: exit pub/sub mode and reset client state (Redis 6.2+)
+            // Client handshake / introspection
+            "CLIENT" => self.handle_client(&args[1..]),
+            "COMMAND" => self.handle_command(&args[1..]),
+            "ACL" => self.handle_acl(&args[1..]),
+            // Cluster
+            "CLUSTER" => self.handle_cluster(&args[1..]).await,
+            "ASKING" => self.handle_asking(&args[1..]),
+            // HELLO handled before auth gate
+
+            // RESET: exit pub/sub mode, multi, and watches (Redis 6.2+)
+            // Also re-selects DB 0 (Redis RESET behavior).
             "RESET" => {
                 self.pubsub_subscriptions = 0;
                 self.shard_subscriptions = 0;
+                self.in_multi = false;
+                self.multi_aborted = false;
+                self.multi_queue.clear();
+                self.clear_watches();
+                self.client_name = None;
+                self.selected_db = 0;
+                self.cache = self.databases.db0();
                 Ok(RespValue::SimpleString(bytes::Bytes::from_static(b"RESET")))
             }
 
@@ -126,8 +349,16 @@ impl CommandHandler {
             "GET" => self.handle_get(&args[1..]),
             "DEL" => self.handle_del(&args[1..]),
             "EXISTS" => self.handle_exists(&args[1..]),
+            "TYPE" => self.handle_type(&args[1..]),
             "MGET" => self.handle_mget(&args[1..]),
             "MSET" => self.handle_mset(&args[1..]),
+            "APPEND" => self.handle_append(&args[1..]),
+            "STRLEN" => self.handle_strlen(&args[1..]),
+            "SETEX" => self.handle_setex(&args[1..]),
+            "GETSET" => self.handle_getset(&args[1..]),
+            "UNLINK" => self.handle_unlink(&args[1..]),
+            "RENAME" => self.handle_rename(&args[1..]),
+            "RENAMENX" => self.handle_renamenx(&args[1..]),
 
             // Distributed lock commands
             "SETNX" => self.handle_setnx(&args[1..]),
@@ -147,12 +378,28 @@ impl CommandHandler {
             "PTTL" => self.handle_pttl(&args[1..]),
 
             // Admin commands
+            "SELECT" => self.handle_select(&args[1..]),
             "DBSIZE" => self.handle_dbsize(&args[1..]),
             "KEYS" => self.handle_keys(&args[1..]),
-            "FLUSHDB" | "FLUSHALL" => self.handle_flush(&args[1..]),
+            "SCAN" => self.handle_scan(&args[1..]),
+            "FLUSHDB" => self.handle_flushdb(&args[1..]),
+            "FLUSHALL" => self.handle_flushall(&args[1..]),
             "INFO" => self.handle_info(&args[1..]),
+            "HEALTH" => self.handle_health(&args[1..]),
             "SWEEP" => self.handle_sweep(&args[1..]),
             "CONFIG" => self.handle_config(&args[1..]),
+
+            // Persistence
+            "SAVE" => self.handle_save(&args[1..]),
+            "BGSAVE" => self.handle_bgsave(&args[1..]),
+            "LASTSAVE" => self.handle_lastsave(&args[1..]),
+            "BGREWRITEAOF" => self.handle_bgrewriteaof(&args[1..]),
+            "SYNC" => self.handle_sync(&args[1..]),
+            "PSYNC" => self.handle_psync(&args[1..]),
+            "REPLCONF" => self.handle_replconf(&args[1..]),
+            "ROLE" => self.handle_role(&args[1..]),
+            "REPLICAOF" | "SLAVEOF" => self.handle_replicaof(&args[1..]),
+            "FAILOVER" => self.handle_failover(&args[1..]).await,
 
             // Sorted Set commands
             "ZADD" => self.handle_zadd(&args[1..]),
@@ -174,13 +421,58 @@ impl CommandHandler {
             "GEORADIUS" => self.handle_georadius(&args[1..]),
             "GEORADIUSBYMEMBER" => self.handle_georadiusbymember(&args[1..]),
 
-            // Pub/Sub commands
-            "PUBLISH" => self.handle_publish(&args[1..]),
-            "SUBSCRIBE" => self.handle_subscribe(&args[1..]),
-            "UNSUBSCRIBE" => self.handle_unsubscribe(&args[1..]),
-            "PSUBSCRIBE" => self.handle_psubscribe(&args[1..]),
-            "PUNSUBSCRIBE" => self.handle_punsubscribe(&args[1..]),
-            "PUBSUB" => self.handle_pubsub(&args[1..]),
+            // Hash commands
+            "HSET" => self.handle_hset(&args[1..]),
+            "HGET" => self.handle_hget(&args[1..]),
+            "HMGET" => self.handle_hmget(&args[1..]),
+            "HDEL" => self.handle_hdel(&args[1..]),
+            "HGETALL" => self.handle_hgetall(&args[1..]),
+            "HLEN" => self.handle_hlen(&args[1..]),
+            "HEXISTS" => self.handle_hexists(&args[1..]),
+            "HKEYS" => self.handle_hkeys(&args[1..]),
+            "HVALS" => self.handle_hvals(&args[1..]),
+            "HINCRBY" => self.handle_hincrby(&args[1..]),
+
+            // List commands
+            "LPUSH" => self.handle_lpush(&args[1..]),
+            "RPUSH" => self.handle_rpush(&args[1..]),
+            "LPOP" => self.handle_lpop(&args[1..]),
+            "RPOP" => self.handle_rpop(&args[1..]),
+            "BLPOP" => self.handle_blpop(&args[1..]).await,
+            "BRPOP" => self.handle_brpop(&args[1..]).await,
+            "LRANGE" => self.handle_lrange(&args[1..]),
+            "LLEN" => self.handle_llen(&args[1..]),
+            "LINDEX" => self.handle_lindex(&args[1..]),
+            "LSET" => self.handle_lset(&args[1..]),
+
+            // Set commands
+            "SADD" => self.handle_sadd(&args[1..]),
+            "SREM" => self.handle_srem(&args[1..]),
+            "SMEMBERS" => self.handle_smembers(&args[1..]),
+            "SISMEMBER" => self.handle_sismember(&args[1..]),
+            "SCARD" => self.handle_scard(&args[1..]),
+            "SINTER" => self.handle_sinter(&args[1..]),
+
+            // Stream commands
+            "XADD" => self.handle_xadd(&args[1..]),
+            "XLEN" => self.handle_xlen(&args[1..]),
+            "XRANGE" => self.handle_xrange(&args[1..]),
+            "XREVRANGE" => self.handle_xrevrange(&args[1..]),
+            "XDEL" => self.handle_xdel(&args[1..]),
+            "XTRIM" => self.handle_xtrim(&args[1..]),
+            "XREAD" => self.handle_xread(&args[1..]).await,
+            "XGROUP" => self.handle_xgroup(&args[1..]),
+            "XREADGROUP" => self.handle_xreadgroup(&args[1..]).await,
+            "XACK" => self.handle_xack(&args[1..]),
+            "XPENDING" => self.handle_xpending(&args[1..]),
+
+            // Pub/Sub commands (async — no block_in_place)
+            "PUBLISH" => self.handle_publish(&args[1..]).await,
+            "SUBSCRIBE" => self.handle_subscribe(&args[1..]).await,
+            "UNSUBSCRIBE" => self.handle_unsubscribe(&args[1..]).await,
+            "PSUBSCRIBE" => self.handle_psubscribe(&args[1..]).await,
+            "PUNSUBSCRIBE" => self.handle_punsubscribe(&args[1..]).await,
+            "PUBSUB" => self.handle_pubsub(&args[1..]).await,
 
             // Search commands
             "FT.CREATE" => self.handle_ft_create(&args[1..]),
@@ -190,12 +482,133 @@ impl CommandHandler {
             "FT.SEARCH" => self.handle_ft_search(&args[1..]),
 
             // Shard Pub/Sub commands (Redis 7.0+)
-            "SSUBSCRIBE" => self.handle_ssubscribe(&args[1..]),
-            "SUNSUBSCRIBE" => self.handle_sunsubscribe(&args[1..]),
-            "SPUBLISH" => self.handle_spublish(&args[1..]),
+            "SSUBSCRIBE" => self.handle_ssubscribe(&args[1..]).await,
+            "SUNSUBSCRIBE" => self.handle_sunsubscribe(&args[1..]).await,
+            "SPUBLISH" => self.handle_spublish(&args[1..]).await,
 
             _ => Ok(RespValue::error(format!("ERR unknown command '{}'", cmd_upper))),
+        };
+
+        if let Ok(ref resp) = result {
+            self.maybe_persist_write(&cmd_upper, &args[1..], resp);
+            if is_write_command(&cmd_upper)
+                && response_indicates_success(resp)
+                && !is_noop_write(&cmd_upper, resp)
+            {
+                self.notify_watch_after_write(&cmd_upper, &args[1..]);
+            }
         }
+        result
+    }
+
+    /// Check ACL command + key permissions for the authenticated user.
+    /// Returns `Some(error)` when denied, `None` when allowed.
+    fn check_acl_permission(&self, cmd_upper: &str, args: &[RespValue]) -> Option<RespValue> {
+        let username = self.username.as_deref().unwrap_or("default");
+        let cmd_lower = cmd_upper.to_ascii_lowercase();
+
+        if !self.acl.can_execute(username, &cmd_lower) {
+            return Some(RespValue::error(format!(
+                "NOPERM this user has no permissions to run the '{}' command",
+                cmd_lower
+            )));
+        }
+
+        // Key permission checks using COMMAND_SPECS first_key/last_key/step when available.
+        if let Some((first_key, last_key, step)) = meta::command_key_spec(&cmd_lower) {
+            if first_key > 0 {
+                let keys = extract_command_keys(args, first_key, last_key, step);
+                for key in keys {
+                    if !self.acl.can_access_key(username, &key) {
+                        return Some(RespValue::error(
+                            "NOPERM this user has no permissions to access one of the keys used as arguments",
+                        ));
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Cluster slot / redirect checks (CROSSSLOT, MOVED, ASK).
+    /// Returns `Some(error)` when the command must not run locally.
+    fn check_cluster_redirect(
+        &self,
+        cmd_upper: &str,
+        args: &[RespValue],
+        asking: bool,
+    ) -> Option<RespValue> {
+        let cluster = self.cluster.as_ref()?;
+
+        // SELECT is rejected entirely in cluster mode (even with no key args).
+        if cmd_upper == "SELECT" {
+            return Some(RespValue::error(
+                "ERR SELECT is not allowed in cluster mode",
+            ));
+        }
+
+        // Commands without key specs (or first_key=0) are not redirected.
+        let cmd_lower = cmd_upper.to_ascii_lowercase();
+        let (first_key, last_key, step) = meta::command_key_spec(&cmd_lower)?;
+        if first_key <= 0 {
+            return None;
+        }
+
+        let keys = extract_command_key_bytes(args, first_key, last_key, step);
+        if keys.is_empty() {
+            return None;
+        }
+
+        // CROSSSLOT: multi-key commands must hash to one slot.
+        let mut slot: Option<u16> = None;
+        for key in &keys {
+            let s = key_hash_slot(key);
+            match slot {
+                None => slot = Some(s),
+                Some(prev) if prev != s => {
+                    return Some(RespValue::error(
+                        "CROSSSLOT Keys in request don't hash to the same slot",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        let slot = slot?;
+
+        // IMPORTING + ASKING: serve one-shot even if we don't stably own the slot.
+        if asking && cluster.is_importing(slot) {
+            return None;
+        }
+
+        // Not owned → MOVED to current owner.
+        if !cluster.owns_slot(slot) {
+            if let Some(t) = cluster.moved_target(slot) {
+                return Some(RespValue::error(format!(
+                    "MOVED {} {}:{}",
+                    t.slot, t.ip, t.port
+                )));
+            }
+            return Some(RespValue::error(format!(
+                "CLUSTERDOWN Hash slot not served ({})",
+                slot
+            )));
+        }
+
+        // Owned but MIGRATING and key missing → ASK destination.
+        if cluster.is_migrating(slot) {
+            let any_missing = keys.iter().any(|k| !self.cache.exists(k));
+            if any_missing {
+                if let Some(t) = cluster.ask_target(slot) {
+                    return Some(RespValue::error(format!(
+                        "ASK {} {}:{}",
+                        t.slot, t.ip, t.port
+                    )));
+                }
+            }
+        }
+
+        None
     }
 
     // Helper method for parsing integers
@@ -215,25 +628,17 @@ impl CommandHandler {
         Err(Error::InvalidArgument("expected integer".into()))
     }
 
-    // Pub/Sub command handlers
-    fn handle_publish(&self, args: &[RespValue]) -> Result<RespValue> {
-        Ok(tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                self.cache.cmd_publish(args).await
-            })
-        })?)
+    // Pub/Sub command handlers (fully async)
+    async fn handle_publish(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.cache.cmd_publish(args).await
     }
 
-    fn handle_subscribe(&mut self, args: &[RespValue]) -> Result<RespValue> {
+    async fn handle_subscribe(&mut self, args: &[RespValue]) -> Result<RespValue> {
         let client_id = self.client_id.ok_or_else(|| {
             Error::InvalidArgument("client not registered for pub/sub".into())
         })?;
 
-        let responses = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                self.cache.cmd_subscribe(client_id, args).await
-            })
-        })?;
+        let responses = self.cache.cmd_subscribe(client_id, args).await?;
 
         // Track subscription count from the last response's integer field.
         if let Some(last) = responses.last() {
@@ -252,16 +657,12 @@ impl CommandHandler {
         }
     }
 
-    fn handle_unsubscribe(&mut self, args: &[RespValue]) -> Result<RespValue> {
+    async fn handle_unsubscribe(&mut self, args: &[RespValue]) -> Result<RespValue> {
         let client_id = self.client_id.ok_or_else(|| {
             Error::InvalidArgument("client not registered for pub/sub".into())
         })?;
 
-        let responses = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                self.cache.cmd_unsubscribe(client_id, args).await
-            })
-        })?;
+        let responses = self.cache.cmd_unsubscribe(client_id, args).await?;
 
         if let Some(last) = responses.last() {
             if let RespValue::Array(arr) = last {
@@ -278,16 +679,12 @@ impl CommandHandler {
         }
     }
 
-    fn handle_psubscribe(&mut self, args: &[RespValue]) -> Result<RespValue> {
+    async fn handle_psubscribe(&mut self, args: &[RespValue]) -> Result<RespValue> {
         let client_id = self.client_id.ok_or_else(|| {
             Error::InvalidArgument("client not registered for pub/sub".into())
         })?;
 
-        let responses = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                self.cache.cmd_psubscribe(client_id, args).await
-            })
-        })?;
+        let responses = self.cache.cmd_psubscribe(client_id, args).await?;
 
         if let Some(last) = responses.last() {
             if let RespValue::Array(arr) = last {
@@ -304,16 +701,12 @@ impl CommandHandler {
         }
     }
 
-    fn handle_punsubscribe(&mut self, args: &[RespValue]) -> Result<RespValue> {
+    async fn handle_punsubscribe(&mut self, args: &[RespValue]) -> Result<RespValue> {
         let client_id = self.client_id.ok_or_else(|| {
             Error::InvalidArgument("client not registered for pub/sub".into())
         })?;
 
-        let responses = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                self.cache.cmd_punsubscribe(client_id, args).await
-            })
-        })?;
+        let responses = self.cache.cmd_punsubscribe(client_id, args).await?;
 
         if let Some(last) = responses.last() {
             if let RespValue::Array(arr) = last {
@@ -330,24 +723,16 @@ impl CommandHandler {
         }
     }
 
-    fn handle_pubsub(&self, args: &[RespValue]) -> Result<RespValue> {
-        Ok(tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                self.cache.cmd_pubsub(args).await
-            })
-        })?)
+    async fn handle_pubsub(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.cache.cmd_pubsub(args).await
     }
 
-    fn handle_ssubscribe(&mut self, args: &[RespValue]) -> Result<RespValue> {
+    async fn handle_ssubscribe(&mut self, args: &[RespValue]) -> Result<RespValue> {
         let client_id = self.client_id.ok_or_else(|| {
             Error::InvalidArgument("client not registered for pub/sub".into())
         })?;
 
-        let responses = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                self.cache.cmd_ssubscribe(client_id, args).await
-            })
-        })?;
+        let responses = self.cache.cmd_ssubscribe(client_id, args).await?;
 
         if let Some(last) = responses.last() {
             if let RespValue::Array(arr) = last {
@@ -365,16 +750,12 @@ impl CommandHandler {
         }
     }
 
-    fn handle_sunsubscribe(&mut self, args: &[RespValue]) -> Result<RespValue> {
+    async fn handle_sunsubscribe(&mut self, args: &[RespValue]) -> Result<RespValue> {
         let client_id = self.client_id.ok_or_else(|| {
             Error::InvalidArgument("client not registered for pub/sub".into())
         })?;
 
-        let responses = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                self.cache.cmd_sunsubscribe(client_id, args).await
-            })
-        })?;
+        let responses = self.cache.cmd_sunsubscribe(client_id, args).await?;
 
         if let Some(last) = responses.last() {
             if let RespValue::Array(arr) = last {
@@ -392,11 +773,127 @@ impl CommandHandler {
         }
     }
 
-    fn handle_spublish(&self, args: &[RespValue]) -> Result<RespValue> {
-        Ok(tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                self.cache.cmd_spublish(args).await
-            })
-        })?)
+    async fn handle_spublish(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.cache.cmd_spublish(args).await
     }
+}
+
+fn is_write_command(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "SET"
+            | "DEL"
+            | "MSET"
+            | "SETNX"
+            | "GETDEL"
+            | "GETEX"
+            | "APPEND"
+            | "SETEX"
+            | "GETSET"
+            | "UNLINK"
+            | "RENAME"
+            | "RENAMENX"
+            | "INCR"
+            | "DECR"
+            | "INCRBY"
+            | "DECRBY"
+            | "EXPIRE"
+            | "PEXPIRE"
+            | "FLUSHDB"
+            | "FLUSHALL"
+            | "ZADD"
+            | "ZREM"
+            | "GEOADD"
+            | "GEOSEARCHSTORE"
+            | "HSET"
+            | "HDEL"
+            | "HINCRBY"
+            | "LPUSH"
+            | "RPUSH"
+            | "LPOP"
+            | "RPOP"
+            | "BLPOP"
+            | "BRPOP"
+            | "LSET"
+            | "SADD"
+            | "SREM"
+            | "XADD"
+            | "XDEL"
+            | "XTRIM"
+            | "XGROUP"
+            | "XACK"
+            // XREADGROUP mutates PEL / last_delivered
+            | "XREADGROUP"
+    )
+}
+
+fn response_indicates_success(response: &RespValue) -> bool {
+    match response {
+        RespValue::Error(_) => false,
+        // SET NX failure returns null bulk string
+        RespValue::BulkString(None) => false,
+        _ => true,
+    }
+}
+
+/// Writes that returned success-shaped replies but did not mutate (e.g. RENAMENX=0).
+fn is_noop_write(cmd: &str, response: &RespValue) -> bool {
+    match (cmd, response) {
+        ("RENAMENX", RespValue::Integer(0)) => true,
+        ("SETNX", RespValue::Integer(0)) => true,
+        _ => false,
+    }
+}
+
+/// Extract key argument strings using Redis COMMAND first_key/last_key/step.
+/// `first_key`/`last_key` are 1-based indexes into the command arguments (not including the command name).
+fn extract_command_keys(
+    args: &[RespValue],
+    first_key: i64,
+    last_key: i64,
+    step: i64,
+) -> Vec<String> {
+    extract_command_key_bytes(args, first_key, last_key, step)
+        .into_iter()
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .collect()
+}
+
+/// Extract key argument bytes using Redis COMMAND first_key/last_key/step.
+fn extract_command_key_bytes(
+    args: &[RespValue],
+    first_key: i64,
+    last_key: i64,
+    step: i64,
+) -> Vec<Bytes> {
+    if first_key <= 0 || args.is_empty() {
+        return Vec::new();
+    }
+    let step = if step <= 0 { 1 } else { step as usize };
+    let first = (first_key as usize).saturating_sub(1);
+    if first >= args.len() {
+        return Vec::new();
+    }
+    let last = if last_key >= 0 {
+        (last_key as usize).saturating_sub(1).min(args.len() - 1)
+    } else {
+        // Negative last_key: count from end (Redis: -1 = last arg, -2 = second last, …)
+        let from_end = (-last_key) as usize;
+        if from_end > args.len() {
+            return Vec::new();
+        }
+        args.len() - from_end
+    };
+    if first > last {
+        return Vec::new();
+    }
+    let mut keys = Vec::new();
+    let mut i = first;
+    while i <= last {
+        if let Some(b) = args[i].as_bulk_string() {
+            keys.push(b.clone());
+        }
+        i += step;
+    }
+    keys
 }

@@ -1,34 +1,101 @@
-use crate::sorted_set::SharedSortedSet;
+use crate::error::{Error, Result};
+use crate::memory::MemoryCategory;
+use crate::sorted_set::{SharedSortedSet, SortedSet};
 use bytes::Bytes;
 use std::sync::{Arc, RwLock};
 
+use super::storage::KeyType;
 use super::Cache;
-use crate::sorted_set::SortedSet;
 
 impl Cache {
-    /// Get or create a sorted set
-    pub fn get_or_create_sorted_set(&self, key: &Bytes) -> SharedSortedSet {
-        let mut sets = self.sorted_sets.write().unwrap();
-        sets.entry(key.clone())
-            .or_insert_with(|| Arc::new(RwLock::new(SortedSet::new())))
-            .clone()
+    /// Account a net memory change for sorted sets (updates MemoryTracker only).
+    pub(crate) fn account_sorted_set_delta(&self, old_size: usize, new_size: usize) {
+        if old_size > 0 {
+            self.memory_tracker
+                .deallocate(old_size, MemoryCategory::SortedSets);
+        }
+        if new_size > 0 {
+            self.memory_tracker
+                .account(new_size, MemoryCategory::SortedSets);
+        }
+    }
+
+    /// Ensure capacity for growing a sorted set / geo structure by `needed` bytes.
+    pub(crate) fn ensure_non_string_capacity(&self, needed: usize) -> Result<()> {
+        if needed == 0 {
+            return Ok(());
+        }
+        if self
+            .memory_tracker
+            .can_allocate(needed, MemoryCategory::SortedSets)
+        {
+            return Ok(());
+        }
+        if self.eviction_allowed() {
+            // Evict string KV to free room in the shared max_memory budget.
+            if self.evict_memory(needed).is_ok()
+                && self
+                    .memory_tracker
+                    .can_allocate(needed, MemoryCategory::SortedSets)
+            {
+                return Ok(());
+            }
+        }
+        self.stats.incr(&self.stats.store_no_memory);
+        Err(Error::OutOfMemory)
+    }
+
+    /// Get or create a sorted set.
+    /// Returns WrongType if the key already holds a different type.
+    pub fn get_or_create_sorted_set(&self, key: &Bytes) -> Result<SharedSortedSet> {
+        self.ensure_type(key, KeyType::ZSet)?;
+        if let Some(existing) = self.sorted_sets.get(key) {
+            return Ok(existing);
+        }
+        // Base overhead: key + empty SortedSet
+        let base = key.len() + std::mem::size_of::<SortedSet>();
+        self.ensure_non_string_capacity(base)?;
+        Ok(self.sorted_sets.get_or_insert_with(key.clone(), || {
+            self.memory_tracker
+                .account(base, MemoryCategory::SortedSets);
+            Arc::new(RwLock::new(SortedSet::new()))
+        }))
     }
 
     /// Get a sorted set if it exists
     pub fn get_sorted_set(&self, key: &Bytes) -> Option<SharedSortedSet> {
-        let sets = self.sorted_sets.read().unwrap();
-        sets.get(key).cloned()
+        self.sorted_sets.get(key)
     }
 
-    /// Remove a sorted set
+    /// Remove a sorted set and free its tracked memory
     pub fn remove_sorted_set(&self, key: &Bytes) -> bool {
-        let mut sets = self.sorted_sets.write().unwrap();
-        sets.remove(key).is_some()
+        if let Some(set) = self.sorted_sets.remove(key) {
+            let size = key.len()
+                + set
+                    .read()
+                    .map(|s| s.memory_size())
+                    .unwrap_or(std::mem::size_of::<SortedSet>());
+            self.memory_tracker
+                .deallocate(size, MemoryCategory::SortedSets);
+            true
+        } else {
+            false
+        }
     }
 
     /// Check if a sorted set exists
     pub fn sorted_set_exists(&self, key: &Bytes) -> bool {
-        let sets = self.sorted_sets.read().unwrap();
-        sets.contains_key(key)
+        self.sorted_sets.contains_key(key)
+    }
+
+    /// Export all sorted sets for persistence: (key, [(member, score), ...]).
+    pub fn export_zsets(&self) -> Vec<(Bytes, Vec<(Bytes, f64)>)> {
+        let mut out = Vec::new();
+        self.sorted_sets.for_each(|key, zset| {
+            if let Ok(set) = zset.read() {
+                out.push((key.clone(), set.iter_members().collect()));
+            }
+        });
+        out
     }
 }

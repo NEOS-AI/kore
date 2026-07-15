@@ -132,7 +132,7 @@ mod geospatial_tests {
         let cache = Cache::new(4, 1024 * 1024 * 1024);
 
         // Get or create geospatial set
-        let geoset = cache.get_or_create_geo_set(&Bytes::from("cities"));
+        let geoset = cache.get_or_create_geo_set(&Bytes::from("cities")).unwrap();
         {
             let mut set = geoset.write().unwrap();
             set.add(Bytes::from("Seoul"), 126.9780, 37.5665);
@@ -252,7 +252,7 @@ mod geospatial_tests {
         assert_eq!(cache.geo_set_count(), 0);
 
         // Create first geo set
-        let geoset1 = cache.get_or_create_geo_set(&Bytes::from("cities"));
+        let geoset1 = cache.get_or_create_geo_set(&Bytes::from("cities")).unwrap();
         {
             let mut set = geoset1.write().unwrap();
             set.add(Bytes::from("Seoul"), 126.9780, 37.5665);
@@ -264,7 +264,7 @@ mod geospatial_tests {
         assert_eq!(cache.geo_set_count(), 1);
 
         // Create second geo set
-        let geoset2 = cache.get_or_create_geo_set(&Bytes::from("landmarks"));
+        let geoset2 = cache.get_or_create_geo_set(&Bytes::from("landmarks")).unwrap();
         {
             let mut set = geoset2.write().unwrap();
             set.add(Bytes::from("Eiffel Tower"), 2.2945, 48.8584);

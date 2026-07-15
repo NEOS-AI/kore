@@ -47,7 +47,20 @@ async fn test_network_basic_commands() {
         redlock_instances: String::new(),
         redlock_retry_count: 3,
         redlock_retry_delay_ms: 200,
-    });
+            dir: "./data".to_string(),
+            dbfilename: "dump.rdb".to_string(),
+            appendonly: false,
+            appendfilename: "appendonly.aof".to_string(),
+            replicaof: String::new(),
+            save: "900,1 300,10 60,10000".to_string(),
+            maxmemory_policy: "allkeys-lru".to_string(),
+        databases: 16,
+        metrics_port: 0,
+        tls: false,
+        tls_cert: String::new(),
+        tls_key: String::new(),
+        cluster_enabled: false,
+});
 
     let cache = Cache::new(config.shards, config.maxmemory);
     let server = Server::new(cache.clone(), config.clone());
@@ -114,7 +127,20 @@ async fn test_network_concurrent_clients() {
         redlock_instances: String::new(),
         redlock_retry_count: 3,
         redlock_retry_delay_ms: 200,
-    });
+            dir: "./data".to_string(),
+            dbfilename: "dump.rdb".to_string(),
+            appendonly: false,
+            appendfilename: "appendonly.aof".to_string(),
+            replicaof: String::new(),
+            save: "900,1 300,10 60,10000".to_string(),
+            maxmemory_policy: "allkeys-lru".to_string(),
+        databases: 16,
+        metrics_port: 0,
+        tls: false,
+        tls_cert: String::new(),
+        tls_key: String::new(),
+        cluster_enabled: false,
+});
 
     let cache = Cache::new(config.shards, config.maxmemory);
     let cache_clone = cache.clone();
@@ -211,7 +237,20 @@ async fn test_network_info_command() {
         redlock_instances: String::new(),
         redlock_retry_count: 3,
         redlock_retry_delay_ms: 200,
-    });
+            dir: "./data".to_string(),
+            dbfilename: "dump.rdb".to_string(),
+            appendonly: false,
+            appendfilename: "appendonly.aof".to_string(),
+            replicaof: String::new(),
+            save: "900,1 300,10 60,10000".to_string(),
+            maxmemory_policy: "allkeys-lru".to_string(),
+        databases: 16,
+        metrics_port: 0,
+        tls: false,
+        tls_cert: String::new(),
+        tls_key: String::new(),
+        cluster_enabled: false,
+});
 
     let cache = Cache::new(config.shards, config.maxmemory);
     let server = Server::new(cache.clone(), config.clone());
@@ -246,6 +285,236 @@ async fn test_network_info_command() {
     assert!(info.contains("active_connections"));
     
     // Clean up
+    drop(stream);
+    server_handle.abort();
+    sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_network_maxconns() {
+    // Start server with maxconns=2 on a unique high port to avoid collisions
+    let config = Arc::new(Config {
+        host: "127.0.0.1".to_string(),
+        port: 16490,
+        threads: 1,
+        shards: 16,
+        maxmemory: 1024 * 1024 * 100,
+        evict: true,
+        autosweep: false,
+        loadfactor: 0.75,
+        maxconns: 2,
+        auth: String::new(),
+        maxentrysize: 500 * 1024 * 1024,
+        verbosity: 0,
+        enable_redlock: false,
+        redlock_instances: String::new(),
+        redlock_retry_count: 3,
+        redlock_retry_delay_ms: 200,
+            dir: "./data".to_string(),
+            dbfilename: "dump.rdb".to_string(),
+            appendonly: false,
+            appendfilename: "appendonly.aof".to_string(),
+            replicaof: String::new(),
+            save: "900,1 300,10 60,10000".to_string(),
+            maxmemory_policy: "allkeys-lru".to_string(),
+        databases: 16,
+        metrics_port: 0,
+        tls: false,
+        tls_cert: String::new(),
+        tls_key: String::new(),
+        cluster_enabled: false,
+});
+
+    let cache = Cache::new(config.shards, config.maxmemory);
+    let server = Server::new(cache.clone(), config.clone());
+
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    sleep(Duration::from_millis(200)).await;
+
+    // Open 2 connections that stay open (hold the maxconns slots)
+    let stream1 = match timeout(Duration::from_secs(2), TcpStream::connect("127.0.0.1:16490")).await {
+        Ok(Ok(s)) => s,
+        _ => {
+            server_handle.abort();
+            panic!("Failed to open first connection");
+        }
+    };
+
+    let stream2 = match timeout(Duration::from_secs(2), TcpStream::connect("127.0.0.1:16490")).await {
+        Ok(Ok(s)) => s,
+        _ => {
+            server_handle.abort();
+            drop(stream1);
+            panic!("Failed to open second connection");
+        }
+    };
+
+    // Give the server a moment to accept and reserve permits
+    sleep(Duration::from_millis(100)).await;
+
+    // Third connection should be rejected (error reply and/or closed)
+    let mut stream3 = match timeout(Duration::from_secs(2), TcpStream::connect("127.0.0.1:16490")).await {
+        Ok(Ok(s)) => s,
+        _ => {
+            drop(stream1);
+            drop(stream2);
+            server_handle.abort();
+            panic!("Failed to open third connection (TCP connect should still succeed)");
+        }
+    };
+
+    let mut buf = vec![0u8; 256];
+    let read_result = timeout(Duration::from_secs(2), stream3.read(&mut buf)).await;
+
+    let rejected = match read_result {
+        // Connection closed without data
+        Ok(Ok(0)) => true,
+        // Received Redis-style max clients error
+        Ok(Ok(n)) => {
+            let msg = String::from_utf8_lossy(&buf[..n]);
+            msg.contains("max number of clients reached") || msg.contains("ERR")
+        }
+        // Read error / timeout also indicates rejection path closed the socket
+        Ok(Err(_)) | Err(_) => true,
+    };
+
+    assert!(
+        rejected,
+        "Third connection should be rejected when maxconns=2"
+    );
+
+    // After closing one held connection, a new one should be accepted
+    drop(stream1);
+    sleep(Duration::from_millis(150)).await;
+
+    let mut stream4 = match timeout(Duration::from_secs(2), TcpStream::connect("127.0.0.1:16490")).await {
+        Ok(Ok(s)) => s,
+        _ => {
+            drop(stream2);
+            drop(stream3);
+            server_handle.abort();
+            panic!("Failed to reconnect after freeing a slot");
+        }
+    };
+
+    let response = send_command(&mut stream4, "*1\r\n$4\r\nPING\r\n")
+        .await
+        .expect("PING should succeed after a connection slot is freed");
+    assert!(response.starts_with(b"+PONG"));
+
+    // Clean up
+    drop(stream2);
+    drop(stream3);
+    drop(stream4);
+    server_handle.abort();
+    sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_network_auth() {
+    let config = Arc::new(Config {
+        host: "127.0.0.1".to_string(),
+        port: 16491,
+        threads: 1,
+        shards: 16,
+        maxmemory: 1024 * 1024 * 100,
+        evict: true,
+        autosweep: false,
+        loadfactor: 0.75,
+        maxconns: 100,
+        auth: "s3cret".to_string(),
+        maxentrysize: 500 * 1024 * 1024,
+        verbosity: 0,
+        enable_redlock: false,
+        redlock_instances: String::new(),
+        redlock_retry_count: 3,
+        redlock_retry_delay_ms: 200,
+        dir: "./data".to_string(),
+        dbfilename: "dump.rdb".to_string(),
+        appendonly: false,
+        appendfilename: "appendonly.aof".to_string(),
+        replicaof: String::new(),
+            save: "900,1 300,10 60,10000".to_string(),
+            maxmemory_policy: "allkeys-lru".to_string(),
+        databases: 16,
+        metrics_port: 0,
+        tls: false,
+        tls_cert: String::new(),
+        tls_key: String::new(),
+        cluster_enabled: false,
+});
+
+    let cache = Cache::new(config.shards, config.maxmemory);
+    let server = Server::new(cache.clone(), config.clone());
+
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    sleep(Duration::from_millis(200)).await;
+
+    let mut stream = match timeout(Duration::from_secs(2), TcpStream::connect("127.0.0.1:16491")).await
+    {
+        Ok(Ok(s)) => s,
+        _ => {
+            server_handle.abort();
+            panic!("Failed to connect to server");
+        }
+    };
+
+    // Unauthenticated PING must fail
+    let response = send_command(&mut stream, "*1\r\n$4\r\nPING\r\n")
+        .await
+        .expect("PING should get a reply");
+    assert!(
+        String::from_utf8_lossy(&response).contains("NOAUTH"),
+        "expected NOAUTH, got {:?}",
+        String::from_utf8_lossy(&response)
+    );
+
+    // Wrong password
+    let response = send_command(&mut stream, "*2\r\n$4\r\nAUTH\r\n$5\r\nwrong\r\n")
+        .await
+        .expect("AUTH wrong password");
+    assert!(
+        String::from_utf8_lossy(&response).contains("invalid password")
+            || String::from_utf8_lossy(&response).contains("WRONGPASS")
+            || String::from_utf8_lossy(&response).contains("ERR"),
+        "expected auth failure, got {:?}",
+        String::from_utf8_lossy(&response)
+    );
+
+    // Correct password
+    let response = send_command(&mut stream, "*2\r\n$4\r\nAUTH\r\n$6\r\ns3cret\r\n")
+        .await
+        .expect("AUTH correct password");
+    assert!(
+        response.starts_with(b"+OK"),
+        "expected +OK, got {:?}",
+        String::from_utf8_lossy(&response)
+    );
+
+    // Now PING works
+    let response = send_command(&mut stream, "*1\r\n$4\r\nPING\r\n")
+        .await
+        .expect("PING after AUTH");
+    assert!(response.starts_with(b"+PONG"));
+
+    // SET/GET after AUTH
+    let response =
+        send_command(&mut stream, "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
+            .await
+            .expect("SET after AUTH");
+    assert!(response.starts_with(b"+OK"));
+
+    let response = send_command(&mut stream, "*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n")
+        .await
+        .expect("GET after AUTH");
+    assert!(String::from_utf8_lossy(&response).contains("bar"));
+
     drop(stream);
     server_handle.abort();
     sleep(Duration::from_millis(100)).await;

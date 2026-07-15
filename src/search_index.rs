@@ -379,6 +379,25 @@ impl SearchIndex {
     pub fn get_document_data(&self, doc_id: &Bytes) -> Option<&HashMap<String, DocumentField>> {
         self.document_data.get(doc_id)
     }
+
+    /// Approximate memory for a single document (id + field storage + inverted-index overhead).
+    pub fn document_approx_size(doc_id: &Bytes, fields: &HashMap<String, DocumentField>) -> usize {
+        let mut size = doc_id.len() + 64; // id + hash-set / map overhead
+        for (name, value) in fields {
+            size += name.len() + value.approx_size() + 48;
+            // Rough inverted-index / posting overhead per field
+            size += 32;
+        }
+        size
+    }
+
+    /// Approximate total memory used by all documents in this index.
+    pub fn approx_memory(&self) -> usize {
+        self.document_data
+            .iter()
+            .map(|(id, fields)| Self::document_approx_size(id, fields))
+            .sum()
+    }
 }
 
 /// Document field value
@@ -388,6 +407,20 @@ pub enum DocumentField {
     Numeric(f64),
     Tag(Vec<String>),
     Vector(Vec<f32>),
+}
+
+impl DocumentField {
+    /// Approximate heap size of this field value (for memory accounting).
+    pub fn approx_size(&self) -> usize {
+        match self {
+            DocumentField::Text(s) => s.len() + 24,
+            DocumentField::Numeric(_) => 16,
+            DocumentField::Tag(tags) => {
+                tags.iter().map(|t| t.len() + 8).sum::<usize>() + 24
+            }
+            DocumentField::Vector(v) => v.len() * std::mem::size_of::<f32>() + 24,
+        }
+    }
 }
 
 /// Manager for all search indices

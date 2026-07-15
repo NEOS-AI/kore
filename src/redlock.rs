@@ -1,4 +1,5 @@
 use crate::cache::Cache;
+use crate::config::Config;
 use crate::deadlock::{DeadlockDetector, DeadlockStatus};
 use crate::entry::{LoadOptions, StoreOptions};
 use crate::error::{Error, Result};
@@ -7,6 +8,7 @@ use bytes::Bytes;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rand::{thread_rng, Rng};
+use tracing::info;
 
 /// Redlock distributed lock implementation
 /// 
@@ -80,7 +82,87 @@ impl Redlock {
         redlock.clock_drift_factor = clock_drift_factor;
         Ok(redlock)
     }
-    
+
+    /// Build Redlock from CLI/config flags.
+    ///
+    /// - When `enable_redlock` is false → `Ok(None)`.
+    /// - When enabled, uses `backends` if provided (injectible for tests);
+    ///   otherwise creates **N in-process** `Cache` backends matching the
+    ///   number of addresses in `--redlock-instances`.
+    ///
+    /// **MVP note:** remote RESP backends (talking to other Kore/Redis
+    /// processes over the network) are deferred. Listed addresses are used
+    /// for count/validation and logging only; lock state lives in local
+    /// multi-cache instances so the Redlock algorithm is wired end-to-end.
+    pub fn from_config(
+        config: &Config,
+        backends: Option<Vec<Arc<Cache>>>,
+    ) -> Result<Option<Arc<Self>>> {
+        if !config.enable_redlock {
+            return Ok(None);
+        }
+
+        let addrs = config.redlock_instance_addrs();
+        let instances = match backends {
+            Some(b) => {
+                if b.is_empty() {
+                    return Err(Error::InvalidArgument(
+                        "At least one backend required when Redlock is enabled".to_string(),
+                    ));
+                }
+                b
+            }
+            None => {
+                if addrs.len() < 3 {
+                    return Err(Error::ConfigError(format!(
+                        "Redlock requires at least 3 instances, got {}",
+                        addrs.len()
+                    )));
+                }
+                info!(
+                    "Redlock: creating {} in-process cache backends for addresses {:?} \
+                     (remote RESP backends deferred)",
+                    addrs.len(),
+                    addrs
+                );
+                Self::create_local_backends(addrs.len())
+            }
+        };
+
+        let redlock = Self::with_config(
+            instances,
+            config.redlock_retry_count,
+            config.redlock_retry_delay_ms,
+            0.01,
+        )?;
+        Ok(Some(Arc::new(redlock)))
+    }
+
+    /// Create N independent in-process caches for Redlock algorithm wiring.
+    pub fn create_local_backends(n: usize) -> Vec<Arc<Cache>> {
+        (0..n)
+            .map(|_| {
+                // Modest standalone keyspaces — not the primary DB.
+                Cache::new_with_sweep(256, 64 * 1024 * 1024, 1024 * 1024, false)
+            })
+            .collect()
+    }
+
+    /// Number of underlying cache backends.
+    pub fn instance_count(&self) -> usize {
+        self.instances.len()
+    }
+
+    /// Configured retry attempts for lock acquisition.
+    pub fn retry_count(&self) -> usize {
+        self.retry_count
+    }
+
+    /// Base delay between retries in milliseconds.
+    pub fn retry_delay_ms(&self) -> u64 {
+        self.retry_delay_ms
+    }
+
     /// Enable deadlock detection
     /// 
     /// # Arguments

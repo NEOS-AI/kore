@@ -28,6 +28,12 @@ Kore implements the same core concepts as pogocache but leverages Rust's safety 
 cargo build --release
 ```
 
+CI (GitHub Actions) runs `cargo build --all-targets` and `cargo test --all-targets -- --test-threads=1` on every push/PR to `main`.
+
+## Benchmarks
+
+See [docs/benchmarks.md](docs/benchmarks.md) for a reproducible methodology comparing Kore to Redis/Valkey with `redis-benchmark` (persistence disabled).
+
 ## Running
 
 Basic usage:

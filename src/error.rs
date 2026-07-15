@@ -61,6 +61,23 @@ pub enum Error {
 
     #[error("Configuration error: {0}")]
     ConfigError(String),
+
+    #[error("WRONGTYPE Operation against a key holding the wrong kind of value")]
+    WrongType,
+}
+
+impl Error {
+    /// Format this error as a Redis RESP error payload (without the leading `-`).
+    pub fn to_resp_string(&self) -> String {
+        match self {
+            // Redis emits WRONGTYPE / OOM without an ERR prefix.
+            Error::WrongType => self.to_string(),
+            Error::OutOfMemory => {
+                "OOM command not allowed when used memory > 'maxmemory'".to_string()
+            }
+            other => format!("ERR {}", other),
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
