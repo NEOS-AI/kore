@@ -1,4 +1,4 @@
-//! SAVE / BGSAVE / LASTSAVE / BGREWRITEAOF / SYNC / PSYNC / REPLICAOF / FAILOVER / ROLE / REPLCONF
+//! SAVE / BGSAVE / LASTSAVE / BGREWRITEAOF / SYNC / PSYNC / REPLICAOF / FAILOVER / ROLE / REPLCONF / WAIT
 
 use crate::error::Result;
 use crate::persistence::replication::{ReplicationManager, SyncStart};
@@ -244,6 +244,38 @@ impl CommandHandler {
         ))
     }
 
+    /// WAIT numreplicas timeout — block until enough replicas ACK the current offset.
+    ///
+    /// Redis-compatible: returns the number of replicas that acknowledged
+    /// (may be less than `numreplicas` on timeout). `timeout` is milliseconds;
+    /// `0` waits indefinitely. Without persistence configured, returns 0.
+    pub(super) async fn handle_wait(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'wait' command",
+            ));
+        }
+        let numreplicas = match parse_nonneg_usize(&args[0]) {
+            Ok(n) => n,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+        let timeout_ms = match parse_nonneg_u64(&args[1]) {
+            Ok(n) => n,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+
+        let Some(p) = self.persistence.as_ref() else {
+            // No replication configured → nothing to wait for.
+            return Ok(RespValue::Integer(0));
+        };
+
+        let n = p
+            .replication
+            .wait_numreplicas(numreplicas, timeout_ms)
+            .await;
+        Ok(RespValue::Integer(n as i64))
+    }
+
     /// FAILOVER — bare promote on replica, or coordinated `FAILOVER TO` on master.
     ///
     /// - Bare `FAILOVER` (replica only): local `promote_to_master()`.
@@ -386,4 +418,36 @@ impl CommandHandler {
             Err(e) => Ok(RespValue::error(e)),
         }
     }
+}
+
+fn parse_nonneg_usize(v: &RespValue) -> std::result::Result<usize, String> {
+    parse_nonneg_i64(v).and_then(|n| {
+        usize::try_from(n).map_err(|_| {
+            "ERR value is not an integer or out of range".into()
+        })
+    })
+}
+
+fn parse_nonneg_u64(v: &RespValue) -> std::result::Result<u64, String> {
+    parse_nonneg_i64(v).map(|n| n as u64)
+}
+
+fn parse_nonneg_i64(v: &RespValue) -> std::result::Result<i64, String> {
+    if let Some(i) = v.as_integer() {
+        if i < 0 {
+            return Err("ERR timeout is negative".into());
+        }
+        return Ok(i);
+    }
+    let s = v
+        .as_bulk_string()
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .ok_or_else(|| "ERR value is not an integer or out of range".to_string())?;
+    let n: i64 = s
+        .parse()
+        .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
+    if n < 0 {
+        return Err("ERR timeout is negative".into());
+    }
+    Ok(n)
 }

@@ -130,6 +130,7 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     CmdSpec { name: "psync", arity: 3, flags: &["admin", "noscript"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "replconf", arity: -1, flags: &["admin", "noscript", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "role", arity: 1, flags: &["readonly", "fast", "noscript", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "wait", arity: 3, flags: &["noscript"], first_key: 0, last_key: 0, step: 0 },
 ];
 
 fn bulk(s: impl Into<Bytes>) -> RespValue {

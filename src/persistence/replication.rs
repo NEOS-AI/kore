@@ -37,6 +37,8 @@ struct ReplicaFeed {
     port: Option<u16>,
     /// Last ACK offset reported by this replica (live repl link or GETACK).
     ack_offset: AtomicU64,
+    /// Unix millis of last ACK (or connect time). Used for `min-replicas-max-lag`.
+    last_ack_unix_ms: AtomicU64,
 }
 
 /// Circular replication backlog: retains recent write stream for partial resync.
@@ -174,6 +176,10 @@ pub struct ReplicationManager {
     announce_port: AtomicUsize,
     /// Temporary write pause during coordinated failover (master side).
     failover_in_progress: AtomicBool,
+    /// Refuse writes unless at least this many "good" replicas (0 = disabled).
+    min_replicas_to_write: AtomicUsize,
+    /// Max lag in seconds for a replica to count as good (Redis default 10).
+    min_replicas_max_lag_secs: AtomicUsize,
 }
 
 impl ReplicationManager {
@@ -195,6 +201,8 @@ impl ReplicationManager {
             second_repl_offset_set: AtomicBool::new(false),
             announce_port: AtomicUsize::new(0),
             failover_in_progress: AtomicBool::new(false),
+            min_replicas_to_write: AtomicUsize::new(0),
+            min_replicas_max_lag_secs: AtomicUsize::new(10),
         })
     }
 
@@ -222,6 +230,102 @@ impl ReplicationManager {
 
     pub fn connected_replicas(&self) -> usize {
         self.connected_replicas.load(Ordering::Relaxed)
+    }
+
+    pub fn min_replicas_to_write(&self) -> usize {
+        self.min_replicas_to_write.load(Ordering::Relaxed)
+    }
+
+    pub fn set_min_replicas_to_write(&self, n: usize) {
+        self.min_replicas_to_write.store(n, Ordering::Relaxed);
+    }
+
+    pub fn min_replicas_max_lag(&self) -> usize {
+        self.min_replicas_max_lag_secs.load(Ordering::Relaxed)
+    }
+
+    pub fn set_min_replicas_max_lag(&self, secs: usize) {
+        self.min_replicas_max_lag_secs.store(secs, Ordering::Relaxed);
+    }
+
+    /// Number of connected replicas whose last ACK is within `min-replicas-max-lag`.
+    pub fn good_replica_count(&self) -> usize {
+        let max_lag_secs = self.min_replicas_max_lag() as u64;
+        let now = unix_now_ms();
+        let max_lag_ms = max_lag_secs.saturating_mul(1000);
+        let reps = self.replicas.lock();
+        reps.iter()
+            .filter(|r| {
+                let last = r.last_ack_unix_ms.load(Ordering::Relaxed);
+                if last == 0 {
+                    return false;
+                }
+                now.saturating_sub(last) <= max_lag_ms
+            })
+            .count()
+    }
+
+    /// True when writes are allowed under `min-replicas-to-write` (always true if 0).
+    pub fn writes_allowed_by_min_replicas(&self) -> bool {
+        let need = self.min_replicas_to_write();
+        if need == 0 || self.is_replica() {
+            return true;
+        }
+        self.good_replica_count() >= need
+    }
+
+    /// Count connected replica feeds whose tracked ACK ≥ `offset`.
+    pub fn count_replicas_acked(&self, offset: u64) -> usize {
+        let reps = self.replicas.lock();
+        reps.iter()
+            .filter(|r| r.ack_offset.load(Ordering::Relaxed) >= offset)
+            .count()
+    }
+
+    /// Redis `WAIT numreplicas timeout_ms`: block until enough replicas have
+    /// acknowledged the current master offset, or until timeout.
+    ///
+    /// - Freezes `master_repl_offset` at call time as the target.
+    /// - `timeout_ms == 0` waits indefinitely.
+    /// - Returns how many replicas reached the offset (may be &lt; numreplicas on timeout).
+    /// - On a replica (no feeds), returns 0 immediately.
+    pub async fn wait_numreplicas(&self, numreplicas: usize, timeout_ms: u64) -> usize {
+        let target = self.master_repl_offset();
+        if self.is_replica() {
+            return 0;
+        }
+
+        let deadline = if timeout_ms == 0 {
+            None
+        } else {
+            Some(Instant::now() + Duration::from_millis(timeout_ms))
+        };
+
+        loop {
+            let n = self.count_replicas_acked(target);
+            if numreplicas == 0 || n >= numreplicas {
+                return n;
+            }
+            if let Some(d) = deadline {
+                if Instant::now() >= d {
+                    return n;
+                }
+            }
+
+            // Probe live feeds so ACKs can advance without client-port GETACK.
+            self.send_getack_probe_to_feeds(None, None);
+
+            let slice = match deadline {
+                Some(d) => d
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(25)),
+                None => Duration::from_millis(25),
+            };
+            if slice.is_zero() {
+                return self.count_replicas_acked(target);
+            }
+            tokio::time::sleep(slice).await;
+        }
     }
 
     pub fn primary_addr(&self) -> Option<String> {
@@ -283,11 +387,13 @@ impl ReplicationManager {
         port: Option<u16>,
     ) -> mpsc::Receiver<Bytes> {
         let (tx, rx) = mpsc::channel(REPLICA_CHANNEL_CAP);
+        let now = unix_now_ms();
         self.replicas.lock().push(ReplicaFeed {
             tx,
             host,
             port,
             ack_offset: AtomicU64::new(0),
+            last_ack_unix_ms: AtomicU64::new(now),
         });
         self.connected_replicas.fetch_add(1, Ordering::Relaxed);
         rx
@@ -325,12 +431,17 @@ impl ReplicationManager {
             if host_ok && port_ok && (host.is_some() || port.is_some() || r.port.is_none()) {
                 // Monotonic: never decrease a known ack.
                 r.ack_offset.fetch_max(offset, Ordering::Relaxed);
+                r.last_ack_unix_ms
+                    .store(unix_now_ms(), Ordering::Relaxed);
                 matched = true;
             }
         }
         // Fallback: single anonymous feed
         if !matched && reps.len() == 1 {
             reps[0].ack_offset.fetch_max(offset, Ordering::Relaxed);
+            reps[0]
+                .last_ack_unix_ms
+                .store(unix_now_ms(), Ordering::Relaxed);
         }
     }
 
@@ -464,6 +575,7 @@ impl ReplicationManager {
                         host: replica_host,
                         port: replica_port,
                         ack_offset: AtomicU64::new(0),
+                        last_ack_unix_ms: AtomicU64::new(unix_now_ms()),
                     });
                     self.connected_replicas.fetch_add(1, Ordering::Relaxed);
 
@@ -984,10 +1096,16 @@ impl ReplicationManager {
                 "role:master\r\n\
                  connected_slaves:{}\r\n\
                  master_replid:{}\r\n\
-                 master_repl_offset:{}\r\n",
+                 master_repl_offset:{}\r\n\
+                 min_slaves_good:{}\r\n\
+                 min_slaves_to_write:{}\r\n\
+                 min_slaves_max_lag:{}\r\n",
                 self.connected_replicas(),
                 self.replid(),
                 self.master_repl_offset(),
+                self.good_replica_count(),
+                self.min_replicas_to_write(),
+                self.min_replicas_max_lag(),
             );
             if !replid2.is_empty() {
                 s.push_str(&format!(
@@ -1029,8 +1147,18 @@ impl Default for ReplicationManager {
             second_repl_offset_set: AtomicBool::new(false),
             announce_port: AtomicUsize::new(0),
             failover_in_progress: AtomicBool::new(false),
+            min_replicas_to_write: AtomicUsize::new(0),
+            min_replicas_max_lag_secs: AtomicUsize::new(10),
         }
     }
+}
+
+fn unix_now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn generate_replid() -> String {
@@ -2499,5 +2627,119 @@ mod tests {
             RespValue::BulkString(Some(Bytes::from_static(b"7"))),
         ]);
         assert_eq!(parse_replconf_ack_offset(&reply), Some(7));
+    }
+
+    #[test]
+    fn count_replicas_acked_by_offset() {
+        let repl = ReplicationManager::new();
+        let _a = repl.register_replica_announced(Some("127.0.0.1".into()), Some(1));
+        let _b = repl.register_replica_announced(Some("127.0.0.1".into()), Some(2));
+        assert_eq!(repl.count_replicas_acked(0), 2);
+        assert_eq!(repl.count_replicas_acked(1), 0);
+        repl.note_replica_ack(Some("127.0.0.1"), Some(1), 50);
+        assert_eq!(repl.count_replicas_acked(50), 1);
+        assert_eq!(repl.count_replicas_acked(51), 0);
+        repl.note_replica_ack(Some("127.0.0.1"), Some(2), 100);
+        assert_eq!(repl.count_replicas_acked(50), 2);
+        assert_eq!(repl.count_replicas_acked(100), 1);
+    }
+
+    #[tokio::test]
+    async fn wait_numreplicas_returns_when_enough_acked() {
+        let repl = ReplicationManager::new();
+        repl.propagate_command(&[
+            Bytes::from_static(b"SET"),
+            Bytes::from_static(b"k"),
+            Bytes::from_static(b"v"),
+        ]);
+        let target = repl.master_repl_offset();
+        let _rx = repl.register_replica_announced(Some("127.0.0.1".into()), Some(9001));
+        // Pretend catch-up already happened
+        repl.note_replica_ack(Some("127.0.0.1"), Some(9001), target);
+        let n = repl.wait_numreplicas(1, 500).await;
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn wait_numreplicas_times_out_with_partial_count() {
+        let repl = ReplicationManager::new();
+        repl.propagate_command(&[
+            Bytes::from_static(b"SET"),
+            Bytes::from_static(b"k"),
+            Bytes::from_static(b"v"),
+        ]);
+        assert!(repl.master_repl_offset() > 0);
+        let _rx = repl.register_replica_announced(Some("127.0.0.1".into()), Some(9002));
+        // Leave ACK at 0 — below master offset
+        let start = Instant::now();
+        let n = repl.wait_numreplicas(1, 80).await;
+        assert_eq!(n, 0);
+        assert!(start.elapsed() >= Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn wait_numreplicas_zero_num_returns_current_count() {
+        let repl = ReplicationManager::new();
+        let _rx = repl.register_replica();
+        // offset 0, ack 0 → counts
+        let n = repl.wait_numreplicas(0, 1000).await;
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn wait_on_replica_returns_zero() {
+        let repl = ReplicationManager::new();
+        repl.set_replicaof(Some("10.0.0.1:6379".into()));
+        let n = repl.wait_numreplicas(1, 100).await;
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn min_replicas_to_write_gates_writes() {
+        let repl = ReplicationManager::new();
+        assert!(repl.writes_allowed_by_min_replicas());
+        repl.set_min_replicas_to_write(1);
+        assert!(!repl.writes_allowed_by_min_replicas());
+        let _rx = repl.register_replica();
+        // Fresh connect counts as good within max lag
+        assert!(repl.good_replica_count() >= 1);
+        assert!(repl.writes_allowed_by_min_replicas());
+        repl.set_min_replicas_to_write(2);
+        assert!(!repl.writes_allowed_by_min_replicas());
+        // On replica role, gate is off
+        repl.set_replicaof(Some("1.2.3.4:9".into()));
+        assert!(repl.writes_allowed_by_min_replicas());
+    }
+
+    #[test]
+    fn min_replicas_max_lag_expires_good_count() {
+        let repl = ReplicationManager::new();
+        let _rx = repl.register_replica_announced(Some("127.0.0.1".into()), Some(1));
+        repl.set_min_replicas_max_lag(0); // 0 seconds → only exact-now ACKs
+        // last_ack was at connect; with 0 lag window, may or may not still be good
+        // Force stale: set last ack far in the past via note then max_lag 0 after sleep is flaky.
+        // With max_lag 0, only last_ack_ms == now counts (within 0ms). After any delay, stale.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(
+            repl.good_replica_count(),
+            0,
+            "after 5ms with max_lag=0, replica should not be good"
+        );
+        repl.note_replica_ack(Some("127.0.0.1"), Some(1), 1);
+        // Immediately after ACK with max_lag=0: now - last ≈ 0 → good
+        assert_eq!(repl.good_replica_count(), 1);
+        repl.set_min_replicas_max_lag(10);
+        assert_eq!(repl.good_replica_count(), 1);
+    }
+
+    #[test]
+    fn info_includes_min_slaves_fields() {
+        let repl = ReplicationManager::new();
+        repl.set_min_replicas_to_write(2);
+        repl.set_min_replicas_max_lag(5);
+        let info = repl.info_replication();
+        assert!(info.contains("min_slaves_to_write:2"), "{}", info);
+        assert!(info.contains("min_slaves_max_lag:5"), "{}", info);
+        assert!(info.contains("min_slaves_good:"), "{}", info);
     }
 }

@@ -402,6 +402,28 @@ impl CommandHandler {
                             self.databases.len().to_string(),
                         ))),
                     ])),
+                    "min-replicas-to-write" | "min-slaves-to-write" => {
+                        let n = self
+                            .persistence
+                            .as_ref()
+                            .map(|p| p.replication.min_replicas_to_write())
+                            .unwrap_or(0);
+                        Ok(RespValue::Array(vec![
+                            RespValue::BulkString(Some(Bytes::from("min-replicas-to-write"))),
+                            RespValue::BulkString(Some(Bytes::from(n.to_string()))),
+                        ]))
+                    }
+                    "min-replicas-max-lag" | "min-slaves-max-lag" => {
+                        let n = self
+                            .persistence
+                            .as_ref()
+                            .map(|p| p.replication.min_replicas_max_lag())
+                            .unwrap_or(10);
+                        Ok(RespValue::Array(vec![
+                            RespValue::BulkString(Some(Bytes::from("min-replicas-max-lag"))),
+                            RespValue::BulkString(Some(Bytes::from(n.to_string()))),
+                        ]))
+                    }
                     _ => {
                         // Return empty array for unknown parameters (Redis behavior)
                         Ok(RespValue::Array(vec![]))
@@ -474,6 +496,36 @@ impl CommandHandler {
                         Ok(RespValue::error(
                             "ERR CONFIG SET failed: unsupported config parameter for set: databases",
                         ))
+                    }
+                    "min-replicas-to-write" | "min-slaves-to-write" => {
+                        let Some(p) = self.persistence.as_ref() else {
+                            return Ok(RespValue::error("ERR persistence not configured"));
+                        };
+                        let n: usize = match value_str.parse() {
+                            Ok(n) => n,
+                            Err(_) => {
+                                return Ok(RespValue::error(
+                                    "ERR invalid min-replicas-to-write value",
+                                ))
+                            }
+                        };
+                        p.replication.set_min_replicas_to_write(n);
+                        Ok(RespValue::ok())
+                    }
+                    "min-replicas-max-lag" | "min-slaves-max-lag" => {
+                        let Some(p) = self.persistence.as_ref() else {
+                            return Ok(RespValue::error("ERR persistence not configured"));
+                        };
+                        let n: usize = match value_str.parse() {
+                            Ok(n) => n,
+                            Err(_) => {
+                                return Ok(RespValue::error(
+                                    "ERR invalid min-replicas-max-lag value",
+                                ))
+                            }
+                        };
+                        p.replication.set_min_replicas_max_lag(n);
+                        Ok(RespValue::ok())
                     }
                     _ => Ok(RespValue::error("ERR Unsupported CONFIG parameter")),
                 }

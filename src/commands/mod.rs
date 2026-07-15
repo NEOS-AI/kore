@@ -293,6 +293,12 @@ impl CommandHandler {
                         "READONLY You can't write against a read only replica.",
                     ));
                 }
+                // min-replicas-to-write: refuse when not enough fresh replicas.
+                if !p.replication.writes_allowed_by_min_replicas() {
+                    return Ok(RespValue::error(
+                        "NOREPLICAS Not enough good replicas to write.",
+                    ));
+                }
             }
         }
 
@@ -415,6 +421,7 @@ impl CommandHandler {
             "ROLE" => self.handle_role(&args[1..]),
             "REPLICAOF" | "SLAVEOF" => self.handle_replicaof(&args[1..]),
             "FAILOVER" => self.handle_failover(&args[1..]).await,
+            "WAIT" => self.handle_wait(&args[1..]).await,
 
             // Sorted Set commands
             "ZADD" => self.handle_zadd(&args[1..]),
