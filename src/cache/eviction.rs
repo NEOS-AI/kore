@@ -272,12 +272,13 @@ impl Cache {
                 if volatile_only && e.expires_at.is_none() {
                     continue;
                 }
+                let decay = self.lfu_decay_time.load(Ordering::Relaxed);
                 out.push(EvictCandidate {
                     key: k,
                     key_type: KeyType::String,
                     size: e.size(),
                     last_access: e.last_access_time(),
-                    lfu_freq: e.lfu_freq(),
+                    lfu_freq: e.lfu_freq(decay),
                     expires_at: e.expires_at,
                 });
                 if out.len() >= sample_size && volatile_only {

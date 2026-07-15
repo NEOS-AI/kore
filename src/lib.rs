@@ -22,6 +22,7 @@ pub mod deadlock;
 pub mod fair_queue;
 pub mod pubsub;
 pub mod memory;
+pub mod lfu;
 pub mod search_index;
 pub mod query_engine;
 pub mod vector_search;

@@ -405,6 +405,14 @@ impl CommandHandler {
                         let value = self.cache.eviction_policy().as_str();
                         Ok(self.config_kv_reply("maxmemory-policy", value))
                     }
+                    "lfu-log-factor" | "lfu_log_factor" => Ok(self.config_kv_reply(
+                        "lfu-log-factor",
+                        &self.cache.lfu_log_factor().to_string(),
+                    )),
+                    "lfu-decay-time" | "lfu_decay_time" => Ok(self.config_kv_reply(
+                        "lfu-decay-time",
+                        &self.cache.lfu_decay_time().to_string(),
+                    )),
                     "databases" => Ok(self.config_kv_reply(
                         "databases",
                         &self.databases.len().to_string(),
@@ -502,6 +510,50 @@ impl CommandHandler {
                             }
                             Err(e) => Ok(RespValue::error(e.to_resp_string())),
                         }
+                    }
+                    "lfu-log-factor" | "lfu_log_factor" => {
+                        let n: u64 = match value_str.parse() {
+                            Ok(n) => n,
+                            Err(_) => {
+                                return Ok(RespValue::error(
+                                    "ERR invalid lfu-log-factor value",
+                                ))
+                            }
+                        };
+                        if n > 255 {
+                            return Ok(RespValue::error(
+                                "ERR lfu-log-factor must be between 0 and 255",
+                            ));
+                        }
+                        let _ = self.cache.set_lfu_log_factor(n as u8);
+                        for db in self.databases.iter() {
+                            if !std::sync::Arc::ptr_eq(db, &self.cache) {
+                                let _ = db.set_lfu_log_factor(n as u8);
+                            }
+                        }
+                        Ok(RespValue::ok())
+                    }
+                    "lfu-decay-time" | "lfu_decay_time" => {
+                        let n: u64 = match value_str.parse() {
+                            Ok(n) => n,
+                            Err(_) => {
+                                return Ok(RespValue::error(
+                                    "ERR invalid lfu-decay-time value",
+                                ))
+                            }
+                        };
+                        if n > 255 {
+                            return Ok(RespValue::error(
+                                "ERR lfu-decay-time must be between 0 and 255",
+                            ));
+                        }
+                        let _ = self.cache.set_lfu_decay_time(n as u8);
+                        for db in self.databases.iter() {
+                            if !std::sync::Arc::ptr_eq(db, &self.cache) {
+                                let _ = db.set_lfu_decay_time(n as u8);
+                            }
+                        }
+                        Ok(RespValue::ok())
                     }
                     "databases" => {
                         // Redis treats `databases` as read-only at runtime

@@ -177,7 +177,7 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P1]`** Eviction policies: `allkeys-lru`, `volatile-lru`, `allkeys-lfu`, `volatile-ttl`, `noeviction`
   - *Done*: all 8 Redis policies via `--maxmemory-policy` / `CONFIG maxmemory-policy`; sampling victim selection
 - [x] **`[P1]`** Approximated LFU (Redis-style)
-  - *Partial*: counter-based LFU on touch (not full Redis 24-bit log counter / decay)
+  - *Done (Batch AB)*: Redis 24-bit LFU word (16-bit minute stamp + 8-bit log counter); probabilistic `LFULogIncr`; time decay via `lfu-decay-time` (default 1 min); `lfu-log-factor` (default 10); `CONFIG GET/SET` for both; init counter = 5. Not full redis.conf boot defaults CLI yet.
 - [x] **`[P1]`** Active expire sampling (avoid full-shard `retain` pauses on large datasets)
   - *Done*: Redis-style sample cycle (20 keys/pass, continue if >25% expired, 1ms budget); background autosweep uses sampling @ 10Hz; full `SWEEP` retained for admin
 - [x] **`[P2]`** More accurate memory sizing (allocator overhead, index structures)
@@ -323,6 +323,6 @@ Highest urgency checklist (phase order preserved):
 - [x] Common string ops (`APPEND` / `STRLEN` / `SETEX` / `GETSET` / `UNLINK` / `RENAME`)
 - [x] `CLIENT` / `COMMAND` / `HELLO` (RESP2)
 - [x] Eviction policies (`maxmemory-policy`)
-  - *Follow-ups*: Streams, bitmaps/HLL, RESP3, full Redis LFU decay
+  - *Follow-ups*: Streams, bitmaps/HLL, RESP3 (done elsewhere); LFU decay done in Batch AB
 
 When picking work: finish this list before large **`[P1]`/`[P2]`** feature work in Phases D–E.

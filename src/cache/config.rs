@@ -79,4 +79,26 @@ impl Cache {
         self.eviction_sample_size.store(size, Ordering::Relaxed);
         Ok(())
     }
+
+    /// Redis `lfu-log-factor` (default 10).
+    pub fn lfu_log_factor(&self) -> u8 {
+        self.lfu_log_factor.load(Ordering::Relaxed)
+    }
+
+    /// Set `lfu-log-factor` (0..=255; Redis uses 0..100 typically, we allow full range).
+    pub fn set_lfu_log_factor(&self, factor: u8) -> Result<()> {
+        self.lfu_log_factor.store(factor, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Redis `lfu-decay-time` in minutes (default 1; 0 = never decay).
+    pub fn lfu_decay_time(&self) -> u8 {
+        self.lfu_decay_time.load(Ordering::Relaxed)
+    }
+
+    /// Set `lfu-decay-time` minutes (0 disables decay).
+    pub fn set_lfu_decay_time(&self, minutes: u8) -> Result<()> {
+        self.lfu_decay_time.store(minutes, Ordering::Relaxed);
+        Ok(())
+    }
 }

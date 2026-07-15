@@ -78,6 +78,10 @@ pub struct Cache {
     pub(super) autosweep_enabled: AtomicBool,
     /// Number of samples for approximated LRU/LFU eviction (default: 5)
     pub(super) eviction_sample_size: AtomicUsize,
+    /// Redis `lfu-log-factor` (default 10): higher slows counter growth.
+    pub(super) lfu_log_factor: AtomicU8,
+    /// Redis `lfu-decay-time` in minutes (default 1); 0 disables decay.
+    pub(super) lfu_decay_time: AtomicU8,
     /// Per-key generation counters for WATCH / optimistic locking.
     /// Only keys that have been WATCHed (or modified while watched) appear here.
     watch_gens: Mutex<HashMap<Bytes, u64>>,
@@ -136,6 +140,8 @@ impl Cache {
             eviction_policy: AtomicU8::new(EvictionPolicy::AllKeysLru as u8),
             autosweep_enabled: AtomicBool::new(true),
             eviction_sample_size: AtomicUsize::new(5), // Redis default
+            lfu_log_factor: AtomicU8::new(crate::lfu::LFU_LOG_FACTOR_DEFAULT),
+            lfu_decay_time: AtomicU8::new(crate::lfu::LFU_DECAY_TIME_DEFAULT),
             watch_gens: Mutex::new(HashMap::new()),
         });
 
@@ -198,6 +204,16 @@ impl Cache {
             eviction_sample_size: AtomicUsize::new(
                 shared
                     .eviction_sample_size
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            lfu_log_factor: AtomicU8::new(
+                shared
+                    .lfu_log_factor
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            lfu_decay_time: AtomicU8::new(
+                shared
+                    .lfu_decay_time
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
             watch_gens: Mutex::new(HashMap::new()),

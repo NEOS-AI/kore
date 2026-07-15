@@ -14,8 +14,8 @@ pub struct Entry {
     pub created_at: Instant,
     /// Last access time (for LRU eviction) - stored as micros since creation
     last_access_micros: AtomicU64,
-    /// Access frequency counter for LFU eviction (incremented on touch).
-    lfu_freq: AtomicU64,
+    /// Redis-style LFU word: high 16 bits = minute stamp, low 8 = log counter.
+    lfu: AtomicU64,
     /// Expiration time (None = no expiration)
     pub expires_at: Option<Instant>,
     /// User-defined flags (for Memcache compatibility)
@@ -31,7 +31,7 @@ impl Entry {
             value,
             created_at: Instant::now(),
             last_access_micros: AtomicU64::new(0),
-            lfu_freq: AtomicU64::new(0),
+            lfu: AtomicU64::new(crate::lfu::initial()),
             expires_at: None,
             flags: 0,
             cas: 0,
@@ -95,15 +95,25 @@ impl Entry {
         )
     }
 
-    /// Update the last access time to now and bump LFU frequency.
-    pub fn touch(&self) {
+    /// Update last-access time (LRU) and Redis-style LFU on read/write touch.
+    ///
+    /// `log_factor` / `decay_time` come from cache config (`lfu-log-factor`,
+    /// `lfu-decay-time`). Defaults match Redis (10 and 1 minute).
+    pub fn touch(&self, log_factor: u8, decay_time: u8) {
         let micros_since_creation = self.created_at.elapsed().as_micros() as u64;
         self.last_access_micros
             .store(micros_since_creation, Ordering::Relaxed);
-        // Saturating-ish: cap so counters stay comparable under long uptime
-        let _ = self.lfu_freq.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |f| {
-            Some(f.saturating_add(1).min(u32::MAX as u64))
+        let _ = self.lfu.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some(crate::lfu::on_access(cur, log_factor, decay_time))
         });
+    }
+
+    /// Convenience touch with Redis defaults (tests / call sites without config).
+    pub fn touch_default(&self) {
+        self.touch(
+            crate::lfu::LFU_LOG_FACTOR_DEFAULT,
+            crate::lfu::LFU_DECAY_TIME_DEFAULT,
+        );
     }
 
     /// Get the last access time as an Instant
@@ -117,9 +127,15 @@ impl Entry {
         }
     }
 
-    /// LFU frequency (higher = more frequently accessed).
-    pub fn lfu_freq(&self) -> u64 {
-        self.lfu_freq.load(Ordering::Relaxed)
+    /// Effective LFU frequency for eviction (decayed log counter; higher = hotter).
+    pub fn lfu_freq(&self, decay_time: u8) -> u64 {
+        let packed = self.lfu.load(Ordering::Relaxed);
+        crate::lfu::effective_counter(packed, decay_time) as u64
+    }
+
+    /// Raw packed LFU word (tests / debug).
+    pub fn lfu_raw(&self) -> u64 {
+        self.lfu.load(Ordering::Relaxed)
     }
 }
 
@@ -130,7 +146,7 @@ impl Clone for Entry {
             value: self.value.clone(),
             created_at: self.created_at,
             last_access_micros: AtomicU64::new(self.last_access_micros.load(Ordering::Relaxed)),
-            lfu_freq: AtomicU64::new(self.lfu_freq.load(Ordering::Relaxed)),
+            lfu: AtomicU64::new(self.lfu.load(Ordering::Relaxed)),
             expires_at: self.expires_at,
             flags: self.flags,
             cas: self.cas,

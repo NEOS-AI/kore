@@ -283,6 +283,124 @@ fn policy_parse_roundtrip() {
     assert!(EvictionPolicy::parse("nope").is_err());
 }
 
+#[test]
+fn allkeys_lfu_prefers_cold_keys() {
+    // Hot key is touched many times; cold keys are written once then left idle.
+    // Under allkeys-lfu the hot key should survive memory pressure.
+    let cache = small_cache(12 * 1024);
+    cache.set_eviction_policy(EvictionPolicy::AllKeysLfu);
+    cache.set_eviction_sample_size(16).unwrap();
+    // No decay during the test (same-minute accesses already skip decay).
+    cache.set_lfu_decay_time(0).unwrap();
+    // Low log-factor so repeated touches raise the counter quickly.
+    cache.set_lfu_log_factor(1).unwrap();
+
+    store(&cache, "hot", &"H".repeat(80), None);
+    for _ in 0..200 {
+        let e = cache
+            .load(&Bytes::from_static(b"hot"), kore::LoadOptions::default())
+            .unwrap()
+            .expect("hot key");
+        // touch already applied by load
+        let _ = e;
+    }
+
+    // Flood with cold keys until eviction runs
+    let mut n = 0;
+    for i in 0..500 {
+        let key = format!("cold{}", i);
+        let opts = StoreOptions::default();
+        match cache.store(
+            Bytes::from(key),
+            Bytes::from("C".repeat(80)),
+            opts,
+        ) {
+            Ok(_) => n += 1,
+            Err(_) => break,
+        }
+    }
+    assert!(n > 5, "should insert several cold keys, got {}", n);
+
+    let hot_alive = cache
+        .load(
+            &Bytes::from_static(b"hot"),
+            kore::LoadOptions {
+                touch: false,
+                with_cas: false,
+            },
+        )
+        .unwrap()
+        .is_some();
+    assert!(
+        hot_alive,
+        "hot key should survive LFU eviction (counter raised by touches)"
+    );
+}
+
+#[test]
+fn config_lfu_params_roundtrip() {
+    let cache = small_cache(1024 * 1024);
+    let config = Arc::new(Config {
+        host: "127.0.0.1".to_string(),
+        port: 6379,
+        threads: 1,
+        shards: 4,
+        maxmemory: 1024 * 1024,
+        evict: true,
+        autosweep: false,
+        loadfactor: 0.75,
+        maxconns: 10,
+        auth: String::new(),
+        maxentrysize: 500 * 1024 * 1024,
+        verbosity: 0,
+        enable_redlock: false,
+        redlock_instances: String::new(),
+        redlock_retry_count: 3,
+        redlock_retry_delay_ms: 200,
+        enable_fair_queue: false,
+        fair_queue_max_size: 1024,
+        fair_queue_cleanup_ms: 500,
+        dir: "./data".to_string(),
+        dbfilename: "dump.rdb".to_string(),
+        appendonly: false,
+        appendfilename: "appendonly.aof".to_string(),
+        replicaof: String::new(),
+        save: "".to_string(),
+        maxmemory_policy: "allkeys-lfu".to_string(),
+        databases: 16,
+        metrics_port: 0,
+        tls: false,
+        tls_cert: String::new(),
+        tls_key: String::new(),
+        aclfile: String::new(),
+        cluster_enabled: false,
+        unixsocket: String::new(),
+    });
+    let mut h = CommandHandler::new(cache.clone(), config);
+
+    assert_eq!(
+        handle(&mut h, &["CONFIG", "SET", "lfu-log-factor", "7"]),
+        RespValue::ok()
+    );
+    assert_eq!(cache.lfu_log_factor(), 7);
+    assert_eq!(
+        handle(&mut h, &["CONFIG", "SET", "lfu-decay-time", "3"]),
+        RespValue::ok()
+    );
+    assert_eq!(cache.lfu_decay_time(), 3);
+
+    match handle(&mut h, &["CONFIG", "GET", "lfu-log-factor"]) {
+        RespValue::Array(a) => {
+            assert_eq!(a.len(), 2);
+            assert_eq!(
+                a[1],
+                RespValue::BulkString(Some(Bytes::from_static(b"7")))
+            );
+        }
+        other => panic!("unexpected {:?}", other),
+    }
+}
+
 fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

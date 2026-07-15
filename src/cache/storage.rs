@@ -320,9 +320,12 @@ impl Cache {
                     self.stats.incr(&self.stats.misses);
                     Ok(None)
                 } else {
-                    // Update last access time for LRU
+                    // Update last access (LRU) and Redis-style LFU
                     if opts.touch {
-                        entry.touch();
+                        entry.touch(
+                            self.lfu_log_factor.load(Ordering::Relaxed),
+                            self.lfu_decay_time.load(Ordering::Relaxed),
+                        );
                     }
                     self.stats.incr(&self.stats.hits);
                     Ok(Some(entry))
