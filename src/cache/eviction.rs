@@ -139,8 +139,8 @@ impl Cache {
     ///
     /// Samples **all key types** (string, hash, list, set, zset, geo, stream)
     /// and **search index documents** under `allkeys-*` policies. Volatile
-    /// policies still only consider string keys with an expire (typed keys and
-    /// search docs have no TTL support yet).
+    /// policies sample string keys with expire and typed keys that have a TTL
+    /// (Batch AE). Search docs are not volatile victims.
     pub(super) fn evict_memory(&self, needed: usize) -> Result<()> {
         self.evict_memory_excluding(needed, None)
     }
@@ -318,61 +318,83 @@ impl Cache {
             }
         }
 
-        // --- Typed keys: only under allkeys-* (no per-key TTL yet) ---
-        if policy.allkeys() {
+        // --- Typed keys: allkeys always; volatile only when they have a TTL ---
+        {
             let per_type = (sample_size / 3).max(1);
+            let push_typed = |out: &mut Vec<EvictCandidate>,
+                              k: Bytes,
+                              kt: KeyType,
+                              size: usize,
+                              expires_at: Option<Instant>| {
+                if volatile_only && expires_at.is_none() {
+                    return;
+                }
+                // Skip already-expired typed keys (lazy purge will clean later).
+                if expires_at.map(|e| e <= Instant::now()).unwrap_or(false) {
+                    return;
+                }
+                out.push(typed_candidate(k, kt, size, expires_at));
+            };
 
             // Sharded maps (zset / geo)
             for (k, z) in self.sorted_sets.get_n_random(per_type) {
                 let size =
                     crate::memory::estimate_keyed_object(k.len(), z.read().memory_size());
-                out.push(typed_candidate(k, KeyType::ZSet, size));
+                let exp = self.typed_expires_at(&k);
+                push_typed(&mut out, k, KeyType::ZSet, size, exp);
             }
             for (k, g) in self.geo_sets.get_n_random(per_type) {
                 let size = crate::memory::estimate_keyed_object(
                     k.len(),
                     g.read().memory_usage(),
                 );
-                out.push(typed_candidate(k, KeyType::Geo, size));
+                let exp = self.typed_expires_at(&k);
+                push_typed(&mut out, k, KeyType::Geo, size, exp);
             }
 
             // Global maps (hash / list / set / stream)
             sample_map_keys(&self.hashes, per_type, |k, h| {
                 let size =
                     crate::memory::estimate_keyed_object(k.len(), h.read().memory_size());
-                out.push(typed_candidate(k, KeyType::Hash, size));
+                let exp = self.typed_expires_at(&k);
+                push_typed(&mut out, k, KeyType::Hash, size, exp);
             });
             sample_map_keys(&self.lists, per_type, |k, l| {
                 let size =
                     crate::memory::estimate_keyed_object(k.len(), l.read().memory_size());
-                out.push(typed_candidate(k, KeyType::List, size));
+                let exp = self.typed_expires_at(&k);
+                push_typed(&mut out, k, KeyType::List, size, exp);
             });
             sample_map_keys(&self.sets, per_type, |k, s| {
                 let size =
                     crate::memory::estimate_keyed_object(k.len(), s.read().memory_size());
-                out.push(typed_candidate(k, KeyType::Set, size));
+                let exp = self.typed_expires_at(&k);
+                push_typed(&mut out, k, KeyType::Set, size, exp);
             });
             sample_map_keys(&self.streams, per_type, |k, s| {
                 let size =
                     crate::memory::estimate_keyed_object(k.len(), s.read().memory_size());
-                out.push(typed_candidate(k, KeyType::Stream, size));
+                let exp = self.typed_expires_at(&k);
+                push_typed(&mut out, k, KeyType::Stream, size, exp);
             });
 
-            // Search index documents (MemoryCategory::Search victims)
-            let search_n = per_type.max(2);
-            for (index_name, doc_id, size) in self
-                .search_index_manager
-                .sample_documents_for_eviction(search_n, exclude_search_doc)
-            {
-                out.push(EvictCandidate {
-                    key: doc_id,
-                    key_type: KeyType::None,
-                    size,
-                    last_access: cold_instant(),
-                    lfu_freq: 0,
-                    expires_at: None,
-                    search_index: Some(index_name),
-                });
+            // Search index documents only under allkeys (no TTL).
+            if policy.allkeys() {
+                let search_n = per_type.max(2);
+                for (index_name, doc_id, size) in self
+                    .search_index_manager
+                    .sample_documents_for_eviction(search_n, exclude_search_doc)
+                {
+                    out.push(EvictCandidate {
+                        key: doc_id,
+                        key_type: KeyType::None,
+                        size,
+                        last_access: cold_instant(),
+                        lfu_freq: 0,
+                        expires_at: None,
+                        search_index: Some(index_name),
+                    });
+                }
             }
         }
 
@@ -460,6 +482,8 @@ impl Cache {
                     result.passes
                 );
             }
+            // Typed keys with TTL (hash/list/set/zset/geo/stream).
+            let _ = self.active_expire_typed(crate::hashmap::ACTIVE_EXPIRE_SAMPLES_PER_PASS);
         }
     }
 
@@ -481,7 +505,9 @@ impl Cache {
         if result.count > 0 {
             self.apply_expire_accounting(result.count, result.bytes_freed);
         }
-        result.count
+        // Full typed expire pass: delete every past-due typed key.
+        let typed = self.sweep_typed_expired();
+        result.count + typed
     }
 
     /// Run one Redis-style active expire cycle (sampling). Returns keys deleted.
@@ -490,7 +516,7 @@ impl Cache {
         if result.count > 0 {
             self.apply_expire_accounting(result.count, result.bytes_freed);
         }
-        result.count
+        result.count + self.active_expire_typed(crate::hashmap::ACTIVE_EXPIRE_SAMPLES_PER_PASS)
     }
 
     /// Active expire with explicit parameters (for tests / tuning).
@@ -500,13 +526,38 @@ impl Cache {
         max_passes: usize,
         time_budget: Duration,
     ) -> crate::hashmap::ActiveExpireResult {
-        let result = self
+        let mut result = self
             .map
             .active_expire_cycle(samples_per_pass, max_passes, time_budget);
         if result.count > 0 {
             self.apply_expire_accounting(result.count, result.bytes_freed);
         }
+        let typed = self.active_expire_typed(samples_per_pass);
+        result.count += typed;
         result
+    }
+
+    /// Delete all typed keys whose expire Instant is in the past.
+    fn sweep_typed_expired(&self) -> usize {
+        let now = Instant::now();
+        let expired: Vec<Bytes> = self
+            .typed_expires
+            .read()
+            .iter()
+            .filter(|(_, exp)| **exp <= now)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut count = 0usize;
+        for key in expired {
+            // purge_typed_if_expired re-checks and deletes without cmd_del bump.
+            if self.purge_typed_if_expired(&key) {
+                count += 1;
+                self.stats
+                    .evicted_expired
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        count
     }
 
     /// Set autosweep enabled
@@ -535,15 +586,20 @@ fn cold_instant() -> Instant {
         .unwrap_or_else(Instant::now)
 }
 
-fn typed_candidate(key: Bytes, key_type: KeyType, size: usize) -> EvictCandidate {
-    // No access / expire metadata for typed keys yet: treat as cold (idle forever).
+fn typed_candidate(
+    key: Bytes,
+    key_type: KeyType,
+    size: usize,
+    expires_at: Option<Instant>,
+) -> EvictCandidate {
+    // Typed keys lack LRU/LFU access metadata: treat as cold for approximated LRU.
     EvictCandidate {
         key,
         key_type,
         size,
         last_access: cold_instant(),
         lfu_freq: 0,
-        expires_at: None,
+        expires_at,
         search_index: None,
     }
 }

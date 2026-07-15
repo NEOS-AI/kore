@@ -64,6 +64,10 @@ impl Cache {
                 return KeyType::String;
             }
         }
+        // Lazy expire for typed keys with TTL.
+        if self.purge_typed_if_expired(key) {
+            return KeyType::None;
+        }
         if self.sorted_sets.contains_key(key) {
             return KeyType::ZSet;
         }
@@ -363,6 +367,9 @@ impl Cache {
             false
         };
 
+        // Always drop typed expire metadata (no-op if absent).
+        self.clear_typed_expire(key);
+
         // DEL/UNLINK: remove key from any matching search indices
         if deleted {
             self.auto_remove_from_indices(key);
@@ -454,6 +461,7 @@ impl Cache {
         self.lists.write().clear();
         self.sets.write().clear();
         self.streams.write().clear();
+        self.typed_expires.write().clear();
         self.memory_usage.store(0, Ordering::Relaxed);
         self.memory_tracker.reset();
     }
@@ -494,46 +502,67 @@ impl Cache {
             }
         };
 
-        for key in self.sorted_sets.keys(pattern) {
+        let push_typed = |key: Bytes, seen: &mut HashSet<Bytes>, result: &mut Vec<Bytes>| {
+            if self.purge_typed_if_expired(&key) {
+                return;
+            }
             if seen.insert(key.clone()) {
                 result.push(key);
             }
+        };
+
+        for key in self.sorted_sets.keys(pattern) {
+            push_typed(key, &mut seen, &mut result);
         }
         for key in self.geo_sets.keys(pattern) {
-            if seen.insert(key.clone()) {
-                result.push(key);
+            push_typed(key, &mut seen, &mut result);
+        }
+        {
+            let keys: Vec<Bytes> = self
+                .hashes
+                .read()
+                .keys()
+                .filter(|k| matches(k))
+                .cloned()
+                .collect();
+            for key in keys {
+                push_typed(key, &mut seen, &mut result);
             }
         }
         {
-            let hashes = self.hashes.read();
-            for key in hashes.keys() {
-                if matches(key) && seen.insert(key.clone()) {
-                    result.push(key.clone());
-                }
+            let keys: Vec<Bytes> = self
+                .lists
+                .read()
+                .keys()
+                .filter(|k| matches(k))
+                .cloned()
+                .collect();
+            for key in keys {
+                push_typed(key, &mut seen, &mut result);
             }
         }
         {
-            let lists = self.lists.read();
-            for key in lists.keys() {
-                if matches(key) && seen.insert(key.clone()) {
-                    result.push(key.clone());
-                }
+            let keys: Vec<Bytes> = self
+                .sets
+                .read()
+                .keys()
+                .filter(|k| matches(k))
+                .cloned()
+                .collect();
+            for key in keys {
+                push_typed(key, &mut seen, &mut result);
             }
         }
         {
-            let sets = self.sets.read();
-            for key in sets.keys() {
-                if matches(key) && seen.insert(key.clone()) {
-                    result.push(key.clone());
-                }
-            }
-        }
-        {
-            let streams = self.streams.read();
-            for key in streams.keys() {
-                if matches(key) && seen.insert(key.clone()) {
-                    result.push(key.clone());
-                }
+            let keys: Vec<Bytes> = self
+                .streams
+                .read()
+                .keys()
+                .filter(|k| matches(k))
+                .cloned()
+                .collect();
+            for key in keys {
+                push_typed(key, &mut seen, &mut result);
             }
         }
 

@@ -354,6 +354,11 @@ impl Cache {
             }
         }
 
+        // Carry typed-key TTL with the rename (Redis keeps expire on RENAME).
+        if src_type != super::KeyType::String {
+            self.move_typed_expire(src, dst);
+        }
+
         Ok(true)
     }
 }

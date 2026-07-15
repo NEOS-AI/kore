@@ -32,6 +32,7 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
 use std::sync::Arc;
+use std::time::Instant;
 
 pub use storage::KeyType;
 pub use eviction::EvictionPolicy;
@@ -56,6 +57,9 @@ pub struct Cache {
     pub(super) sets: Arc<RwLock<HashMap<Bytes, SharedSet>>>,
     /// Redis Stream keys
     pub(super) streams: Arc<RwLock<HashMap<Bytes, SharedStream>>>,
+    /// Absolute Instant expiry for non-string keys (Redis expires-dict style).
+    /// Strings keep TTL on `Entry`; typed keys store it here.
+    pub(super) typed_expires: RwLock<HashMap<Bytes, Instant>>,
     /// Pub/Sub system
     pub pubsub: Arc<PubSub>,
     /// Search index manager
@@ -129,6 +133,7 @@ impl Cache {
             stream_blockers: ListBlockers::new(),
             sets: Arc::new(RwLock::new(HashMap::new())),
             streams: Arc::new(RwLock::new(HashMap::new())),
+            typed_expires: RwLock::new(HashMap::new()),
             pubsub: PubSub::new(),
             search_index_manager: Arc::new(SearchIndexManager::new()),
             memory_tracker,
@@ -181,6 +186,7 @@ impl Cache {
             stream_blockers: ListBlockers::new(),
             sets: Arc::new(RwLock::new(HashMap::new())),
             streams: Arc::new(RwLock::new(HashMap::new())),
+            typed_expires: RwLock::new(HashMap::new()),
             pubsub: Arc::clone(&shared.pubsub),
             search_index_manager: Arc::new(SearchIndexManager::new()),
             memory_tracker,

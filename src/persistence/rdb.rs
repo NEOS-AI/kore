@@ -11,6 +11,9 @@
 //!
 //! Layout (version 3):
 //!   magic + version
+//! Layout (version 4):
+//!   same as v3 plus trailing typed-expires section per DB body
+//!   (key + expire_unix_ms for non-string keys with TTL)
 //!   n_databases: u64
 //!   for each non-empty DB:
 //!     db_index: u32
@@ -44,9 +47,10 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAGIC: &[u8; 6] = b"KORDB\0";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const VERSION_V1: u32 = 1;
 const VERSION_V2: u32 = 2;
+const VERSION_V3: u32 = 3;
 const FOOTER: u8 = 0xFF;
 
 fn now_unix_ms() -> i64 {
@@ -185,6 +189,8 @@ pub struct DbSnapshot {
     pub lists: Vec<ListRecord>,
     pub sets: Vec<SetRecord>,
     pub streams: Vec<StreamRecord>,
+    /// Non-string key expiries: (key, absolute Unix epoch ms). RDB v4+.
+    pub typed_expires: Vec<(Bytes, i64)>,
 }
 
 /// Multi-database snapshot (RDB v3).
@@ -244,6 +250,7 @@ impl DbSnapshot {
             .into_iter()
             .map(|(key, state)| StreamRecord { key, state })
             .collect();
+        let typed_expires = cache.export_typed_expires_unix_ms();
 
         Ok(Self {
             strings,
@@ -253,6 +260,7 @@ impl DbSnapshot {
             lists,
             sets,
             streams,
+            typed_expires,
         })
     }
 
@@ -360,6 +368,14 @@ impl DbSnapshot {
             }
         }
 
+
+        // Version 4+: typed-key expires (key + absolute unix ms)
+        write_u64(w, self.typed_expires.len() as u64)?;
+        for (key, exp) in &self.typed_expires {
+            write_bytes(w, key)?;
+            write_i64(w, *exp)?;
+        }
+
         Ok(())
     }
 
@@ -453,7 +469,7 @@ impl DbSnapshot {
             }
         }
 
-        if version >= VERSION {
+        if version >= VERSION_V3 {
             let n_streams = read_u64(r)? as usize;
             streams.reserve(n_streams);
             for _ in 0..n_streams {
@@ -521,6 +537,17 @@ impl DbSnapshot {
             }
         }
 
+        let mut typed_expires = Vec::new();
+        if version >= VERSION {
+            let n = read_u64(r)? as usize;
+            typed_expires.reserve(n);
+            for _ in 0..n {
+                let key = Bytes::from(read_bytes(r)?);
+                let exp = read_i64(r)?;
+                typed_expires.push((key, exp));
+            }
+        }
+
         Ok(Self {
             strings,
             zsets,
@@ -529,10 +556,11 @@ impl DbSnapshot {
             lists,
             sets,
             streams,
+            typed_expires,
         })
     }
 
-    /// Encode as a standalone v3 file containing this single DB at index 0
+    /// Encode as a standalone KORDB file containing this single DB at index 0
     /// (or an empty multi-DB file if this snapshot is empty).
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(4096);
@@ -564,6 +592,7 @@ impl DbSnapshot {
                 lists: Vec::new(),
                 sets: Vec::new(),
                 streams: Vec::new(),
+                typed_expires: Vec::new(),
             })
         }
     }
@@ -639,6 +668,15 @@ impl DbSnapshot {
             loaded += 1;
         }
 
+        for (key, exp) in &self.typed_expires {
+            if *exp >= 0 && *exp <= now {
+                // Expired typed key: drop if loaded above.
+                let _ = cache.delete(key);
+                continue;
+            }
+            cache.set_typed_expire_unix_ms(key, *exp);
+        }
+
         Ok(loaded)
     }
 }
@@ -692,14 +730,18 @@ impl MultiDbSnapshot {
             return Err(Error::ParseError("invalid RDB magic".into()));
         }
         let version = read_u32(&mut cur)?;
-        if version != VERSION && version != VERSION_V1 && version != VERSION_V2 {
+        if version != VERSION
+            && version != VERSION_V1
+            && version != VERSION_V2
+            && version != VERSION_V3
+        {
             return Err(Error::ParseError(format!(
                 "unsupported RDB version {}",
                 version
             )));
         }
 
-        let databases = if version >= VERSION {
+        let databases = if version >= VERSION_V3 {
             let n_dbs = read_u64(&mut cur)? as usize;
             let mut dbs = Vec::with_capacity(n_dbs);
             for _ in 0..n_dbs {
@@ -880,6 +922,7 @@ mod tests {
                 key: Bytes::from("s"),
                 state: state.clone(),
             }],
+            typed_expires: vec![],
         };
         let multi = MultiDbSnapshot {
             databases: vec![(0, snap)],
@@ -887,7 +930,7 @@ mod tests {
         let bytes = multi.encode().unwrap();
         assert!(bytes.starts_with(b"KORDB\0"));
         let version = u32::from_le_bytes(bytes[6..10].try_into().unwrap());
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
 
         let decoded = MultiDbSnapshot::decode(&bytes).unwrap();
         assert_eq!(decoded.databases.len(), 1);

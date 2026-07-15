@@ -77,6 +77,7 @@ Example: fix EXAT (`A` / `P0`) before RESP3 (`D` / `P1`) or HNSW benchmarks (`E`
 - [x] **`[P0]`** **Type safety**: Redis-style type errors when a key exists with a different type
 - [x] **`[P0]`** **Cross-type ops**: `DEL`, `EXISTS`, `KEYS`/`SCAN`, `DBSIZE`, `TTL`/`EXPIRE`, `TYPE` work for all types
   - *Done*: `SCAN` implemented (cursor-based, sorted key index); `KEYS`/`DBSIZE`/`DEL`/`EXISTS`/`TYPE`/`FLUSH` cover all types
+  - *Batch AE*: `EXPIRE`/`PEXPIRE`/`TTL`/`PTTL` on hash/list/set/zset/geo/stream (side expire map); lazy + active expire; RENAME keeps TTL
 - [x] **`[P0]`** **Eviction / maxmemory**: account for zset, geo, search indexes, and pub/sub buffers—not only string KV
   - *Done*: zset/geo/hash/list/set/stream/search tracked in `MemoryTracker` and count toward maxmemory; eviction still samples string KV only
 
@@ -177,6 +178,7 @@ Also tracked in `docs/roadmap.md`.
 
 - [x] **`[P1]`** Eviction policies: `allkeys-lru`, `volatile-lru`, `allkeys-lfu`, `volatile-ttl`, `noeviction`
   - *Done*: all 8 Redis policies via `--maxmemory-policy` / `CONFIG maxmemory-policy`; sampling victim selection
+  - *Batch AE*: volatile-* includes typed keys that have a TTL (not only strings)
 - [x] **`[P1]`** Approximated LFU (Redis-style)
   - *Done (Batch AB)*: Redis 24-bit LFU word (16-bit minute stamp + 8-bit log counter); probabilistic `LFULogIncr`; time decay via `lfu-decay-time` (default 1 min); `lfu-log-factor` (default 10); `CONFIG GET/SET` for both; init counter = 5. Not full redis.conf boot defaults CLI yet.
 - [x] **`[P1]`** Active expire sampling (avoid full-shard `retain` pauses on large datasets)
@@ -259,7 +261,7 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P1]`** Document and test `FT.SEARCH` end-to-end over RESP (not only programmatic indexing)
   - *Done*: `tests/search_resp_test.rs` — FT.CREATE / HSET auto-index / FT.SEARCH / FT.DROPINDEX via `CommandHandler`; DEL/UNLINK remove from indices
 - [x] **`[P1]`** Memory limits and eviction interaction for indexes
-  - *Done (MVP + Batch AD)*: `MemoryCategory::Search`; `index_document` / `auto_index_key` allocate approx size; remove/drop deallocate; counts toward maxmemory. Under `allkeys-*`, sampled **search documents** are eviction victims (drop index entry + free Search bytes; underlying hash key kept). Account path may `evict_memory` before OOM. Volatile policies still string-TTL only; search not a victim there.
+  - *Done (MVP + Batch AD)*: `MemoryCategory::Search`; `index_document` / `auto_index_key` allocate approx size; remove/drop deallocate; counts toward maxmemory. Under `allkeys-*`, sampled **search documents** are eviction victims (drop index entry + free Search bytes; underlying hash key kept). Account path may `evict_memory` before OOM. Search docs still not volatile victims (no search TTL).
 - [ ] **`[P2]`** HNSW correctness/performance benchmarks vs FLAT
 
 ### Pub/Sub
@@ -304,9 +306,10 @@ Highest urgency checklist (phase order preserved):
 - [x] Enforce `maxconns`
 - [x] Honor `--threads`
 - [x] Unified keyspace + type safety + cross-type ops + maxmemory for all types
-  - *Done (Batch X)*: cross-type eviction samples string/hash/list/set/zset/geo/stream victims (volatile still TTL-on-string)
+  - *Done (Batch X)*: cross-type eviction samples string/hash/list/set/zset/geo/stream victims
   - *Done (Batch AD)*: search documents are allkeys eviction victims
-  - *Follow-ups*: true single-map keyspace, auth network test
+  - *Done (Batch AE)*: typed-key TTL (`EXPIRE`/`PEXPIRE`/`TTL`/`PTTL`) via side `typed_expires` map; lazy + active expire; volatile policies sample typed keys with TTL; RDB v4 + AOF rewrite `PEXPIREAT`
+  - *Follow-ups*: true single-map keyspace
 - [x] Phase A concurrency / memory / EXAT / network tests (incl. AUTH)
 
 **B**

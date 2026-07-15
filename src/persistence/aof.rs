@@ -211,6 +211,18 @@ fn encode_snapshot_commands(snap: &DbSnapshot, buf: &mut Vec<u8>) {
             }
         }
     }
+
+    // Typed-key TTLs (hash/list/set/zset/geo/stream)
+    for (key, exp) in &snap.typed_expires {
+        if *exp >= 0 {
+            let args = vec![
+                Bytes::from_static(b"PEXPIREAT"),
+                key.clone(),
+                Bytes::from(exp.to_string()),
+            ];
+            buf.extend_from_slice(&encode_command(&args));
+        }
+    }
 }
 
 fn write_aof_buffer(buf: &[u8], path: &Path) -> Result<()> {
@@ -385,6 +397,42 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
         "DEL" => {
             for k in argv.iter().skip(1) {
                 let _ = cache.delete(k);
+            }
+            Ok(())
+        }
+        "EXPIRE" | "PEXPIRE" | "PEXPIREAT" => {
+            if argv.len() >= 3 {
+                let n: i64 = std::str::from_utf8(&argv[2])
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                match cmd.as_str() {
+                    "EXPIRE" => {
+                        let _ = cache.expire(&argv[1], (n.max(0) as u64).saturating_mul(1000));
+                    }
+                    "PEXPIRE" => {
+                        let _ = cache.expire(&argv[1], n.max(0) as u64);
+                    }
+                    "PEXPIREAT" => {
+                        use crate::cache::KeyType;
+                        match cache.key_type(&argv[1]) {
+                            KeyType::String => {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as i64)
+                                    .unwrap_or(0);
+                                if n > now {
+                                    let _ = cache.expire(&argv[1], (n - now) as u64);
+                                } else {
+                                    let _ = cache.delete(&argv[1]);
+                                }
+                            }
+                            KeyType::None => {}
+                            _ => cache.set_typed_expire_unix_ms(&argv[1], n),
+                        }
+                    }
+                    _ => {}
+                }
             }
             Ok(())
         }
