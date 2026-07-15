@@ -289,3 +289,10 @@ kore --enable-redlock \
 - `--redlock-instances`: Comma-separated list of instance addresses
 - `--redlock-retry-count`: Number of retry attempts (default: 3)
 - `--redlock-retry-delay-ms`: Delay between retries in milliseconds (default: 200)
+
+
+## Fair queueing (Redlock)
+
+For multi-client fairness on the same resource, enable fair queueing on Redlock
+(`--enable-fair-queue` with `--enable-redlock`). See [redlock.md](redlock.md#fair-lock-queueing)
+for CLI flags, INFO metrics, and semantics.

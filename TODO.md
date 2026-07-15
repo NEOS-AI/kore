@@ -93,7 +93,8 @@ Example: fix EXAT (`A` / `P0`) before RESP3 (`D` / `P1`) or HNSW benchmarks (`E`
 ### Networking / async
 
 - [x] **`[P1]`** Remove `block_in_place` + nested `block_on` from pub/sub command path; keep handlers fully async
-- [ ] **`[P1]`** Align lock types (`parking_lot` vs `std::sync` vs `tokio::sync`) with sync vs async call sites
+- [x] **`[P1]`** Align lock types (`parking_lot` vs `std::sync` vs `tokio::sync`) with sync vs async call sites
+  - *Done*: sync keyspace / type maps / search indices use `parking_lot::RwLock` (no poison unwraps); `tokio::sync` kept for async pub/sub, network, replication channels; `parking_lot::Mutex` for short sync critical sections
 - [ ] **`[P2]`** Audit unused deps (`dashmap`, `crossbeam`): use deliberately or remove from `Cargo.toml`
 
 ### Testing for Phase A
@@ -238,7 +239,8 @@ Also tracked in `docs/roadmap.md`.
 
 - [x] **`[P1]`** Ensure Redlock CLI flags actually wire into the running server path
   - *Done (MVP)*: `Redlock::from_config` + `Server::with_redlock`; INFO fields; N in-process `Cache` backends from address count. Remote RESP backends deferred.
-- [ ] **`[P1]`** Fair lock queueing: production hardening, metrics, docs
+- [x] **`[P1]`** Fair lock queueing: production hardening, metrics, docs
+  - *Done*: atomic `try_acquire` under write lock; `dequeue_client` front-safe pop; retry cleanup uses `max_attempts`; Drop stops cleanup thread; CLI `--enable-fair-queue` / max-size / cleanup-ms; INFO `# FairQueue` section; docs
 - [ ] **`[P2]`** Deadlock detection advanced (from roadmap)
   - [ ] **`[P2]`** Cross-process detection
   - [ ] **`[P2]`** Async support
@@ -273,7 +275,8 @@ Also tracked in `docs/roadmap.md`.
   - *Done*: methodology runbook; result tables TBD until measured
 - [x] **`[P1]`** **Fuzz** RESP parser and command argument parsing
   - *Done*: in-tree smoke fuzz unit tests (random + structured); `fuzz/` crate with `resp_parse` + `command_dispatch` targets (`cargo +nightly fuzz run …` when cargo-fuzz installed).
-- [ ] **`[P1]`** **Concurrency / loom or stress** jobs for shard RMW paths
+- [x] **`[P1]`** **Concurrency / loom or stress** jobs for shard RMW paths
+  - *Done*: `tests/concurrency_stress_test.rs` — concurrent INCR, INCR/DECR net-zero, SET NX single winner, multi-key multi-shard, mixed RMW+reads, hash field RMW under `parking_lot`
 - [ ] **`[P2]`** Align version strings in docs/`INFO` examples with `Cargo.toml` (currently 0.6.0)
 - [ ] **`[P2]`** Consistent locking and error handling guidelines in contributor docs
 - [ ] **`[P2]`** Keep `docs/roadmap.md` in sync with this file (or make this the single source of truth)

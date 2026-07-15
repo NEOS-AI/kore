@@ -134,7 +134,7 @@ mod geospatial_tests {
         // Get or create geospatial set
         let geoset = cache.get_or_create_geo_set(&Bytes::from("cities")).unwrap();
         {
-            let mut set = geoset.write().unwrap();
+            let mut set = geoset.write();
             set.add(Bytes::from("Seoul"), 126.9780, 37.5665);
             set.add(Bytes::from("Busan"), 129.0756, 35.1796);
         }
@@ -144,7 +144,7 @@ mod geospatial_tests {
         assert!(geoset2.is_some());
         {
             let geoset_guard = geoset2.unwrap();
-            let set = geoset_guard.read().unwrap();
+            let set = geoset_guard.read();
             assert_eq!(set.len(), 2);
         }
 
@@ -254,7 +254,7 @@ mod geospatial_tests {
         // Create first geo set
         let geoset1 = cache.get_or_create_geo_set(&Bytes::from("cities")).unwrap();
         {
-            let mut set = geoset1.write().unwrap();
+            let mut set = geoset1.write();
             set.add(Bytes::from("Seoul"), 126.9780, 37.5665);
             set.add(Bytes::from("Busan"), 129.0756, 35.1796);
         }
@@ -266,7 +266,7 @@ mod geospatial_tests {
         // Create second geo set
         let geoset2 = cache.get_or_create_geo_set(&Bytes::from("landmarks")).unwrap();
         {
-            let mut set = geoset2.write().unwrap();
+            let mut set = geoset2.write();
             set.add(Bytes::from("Eiffel Tower"), 2.2945, 48.8584);
             set.add(Bytes::from("Big Ben"), -0.1246, 51.5007);
         }

@@ -2,7 +2,8 @@ use crate::error::Result;
 use crate::geospatial::GeoSet;
 use crate::memory::MemoryCategory;
 use bytes::Bytes;
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 use super::storage::KeyType;
 use super::Cache;
@@ -46,11 +47,7 @@ impl Cache {
     /// Remove a geospatial set and free its tracked memory
     pub fn remove_geo_set(&self, key: &Bytes) -> bool {
         if let Some(set) = self.geo_sets.remove(key) {
-            let size = key.len()
-                + set
-                    .read()
-                    .map(|s| s.memory_usage())
-                    .unwrap_or(std::mem::size_of::<GeoSet>());
+            let size = key.len() + set.read().memory_usage();
             self.memory_tracker
                 .deallocate(size, MemoryCategory::GeoSets);
             true
@@ -68,7 +65,7 @@ impl Cache {
     pub fn geo_sets_memory(&self) -> usize {
         let mut total = 0usize;
         self.geo_sets.for_each(|key, geo_set| {
-            if let Ok(set) = geo_set.read() {
+            { let set = geo_set.read();
                 total += key.len() + set.memory_usage();
             }
         });
@@ -84,7 +81,7 @@ impl Cache {
     pub fn export_geos(&self) -> Vec<(Bytes, Vec<(Bytes, f64, f64)>)> {
         let mut out = Vec::new();
         self.geo_sets.for_each(|key, geoset| {
-            if let Ok(set) = geoset.read() {
+            { let set = geoset.read();
                 out.push((key.clone(), set.iter_members().collect()));
             }
         });

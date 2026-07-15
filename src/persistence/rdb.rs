@@ -590,8 +590,7 @@ impl DbSnapshot {
         for z in &self.zsets {
             let zset = cache.get_or_create_sorted_set(&z.key)?;
             let mut set = zset
-                .write()
-                .map_err(|_| Error::NetworkError("sorted set lock poisoned".into()))?;
+                .write();
             for (m, score) in &z.members {
                 set.add(m.clone(), *score);
             }
@@ -601,8 +600,7 @@ impl DbSnapshot {
         for g in &self.geos {
             let geoset = cache.get_or_create_geo_set(&g.key)?;
             let mut set = geoset
-                .write()
-                .map_err(|_| Error::NetworkError("geo set lock poisoned".into()))?;
+                .write();
             for (m, lon, lat) in &g.members {
                 let _ = set.add(m.clone(), *lon, *lat);
             }
@@ -612,8 +610,7 @@ impl DbSnapshot {
         for h in &self.hashes {
             let hash = cache.get_or_create_hash(&h.key)?;
             let mut set = hash
-                .write()
-                .map_err(|_| Error::NetworkError("hash lock poisoned".into()))?;
+                .write();
             for (f, v) in &h.fields {
                 set.hset(f.clone(), v.clone());
             }
@@ -623,8 +620,7 @@ impl DbSnapshot {
         for l in &self.lists {
             let list = cache.get_or_create_list(&l.key)?;
             let mut set = list
-                .write()
-                .map_err(|_| Error::NetworkError("list lock poisoned".into()))?;
+                .write();
             // Elements are stored left-to-right; RPUSH preserves order.
             set.rpush(l.elements.iter().cloned());
             loaded += 1;
@@ -633,8 +629,7 @@ impl DbSnapshot {
         for s in &self.sets {
             let set = cache.get_or_create_set(&s.key)?;
             let mut inner = set
-                .write()
-                .map_err(|_| Error::NetworkError("set lock poisoned".into()))?;
+                .write();
             inner.sadd(s.members.iter().cloned());
             loaded += 1;
         }

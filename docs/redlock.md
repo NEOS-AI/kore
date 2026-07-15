@@ -290,3 +290,60 @@ Available tests:
 2. **Network dependent**: Requires reliable network
 3. **Clock synchronization**: Assumes reasonable clock sync (NTP)
 4. **No lock queuing**: First-come-first-served with retries
+
+
+## Fair lock queueing
+
+When multiple clients contend for the same resource, fair queueing ensures
+FIFO (with optional priority) ordering so waiters are not starved.
+
+### Enable via CLI
+
+```bash
+kore --enable-redlock \
+     --redlock-instances 127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003 \
+     --enable-fair-queue \
+     --fair-queue-max-size 1024 \
+     --fair-queue-cleanup-ms 500
+```
+
+### Programmatic API
+
+```rust
+let redlock = Redlock::new(vec![c1, c2, c3])?
+    .with_fair_queueing(1024);
+// or with background cleanup of expired waiters:
+let redlock = Redlock::new(vec![c1, c2, c3])?
+    .with_fair_queueing_cleanup(1024, 500);
+```
+
+### Semantics
+
+1. On `lock`, the client is **enqueued** for the resource (priority, then FIFO).
+2. Only the **front** waiter may attempt quorum acquisition (`try_acquire` under a write lock).
+3. On success, the waiter is removed with `dequeue_client` (front-safe: never pops a different client).
+4. On timeout / final failure, the waiter is **removed** so the next client can proceed.
+5. Queue entries expire after their request TTL; a background cleanup thread (optional) sweeps them.
+
+### INFO metrics
+
+`INFO` includes a `# FairQueue` section when Redlock is wired into the server:
+
+| Field | Meaning |
+|-------|---------|
+| `fair_queue_enabled` | 1 if fair queueing is on |
+| `fair_queue_total_queued` | Current waiters across resources |
+| `fair_queue_active_queues` | Resources with non-empty queues |
+| `fair_queue_total_enqueued` | Lifetime enqueues |
+| `fair_queue_total_dequeued` | Lifetime successful dequeue |
+| `fair_queue_total_expired` | Lifetime expired removals |
+| `fair_queue_total_claim_denied` | Non-front clients denied a turn |
+| `fair_queue_total_removed` | Explicit removes (timeout/fail) |
+| `fair_queue_max_wait_time_ms` | Max observed wait |
+| `fair_queue_avg_wait_time_ms` | Rolling average wait |
+
+### Production notes
+
+- Prefer `with_fair_queueing_cleanup` (or CLI `--enable-fair-queue`) so abandoned waiters do not pin memory.
+- Fair queueing raises the effective retry budget to the lock TTL so waiters are not cut off by a small `retry_count`.
+- Remote multi-process Redlock backends remain deferred; fair queue state is **in-process** with the local Redlock instance.

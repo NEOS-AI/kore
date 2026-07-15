@@ -47,7 +47,7 @@ fn test_rdb_save_and_load_strings_zsets() {
         let z = cache
             .get_or_create_sorted_set(&Bytes::from("scores"))
             .unwrap();
-        let mut s = z.write().unwrap();
+        let mut s = z.write();
         s.add(Bytes::from("alice"), 10.0);
         s.add(Bytes::from("bob"), 20.0);
     }
@@ -66,7 +66,7 @@ fn test_rdb_save_and_load_strings_zsets() {
     assert_eq!(e.value, Bytes::from("world"));
 
     let z = cache2.get_sorted_set(&Bytes::from("scores")).unwrap();
-    let s = z.read().unwrap();
+    let s = z.read();
     assert_eq!(s.score(&Bytes::from("alice")), Some(10.0));
     assert_eq!(s.score(&Bytes::from("bob")), Some(20.0));
 
@@ -273,6 +273,9 @@ async fn test_config_set_save_updates_rules() {
         redlock_instances: String::new(),
         redlock_retry_count: 3,
         redlock_retry_delay_ms: 200,
+        enable_fair_queue: false,
+        fair_queue_max_size: 1024,
+        fair_queue_cleanup_ms: 500,
         dir: dir.to_string_lossy().to_string(),
         dbfilename: "dump.rdb".to_string(),
         appendonly: false,

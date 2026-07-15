@@ -45,7 +45,7 @@ impl CommandHandler {
             }
             Err(e) => return Ok(RespValue::error(e.to_resp_string())),
         };
-        let mut s = set.write().unwrap();
+        let mut s = set.write();
         let before = key.len() + s.memory_size();
         let added = s.sadd(members) as i64;
         let after = key.len() + s.memory_size();
@@ -76,7 +76,7 @@ impl CommandHandler {
             Some(s) => s,
             None => return Ok(RespValue::Integer(0)),
         };
-        let mut s = set.write().unwrap();
+        let mut s = set.write();
         let before = key.len() + s.memory_size();
         let removed = s.srem(members) as i64;
         let empty = s.is_empty();
@@ -105,7 +105,7 @@ impl CommandHandler {
         }
         match self.cache.get_set(key) {
             Some(s) => {
-                let set = s.read().unwrap();
+                let set = s.read();
                 Ok(RespValue::Array(
                     set.smembers()
                         .into_iter()
@@ -138,7 +138,7 @@ impl CommandHandler {
         let exists = self
             .cache
             .get_set(key)
-            .map(|s| s.read().unwrap().sismember(member))
+            .map(|s| s.read().sismember(member))
             .unwrap_or(false);
         Ok(RespValue::Integer(if exists { 1 } else { 0 }))
     }
@@ -160,7 +160,7 @@ impl CommandHandler {
         let n = self
             .cache
             .get_set(key)
-            .map(|s| s.read().unwrap().scard())
+            .map(|s| s.read().scard())
             .unwrap_or(0);
         Ok(RespValue::Integer(n as i64))
     }
@@ -198,7 +198,7 @@ impl CommandHandler {
             None => return Ok(RespValue::Array(vec![])),
         };
 
-        let locks: Vec<_> = shared.iter().map(|s| s.read().unwrap()).collect();
+        let locks: Vec<_> = shared.iter().map(|s| s.read()).collect();
         let set_refs: Vec<&RedisSet> = locks.iter().map(|g| &**g).collect();
         let members = RedisSet::sinter(&set_refs);
         Ok(RespValue::Array(

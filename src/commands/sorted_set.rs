@@ -62,7 +62,7 @@ impl CommandHandler {
             }
             Err(e) => return Ok(RespValue::error(e.to_resp_string())),
         };
-        let mut set = zset.write().unwrap();
+        let mut set = zset.write();
         let before = key.len() + set.memory_size();
 
         let mut added = 0;
@@ -127,7 +127,7 @@ impl CommandHandler {
             None => return Ok(RespValue::Array(vec![])),
         };
 
-        let set = zset.read().unwrap();
+        let set = zset.read();
         let members = set.range(start, stop, false);
 
         let mut result = Vec::new();
@@ -189,7 +189,7 @@ impl CommandHandler {
             None => return Ok(RespValue::Array(vec![])),
         };
 
-        let set = zset.read().unwrap();
+        let set = zset.read();
         let members = set.range(start, stop, true);
 
         let mut result = Vec::new();
@@ -221,7 +221,7 @@ impl CommandHandler {
 
         let count = match self.cache.get_sorted_set(key) {
             Some(zset) => {
-                let set = zset.read().unwrap();
+                let set = zset.read();
                 set.len()
             }
             None => 0,
@@ -256,7 +256,7 @@ impl CommandHandler {
             None => return Ok(RespValue::null()),
         };
 
-        let set = zset.read().unwrap();
+        let set = zset.read();
         match set.score(member) {
             Some(score) => Ok(RespValue::BulkString(Some(Bytes::from(score.to_string())))),
             None => Ok(RespValue::null()),
@@ -284,7 +284,7 @@ impl CommandHandler {
             None => return Ok(RespValue::Integer(0)),
         };
 
-        let mut set = zset.write().unwrap();
+        let mut set = zset.write();
         let before = key.len() + set.memory_size();
         let mut removed = 0;
 
@@ -332,7 +332,7 @@ impl CommandHandler {
             None => return Ok(RespValue::null()),
         };
 
-        let set = zset.read().unwrap();
+        let set = zset.read();
         match set.rank(member) {
             Some(rank) => Ok(RespValue::Integer(rank as i64)),
             None => Ok(RespValue::null()),
@@ -365,7 +365,7 @@ impl CommandHandler {
             None => return Ok(RespValue::null()),
         };
 
-        let set = zset.read().unwrap();
+        let set = zset.read();
         match set.rev_rank(member) {
             Some(rank) => Ok(RespValue::Integer(rank as i64)),
             None => Ok(RespValue::null()),

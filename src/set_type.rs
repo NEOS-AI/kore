@@ -2,7 +2,8 @@
 
 use bytes::Bytes;
 use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 /// Redis-compatible Set.
 pub struct RedisSet {

@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 /// Field types supported in search indices
@@ -438,7 +439,7 @@ impl SearchIndexManager {
 
     /// Create a new index
     pub fn create_index(&self, definition: IndexDefinition) -> Result<(), String> {
-        let mut indices = self.indices.write().unwrap();
+        let mut indices = self.indices.write();
 
         if indices.contains_key(&definition.name) {
             return Err(format!("Index '{}' already exists", definition.name));
@@ -451,7 +452,7 @@ impl SearchIndexManager {
 
     /// Drop an index
     pub fn drop_index(&self, name: &str) -> Result<(), String> {
-        let mut indices = self.indices.write().unwrap();
+        let mut indices = self.indices.write();
 
         if indices.remove(name).is_none() {
             return Err(format!("Index '{}' does not exist", name));
@@ -461,29 +462,29 @@ impl SearchIndexManager {
 
     /// Get an index
     pub fn get_index(&self, name: &str) -> Option<Arc<RwLock<SearchIndex>>> {
-        let indices = self.indices.read().unwrap();
+        let indices = self.indices.read();
         indices.get(name).cloned()
     }
 
     /// List all index names
     pub fn list_indices(&self) -> Vec<String> {
-        let indices = self.indices.read().unwrap();
+        let indices = self.indices.read();
         indices.keys().cloned().collect()
     }
 
     /// Get index definition
     pub fn get_definition(&self, name: &str) -> Option<IndexDefinition> {
-        let indices = self.indices.read().unwrap();
-        indices.get(name).map(|idx| idx.read().unwrap().definition.clone())
+        let indices = self.indices.read();
+        indices.get(name).map(|idx| idx.read().definition.clone())
     }
 
     /// Find indices that match a key prefix
     pub fn find_matching_indices(&self, key: &str) -> Vec<Arc<RwLock<SearchIndex>>> {
-        let indices = self.indices.read().unwrap();
+        let indices = self.indices.read();
         indices
             .values()
             .filter(|idx| {
-                let index = idx.read().unwrap();
+                let index = idx.read();
                 index.definition.matches_prefix(key)
             })
             .cloned()

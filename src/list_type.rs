@@ -2,7 +2,8 @@
 
 use bytes::Bytes;
 use std::collections::VecDeque;
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 /// Redis-compatible List backed by `VecDeque`.
 pub struct RedisList {

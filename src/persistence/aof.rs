@@ -424,8 +424,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             }
             let zset = cache.get_or_create_sorted_set(&argv[1])?;
             let mut set = zset
-                .write()
-                .map_err(|_| Error::NetworkError("zset lock".into()))?;
+                .write();
             let mut i = 2;
             while i + 1 < argv.len() {
                 let score: f64 = std::str::from_utf8(&argv[i])
@@ -443,8 +442,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             }
             if let Some(zset) = cache.get_sorted_set(&argv[1]) {
                 let mut set = zset
-                    .write()
-                    .map_err(|_| Error::NetworkError("zset lock".into()))?;
+                    .write();
                 for m in argv.iter().skip(2) {
                     set.remove(m);
                 }
@@ -457,8 +455,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             }
             let geoset = cache.get_or_create_geo_set(&argv[1])?;
             let mut set = geoset
-                .write()
-                .map_err(|_| Error::NetworkError("geo lock".into()))?;
+                .write();
             let mut i = 2;
             while i + 2 < argv.len() {
                 let lon: f64 = std::str::from_utf8(&argv[i])
@@ -480,8 +477,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             }
             let hash = cache.get_or_create_hash(&argv[1])?;
             let mut h = hash
-                .write()
-                .map_err(|_| Error::NetworkError("hash lock".into()))?;
+                .write();
             let mut i = 2;
             while i + 1 < argv.len() {
                 h.hset(argv[i].clone(), argv[i + 1].clone());
@@ -495,8 +491,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             }
             if let Some(hash) = cache.get_hash(&argv[1]) {
                 let mut h = hash
-                    .write()
-                    .map_err(|_| Error::NetworkError("hash lock".into()))?;
+                    .write();
                 let fields: Vec<_> = argv[2..].to_vec();
                 h.hdel(&fields);
                 if h.is_empty() {
@@ -512,8 +507,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             }
             let list = cache.get_or_create_list(&argv[1])?;
             let mut l = list
-                .write()
-                .map_err(|_| Error::NetworkError("list lock".into()))?;
+                .write();
             l.lpush(argv[2..].iter().cloned());
             Ok(())
         }
@@ -523,8 +517,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             }
             let list = cache.get_or_create_list(&argv[1])?;
             let mut l = list
-                .write()
-                .map_err(|_| Error::NetworkError("list lock".into()))?;
+                .write();
             l.rpush(argv[2..].iter().cloned());
             Ok(())
         }
@@ -534,8 +527,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             }
             if let Some(list) = cache.get_list(&argv[1]) {
                 let mut l = list
-                    .write()
-                    .map_err(|_| Error::NetworkError("list lock".into()))?;
+                    .write();
                 let _ = l.lpop();
                 if l.is_empty() {
                     drop(l);
@@ -550,8 +542,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             }
             if let Some(list) = cache.get_list(&argv[1]) {
                 let mut l = list
-                    .write()
-                    .map_err(|_| Error::NetworkError("list lock".into()))?;
+                    .write();
                 let _ = l.rpop();
                 if l.is_empty() {
                     drop(l);
@@ -566,8 +557,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             }
             let set = cache.get_or_create_set(&argv[1])?;
             let mut s = set
-                .write()
-                .map_err(|_| Error::NetworkError("set lock".into()))?;
+                .write();
             s.sadd(argv[2..].iter().cloned());
             Ok(())
         }
@@ -577,8 +567,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             }
             if let Some(set) = cache.get_set(&argv[1]) {
                 let mut s = set
-                    .write()
-                    .map_err(|_| Error::NetworkError("set lock".into()))?;
+                    .write();
                 s.srem(argv[2..].iter().cloned());
                 if s.is_empty() {
                     drop(s);
@@ -606,8 +595,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             }
             let stream = cache.get_or_create_stream(key)?;
             let mut s = stream
-                .write()
-                .map_err(|_| Error::NetworkError("stream lock".into()))?;
+                .write();
             let _ = s.xadd(id_spec, fields);
             Ok(())
         }
@@ -617,8 +605,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             }
             if let Some(stream) = cache.get_stream(&argv[1]) {
                 let mut s = stream
-                    .write()
-                    .map_err(|_| Error::NetworkError("stream lock".into()))?;
+                    .write();
                 let mut ids = Vec::new();
                 for raw in argv.iter().skip(2) {
                     if let Ok(txt) = std::str::from_utf8(raw) {
@@ -639,8 +626,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             }
             if let Some(stream) = cache.get_stream(&argv[1]) {
                 let mut s = stream
-                    .write()
-                    .map_err(|_| Error::NetworkError("stream lock".into()))?;
+                    .write();
                 let mut i = 2;
                 let sub = String::from_utf8_lossy(&argv[i]).to_uppercase();
                 if sub == "MAXLEN" {
@@ -678,7 +664,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
                         // last entry id or zero
                         cache
                             .get_stream(key)
-                            .and_then(|s| s.read().ok().map(|st| st.last_id()))
+                            .map(|s| { let st = s.read(); st.last_id() })
                             .unwrap_or(StreamId::ZERO)
                     } else if id_spec == "0" || id_spec == "0-0" {
                         StreamId::ZERO
@@ -699,8 +685,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
                     }
                     if let Some(stream) = cache.get_stream(key) {
                         let mut s = stream
-                            .write()
-                            .map_err(|_| Error::NetworkError("stream lock".into()))?;
+                            .write();
                         let _ = s.group_create(gname, id, true);
                     }
                     Ok(())
@@ -711,8 +696,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
                     }
                     if let Some(stream) = cache.get_stream(&argv[2]) {
                         let mut s = stream
-                            .write()
-                            .map_err(|_| Error::NetworkError("stream lock".into()))?;
+                            .write();
                         let _ = s.group_destroy(&argv[3]);
                     }
                     Ok(())
@@ -727,8 +711,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
                         .unwrap_or(StreamId::ZERO);
                     if let Some(stream) = cache.get_stream(&argv[2]) {
                         let mut s = stream
-                            .write()
-                            .map_err(|_| Error::NetworkError("stream lock".into()))?;
+                            .write();
                         let _ = s.group_setid(&argv[3], id);
                     }
                     Ok(())
@@ -747,8 +730,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
                 .unwrap_or(StreamId::ZERO);
             if let Some(stream) = cache.get_stream(&argv[1]) {
                 let mut s = stream
-                    .write()
-                    .map_err(|_| Error::NetworkError("stream lock".into()))?;
+                    .write();
                 let _ = s.xsetid(id);
             }
             Ok(())
@@ -811,8 +793,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             }
             if let Some(stream) = cache.get_stream(key) {
                 let mut s = stream
-                    .write()
-                    .map_err(|_| Error::NetworkError("stream lock".into()))?;
+                    .write();
                 let _ = s.xclaim_force(group, consumer, &ids, time_ms, retry);
             }
             Ok(())
@@ -824,8 +805,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             }
             if let Some(stream) = cache.get_stream(&argv[1]) {
                 let mut s = stream
-                    .write()
-                    .map_err(|_| Error::NetworkError("stream lock".into()))?;
+                    .write();
                 let ids: Vec<StreamId> = argv[3..]
                     .iter()
                     .filter_map(|b| {
@@ -888,8 +868,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
                 }
                 if let Some(stream) = cache.get_stream(key) {
                     let mut s = stream
-                        .write()
-                        .map_err(|_| Error::NetworkError("stream lock".into()))?;
+                        .write();
                     let _ = s.xreadgroup(&group, &consumer, ">", count);
                 }
             }

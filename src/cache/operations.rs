@@ -249,14 +249,11 @@ impl Cache {
                 }
             }
             super::KeyType::Hash => {
-                let mut hashes = self.hashes.write().unwrap();
+                let mut hashes = self.hashes.write();
                 let h = hashes
                     .remove(src)
                     .ok_or_else(|| Error::InvalidArgument("no such key".into()))?;
-                let content = h
-                    .read()
-                    .map(|s| s.memory_size())
-                    .unwrap_or(std::mem::size_of::<crate::hash_type::RedisHash>());
+                let content = h.read().memory_size();
                 // Re-account key length portion
                 if src.len() != dst.len() {
                     self.memory_tracker
@@ -267,14 +264,11 @@ impl Cache {
                 hashes.insert(dst.clone(), h);
             }
             super::KeyType::List => {
-                let mut lists = self.lists.write().unwrap();
+                let mut lists = self.lists.write();
                 let l = lists
                     .remove(src)
                     .ok_or_else(|| Error::InvalidArgument("no such key".into()))?;
-                let content = l
-                    .read()
-                    .map(|s| s.memory_size())
-                    .unwrap_or(std::mem::size_of::<crate::list_type::RedisList>());
+                let content = l.read().memory_size();
                 if src.len() != dst.len() {
                     self.memory_tracker
                         .deallocate(src.len() + content, MemoryCategory::Lists);
@@ -284,14 +278,11 @@ impl Cache {
                 lists.insert(dst.clone(), l);
             }
             super::KeyType::Set => {
-                let mut sets = self.sets.write().unwrap();
+                let mut sets = self.sets.write();
                 let s = sets
                     .remove(src)
                     .ok_or_else(|| Error::InvalidArgument("no such key".into()))?;
-                let content = s
-                    .read()
-                    .map(|x| x.memory_size())
-                    .unwrap_or(std::mem::size_of::<crate::set_type::RedisSet>());
+                let content = s.read().memory_size();
                 if src.len() != dst.len() {
                     self.memory_tracker
                         .deallocate(src.len() + content, MemoryCategory::Sets);
@@ -338,14 +329,11 @@ impl Cache {
                 self.geo_sets.insert(dst.clone(), g);
             }
             super::KeyType::Stream => {
-                let mut streams = self.streams.write().unwrap();
+                let mut streams = self.streams.write();
                 let s = streams
                     .remove(src)
                     .ok_or_else(|| Error::InvalidArgument("no such key".into()))?;
-                let content = s
-                    .read()
-                    .map(|st| st.memory_size())
-                    .unwrap_or(std::mem::size_of::<crate::stream_type::RedisStream>());
+                let content = s.read().memory_size();
                 if src.len() != dst.len() {
                     self.memory_tracker
                         .deallocate(src.len() + content, MemoryCategory::Streams);

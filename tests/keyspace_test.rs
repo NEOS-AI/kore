@@ -32,6 +32,9 @@ fn make_handler(cache: Arc<Cache>) -> CommandHandler {
         redlock_instances: String::new(),
         redlock_retry_count: 3,
         redlock_retry_delay_ms: 200,
+        enable_fair_queue: false,
+        fair_queue_max_size: 1024,
+        fair_queue_cleanup_ms: 500,
             dir: "./data".to_string(),
             dbfilename: "dump.rdb".to_string(),
             appendonly: false,
@@ -238,7 +241,6 @@ fn test_cache_api_cross_type_delete_exists() {
         .get_or_create_sorted_set(&key)
         .unwrap()
         .write()
-        .unwrap()
         .add(Bytes::from("m"), 1.0);
 
     assert!(cache.exists(&key));

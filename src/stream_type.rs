@@ -5,7 +5,8 @@
 
 use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Shared stream handle stored in the cache keyspace.

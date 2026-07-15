@@ -28,10 +28,10 @@ use crate::pubsub::PubSub;
 use crate::memory::MemoryTracker;
 use crate::search_index::SearchIndexManager;
 use bytes::Bytes;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 pub use storage::KeyType;
 pub use eviction::EvictionPolicy;

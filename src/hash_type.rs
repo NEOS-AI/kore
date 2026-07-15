@@ -2,7 +2,8 @@
 
 use bytes::Bytes;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 /// Redis-compatible Hash: `HSET`/`HGET`/… over field→value pairs.
 pub struct RedisHash {

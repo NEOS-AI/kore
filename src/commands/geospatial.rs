@@ -91,7 +91,7 @@ impl CommandHandler {
             }
             Err(e) => return Ok(RespValue::error(e.to_resp_string())),
         };
-        let mut set = geoset.write().unwrap();
+        let mut set = geoset.write();
         let before = key.len() + set.memory_usage();
 
         let mut count = 0i64;
@@ -183,7 +183,7 @@ impl CommandHandler {
             None => return Ok(RespValue::null()),
         };
 
-        let set = geoset.read().unwrap();
+        let set = geoset.read();
         match set.distance_between(&member1, &member2) {
             Some(dist_m) => {
                 let dist = unit.from_meters(dist_m);
@@ -220,7 +220,7 @@ impl CommandHandler {
                     Some(m) => m.clone(),
                     None => return RespValue::null(),
                 };
-                match geoset_opt.as_ref().and_then(|g| g.read().unwrap().get_position(&member)) {
+                match geoset_opt.as_ref().and_then(|g| g.read().get_position(&member)) {
                     Some((lon, lat)) => RespValue::Array(vec![
                         RespValue::BulkString(Some(Bytes::from(format!("{:.17}", lon)))),
                         RespValue::BulkString(Some(Bytes::from(format!("{:.17}", lat)))),
@@ -261,7 +261,7 @@ impl CommandHandler {
                     None => return RespValue::null(),
                 };
                 match geoset_opt.as_ref().and_then(|g| {
-                    let set = g.read().unwrap();
+                    let set = g.read();
                     set.get_position(&member).map(|(lon, lat)| (lon, lat))
                 }) {
                     Some((lon, lat)) => {
@@ -318,7 +318,7 @@ impl CommandHandler {
                     Some(g) => g,
                     None => return Ok(RespValue::Array(vec![])),
                 };
-                let set = geoset.read().unwrap();
+                let set = geoset.read();
                 let (lon, lat) = match set.get_position(member) {
                     Some(pos) => pos,
                     None => return Ok(RespValue::error("ERR could not decode requested member")),
@@ -375,7 +375,7 @@ impl CommandHandler {
                     Some(g) => g,
                     None => return Ok(RespValue::Array(vec![])),
                 };
-                let set = geoset.read().unwrap();
+                let set = geoset.read();
                 let res = set.search_radius_sorted(center_lon, center_lat, radius, unit, SortOrder::None);
                 (res, from_idx + 3, unit)
             }
@@ -407,7 +407,7 @@ impl CommandHandler {
                     Some(g) => g,
                     None => return Ok(RespValue::Array(vec![])),
                 };
-                let set = geoset.read().unwrap();
+                let set = geoset.read();
                 let res = set.search_box(center_lon, center_lat, width_m, height_m, SortOrder::None);
                 (res, from_idx + 4, unit)
             }
@@ -530,7 +530,7 @@ impl CommandHandler {
                 }
                 Err(e) => return Ok(RespValue::error(e.to_resp_string())),
             };
-            let mut zset = dest_sorted.write().unwrap();
+            let mut zset = dest_sorted.write();
             let _ = source_key; // consumed above
 
             let mut count = 0i64;
@@ -603,8 +603,8 @@ impl CommandHandler {
             }
             Err(e) => return Ok(RespValue::error(e.to_resp_string())),
         };
-        let mut dest = dest_geoset.write().unwrap();
-        let src = source_geoset.read().unwrap();
+        let mut dest = dest_geoset.write();
+        let src = source_geoset.read();
 
         for name in &member_names {
             if let Some((lon, lat)) = src.get_position(name) {

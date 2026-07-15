@@ -70,36 +70,16 @@ impl Cache {
         if self.geo_sets.contains_key(key) {
             return KeyType::Geo;
         }
-        if self
-            .hashes
-            .read()
-            .map(|h| h.contains_key(key))
-            .unwrap_or(false)
-        {
+        if self.hashes.read().contains_key(key) {
             return KeyType::Hash;
         }
-        if self
-            .lists
-            .read()
-            .map(|l| l.contains_key(key))
-            .unwrap_or(false)
-        {
+        if self.lists.read().contains_key(key) {
             return KeyType::List;
         }
-        if self
-            .sets
-            .read()
-            .map(|s| s.contains_key(key))
-            .unwrap_or(false)
-        {
+        if self.sets.read().contains_key(key) {
             return KeyType::Set;
         }
-        if self
-            .streams
-            .read()
-            .map(|s| s.contains_key(key))
-            .unwrap_or(false)
-        {
+        if self.streams.read().contains_key(key) {
             return KeyType::Stream;
         }
         KeyType::None
@@ -396,10 +376,10 @@ impl Cache {
         let strings = self.map.len();
         let zsets = self.sorted_sets.len();
         let geos = self.geo_sets.len();
-        let hashes = self.hashes.read().map(|h| h.len()).unwrap_or(0);
-        let lists = self.lists.read().map(|l| l.len()).unwrap_or(0);
-        let sets = self.sets.read().map(|s| s.len()).unwrap_or(0);
-        let streams = self.streams.read().map(|s| s.len()).unwrap_or(0);
+        let hashes = self.hashes.read().len();
+        let lists = self.lists.read().len();
+        let sets = self.sets.read().len();
+        let streams = self.streams.read().len();
         strings + zsets + geos + hashes + lists + sets + streams
     }
 
@@ -449,18 +429,10 @@ impl Cache {
         self.map.clear();
         self.sorted_sets.clear();
         self.geo_sets.clear();
-        if let Ok(mut hashes) = self.hashes.write() {
-            hashes.clear();
-        }
-        if let Ok(mut lists) = self.lists.write() {
-            lists.clear();
-        }
-        if let Ok(mut sets) = self.sets.write() {
-            sets.clear();
-        }
-        if let Ok(mut streams) = self.streams.write() {
-            streams.clear();
-        }
+        self.hashes.write().clear();
+        self.lists.write().clear();
+        self.sets.write().clear();
+        self.streams.write().clear();
         self.memory_usage.store(0, Ordering::Relaxed);
         self.memory_tracker.reset();
     }
@@ -511,28 +483,32 @@ impl Cache {
                 result.push(key);
             }
         }
-        if let Ok(hashes) = self.hashes.read() {
+        {
+            let hashes = self.hashes.read();
             for key in hashes.keys() {
                 if matches(key) && seen.insert(key.clone()) {
                     result.push(key.clone());
                 }
             }
         }
-        if let Ok(lists) = self.lists.read() {
+        {
+            let lists = self.lists.read();
             for key in lists.keys() {
                 if matches(key) && seen.insert(key.clone()) {
                     result.push(key.clone());
                 }
             }
         }
-        if let Ok(sets) = self.sets.read() {
+        {
+            let sets = self.sets.read();
             for key in sets.keys() {
                 if matches(key) && seen.insert(key.clone()) {
                     result.push(key.clone());
                 }
             }
         }
-        if let Ok(streams) = self.streams.read() {
+        {
+            let streams = self.streams.read();
             for key in streams.keys() {
                 if matches(key) && seen.insert(key.clone()) {
                     result.push(key.clone());

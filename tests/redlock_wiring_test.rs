@@ -162,3 +162,73 @@ fn test_enable_redlock_requires_at_least_three_instances() {
         msg
     );
 }
+
+
+#[test]
+fn test_info_reports_fair_queue_disabled_by_default() {
+    let config = Arc::new(Config::default());
+    let cache = make_cache();
+    let mut handler = CommandHandler::new(cache, config);
+    let body = bulk_str(&handle(&mut handler, cmd(&["INFO"])));
+    assert!(
+        body.contains("fair_queue_enabled:0"),
+        "INFO should report fair queue disabled: {}",
+        body
+    );
+    assert!(body.contains("# FairQueue"), "got: {}", body);
+}
+
+#[test]
+fn test_from_config_enables_fair_queue() {
+    let mut config = enabled_config(5, 100);
+    config.enable_fair_queue = true;
+    config.fair_queue_max_size = 64;
+    config.fair_queue_cleanup_ms = 200;
+    config.validate().unwrap();
+
+    let redlock = Redlock::from_config(&config, Some(local_backends(3)))
+        .unwrap()
+        .expect("redlock");
+    assert!(redlock.fair_queue_enabled());
+    let stats = redlock.get_fair_queue_stats().expect("stats");
+    assert_eq!(stats.total_enqueued, 0);
+
+    let info = redlock.fair_queue_info_lines();
+    assert!(info.contains("fair_queue_enabled:1"), "got: {}", info);
+}
+
+#[test]
+fn test_fair_queue_requires_redlock() {
+    let mut config = Config::default();
+    config.enable_fair_queue = true;
+    let err = config.validate().unwrap_err();
+    let msg = format!("{}", err);
+    assert!(
+        msg.contains("enable_fair_queue") || msg.contains("redlock"),
+        "got: {}",
+        msg
+    );
+}
+
+#[test]
+fn test_server_handler_info_with_fair_queue_redlock() {
+    let mut config = enabled_config(3, 50);
+    config.enable_fair_queue = true;
+    config.validate().unwrap();
+    let config = Arc::new(config);
+    let cache = make_cache();
+    let redlock = Redlock::from_config(&config, Some(local_backends(3)))
+        .unwrap();
+    let server = Server::new(cache.clone(), config.clone()).with_redlock(redlock);
+    assert!(server.redlock().is_some());
+    assert!(server.redlock().unwrap().fair_queue_enabled());
+
+    let mut handler = CommandHandler::new(cache, config)
+        .with_redlock(server.redlock().cloned());
+    // enqueue via lock so stats move
+    let rl = server.redlock().unwrap();
+    let _lock = rl.lock("info-res", Bytes::from("c1"), 2000).unwrap();
+    let body = bulk_str(&handle(&mut handler, cmd(&["INFO"])));
+    assert!(body.contains("fair_queue_enabled:1"), "got: {}", body);
+    assert!(body.contains("fair_queue_total_enqueued:"), "got: {}", body);
+}

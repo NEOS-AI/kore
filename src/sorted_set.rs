@@ -5,7 +5,8 @@ use bytes::Bytes;
 use rand::Rng;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 /// Maximum skiplist height (Redis uses 64; 32 is plenty for 2^32 elements).
 const SKIPLIST_MAXLEVEL: usize = 32;

@@ -1810,7 +1810,7 @@ pub fn apply_argv(
         "ZADD" => {
             if argv.len() >= 4 {
                 if let Ok(zset) = cache.get_or_create_sorted_set(&argv[1]) {
-                    if let Ok(mut set) = zset.write() {
+                    { let mut set = zset.write();
                         let mut i = 2;
                         while i + 1 < argv.len() {
                             let score: f64 = std::str::from_utf8(&argv[i])
@@ -1827,7 +1827,7 @@ pub fn apply_argv(
         "ZREM" => {
             if argv.len() >= 3 {
                 if let Some(zset) = cache.get_sorted_set(&argv[1]) {
-                    if let Ok(mut set) = zset.write() {
+                    { let mut set = zset.write();
                         for m in argv.iter().skip(2) {
                             set.remove(m);
                         }
@@ -1838,7 +1838,7 @@ pub fn apply_argv(
         "GEOADD" => {
             if argv.len() >= 5 {
                 if let Ok(geoset) = cache.get_or_create_geo_set(&argv[1]) {
-                    if let Ok(mut set) = geoset.write() {
+                    { let mut set = geoset.write();
                         let mut i = 2;
                         while i + 2 < argv.len() {
                             let lon: f64 = std::str::from_utf8(&argv[i])
@@ -1859,7 +1859,7 @@ pub fn apply_argv(
         "HSET" => {
             if argv.len() >= 4 {
                 if let Ok(h) = cache.get_or_create_hash(&argv[1]) {
-                    if let Ok(mut hash) = h.write() {
+                    { let mut hash = h.write();
                         let mut i = 2;
                         while i + 1 < argv.len() {
                             hash.hset(argv[i].clone(), argv[i + 1].clone());
@@ -1872,7 +1872,7 @@ pub fn apply_argv(
         "HDEL" => {
             if argv.len() >= 3 {
                 if let Some(h) = cache.get_hash(&argv[1]) {
-                    if let Ok(mut hash) = h.write() {
+                    { let mut hash = h.write();
                         let fields: Vec<Bytes> = argv[2..].to_vec();
                         hash.hdel(&fields);
                     }
@@ -1883,7 +1883,7 @@ pub fn apply_argv(
         "LPUSH" => {
             if argv.len() >= 3 {
                 if let Ok(list) = cache.get_or_create_list(&argv[1]) {
-                    if let Ok(mut l) = list.write() {
+                    { let mut l = list.write();
                         l.lpush(argv[2..].iter().cloned());
                     }
                 }
@@ -1892,7 +1892,7 @@ pub fn apply_argv(
         "RPUSH" => {
             if argv.len() >= 3 {
                 if let Ok(list) = cache.get_or_create_list(&argv[1]) {
-                    if let Ok(mut l) = list.write() {
+                    { let mut l = list.write();
                         l.rpush(argv[2..].iter().cloned());
                     }
                 }
@@ -1901,7 +1901,7 @@ pub fn apply_argv(
         "LPOP" => {
             if argv.len() >= 2 {
                 if let Some(list) = cache.get_list(&argv[1]) {
-                    if let Ok(mut l) = list.write() {
+                    { let mut l = list.write();
                         let _ = l.lpop();
                     }
                     cache.remove_list_if_empty(&argv[1]);
@@ -1911,7 +1911,7 @@ pub fn apply_argv(
         "RPOP" => {
             if argv.len() >= 2 {
                 if let Some(list) = cache.get_list(&argv[1]) {
-                    if let Ok(mut l) = list.write() {
+                    { let mut l = list.write();
                         let _ = l.rpop();
                     }
                     cache.remove_list_if_empty(&argv[1]);
@@ -1921,7 +1921,7 @@ pub fn apply_argv(
         "SADD" => {
             if argv.len() >= 3 {
                 if let Ok(s) = cache.get_or_create_set(&argv[1]) {
-                    if let Ok(mut set) = s.write() {
+                    { let mut set = s.write();
                         set.sadd(argv[2..].iter().cloned());
                     }
                 }
@@ -1930,7 +1930,7 @@ pub fn apply_argv(
         "SREM" => {
             if argv.len() >= 3 {
                 if let Some(s) = cache.get_set(&argv[1]) {
-                    if let Ok(mut set) = s.write() {
+                    { let mut set = s.write();
                         set.srem(argv[2..].iter().cloned());
                     }
                     cache.remove_set_if_empty(&argv[1]);
@@ -2264,7 +2264,7 @@ mod tests {
         .unwrap();
         {
             let z = cache.get_sorted_set(&Bytes::from_static(b"z")).unwrap();
-            let set = z.read().unwrap();
+            let set = z.read();
             assert_eq!(set.len(), 1);
             assert!(set.score(&Bytes::from_static(b"b")).is_some());
             assert!(set.score(&Bytes::from_static(b"a")).is_none());
@@ -2295,7 +2295,7 @@ mod tests {
         .unwrap();
         {
             let h = cache.get_hash(&Bytes::from_static(b"h")).unwrap();
-            let hash = h.read().unwrap();
+            let hash = h.read();
             assert!(hash.hget(&Bytes::from_static(b"f1")).is_none());
             assert!(hash.hget(&Bytes::from_static(b"f2")).is_some());
         }
@@ -2323,7 +2323,7 @@ mod tests {
         .unwrap();
         {
             let s = cache.get_set(&Bytes::from_static(b"s")).unwrap();
-            let set = s.read().unwrap();
+            let set = s.read();
             assert!(!set.sismember(&Bytes::from_static(b"m1")));
             assert!(set.sismember(&Bytes::from_static(b"m2")));
         }

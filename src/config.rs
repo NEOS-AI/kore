@@ -76,6 +76,18 @@ pub struct Config {
     #[arg(long, default_value = "200")]
     pub redlock_retry_delay_ms: u64,
 
+    /// Enable fair lock queueing on Redlock (FIFO / priority waiters).
+    #[arg(long, default_value = "false")]
+    pub enable_fair_queue: bool,
+
+    /// Max waiters per resource when fair queueing is enabled (default: 1024).
+    #[arg(long, default_value = "1024")]
+    pub fair_queue_max_size: usize,
+
+    /// Background fair-queue expired-entry cleanup interval in ms (default: 500).
+    #[arg(long, default_value = "500")]
+    pub fair_queue_cleanup_ms: u64,
+
     /// Working directory for RDB/AOF files
     #[arg(long, default_value = "./data")]
     pub dir: String,
@@ -154,6 +166,9 @@ impl Default for Config {
             redlock_instances: String::new(),
             redlock_retry_count: 3,
             redlock_retry_delay_ms: 200,
+            enable_fair_queue: false,
+            fair_queue_max_size: 1024,
+            fair_queue_cleanup_ms: 500,
             dir: "./data".to_string(),
             dbfilename: "dump.rdb".to_string(),
             appendonly: false,
@@ -299,6 +314,24 @@ impl Config {
 
             if self.redlock_retry_count == 0 {
                 return Err(Error::ConfigError("Redlock retry count cannot be 0".to_string()));
+            }
+        }
+
+        if self.enable_fair_queue && !self.enable_redlock {
+            return Err(Error::ConfigError(
+                "enable_fair_queue requires enable_redlock".to_string(),
+            ));
+        }
+        if self.enable_fair_queue {
+            if self.fair_queue_max_size == 0 {
+                return Err(Error::ConfigError(
+                    "fair_queue_max_size cannot be 0".to_string(),
+                ));
+            }
+            if self.fair_queue_cleanup_ms == 0 {
+                return Err(Error::ConfigError(
+                    "fair_queue_cleanup_ms cannot be 0".to_string(),
+                ));
             }
         }
 

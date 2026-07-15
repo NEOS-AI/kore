@@ -40,7 +40,7 @@ impl Cache {
         let size = self
             .search_index_manager
             .get_index(name)
-            .map(|idx| idx.read().unwrap().approx_memory())
+            .map(|idx| idx.read().approx_memory())
             .unwrap_or(0);
 
         self.search_index_manager.drop_index(name)?;
@@ -60,7 +60,7 @@ impl Cache {
     /// Get search index information
     pub fn get_search_index_info(&self, name: &str) -> Option<IndexInfo> {
         let index = self.search_index_manager.get_index(name)?;
-        let index_guard = index.read().unwrap();
+        let index_guard = index.read();
 
         Some(IndexInfo {
             name: index_guard.definition.name.clone(),
@@ -118,7 +118,7 @@ impl Cache {
             .get_index(index_name)
             .ok_or_else(|| format!("Index '{}' not found", index_name))?;
 
-        let mut index_guard = index.write().unwrap();
+        let mut index_guard = index.write();
         let old_fields = index_guard.get_document_data(&doc_id).cloned();
         self.account_search_index_write(&doc_id, old_fields.as_ref(), &fields)?;
         index_guard.index_document(doc_id, fields);
@@ -131,7 +131,7 @@ impl Cache {
             .get_index(index_name)
             .ok_or_else(|| format!("Index '{}' not found", index_name))?;
 
-        let mut index_guard = index.write().unwrap();
+        let mut index_guard = index.write();
         if let Some(fields) = index_guard.get_document_data(doc_id) {
             let size = SearchIndex::document_approx_size(doc_id, fields);
             self.memory_tracker
@@ -153,7 +153,7 @@ impl Cache {
             .get_index(index_name)
             .ok_or_else(|| format!("Index '{}' not found", index_name))?;
 
-        let index_guard = index.read().unwrap();
+        let index_guard = index.read();
 
         // Parse query
         let mut query = QueryParser::parse_simple(query_str)
@@ -242,7 +242,7 @@ impl Cache {
         let matching_indices = self.search_index_manager.find_matching_indices(&key_str);
 
         for index_arc in matching_indices {
-            let mut index = index_arc.write().unwrap();
+            let mut index = index_arc.write();
             let old_fields = index.get_document_data(key).cloned();
             if self
                 .account_search_index_write(key, old_fields.as_ref(), &fields)
@@ -261,7 +261,7 @@ impl Cache {
         let matching_indices = self.search_index_manager.find_matching_indices(&key_str);
 
         for index_arc in matching_indices {
-            let mut index = index_arc.write().unwrap();
+            let mut index = index_arc.write();
             if let Some(fields) = index.get_document_data(key) {
                 let size = SearchIndex::document_approx_size(key, fields);
                 self.memory_tracker

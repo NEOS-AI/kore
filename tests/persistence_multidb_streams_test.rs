@@ -43,6 +43,9 @@ fn make_config(dir: &PathBuf) -> Arc<Config> {
         redlock_instances: String::new(),
         redlock_retry_count: 3,
         redlock_retry_delay_ms: 200,
+        enable_fair_queue: false,
+        fair_queue_max_size: 1024,
+        fair_queue_cleanup_ms: 500,
         dir: dir.to_string_lossy().to_string(),
         dbfilename: "dump.rdb".to_string(),
         appendonly: false,
@@ -517,7 +520,7 @@ fn rdb_single_cache_stream_roundtrip() {
         let s = cache
             .get_or_create_stream(&Bytes::from("st"))
             .unwrap();
-        let mut st = s.write().unwrap();
+        let mut st = s.write();
         st.xadd("5-0", vec![(Bytes::from("x"), Bytes::from("y"))])
             .unwrap();
     }
@@ -527,7 +530,7 @@ fn rdb_single_cache_stream_roundtrip() {
     let cache2 = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
     rdb::load_bytes(&cache2, &bytes, true).unwrap();
     let s = cache2.get_stream(&Bytes::from("st")).expect("stream");
-    let st = s.read().unwrap();
+    let st = s.read();
     assert_eq!(st.len(), 1);
     assert_eq!(st.last_generated_id().to_string_id(), "5-0");
 }

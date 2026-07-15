@@ -2,7 +2,8 @@ use crate::error::{Error, Result};
 use crate::memory::MemoryCategory;
 use crate::sorted_set::{SharedSortedSet, SortedSet};
 use bytes::Bytes;
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 use super::storage::KeyType;
 use super::Cache;
@@ -70,11 +71,7 @@ impl Cache {
     /// Remove a sorted set and free its tracked memory
     pub fn remove_sorted_set(&self, key: &Bytes) -> bool {
         if let Some(set) = self.sorted_sets.remove(key) {
-            let size = key.len()
-                + set
-                    .read()
-                    .map(|s| s.memory_size())
-                    .unwrap_or(std::mem::size_of::<SortedSet>());
+            let size = key.len() + set.read().memory_size();
             self.memory_tracker
                 .deallocate(size, MemoryCategory::SortedSets);
             true
@@ -92,7 +89,7 @@ impl Cache {
     pub fn export_zsets(&self) -> Vec<(Bytes, Vec<(Bytes, f64)>)> {
         let mut out = Vec::new();
         self.sorted_sets.for_each(|key, zset| {
-            if let Ok(set) = zset.read() {
+            { let set = zset.read();
                 out.push((key.clone(), set.iter_members().collect()));
             }
         });

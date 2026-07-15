@@ -128,7 +128,7 @@ impl CommandHandler {
             Err(e) => return Ok(RespValue::error(e.to_resp_string())),
         };
 
-        let mut s = stream.write().unwrap();
+        let mut s = stream.write();
         let before = key.len() + s.memory_size();
         let id = match s.xadd_maxlen(&id_spec, fields, maxlen) {
             Ok(id) => id,
@@ -160,7 +160,7 @@ impl CommandHandler {
                 let len = self
                     .cache
                     .get_stream(&key)
-                    .and_then(|s| s.read().ok().map(|g| g.len() as i64))
+                    .map(|s| s.read().len() as i64)
                     .unwrap_or(0);
                 Ok(RespValue::Integer(len))
             }
@@ -234,7 +234,7 @@ impl CommandHandler {
                     Some(s) => s,
                     None => return Ok(RespValue::Array(vec![])),
                 };
-                let s = stream.read().unwrap();
+                let s = stream.read();
                 let entries = if rev {
                     // XREVRANGE key end start
                     let end = match Self::parse_stream_id_bound(&a) {
@@ -297,7 +297,7 @@ impl CommandHandler {
                     Some(s) => s,
                     None => return Ok(RespValue::Integer(0)),
                 };
-                let mut s = stream.write().unwrap();
+                let mut s = stream.write();
                 let before = key.len() + s.memory_size();
                 let n = s.xdel(&ids) as i64;
                 let after = key.len() + s.memory_size();
@@ -356,7 +356,7 @@ impl CommandHandler {
                     Some(s) => s,
                     None => return Ok(RespValue::Integer(0)),
                 };
-                let mut s = stream.write().unwrap();
+                let mut s = stream.write();
                 let before = key.len() + s.memory_size();
                 let n = s.trim_maxlen(count) as i64;
                 let after = key.len() + s.memory_size();
@@ -467,7 +467,7 @@ impl CommandHandler {
             let after = if id_s == "$" {
                 self.cache
                     .get_stream(&key)
-                    .and_then(|s| s.read().ok().map(|g| g.last_id()))
+                    .map(|s| { let g = s.read(); g.last_id() })
                     .unwrap_or(StreamId::ZERO)
             } else if id_s == "0" || id_s == "0-0" {
                 StreamId::ZERO
@@ -550,7 +550,7 @@ impl CommandHandler {
                 Some(s) => s,
                 None => continue,
             };
-            let s = stream.read().unwrap();
+            let s = stream.read();
             let entries = s.xread_after(*after, count);
             if entries.is_empty() {
                 continue;
@@ -629,7 +629,7 @@ impl CommandHandler {
                 let id = if id_s == "$" {
                     self.cache
                         .get_stream(&key)
-                        .and_then(|s| s.read().ok().map(|g| g.last_id()))
+                        .map(|s| { let g = s.read(); g.last_id() })
                         .unwrap_or(StreamId::ZERO)
                 } else if id_s == "0" || id_s == "0-0" {
                     StreamId::ZERO
@@ -648,7 +648,7 @@ impl CommandHandler {
                     Some(s) => s,
                     None => return Ok(RespValue::error("ERR no such key")),
                 };
-                let mut s = stream.write().unwrap();
+                let mut s = stream.write();
                 match s.group_create(group, id, mkstream) {
                     Ok(()) => Ok(RespValue::ok()),
                     Err(e) => Ok(RespValue::error(e)),
@@ -675,7 +675,7 @@ impl CommandHandler {
                             Some(s) => s,
                             None => return Ok(RespValue::Integer(0)),
                         };
-                        let mut s = stream.write().unwrap();
+                        let mut s = stream.write();
                         Ok(RespValue::Integer(if s.group_destroy(&group) { 1 } else { 0 }))
                     }
                     _ => Ok(RespValue::error(Error::WrongType.to_resp_string())),
@@ -881,7 +881,7 @@ impl CommandHandler {
                     ))));
                 }
             };
-            let mut s = stream.write().unwrap();
+            let mut s = stream.write();
             let entries = match s.xreadgroup(group, consumer, id_s, count) {
                 Ok(e) => e,
                 Err(e) => {
@@ -951,7 +951,7 @@ impl CommandHandler {
                     Some(s) => s,
                     None => return Ok(RespValue::Integer(0)),
                 };
-                let mut s = stream.write().unwrap();
+                let mut s = stream.write();
                 match s.xack(&group, &ids) {
                     Ok(n) => Ok(RespValue::Integer(n as i64)),
                     Err(e) => Ok(RespValue::error(e)),
@@ -997,7 +997,7 @@ impl CommandHandler {
                         )));
                     }
                 };
-                let s = stream.read().unwrap();
+                let s = stream.read();
                 match s.xpending_summary(&group) {
                     Ok((total, min_id, max_id, consumers)) => {
                         let min = min_id

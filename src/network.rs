@@ -383,6 +383,7 @@ impl Server {
         let persistence = self.persistence.clone();
         let acl = self.acl.clone();
         let cluster = self.cluster.clone();
+        let redlock = self.redlock.clone();
 
         tokio::spawn(async move {
             let _permit = permit;
@@ -396,13 +397,23 @@ impl Server {
                             persistence,
                             acl,
                             cluster,
+                            redlock,
                         )
                         .await
                     }
                     Err(e) => Err(anyhow::anyhow!("TLS handshake failed: {}", e)),
                 }
             } else {
-                handle_connection(socket, databases, config, persistence, acl, cluster).await
+                handle_connection(
+                    socket,
+                    databases,
+                    config,
+                    persistence,
+                    acl,
+                    cluster,
+                    redlock,
+                )
+                .await
             };
             if let Err(e) = result {
                 warn!("Connection error from {}: {}", peer_label, e);
@@ -457,6 +468,7 @@ async fn handle_connection<S>(
     persistence: Option<Arc<PersistenceManager>>,
     acl: Arc<AclStore>,
     cluster: Option<Arc<ClusterState>>,
+    redlock: Option<Arc<Redlock>>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -472,7 +484,8 @@ where
     let mut parser = RespParser::new();
     let mut handler =
         CommandHandler::with_databases_and_acl(databases, config, persistence, acl)
-            .with_cluster(cluster);
+            .with_cluster(cluster)
+            .with_redlock(redlock);
     handler.set_client_id(client_id);
     let mut buf = vec![0u8; BUFFER_SIZE]; // 8KB buffer
 
@@ -741,6 +754,9 @@ mod tests {
             redlock_instances: String::new(),
             redlock_retry_count: 3,
             redlock_retry_delay_ms: 200,
+            enable_fair_queue: false,
+            fair_queue_max_size: 1024,
+            fair_queue_cleanup_ms: 500,
             dir: "./data".to_string(),
             dbfilename: "dump.rdb".to_string(),
             appendonly: false,

@@ -28,6 +28,7 @@ use crate::error::{Error, Result};
 use crate::persistence::PersistenceManager;
 use crate::protocol::RespValue;
 use crate::pubsub::ClientId;
+use crate::redlock::Redlock;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -79,6 +80,8 @@ pub struct CommandHandler {
     asking: bool,
     /// Negotiated RESP protocol version (2 default; 3 after HELLO 3).
     protocol_version: u8,
+    /// Optional Redlock (for INFO fair-queue metrics).
+    redlock: Option<Arc<Redlock>>,
 }
 
 impl CommandHandler {
@@ -148,7 +151,19 @@ impl CommandHandler {
             cluster: None,
             asking: false,
             protocol_version: 2,
+            redlock: None,
         }
+    }
+
+    /// Attach Redlock for INFO metrics (fair queue stats).
+    pub fn with_redlock(mut self, redlock: Option<Arc<Redlock>>) -> Self {
+        self.redlock = redlock;
+        self
+    }
+
+    /// Redlock reference if present.
+    pub fn redlock(&self) -> Option<&Arc<Redlock>> {
+        self.redlock.as_ref()
     }
 
     /// Current RESP protocol version (2 or 3).

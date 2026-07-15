@@ -243,14 +243,14 @@ fn test_cache_sharded_zsets_concurrent() {
                 let key = Bytes::from(format!("zset-{t}"));
                 let zset = cache.get_or_create_sorted_set(&key).unwrap();
                 {
-                    let mut s = zset.write().unwrap();
+                    let mut s = zset.write();
                     s.add(Bytes::from(format!("m{i}")), i as f64);
                 }
             }
             // Rank check under read lock
             let key = Bytes::from(format!("zset-{t}"));
             let zset = cache.get_sorted_set(&key).unwrap();
-            let s = zset.read().unwrap();
+            let s = zset.read();
             assert_eq!(s.len(), 50);
             assert_eq!(s.rank(&Bytes::from("m0")), Some(0));
             assert_eq!(s.rank(&Bytes::from("m49")), Some(49));
@@ -281,7 +281,7 @@ fn test_cache_same_zset_concurrent_updates() {
         handles.push(thread::spawn(move || {
             for i in 0..100 {
                 let zset = cache.get_or_create_sorted_set(&key).unwrap();
-                let mut s = zset.write().unwrap();
+                let mut s = zset.write();
                 s.add(Bytes::from(format!("t{t}-m{i}")), (t * 1000 + i) as f64);
             }
         }));
@@ -290,7 +290,7 @@ fn test_cache_same_zset_concurrent_updates() {
         h.join().unwrap();
     }
     let zset = cache.get_sorted_set(&key).unwrap();
-    let s = zset.read().unwrap();
+    let s = zset.read();
     assert_eq!(s.len(), 400);
     // Lowest score is t0-m0
     assert_eq!(s.rank(&Bytes::from("t0-m0")), Some(0));

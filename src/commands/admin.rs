@@ -158,6 +158,20 @@ impl CommandHandler {
         } else {
             0
         };
+        let fair_queue_section = match &self.redlock {
+            Some(rl) => rl.fair_queue_info_lines(),
+            None => {
+                if self.config.enable_fair_queue {
+                    format!(
+                        "fair_queue_enabled:1\r\n\
+                         fair_queue_max_size:{}\r\n",
+                        self.config.fair_queue_max_size
+                    )
+                } else {
+                    "fair_queue_enabled:0\r\n".to_string()
+                }
+            }
+        };
 
         let info = format!(
             "# Server\r\n\
@@ -166,6 +180,9 @@ impl CommandHandler {
              redlock_instances:{}\r\n\
              redlock_retry_count:{}\r\n\
              redlock_retry_delay_ms:{}\r\n\
+             \r\n\
+             # FairQueue\r\n\
+             {}\
              \r\n\
              # Stats\r\n\
              total_commands_processed:{}\r\n\
@@ -237,6 +254,7 @@ impl CommandHandler {
             redlock_instances,
             self.config.redlock_retry_count,
             self.config.redlock_retry_delay_ms,
+            fair_queue_section,
             total_cmds,
             stats.cmd_get.load(Ordering::Relaxed),
             stats.cmd_set.load(Ordering::Relaxed),

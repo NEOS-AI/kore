@@ -51,7 +51,7 @@ impl CommandHandler {
             }
             Err(e) => return Ok(RespValue::error(e.to_resp_string())),
         };
-        let mut l = list.write().unwrap();
+        let mut l = list.write();
         let before = key.len() + l.memory_size();
         let len = l.lpush(values) as i64;
         let after = key.len() + l.memory_size();
@@ -88,7 +88,7 @@ impl CommandHandler {
             }
             Err(e) => return Ok(RespValue::error(e.to_resp_string())),
         };
-        let mut l = list.write().unwrap();
+        let mut l = list.write();
         let before = key.len() + l.memory_size();
         let len = l.rpush(values) as i64;
         let after = key.len() + l.memory_size();
@@ -113,7 +113,7 @@ impl CommandHandler {
             let Some(list) = self.cache.get_list(key) else {
                 continue;
             };
-            let mut l = list.write().unwrap();
+            let mut l = list.write();
             let before = key.len() + l.memory_size();
             let val = if from_left { l.lpop() } else { l.rpop() };
             if let Some(v) = val {
@@ -278,7 +278,7 @@ impl CommandHandler {
             Some(l) => l,
             None => return Ok(RespValue::null()),
         };
-        let mut l = list.write().unwrap();
+        let mut l = list.write();
         let before = key.len() + l.memory_size();
         let resp = match count {
             None => match l.lpop() {
@@ -336,7 +336,7 @@ impl CommandHandler {
             Some(l) => l,
             None => return Ok(RespValue::null()),
         };
-        let mut l = list.write().unwrap();
+        let mut l = list.write();
         let before = key.len() + l.memory_size();
         let resp = match count {
             None => match l.rpop() {
@@ -395,7 +395,7 @@ impl CommandHandler {
         };
         match self.cache.get_list(key) {
             Some(l) => {
-                let list = l.read().unwrap();
+                let list = l.read();
                 Ok(RespValue::Array(
                     list.lrange(start, stop)
                         .into_iter()
@@ -424,7 +424,7 @@ impl CommandHandler {
         let n = self
             .cache
             .get_list(key)
-            .map(|l| l.read().unwrap().llen())
+            .map(|l| l.read().llen())
             .unwrap_or(0);
         Ok(RespValue::Integer(n as i64))
     }
@@ -453,7 +453,7 @@ impl CommandHandler {
         };
         match self.cache.get_list(key) {
             Some(l) => {
-                let list = l.read().unwrap();
+                let list = l.read();
                 match list.lindex(index) {
                     Some(v) => Ok(RespValue::BulkString(Some(v))),
                     None => Ok(RespValue::null()),
@@ -493,7 +493,7 @@ impl CommandHandler {
             Some(l) => l,
             None => return Ok(RespValue::error("ERR no such key")),
         };
-        let mut l = list.write().unwrap();
+        let mut l = list.write();
         let before = key.len() + l.memory_size();
         match l.lset(index, value) {
             Ok(()) => {

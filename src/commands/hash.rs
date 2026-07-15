@@ -56,7 +56,7 @@ impl CommandHandler {
             Err(e) => return Ok(RespValue::error(e.to_resp_string())),
         };
 
-        let mut h = hash.write().unwrap();
+        let mut h = hash.write();
         let before = key.len() + h.memory_size();
         let mut added = 0i64;
         for (field, value) in pairs {
@@ -101,7 +101,7 @@ impl CommandHandler {
         };
         match self.cache.get_hash(key) {
             Some(h) => {
-                let hash = h.read().unwrap();
+                let hash = h.read();
                 match hash.hget(field) {
                     Some(v) => Ok(RespValue::BulkString(Some(v))),
                     None => Ok(RespValue::null()),
@@ -132,7 +132,7 @@ impl CommandHandler {
 
         match self.cache.get_hash(key) {
             Some(h) => {
-                let hash = h.read().unwrap();
+                let hash = h.read();
                 let vals = hash.hmget(&fields);
                 Ok(RespValue::Array(
                     vals.into_iter()
@@ -172,7 +172,7 @@ impl CommandHandler {
             Some(h) => h,
             None => return Ok(RespValue::Integer(0)),
         };
-        let mut h = hash.write().unwrap();
+        let mut h = hash.write();
         let before = key.len() + h.memory_size();
         let removed = h.hdel(&fields) as i64;
         let empty = h.is_empty();
@@ -202,7 +202,7 @@ impl CommandHandler {
         }
         match self.cache.get_hash(key) {
             Some(h) => {
-                let hash = h.read().unwrap();
+                let hash = h.read();
                 if self.protocol_version() >= 3 {
                     let pairs: Vec<(RespValue, RespValue)> = hash
                         .hgetall()
@@ -251,7 +251,7 @@ impl CommandHandler {
         let n = self
             .cache
             .get_hash(key)
-            .map(|h| h.read().unwrap().hlen())
+            .map(|h| h.read().hlen())
             .unwrap_or(0);
         Ok(RespValue::Integer(n as i64))
     }
@@ -277,7 +277,7 @@ impl CommandHandler {
         let exists = self
             .cache
             .get_hash(key)
-            .map(|h| h.read().unwrap().hexists(field))
+            .map(|h| h.read().hexists(field))
             .unwrap_or(false);
         Ok(RespValue::Integer(if exists { 1 } else { 0 }))
     }
@@ -298,7 +298,7 @@ impl CommandHandler {
         }
         match self.cache.get_hash(key) {
             Some(h) => {
-                let hash = h.read().unwrap();
+                let hash = h.read();
                 Ok(RespValue::Array(
                     hash.hkeys()
                         .into_iter()
@@ -326,7 +326,7 @@ impl CommandHandler {
         }
         match self.cache.get_hash(key) {
             Some(h) => {
-                let hash = h.read().unwrap();
+                let hash = h.read();
                 Ok(RespValue::Array(
                     hash.hvals()
                         .into_iter()
@@ -369,7 +369,7 @@ impl CommandHandler {
             }
             Err(e) => return Ok(RespValue::error(e.to_resp_string())),
         };
-        let mut h = hash.write().unwrap();
+        let mut h = hash.write();
         let before = key.len() + h.memory_size();
         match h.hincrby(field, delta) {
             Ok(v) => {

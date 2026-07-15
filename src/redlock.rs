@@ -129,12 +129,22 @@ impl Redlock {
             }
         };
 
-        let redlock = Self::with_config(
+        let mut redlock = Self::with_config(
             instances,
             config.redlock_retry_count,
             config.redlock_retry_delay_ms,
             0.01,
         )?;
+        if config.enable_fair_queue {
+            redlock = redlock.with_fair_queueing_cleanup(
+                config.fair_queue_max_size,
+                config.fair_queue_cleanup_ms,
+            );
+            info!(
+                "Redlock fair queue enabled: max_size={} cleanup_ms={}",
+                config.fair_queue_max_size, config.fair_queue_cleanup_ms
+            );
+        }
         Ok(Some(Arc::new(redlock)))
     }
 
@@ -174,19 +184,49 @@ impl Redlock {
     }
     
     /// Enable fair lock queueing
-    /// 
+    ///
     /// # Arguments
     /// * `max_queue_size` - Maximum number of clients that can wait for a single resource
     pub fn with_fair_queueing(mut self, max_queue_size: usize) -> Self {
         self.fair_queue = Some(Arc::new(FairQueue::new(max_queue_size)));
-        
+
         // Increase retry count for fair queueing to allow proper queue processing
         // Each client needs time to wait for their turn
         if self.retry_count < 20 {
             self.retry_count = 20;
         }
-        
+
         self
+    }
+
+    /// Enable fair lock queueing with background expired-entry cleanup.
+    pub fn with_fair_queueing_cleanup(
+        mut self,
+        max_queue_size: usize,
+        cleanup_interval_ms: u64,
+    ) -> Self {
+        self.fair_queue = Some(Arc::new(FairQueue::new_with_cleanup(
+            max_queue_size,
+            cleanup_interval_ms,
+        )));
+        if self.retry_count < 20 {
+            self.retry_count = 20;
+        }
+        self
+    }
+
+    /// Whether fair queueing is enabled on this instance.
+    pub fn fair_queue_enabled(&self) -> bool {
+        self.fair_queue.is_some()
+    }
+
+    /// INFO-style fair queue section (empty when disabled).
+    pub fn fair_queue_info_lines(&self) -> String {
+        match &self.fair_queue {
+            Some(q) => q.to_info_lines(),
+            None => "fair_queue_enabled:0
+".to_string(),
+        }
     }
     
     /// Check for deadlocks
@@ -326,9 +366,9 @@ impl Redlock {
             
             match self.try_lock(resource, val.clone(), ttl_ms) {
                 Ok(lock) => {
-                    // Remove from queue if fair queueing is enabled
+                    // Remove this client from the queue (front-safe)
                     if let Some(ref queue) = self.fair_queue {
-                        queue.dequeue(resource);
+                        queue.dequeue_client(resource, &val);
                     }
                     
                     // Record successful acquisition
@@ -338,12 +378,12 @@ impl Redlock {
                     return Ok(lock);
                 }
                 Err(e) => {
-                    if attempt == self.retry_count - 1 {
+                    if attempt + 1 >= max_attempts {
                         // Remove from queue on final failure
                         if let Some(ref queue) = self.fair_queue {
                             queue.remove(resource, &val);
                         }
-                        
+
                         // Clean up wait record on final failure
                         if let Some(ref detector) = self.deadlock_detector {
                             detector.remove_from_waiting(&val);
@@ -352,7 +392,16 @@ impl Redlock {
                     }
                     // Add random jitter to prevent thundering herd
                     let jitter = thread_rng().gen_range(0..50);
-                    std::thread::sleep(Duration::from_millis(self.retry_delay_ms + jitter));
+                    let remaining = deadline.saturating_sub(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64,
+                    );
+                    let wait = std::cmp::min(self.retry_delay_ms + jitter, remaining);
+                    if wait > 0 {
+                        std::thread::sleep(Duration::from_millis(wait));
+                    }
                 }
             }
         }
