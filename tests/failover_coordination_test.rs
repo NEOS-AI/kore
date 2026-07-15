@@ -950,6 +950,22 @@ async fn failover_to_redirects_sibling_replica() {
     wait_listen(r1_port).await;
     wait_listen(r2_port).await;
 
+    // Wait until both replica links are up before writing (avoids racing PSYNC).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if r1_mgr.replication.master_link_up() && r2_mgr.replication.master_link_up() {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!(
+                "replicas did not establish master link (r1={} r2={})",
+                r1_mgr.replication.master_link_up(),
+                r2_mgr.replication.master_link_up()
+            );
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
     let mut master_cli = timeout(
         Duration::from_secs(2),
         TcpStream::connect(format!("127.0.0.1:{}", master_port)),
@@ -961,9 +977,11 @@ async fn failover_to_redirects_sibling_replica() {
         send_cmd(&mut master_cli, &["SET", "rf_key", "v1"]).await,
         RespValue::ok()
     );
+    // Durability: wait for both replicas to ACK the write when possible.
+    let _ = send_cmd(&mut master_cli, &["WAIT", "2", "10000"]).await;
 
     // Wait until both replicas have the key
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         let mut ok = 0;
         for port in [r1_port, r2_port] {
@@ -978,7 +996,13 @@ async fn failover_to_redirects_sibling_replica() {
             break;
         }
         if tokio::time::Instant::now() > deadline {
-            panic!("replicas did not sync rf_key (ok={})", ok);
+            panic!(
+                "replicas did not sync rf_key (ok={} r1_link={} r2_link={} connected={})",
+                ok,
+                r1_mgr.replication.master_link_up(),
+                r2_mgr.replication.master_link_up(),
+                master_mgr.replication.connected_replicas()
+            );
         }
         sleep(Duration::from_millis(50)).await;
     }

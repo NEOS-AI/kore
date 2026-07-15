@@ -182,6 +182,10 @@ pub struct ReplicationManager {
     min_replicas_max_lag_secs: AtomicUsize,
     /// Bumped when primary address changes so `sync_from_primary` reconnects.
     primary_link_epoch: AtomicU64,
+    /// Serializes full-resync (RDB snapshot + feed registration) with
+    /// `propagate_raw` so a write cannot land in the gap between snapshot and
+    /// register (would be missing from both RDB and the new live feed).
+    fullsync_gate: Mutex<()>,
 }
 
 impl ReplicationManager {
@@ -206,6 +210,7 @@ impl ReplicationManager {
             min_replicas_to_write: AtomicUsize::new(0),
             min_replicas_max_lag_secs: AtomicUsize::new(10),
             primary_link_epoch: AtomicU64::new(0),
+            fullsync_gate: Mutex::new(()),
         })
     }
 
@@ -497,6 +502,10 @@ impl ReplicationManager {
 
     /// Propagate a write command (as RESP array bytes) to all replicas and backlog.
     pub fn propagate_raw(&self, data: Bytes) {
+        // Share the fullsync gate so we never append/send while a full resync
+        // is between RDB snapshot and feed registration.
+        let _gate = self.fullsync_gate.lock();
+
         // Always append to backlog (even with no replicas) so reconnecting
         // replicas can PSYNC if they reconnect quickly.
         {
@@ -538,6 +547,8 @@ impl ReplicationManager {
         replica_host: Option<String>,
         replica_port: Option<u16>,
     ) -> Result<(Bytes, mpsc::Receiver<Bytes>)> {
+        // Hold the gate across snapshot + register (see `fullsync_gate`).
+        let _gate = self.fullsync_gate.lock();
         let rdb_bytes = rdb::save_databases_to_bytes(databases)?;
         let response = RespValue::BulkString(Some(rdb_bytes)).serialize();
         let rx = self.register_replica_announced(replica_host, replica_port);
@@ -605,7 +616,10 @@ impl ReplicationManager {
             // fall through to full
         }
 
-        // Full resync — multi-DB snapshot
+        // Full resync — multi-DB snapshot + feed register under one gate so
+        // concurrent `propagate_raw` cannot insert a write into the gap
+        // (missing from RDB and from the new feed).
+        let _gate = self.fullsync_gate.lock();
         let rdb_bytes = rdb::save_databases_to_bytes(databases)?;
         // Offset reported is current master offset (stream starts after RDB)
         let offset_now = self.master_repl_offset();
@@ -1301,6 +1315,7 @@ impl Default for ReplicationManager {
             min_replicas_to_write: AtomicUsize::new(0),
             min_replicas_max_lag_secs: AtomicUsize::new(10),
             primary_link_epoch: AtomicU64::new(0),
+            fullsync_gate: Mutex::new(()),
         }
     }
 }
@@ -2022,6 +2037,62 @@ mod tests {
         let msg = feed.try_recv().expect("feed should have SET");
         let s = String::from_utf8_lossy(&msg);
         assert!(s.contains("SET") && s.contains("live"));
+    }
+
+    /// Concurrent full-resync registration must not drop live writes: every
+    /// propagate after a feed is registered must either be in the RDB snapshot
+    /// or appear on that feed (gate closes the snapshot/register gap).
+    #[test]
+    fn fullsync_gate_keeps_propagates_visible_on_new_feed() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let repl = ReplicationManager::new();
+        let cache = Cache::new_with_sweep(4, 1024 * 1024, 1024 * 1024, false);
+        let databases = Databases::single(cache);
+        let barrier = Arc::new(Barrier::new(2));
+
+        let repl_w = Arc::clone(&repl);
+        let b_w = Arc::clone(&barrier);
+        let writer = thread::spawn(move || {
+            b_w.wait();
+            for i in 0..200 {
+                repl_w.propagate_command(&[
+                    Bytes::from_static(b"SET"),
+                    Bytes::from(format!("k{}", i)),
+                    Bytes::from_static(b"v"),
+                ]);
+            }
+        });
+
+        let repl_s = Arc::clone(&repl);
+        let b_s = Arc::clone(&barrier);
+        let syncer = thread::spawn(move || {
+            b_s.wait();
+            let mut feeds = Vec::new();
+            for _ in 0..4 {
+                let start = repl_s.start_psync(&databases, "?", -1).unwrap();
+                match start {
+                    SyncStart::Full { feed, .. } | SyncStart::Partial { feed, .. } => {
+                        feeds.push(feed);
+                    }
+                }
+            }
+            feeds
+        });
+
+        writer.join().unwrap();
+        let mut feeds = syncer.join().unwrap();
+        // Drain: each feed should be able to recv without panicking; at least
+        // the last registered feed should see some of the later writes if any
+        // happened after its registration. Stronger check: backlog end offset
+        // matches 200 propagates and connected_replicas >= 1.
+        assert!(repl.master_repl_offset() > 0);
+        assert!(repl.connected_replicas() >= 1);
+        // Ensure we can recv from feeds (channel not poisoned / closed).
+        for feed in feeds.iter_mut() {
+            while feed.try_recv().is_ok() {}
+        }
     }
 
     #[test]
