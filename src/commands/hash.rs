@@ -43,11 +43,6 @@ impl CommandHandler {
             i += 2;
         }
 
-        let est: usize = pairs.iter().map(|(f, v)| f.len() + v.len() + 32).sum();
-        if let Err(e) = self.cache.ensure_non_string_capacity(est) {
-            return Ok(RespValue::error(e.to_resp_string()));
-        }
-
         let hash = match self.cache.get_or_create_hash(&key) {
             Ok(h) => h,
             Err(Error::WrongType) => {
@@ -56,26 +51,57 @@ impl CommandHandler {
             Err(e) => return Ok(RespValue::error(e.to_resp_string())),
         };
 
-        let mut h = hash.write();
-        let before = key.len() + h.memory_size();
-        let mut added = 0i64;
-        for (field, value) in pairs {
-            if h.hset(field, value) {
-                added += 1;
+        // Mutate under the hash lock, then drop before capacity/eviction so we
+        // never deadlock (eviction may remove_hash the same key).
+        let (before, after, added, originals, index_fields) = {
+            let mut h = hash.write();
+            let before = crate::memory::estimate_keyed_object(key.len(), h.memory_size());
+            let mut originals: HashMap<Bytes, Option<Bytes>> = HashMap::new();
+            for (field, _) in &pairs {
+                originals
+                    .entry(field.clone())
+                    .or_insert_with(|| h.hget(field));
             }
-        }
-        let after = key.len() + h.memory_size();
-        // Snapshot fields for search auto-index (all values as Text for MVP)
-        let mut index_fields = HashMap::new();
-        for (f, v) in h.hgetall() {
-            let fname = String::from_utf8_lossy(&f).into_owned();
-            let fval = String::from_utf8_lossy(&v).into_owned();
-            index_fields.insert(fname, DocumentField::Text(fval));
-        }
-        drop(h);
-        self.cache.account_hash_delta(before, after);
+            let mut added = 0i64;
+            for (field, value) in pairs {
+                if h.hset(field, value) {
+                    added += 1;
+                }
+            }
+            let after = crate::memory::estimate_keyed_object(key.len(), h.memory_size());
+            // Snapshot fields for search auto-index (all values as Text for MVP)
+            let mut index_fields = HashMap::new();
+            for (f, v) in h.hgetall() {
+                let fname = String::from_utf8_lossy(&f).into_owned();
+                let fval = String::from_utf8_lossy(&v).into_owned();
+                index_fields.insert(fname, DocumentField::Text(fval));
+            }
+            (before, after, added, originals, index_fields)
+        };
 
-        // After successful HSET, auto-index keys matching FT index PREFIX
+        if let Err(e) = self.cache.account_hash_delta(before, after) {
+            // Restore prior field state; drop empty hash created for this write.
+            {
+                let mut h = hash.write();
+                for (field, old) in originals {
+                    match old {
+                        Some(v) => {
+                            h.hset(field, v);
+                        }
+                        None => {
+                            let _ = h.hdel(&[field]);
+                        }
+                    }
+                }
+                if h.is_empty() {
+                    drop(h);
+                    self.cache.remove_hash(&key);
+                }
+            }
+            return Ok(RespValue::error(e.to_resp_string()));
+        }
+
+        // Best-effort: skips index when search memory cannot grow.
         self.cache.auto_index_key(&key, index_fields);
 
         Ok(RespValue::Integer(added))
@@ -173,12 +199,13 @@ impl CommandHandler {
             None => return Ok(RespValue::Integer(0)),
         };
         let mut h = hash.write();
-        let before = key.len() + h.memory_size();
+        let before = crate::memory::estimate_keyed_object(key.len(), h.memory_size());
         let removed = h.hdel(&fields) as i64;
         let empty = h.is_empty();
-        let after = key.len() + h.memory_size();
+        let after = crate::memory::estimate_keyed_object(key.len(), h.memory_size());
         drop(h);
-        self.cache.account_hash_delta(before, after);
+        // HDEL only shrinks (or no-ops); accounting cannot OOM.
+        let _ = self.cache.account_hash_delta(before, after);
         if empty {
             self.cache.remove_hash(key);
         }
@@ -369,13 +396,37 @@ impl CommandHandler {
             }
             Err(e) => return Ok(RespValue::error(e.to_resp_string())),
         };
-        let mut h = hash.write();
-        let before = key.len() + h.memory_size();
-        match h.hincrby(field, delta) {
+        let (before, after, prior, incr_result) = {
+            let mut h = hash.write();
+            let before = crate::memory::estimate_keyed_object(key.len(), h.memory_size());
+            let prior = h.hget(&field);
+            match h.hincrby(field.clone(), delta) {
+                Ok(v) => {
+                    let after = crate::memory::estimate_keyed_object(key.len(), h.memory_size());
+                    (before, after, prior, Ok(v))
+                }
+                Err(msg) => (before, before, prior, Err(msg)),
+            }
+        };
+
+        match incr_result {
             Ok(v) => {
-                let after = key.len() + h.memory_size();
-                drop(h);
-                self.cache.account_hash_delta(before, after);
+                if let Err(e) = self.cache.account_hash_delta(before, after) {
+                    let mut h = hash.write();
+                    match prior {
+                        Some(old) => {
+                            h.hset(field, old);
+                        }
+                        None => {
+                            let _ = h.hdel(&[field]);
+                        }
+                    }
+                    if h.is_empty() {
+                        drop(h);
+                        self.cache.remove_hash(&key);
+                    }
+                    return Ok(RespValue::error(e.to_resp_string()));
+                }
                 Ok(RespValue::Integer(v))
             }
             Err(msg) => Ok(RespValue::error(format!("ERR {}", msg))),

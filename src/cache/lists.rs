@@ -27,7 +27,10 @@ impl Cache {
         if let Some(existing) = lists.get(key) {
             return Ok(existing.clone());
         }
-        let base = key.len() + std::mem::size_of::<RedisList>();
+        let base = crate::memory::estimate_keyed_object(
+            key.len(),
+            RedisList::new().memory_size(),
+        );
         drop(lists);
         self.ensure_non_string_capacity(base)?;
         let mut lists = self.lists.write();
@@ -49,7 +52,7 @@ impl Cache {
     pub fn remove_list(&self, key: &Bytes) -> bool {
         let mut lists = self.lists.write();
         if let Some(l) = lists.remove(key) {
-            let size = key.len() + l.read().memory_size();
+            let size = crate::memory::estimate_keyed_object(key.len(), l.read().memory_size());
             self.memory_tracker
                 .deallocate(size, MemoryCategory::Lists);
             true

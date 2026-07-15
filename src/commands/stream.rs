@@ -129,12 +129,12 @@ impl CommandHandler {
         };
 
         let mut s = stream.write();
-        let before = key.len() + s.memory_size();
+        let before = crate::memory::estimate_keyed_object(key.len(), s.memory_size());
         let id = match s.xadd_maxlen(&id_spec, fields, maxlen) {
             Ok(id) => id,
             Err(e) => return Ok(RespValue::error(e)),
         };
-        let after = key.len() + s.memory_size();
+        let after = crate::memory::estimate_keyed_object(key.len(), s.memory_size());
         drop(s);
         self.cache.account_stream_delta(before, after);
         self.cache.touch_watch_key(&key);
@@ -298,9 +298,9 @@ impl CommandHandler {
                     None => return Ok(RespValue::Integer(0)),
                 };
                 let mut s = stream.write();
-                let before = key.len() + s.memory_size();
+                let before = crate::memory::estimate_keyed_object(key.len(), s.memory_size());
                 let n = s.xdel(&ids) as i64;
-                let after = key.len() + s.memory_size();
+                let after = crate::memory::estimate_keyed_object(key.len(), s.memory_size());
                 drop(s);
                 self.cache.account_stream_delta(before, after);
                 if n > 0 {
@@ -357,9 +357,9 @@ impl CommandHandler {
                     None => return Ok(RespValue::Integer(0)),
                 };
                 let mut s = stream.write();
-                let before = key.len() + s.memory_size();
+                let before = crate::memory::estimate_keyed_object(key.len(), s.memory_size());
                 let n = s.trim_maxlen(count) as i64;
-                let after = key.len() + s.memory_size();
+                let after = crate::memory::estimate_keyed_object(key.len(), s.memory_size());
                 drop(s);
                 self.cache.account_stream_delta(before, after);
                 if n > 0 {

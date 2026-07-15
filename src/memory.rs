@@ -1,4 +1,106 @@
+//! Memory tracking and size estimation.
+//!
+//! Kore does not use jemalloc's `zmalloc`-style RSS accounting. Instead we
+//! estimate heap cost from structural sizes plus:
+//! - per-`Bytes` / string heap headers
+//! - hash-map / dict entry overhead
+//! - a fixed allocator waste factor (~12.5%, 8-byte aligned)
+//!
+//! Call sites should prefer the `estimate_*` helpers so capacity checks and
+//! `MemoryTracker` counters stay consistent.
+
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+// ── Size estimation (Batch AA) ──────────────────────────────────────────────
+
+/// Approximate heap header / Arc-like overhead for a `Bytes` (or similar) blob.
+pub const BYTES_OVERHEAD: usize = 24;
+
+/// Approximate cost of one hash-map / dict entry (pointer, hash, metadata).
+pub const DICT_ENTRY_OVERHEAD: usize = 32;
+
+/// Allocator waste: charge ~12.5% extra (×9/8), then align up to 8 bytes.
+/// Models jemalloc size-class rounding without depending on the system allocator.
+pub fn with_alloc_overhead(raw: usize) -> usize {
+    if raw == 0 {
+        return 0;
+    }
+    // raw * 9/8, rounded up, then 8-byte align
+    let taxed = raw.saturating_add((raw + 7) / 8);
+    align_up_8(taxed)
+}
+
+/// Round up to a multiple of 8.
+#[inline]
+pub fn align_up_8(n: usize) -> usize {
+    (n.saturating_add(7)) & !7
+}
+
+/// Accounted size of a string KV entry (key + value + `Entry` struct + map slot).
+///
+/// `entry_struct_size` is `size_of::<Entry>()` passed from the caller to avoid
+/// a circular dependency between `entry` and `memory`.
+pub fn estimate_string_entry(
+    key_len: usize,
+    value_len: usize,
+    entry_struct_size: usize,
+) -> usize {
+    let raw = key_len
+        + value_len
+        + entry_struct_size
+        + BYTES_OVERHEAD * 2
+        + DICT_ENTRY_OVERHEAD;
+    with_alloc_overhead(raw)
+}
+
+/// Logical (pre-overhead) string entry size used for `maxentrysize` checks.
+pub fn logical_string_entry(
+    key_len: usize,
+    value_len: usize,
+    entry_struct_size: usize,
+) -> usize {
+    key_len + value_len + entry_struct_size
+}
+
+/// Cost of storing `key` as a map key plus an empty typed value container.
+pub fn estimate_typed_key_base(key_len: usize, empty_struct_size: usize) -> usize {
+    let raw = key_len + BYTES_OVERHEAD + DICT_ENTRY_OVERHEAD + empty_struct_size;
+    with_alloc_overhead(raw)
+}
+
+/// One hash field → value pair (two blobs + dict entry).
+pub fn estimate_hash_field(field_len: usize, value_len: usize) -> usize {
+    let raw = field_len + value_len + BYTES_OVERHEAD * 2 + DICT_ENTRY_OVERHEAD;
+    with_alloc_overhead(raw)
+}
+
+/// One list element.
+pub fn estimate_list_element(elem_len: usize) -> usize {
+    let raw = elem_len + BYTES_OVERHEAD + 16; // Vec element pointer-ish
+    with_alloc_overhead(raw)
+}
+
+/// One set member.
+pub fn estimate_set_member(member_len: usize) -> usize {
+    let raw = member_len + BYTES_OVERHEAD + DICT_ENTRY_OVERHEAD;
+    with_alloc_overhead(raw)
+}
+
+/// One sorted-set member (member blob + score + skiplist node approx).
+pub fn estimate_zset_member(member_len: usize, skip_node_size: usize) -> usize {
+    let raw = member_len
+        + BYTES_OVERHEAD
+        + DICT_ENTRY_OVERHEAD
+        + skip_node_size
+        + std::mem::size_of::<f64>();
+    with_alloc_overhead(raw)
+}
+
+/// Keyed object total: map slot for `key` + content estimate (already taxed).
+pub fn estimate_keyed_object(key_len: usize, content_size: usize) -> usize {
+    let key_part = with_alloc_overhead(key_len + BYTES_OVERHEAD + DICT_ENTRY_OVERHEAD);
+    key_part.saturating_add(content_size)
+}
 
 /// Memory tracker for different cache components
 pub struct MemoryTracker {
@@ -250,5 +352,36 @@ mod tests {
         assert_eq!(tracker.category_memory(MemoryCategory::PubSub), 50);
         tracker.reset();
         assert_eq!(tracker.total_memory(), 0);
+    }
+
+    #[test]
+    fn with_alloc_overhead_grows_and_aligns() {
+        assert_eq!(with_alloc_overhead(0), 0);
+        let n = with_alloc_overhead(100);
+        assert!(n > 100, "overhead must increase size");
+        assert_eq!(n % 8, 0, "must be 8-byte aligned");
+        // ~12.5%: 100 + 13 = 113 → align 120
+        assert_eq!(n, 120);
+    }
+
+    #[test]
+    fn string_entry_exceeds_payload() {
+        let entry_sz = 128; // stand-in for size_of::<Entry>()
+        let key = 4usize;
+        let val = 10usize;
+        let logical = logical_string_entry(key, val, entry_sz);
+        let accounted = estimate_string_entry(key, val, entry_sz);
+        assert_eq!(logical, key + val + entry_sz);
+        assert!(accounted > logical);
+        assert!(accounted > key + val);
+    }
+
+    #[test]
+    fn keyed_object_includes_key_slot() {
+        let content = 64;
+        let a = estimate_keyed_object(3, content);
+        let b = estimate_keyed_object(30, content);
+        assert!(b > a);
+        assert!(a > content);
     }
 }

@@ -35,7 +35,10 @@ impl Cache {
         if let Some(existing) = self.geo_sets.get(key) {
             return Ok(existing);
         }
-        let base = key.len() + std::mem::size_of::<GeoSet>();
+        let base = crate::memory::estimate_keyed_object(
+            key.len(),
+            GeoSet::new().memory_usage(),
+        );
         self.ensure_non_string_capacity(base)?;
         Ok(self.geo_sets.get_or_insert_with(key.clone(), || {
             self.memory_tracker
@@ -47,7 +50,8 @@ impl Cache {
     /// Remove a geospatial set and free its tracked memory
     pub fn remove_geo_set(&self, key: &Bytes) -> bool {
         if let Some(set) = self.geo_sets.remove(key) {
-            let size = key.len() + set.read().memory_usage();
+            let size =
+                crate::memory::estimate_keyed_object(key.len(), set.read().memory_usage());
             self.memory_tracker
                 .deallocate(size, MemoryCategory::GeoSets);
             true
@@ -66,7 +70,7 @@ impl Cache {
         let mut total = 0usize;
         self.geo_sets.for_each(|key, geo_set| {
             { let set = geo_set.read();
-                total += key.len() + set.memory_usage();
+                total += crate::memory::estimate_keyed_object(key.len(), set.memory_usage());
             }
         });
         total

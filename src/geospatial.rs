@@ -302,23 +302,22 @@ impl GeoSet {
         self.members.is_empty()
     }
 
-    /// Calculate approximate memory usage in bytes
+    /// Approximate heap size of geo set contents (members only; key charged separately).
     pub fn memory_usage(&self) -> usize {
+        use crate::memory::{with_alloc_overhead, BYTES_OVERHEAD, DICT_ENTRY_OVERHEAD};
         use std::mem;
-        
-        // Base HashMap overhead
-        let mut size = mem::size_of::<Self>();
-        
-        // Each entry: key (Bytes) + value (GeoPoint)
+
+        let mut raw = mem::size_of::<Self>();
+        raw += self.members.capacity().saturating_mul(8);
         for (key, point) in &self.members {
-            // Bytes key size (includes capacity)
-            size += mem::size_of::<Bytes>() + key.len();
-            
-            // GeoPoint size (includes Bytes member + 2 f64s)
-            size += mem::size_of::<GeoPoint>() + point.member.len();
+            // member name stored as map key + inside GeoPoint
+            raw += key.len()
+                + point.member.len()
+                + BYTES_OVERHEAD * 2
+                + DICT_ENTRY_OVERHEAD
+                + mem::size_of::<GeoPoint>();
         }
-        
-        size
+        with_alloc_overhead(raw)
     }
 }
 

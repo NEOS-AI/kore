@@ -299,29 +299,37 @@ impl Cache {
 
             // Sharded maps (zset / geo)
             for (k, z) in self.sorted_sets.get_n_random(per_type) {
-                let size = k.len() + z.read().memory_size();
+                let size =
+                    crate::memory::estimate_keyed_object(k.len(), z.read().memory_size());
                 out.push(typed_candidate(k, KeyType::ZSet, size));
             }
             for (k, g) in self.geo_sets.get_n_random(per_type) {
-                let size = k.len() + g.read().memory_usage();
+                let size = crate::memory::estimate_keyed_object(
+                    k.len(),
+                    g.read().memory_usage(),
+                );
                 out.push(typed_candidate(k, KeyType::Geo, size));
             }
 
             // Global maps (hash / list / set / stream)
             sample_map_keys(&self.hashes, per_type, |k, h| {
-                let size = k.len() + h.read().memory_size();
+                let size =
+                    crate::memory::estimate_keyed_object(k.len(), h.read().memory_size());
                 out.push(typed_candidate(k, KeyType::Hash, size));
             });
             sample_map_keys(&self.lists, per_type, |k, l| {
-                let size = k.len() + l.read().memory_size();
+                let size =
+                    crate::memory::estimate_keyed_object(k.len(), l.read().memory_size());
                 out.push(typed_candidate(k, KeyType::List, size));
             });
             sample_map_keys(&self.sets, per_type, |k, s| {
-                let size = k.len() + s.read().memory_size();
+                let size =
+                    crate::memory::estimate_keyed_object(k.len(), s.read().memory_size());
                 out.push(typed_candidate(k, KeyType::Set, size));
             });
             sample_map_keys(&self.streams, per_type, |k, s| {
-                let size = k.len() + s.read().memory_size();
+                let size =
+                    crate::memory::estimate_keyed_object(k.len(), s.read().memory_size());
                 out.push(typed_candidate(k, KeyType::Stream, size));
             });
         }

@@ -180,7 +180,8 @@ Also tracked in `docs/roadmap.md`.
   - *Partial*: counter-based LFU on touch (not full Redis 24-bit log counter / decay)
 - [x] **`[P1]`** Active expire sampling (avoid full-shard `retain` pauses on large datasets)
   - *Done*: Redis-style sample cycle (20 keys/pass, continue if >25% expired, 1ms budget); background autosweep uses sampling @ 10Hz; full `SWEEP` retained for admin
-- [ ] **`[P2]`** More accurate memory sizing (allocator overhead, index structures)
+- [x] **`[P2]`** More accurate memory sizing (allocator overhead, index structures)
+  - *Done (Batch AA)*: central `memory::estimate_*` helpers — `Bytes`/dict entry overhead, ~12.5% allocator tax + 8-byte align; string `Entry::size`, hash/list/set/zset/geo/stream `memory_size`, search docs, keyed create/remove/rename/eviction samples; `used_memory` / `memory_usage()` = total tracked (all categories); capacity checks use total budget. HSET/HINCRBY account actual post-mutation delta (rollback on OOM; lock dropped before ensure/evict to avoid deadlock); search auto-index is best-effort under maxmemory. Not jemalloc RSS / full skiplist span accounting.
 
 ### Sorted set / geo performance
 

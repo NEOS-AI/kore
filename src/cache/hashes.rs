@@ -9,7 +9,15 @@ use super::storage::KeyType;
 use super::Cache;
 
 impl Cache {
-    pub(crate) fn account_hash_delta(&self, old_size: usize, new_size: usize) {
+    /// Apply a hash size change to the tracker.
+    ///
+    /// When `new_size > old_size`, capacity is checked first (eviction may run).
+    /// On `OutOfMemory` nothing is accounted — the caller must roll back the
+    /// in-memory hash mutation so tracked totals never exceed maxmemory.
+    pub(crate) fn account_hash_delta(&self, old_size: usize, new_size: usize) -> Result<()> {
+        if new_size > old_size {
+            self.ensure_non_string_capacity(new_size - old_size)?;
+        }
         if old_size > 0 {
             self.memory_tracker
                 .deallocate(old_size, MemoryCategory::Hashes);
@@ -18,6 +26,7 @@ impl Cache {
             self.memory_tracker
                 .account(new_size, MemoryCategory::Hashes);
         }
+        Ok(())
     }
 
     /// Get or create a hash. WrongType if key holds a different type.
@@ -27,7 +36,10 @@ impl Cache {
         if let Some(existing) = hashes.get(key) {
             return Ok(existing.clone());
         }
-        let base = key.len() + std::mem::size_of::<RedisHash>();
+        let base = crate::memory::estimate_keyed_object(
+            key.len(),
+            RedisHash::new().memory_size(),
+        );
         drop(hashes);
         self.ensure_non_string_capacity(base)?;
         let mut hashes = self.hashes.write();
@@ -49,7 +61,7 @@ impl Cache {
     pub fn remove_hash(&self, key: &Bytes) -> bool {
         let mut hashes = self.hashes.write();
         if let Some(h) = hashes.remove(key) {
-            let size = key.len() + h.read().memory_size();
+            let size = crate::memory::estimate_keyed_object(key.len(), h.read().memory_size());
             self.memory_tracker
                 .deallocate(size, MemoryCategory::Hashes);
             true

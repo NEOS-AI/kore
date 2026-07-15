@@ -92,7 +92,7 @@ impl CommandHandler {
             Err(e) => return Ok(RespValue::error(e.to_resp_string())),
         };
         let mut set = geoset.write();
-        let before = key.len() + set.memory_usage();
+        let before = crate::memory::estimate_keyed_object(key.len(), set.memory_usage());
 
         let mut count = 0i64;
         let mut old_positions: Vec<RespValue> = Vec::new();
@@ -126,7 +126,7 @@ impl CommandHandler {
             }
         }
 
-        let after = key.len() + set.memory_usage();
+        let after = crate::memory::estimate_keyed_object(key.len(), set.memory_usage());
         drop(set);
         self.cache.account_geo_set_delta(before, after);
 

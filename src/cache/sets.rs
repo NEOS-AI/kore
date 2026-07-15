@@ -27,7 +27,10 @@ impl Cache {
         if let Some(existing) = sets.get(key) {
             return Ok(existing.clone());
         }
-        let base = key.len() + std::mem::size_of::<RedisSet>();
+        let base = crate::memory::estimate_keyed_object(
+            key.len(),
+            RedisSet::new().memory_size(),
+        );
         drop(sets);
         self.ensure_non_string_capacity(base)?;
         let mut sets = self.sets.write();
@@ -49,7 +52,7 @@ impl Cache {
     pub fn remove_set(&self, key: &Bytes) -> bool {
         let mut sets = self.sets.write();
         if let Some(s) = sets.remove(key) {
-            let size = key.len() + s.read().memory_size();
+            let size = crate::memory::estimate_keyed_object(key.len(), s.read().memory_size());
             self.memory_tracker
                 .deallocate(size, MemoryCategory::Sets);
             true

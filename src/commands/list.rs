@@ -52,9 +52,9 @@ impl CommandHandler {
             Err(e) => return Ok(RespValue::error(e.to_resp_string())),
         };
         let mut l = list.write();
-        let before = key.len() + l.memory_size();
+        let before = crate::memory::estimate_keyed_object(key.len(), l.memory_size());
         let len = l.lpush(values) as i64;
-        let after = key.len() + l.memory_size();
+        let after = crate::memory::estimate_keyed_object(key.len(), l.memory_size());
         drop(l);
         self.cache.account_list_delta(before, after);
         // Wake BLPOP/BRPOP waiters on this key
@@ -89,9 +89,9 @@ impl CommandHandler {
             Err(e) => return Ok(RespValue::error(e.to_resp_string())),
         };
         let mut l = list.write();
-        let before = key.len() + l.memory_size();
+        let before = crate::memory::estimate_keyed_object(key.len(), l.memory_size());
         let len = l.rpush(values) as i64;
-        let after = key.len() + l.memory_size();
+        let after = crate::memory::estimate_keyed_object(key.len(), l.memory_size());
         drop(l);
         self.cache.account_list_delta(before, after);
         self.cache.list_blockers.notify_key(&key);
@@ -114,11 +114,11 @@ impl CommandHandler {
                 continue;
             };
             let mut l = list.write();
-            let before = key.len() + l.memory_size();
+            let before = crate::memory::estimate_keyed_object(key.len(), l.memory_size());
             let val = if from_left { l.lpop() } else { l.rpop() };
             if let Some(v) = val {
                 let empty = l.is_empty();
-                let after = key.len() + l.memory_size();
+                let after = crate::memory::estimate_keyed_object(key.len(), l.memory_size());
                 drop(l);
                 self.cache.account_list_delta(before, after);
                 if empty {
@@ -279,7 +279,7 @@ impl CommandHandler {
             None => return Ok(RespValue::null()),
         };
         let mut l = list.write();
-        let before = key.len() + l.memory_size();
+        let before = crate::memory::estimate_keyed_object(key.len(), l.memory_size());
         let resp = match count {
             None => match l.lpop() {
                 Some(v) => RespValue::BulkString(Some(v)),
@@ -296,7 +296,7 @@ impl CommandHandler {
             }
         };
         let empty = l.is_empty();
-        let after = key.len() + l.memory_size();
+        let after = crate::memory::estimate_keyed_object(key.len(), l.memory_size());
         drop(l);
         self.cache.account_list_delta(before, after);
         if empty {
@@ -337,7 +337,7 @@ impl CommandHandler {
             None => return Ok(RespValue::null()),
         };
         let mut l = list.write();
-        let before = key.len() + l.memory_size();
+        let before = crate::memory::estimate_keyed_object(key.len(), l.memory_size());
         let resp = match count {
             None => match l.rpop() {
                 Some(v) => RespValue::BulkString(Some(v)),
@@ -354,7 +354,7 @@ impl CommandHandler {
             }
         };
         let empty = l.is_empty();
-        let after = key.len() + l.memory_size();
+        let after = crate::memory::estimate_keyed_object(key.len(), l.memory_size());
         drop(l);
         self.cache.account_list_delta(before, after);
         if empty {
@@ -494,10 +494,10 @@ impl CommandHandler {
             None => return Ok(RespValue::error("ERR no such key")),
         };
         let mut l = list.write();
-        let before = key.len() + l.memory_size();
+        let before = crate::memory::estimate_keyed_object(key.len(), l.memory_size());
         match l.lset(index, value) {
             Ok(()) => {
-                let after = key.len() + l.memory_size();
+                let after = crate::memory::estimate_keyed_object(key.len(), l.memory_size());
                 drop(l);
                 self.cache.account_list_delta(before, after);
                 Ok(RespValue::ok())

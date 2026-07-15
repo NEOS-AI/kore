@@ -383,13 +383,14 @@ impl SearchIndex {
 
     /// Approximate memory for a single document (id + field storage + inverted-index overhead).
     pub fn document_approx_size(doc_id: &Bytes, fields: &HashMap<String, DocumentField>) -> usize {
-        let mut size = doc_id.len() + 64; // id + hash-set / map overhead
+        use crate::memory::{with_alloc_overhead, BYTES_OVERHEAD, DICT_ENTRY_OVERHEAD};
+        let mut size = doc_id.len() + BYTES_OVERHEAD + DICT_ENTRY_OVERHEAD + 64;
         for (name, value) in fields {
-            size += name.len() + value.approx_size() + 48;
+            size += name.len() + value.approx_size() + DICT_ENTRY_OVERHEAD + 48;
             // Rough inverted-index / posting overhead per field
             size += 32;
         }
-        size
+        with_alloc_overhead(size)
     }
 
     /// Approximate total memory used by all documents in this index.

@@ -136,12 +136,17 @@ impl RedisList {
         self.items.iter().cloned()
     }
 
+    /// Approximate heap size of list contents (elements only; key charged separately).
     pub fn memory_size(&self) -> usize {
-        let mut size = std::mem::size_of::<Self>();
-        for item in &self.items {
-            size += std::mem::size_of::<Bytes>() + item.len();
-        }
-        size
+        use crate::memory::{estimate_list_element, with_alloc_overhead};
+        let mut raw = std::mem::size_of::<Self>();
+        raw += self.items.capacity().saturating_mul(std::mem::size_of::<Bytes>());
+        let elems: usize = self
+            .items
+            .iter()
+            .map(|item| estimate_list_element(item.len()))
+            .sum();
+        with_alloc_overhead(raw).saturating_add(elems)
     }
 }
 

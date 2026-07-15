@@ -497,14 +497,23 @@ impl SortedSet {
         count
     }
 
+    /// Approximate heap size of zset contents (members only; key charged separately).
     pub fn memory_size(&self) -> usize {
-        let mut size = std::mem::size_of::<Self>();
-        size += self.list.nodes.capacity() * std::mem::size_of::<SkipNode>();
-        size += self.member_map.len() * (std::mem::size_of::<Bytes>() + std::mem::size_of::<f64>());
-        for member in self.member_map.keys() {
-            size += member.len();
-        }
-        size
+        use crate::memory::{estimate_zset_member, with_alloc_overhead};
+        let skip_node = std::mem::size_of::<SkipNode>();
+        let mut raw = std::mem::size_of::<Self>();
+        // Skiplist node vector capacity + member map capacity
+        raw += self.list.nodes.capacity().saturating_mul(skip_node);
+        raw += self
+            .member_map
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Bytes>() + std::mem::size_of::<f64>());
+        let members: usize = self
+            .member_map
+            .keys()
+            .map(|m| estimate_zset_member(m.len(), skip_node))
+            .sum();
+        with_alloc_overhead(raw).saturating_add(members)
     }
 }
 

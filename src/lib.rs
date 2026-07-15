@@ -64,7 +64,10 @@ pub use fair_queue::{FairQueue, QueuedClient, FairQueueStats};
 pub use pubsub::{
     ClientId, PublishOutcome, PubSub, DEFAULT_CLIENT_BUFFER_CAPACITY,
 };
-pub use memory::{MemoryTracker, MemoryCategory};
+pub use memory::{
+    estimate_keyed_object, estimate_string_entry, logical_string_entry, with_alloc_overhead,
+    MemoryCategory, MemoryTracker, BYTES_OVERHEAD, DICT_ENTRY_OVERHEAD,
+};
 pub use search_index::{SearchIndexManager, IndexDefinition, FieldDefinition, FieldType, DocumentField, DistanceMetric, VectorAlgorithm};
 pub use query_engine::{Query, QueryFilter, QueryExecutor};
 pub use vector_search::{VectorIndex, VectorSearchResult};

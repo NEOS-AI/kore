@@ -93,12 +93,18 @@ impl RedisHash {
         self.fields.iter().map(|(k, v)| (k.clone(), v.clone()))
     }
 
+    /// Approximate heap size of hash contents (fields only; key is charged separately).
     pub fn memory_size(&self) -> usize {
-        let mut size = std::mem::size_of::<Self>();
-        for (k, v) in &self.fields {
-            size += std::mem::size_of::<Bytes>() * 2 + k.len() + v.len();
-        }
-        size
+        use crate::memory::{estimate_hash_field, with_alloc_overhead};
+        let mut raw = std::mem::size_of::<Self>();
+        // Empty HashMap / capacity overhead
+        raw += self.fields.capacity().saturating_mul(8);
+        let fields: usize = self
+            .fields
+            .iter()
+            .map(|(k, v)| estimate_hash_field(k.len(), v.len()))
+            .sum();
+        with_alloc_overhead(raw).saturating_add(fields)
     }
 }
 

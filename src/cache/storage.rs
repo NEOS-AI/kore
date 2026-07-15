@@ -136,19 +136,21 @@ impl Cache {
     }
 
     /// Ensure there is capacity for `needed` additional bytes, optionally evicting.
+    ///
+    /// Uses total tracked memory (all categories) so string stores respect
+    /// hash/list/zset/search usage under the same maxmemory budget.
     pub(super) fn ensure_capacity(&self, needed: usize) -> Result<()> {
         if needed == 0 {
             return Ok(());
         }
 
-        let current_memory = self.memory_usage.load(Ordering::Relaxed);
         let tracker_ok = self
             .memory_tracker
             .can_allocate(needed, MemoryCategory::Cache);
         let max_memory = self.max_memory.load(Ordering::Relaxed);
         // 0 = unlimited (Redis-compatible CONFIG SET maxmemory 0)
-        let usage_ok =
-            max_memory == 0 || current_memory.saturating_add(needed) <= max_memory;
+        let total = self.memory_tracker.total_memory();
+        let usage_ok = max_memory == 0 || total.saturating_add(needed) <= max_memory;
 
         if tracker_ok && usage_ok {
             return Ok(());
@@ -175,13 +177,24 @@ impl Cache {
         value: Bytes,
         opts: StoreOptions,
     ) -> Result<Option<SharedEntry>> {
-        // Check entry size (including struct overhead)
-        let entry_size = key.len() + value.len() + std::mem::size_of::<Entry>();
+        // maxentrysize: logical payload (no allocator tax)
+        let logical = crate::memory::logical_string_entry(
+            key.len(),
+            value.len(),
+            std::mem::size_of::<Entry>(),
+        );
         let max_entry_size = self.max_entry_size.load(Ordering::Relaxed);
-        if entry_size > max_entry_size {
+        if logical > max_entry_size {
             self.stats.incr(&self.stats.store_too_large);
             return Err(Error::EntryTooLarge);
         }
+
+        // Accounted size includes map slot + allocator overhead (Batch AA).
+        let entry_size = crate::memory::estimate_string_entry(
+            key.len(),
+            value.len(),
+            std::mem::size_of::<Entry>(),
+        );
 
         // Rough pre-check: account for memory that would be freed on replace
         let existing_size = self.map.get(&key).map(|e| e.size()).unwrap_or(0);
@@ -383,12 +396,17 @@ impl Cache {
         strings + zsets + geos + hashes + lists + sets + streams
     }
 
-    /// Get memory usage (string KV atomic counter)
-    pub fn memory_usage(&self) -> usize {
+    /// String-KV atomic counter (kept for replace/evict paths; prefer `tracked_memory`).
+    pub fn string_memory_usage(&self) -> usize {
         self.memory_usage.load(Ordering::Relaxed)
     }
 
-    /// Total memory tracked across all categories (should stay in sync with usage paths)
+    /// Total accounted memory (all categories) — Redis-compatible `used_memory`.
+    pub fn memory_usage(&self) -> usize {
+        self.memory_tracker.total_memory()
+    }
+
+    /// Total memory tracked across all categories (alias of `memory_usage`).
     pub fn tracked_memory(&self) -> usize {
         self.memory_tracker.total_memory()
     }

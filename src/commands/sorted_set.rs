@@ -63,7 +63,7 @@ impl CommandHandler {
             Err(e) => return Ok(RespValue::error(e.to_resp_string())),
         };
         let mut set = zset.write();
-        let before = key.len() + set.memory_size();
+        let before = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
 
         let mut added = 0;
         for (score, member) in pairs {
@@ -72,7 +72,7 @@ impl CommandHandler {
             }
         }
 
-        let after = key.len() + set.memory_size();
+        let after = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
         drop(set);
         self.cache.account_sorted_set_delta(before, after);
 
@@ -285,7 +285,7 @@ impl CommandHandler {
         };
 
         let mut set = zset.write();
-        let before = key.len() + set.memory_size();
+        let before = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
         let mut removed = 0;
 
         for i in 1..args.len() {
@@ -299,7 +299,7 @@ impl CommandHandler {
             }
         }
 
-        let after = key.len() + set.memory_size();
+        let after = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
         drop(set);
         self.cache.account_sorted_set_delta(before, after);
 

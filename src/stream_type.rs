@@ -92,11 +92,12 @@ pub struct StreamEntry {
 
 impl StreamEntry {
     pub fn memory_size(&self) -> usize {
+        use crate::memory::{with_alloc_overhead, BYTES_OVERHEAD, DICT_ENTRY_OVERHEAD};
         let mut n = std::mem::size_of::<Self>() + 16; // ID overhead
         for (k, v) in &self.fields {
-            n += k.len() + v.len() + 32;
+            n += k.len() + v.len() + BYTES_OVERHEAD * 2 + DICT_ENTRY_OVERHEAD;
         }
-        n
+        with_alloc_overhead(n)
     }
 }
 
@@ -180,18 +181,22 @@ impl RedisStream {
     }
 
     pub fn memory_size(&self) -> usize {
+        use crate::memory::{with_alloc_overhead, BYTES_OVERHEAD, DICT_ENTRY_OVERHEAD};
         let mut n = std::mem::size_of::<Self>();
+        // BTree / map structural overhead (rough)
+        n += self.entries.len().saturating_mul(48);
+        n += self.groups.capacity().saturating_mul(8);
         for e in self.entries.values() {
             n += e.memory_size();
         }
         for g in self.groups.values() {
-            n += g.name.len() + 64;
-            n += g.pending.len() * 64;
+            n += g.name.len() + BYTES_OVERHEAD + DICT_ENTRY_OVERHEAD + 64;
+            n += g.pending.len() * (64 + DICT_ENTRY_OVERHEAD);
             for c in g.consumers.values() {
                 n += c.name.len() + 32;
             }
         }
-        n
+        with_alloc_overhead(n)
     }
 
     fn now_ms() -> u64 {

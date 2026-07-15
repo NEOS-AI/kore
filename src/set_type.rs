@@ -104,12 +104,17 @@ impl RedisSet {
         self.members.iter().cloned()
     }
 
+    /// Approximate heap size of set contents (members only; key charged separately).
     pub fn memory_size(&self) -> usize {
-        let mut size = std::mem::size_of::<Self>();
-        for m in &self.members {
-            size += std::mem::size_of::<Bytes>() + m.len();
-        }
-        size
+        use crate::memory::{estimate_set_member, with_alloc_overhead};
+        let mut raw = std::mem::size_of::<Self>();
+        raw += self.members.capacity().saturating_mul(8);
+        let members: usize = self
+            .members
+            .iter()
+            .map(|m| estimate_set_member(m.len()))
+            .sum();
+        with_alloc_overhead(raw).saturating_add(members)
     }
 }
 

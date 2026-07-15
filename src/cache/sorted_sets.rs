@@ -53,8 +53,11 @@ impl Cache {
         if let Some(existing) = self.sorted_sets.get(key) {
             return Ok(existing);
         }
-        // Base overhead: key + empty SortedSet
-        let base = key.len() + std::mem::size_of::<SortedSet>();
+        // Base overhead: key + empty SortedSet (allocator-aware)
+        let base = crate::memory::estimate_keyed_object(
+            key.len(),
+            SortedSet::new().memory_size(),
+        );
         self.ensure_non_string_capacity(base)?;
         Ok(self.sorted_sets.get_or_insert_with(key.clone(), || {
             self.memory_tracker
@@ -71,7 +74,8 @@ impl Cache {
     /// Remove a sorted set and free its tracked memory
     pub fn remove_sorted_set(&self, key: &Bytes) -> bool {
         if let Some(set) = self.sorted_sets.remove(key) {
-            let size = key.len() + set.read().memory_size();
+            let size =
+                crate::memory::estimate_keyed_object(key.len(), set.read().memory_size());
             self.memory_tracker
                 .deallocate(size, MemoryCategory::SortedSets);
             true

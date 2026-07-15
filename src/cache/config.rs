@@ -46,11 +46,10 @@ impl Cache {
             self.max_entry_size.store(size, Ordering::Relaxed);
         }
 
-        // Best-effort: free memory if we're over the new limit
+        // Best-effort: free memory if we're over the new limit (all categories).
         if size > 0 {
-            let current = self.memory_usage.load(Ordering::Relaxed);
             let tracked = self.memory_tracker.total_memory();
-            let over = current.max(tracked).saturating_sub(size);
+            let over = tracked.saturating_sub(size);
             if over > 0 && self.eviction_allowed() {
                 let _ = self.evict_memory(over);
             }

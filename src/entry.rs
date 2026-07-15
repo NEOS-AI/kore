@@ -77,9 +77,22 @@ impl Entry {
         })
     }
 
-    /// Get the size of this entry in bytes
+    /// Accounted heap size of this entry (includes map/allocator overhead).
     pub fn size(&self) -> usize {
-        self.key.len() + self.value.len() + std::mem::size_of::<Self>()
+        crate::memory::estimate_string_entry(
+            self.key.len(),
+            self.value.len(),
+            std::mem::size_of::<Self>(),
+        )
+    }
+
+    /// Logical size for maxentrysize checks (no allocator tax).
+    pub fn logical_size(&self) -> usize {
+        crate::memory::logical_string_entry(
+            self.key.len(),
+            self.value.len(),
+            std::mem::size_of::<Self>(),
+        )
     }
 
     /// Update the last access time to now and bump LFU frequency.

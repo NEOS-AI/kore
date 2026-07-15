@@ -125,12 +125,21 @@ impl Cache {
             .filter(|e| !e.is_expired())
             .map(|e| e.value.len())
             .unwrap_or(0);
-        let projected =
-            key.len() + existing_val_len + suffix.len() + std::mem::size_of::<Entry>();
+        let entry_sz = std::mem::size_of::<Entry>();
+        let logical = crate::memory::logical_string_entry(
+            key.len(),
+            existing_val_len + suffix.len(),
+            entry_sz,
+        );
         let max_entry_size = self.max_entry_size.load(Ordering::Relaxed);
-        if projected > max_entry_size {
+        if logical > max_entry_size {
             return Err(Error::EntryTooLarge);
         }
+        let projected = crate::memory::estimate_string_entry(
+            key.len(),
+            existing_val_len + suffix.len(),
+            entry_sz,
+        );
         let net = projected.saturating_sub(existing_size);
         self.ensure_capacity(net)?;
 
@@ -155,8 +164,9 @@ impl Cache {
             let new_val = Bytes::from(buf);
             let len = new_val.len();
 
-            let entry_size = key.len() + len + std::mem::size_of::<Entry>();
-            if entry_size > max_entry_size {
+            let logical_sz =
+                crate::memory::logical_string_entry(key.len(), len, entry_sz);
+            if logical_sz > max_entry_size {
                 return (EntryAction::Keep, AppendOutcome::TooLarge);
             }
 
@@ -254,12 +264,12 @@ impl Cache {
                     .remove(src)
                     .ok_or_else(|| Error::InvalidArgument("no such key".into()))?;
                 let content = h.read().memory_size();
-                // Re-account key length portion
                 if src.len() != dst.len() {
+                    let old = crate::memory::estimate_keyed_object(src.len(), content);
+                    let new = crate::memory::estimate_keyed_object(dst.len(), content);
                     self.memory_tracker
-                        .deallocate(src.len() + content, MemoryCategory::Hashes);
-                    self.memory_tracker
-                        .account(dst.len() + content, MemoryCategory::Hashes);
+                        .deallocate(old, MemoryCategory::Hashes);
+                    self.memory_tracker.account(new, MemoryCategory::Hashes);
                 }
                 hashes.insert(dst.clone(), h);
             }
@@ -270,10 +280,11 @@ impl Cache {
                     .ok_or_else(|| Error::InvalidArgument("no such key".into()))?;
                 let content = l.read().memory_size();
                 if src.len() != dst.len() {
+                    let old = crate::memory::estimate_keyed_object(src.len(), content);
+                    let new = crate::memory::estimate_keyed_object(dst.len(), content);
                     self.memory_tracker
-                        .deallocate(src.len() + content, MemoryCategory::Lists);
-                    self.memory_tracker
-                        .account(dst.len() + content, MemoryCategory::Lists);
+                        .deallocate(old, MemoryCategory::Lists);
+                    self.memory_tracker.account(new, MemoryCategory::Lists);
                 }
                 lists.insert(dst.clone(), l);
             }
@@ -284,10 +295,11 @@ impl Cache {
                     .ok_or_else(|| Error::InvalidArgument("no such key".into()))?;
                 let content = s.read().memory_size();
                 if src.len() != dst.len() {
+                    let old = crate::memory::estimate_keyed_object(src.len(), content);
+                    let new = crate::memory::estimate_keyed_object(dst.len(), content);
                     self.memory_tracker
-                        .deallocate(src.len() + content, MemoryCategory::Sets);
-                    self.memory_tracker
-                        .account(dst.len() + content, MemoryCategory::Sets);
+                        .deallocate(old, MemoryCategory::Sets);
+                    self.memory_tracker.account(new, MemoryCategory::Sets);
                 }
                 sets.insert(dst.clone(), s);
             }
@@ -296,19 +308,14 @@ impl Cache {
                     .sorted_sets
                     .remove(src)
                     .ok_or_else(|| Error::InvalidArgument("no such key".into()))?;
-                // Zset memory accounting is approximate; key-length delta only
                 if src.len() != dst.len() {
-                    if dst.len() > src.len() {
-                        self.memory_tracker.account(
-                            dst.len() - src.len(),
-                            MemoryCategory::SortedSets,
-                        );
-                    } else {
-                        self.memory_tracker.deallocate(
-                            src.len() - dst.len(),
-                            MemoryCategory::SortedSets,
-                        );
-                    }
+                    let content = z.read().memory_size();
+                    let old = crate::memory::estimate_keyed_object(src.len(), content);
+                    let new = crate::memory::estimate_keyed_object(dst.len(), content);
+                    self.memory_tracker
+                        .deallocate(old, MemoryCategory::SortedSets);
+                    self.memory_tracker
+                        .account(new, MemoryCategory::SortedSets);
                 }
                 self.sorted_sets.insert(dst.clone(), z);
             }
@@ -318,13 +325,12 @@ impl Cache {
                     .remove(src)
                     .ok_or_else(|| Error::InvalidArgument("no such key".into()))?;
                 if src.len() != dst.len() {
-                    if dst.len() > src.len() {
-                        self.memory_tracker
-                            .account(dst.len() - src.len(), MemoryCategory::GeoSets);
-                    } else {
-                        self.memory_tracker
-                            .deallocate(src.len() - dst.len(), MemoryCategory::GeoSets);
-                    }
+                    let content = g.read().memory_usage();
+                    let old = crate::memory::estimate_keyed_object(src.len(), content);
+                    let new = crate::memory::estimate_keyed_object(dst.len(), content);
+                    self.memory_tracker
+                        .deallocate(old, MemoryCategory::GeoSets);
+                    self.memory_tracker.account(new, MemoryCategory::GeoSets);
                 }
                 self.geo_sets.insert(dst.clone(), g);
             }
@@ -335,10 +341,11 @@ impl Cache {
                     .ok_or_else(|| Error::InvalidArgument("no such key".into()))?;
                 let content = s.read().memory_size();
                 if src.len() != dst.len() {
+                    let old = crate::memory::estimate_keyed_object(src.len(), content);
+                    let new = crate::memory::estimate_keyed_object(dst.len(), content);
                     self.memory_tracker
-                        .deallocate(src.len() + content, MemoryCategory::Streams);
-                    self.memory_tracker
-                        .account(dst.len() + content, MemoryCategory::Streams);
+                        .deallocate(old, MemoryCategory::Streams);
+                    self.memory_tracker.account(new, MemoryCategory::Streams);
                 }
                 streams.insert(dst.clone(), s);
             }

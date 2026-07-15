@@ -46,9 +46,9 @@ impl CommandHandler {
             Err(e) => return Ok(RespValue::error(e.to_resp_string())),
         };
         let mut s = set.write();
-        let before = key.len() + s.memory_size();
+        let before = crate::memory::estimate_keyed_object(key.len(), s.memory_size());
         let added = s.sadd(members) as i64;
-        let after = key.len() + s.memory_size();
+        let after = crate::memory::estimate_keyed_object(key.len(), s.memory_size());
         drop(s);
         self.cache.account_set_delta(before, after);
         Ok(RespValue::Integer(added))
@@ -77,10 +77,10 @@ impl CommandHandler {
             None => return Ok(RespValue::Integer(0)),
         };
         let mut s = set.write();
-        let before = key.len() + s.memory_size();
+        let before = crate::memory::estimate_keyed_object(key.len(), s.memory_size());
         let removed = s.srem(members) as i64;
         let empty = s.is_empty();
-        let after = key.len() + s.memory_size();
+        let after = crate::memory::estimate_keyed_object(key.len(), s.memory_size());
         drop(s);
         self.cache.account_set_delta(before, after);
         if empty {

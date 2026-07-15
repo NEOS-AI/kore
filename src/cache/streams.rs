@@ -31,7 +31,10 @@ impl Cache {
                 return Ok(existing.clone());
             }
         }
-        let base = key.len() + std::mem::size_of::<RedisStream>();
+        let base = crate::memory::estimate_keyed_object(
+            key.len(),
+            RedisStream::new().memory_size(),
+        );
         self.ensure_non_string_capacity(base)?;
         let mut streams = self.streams.write();
         Ok(streams
@@ -52,7 +55,8 @@ impl Cache {
     pub fn remove_stream(&self, key: &Bytes) -> bool {
         let mut streams = self.streams.write();
         if let Some(s) = streams.remove(key) {
-            let size = key.len() + s.read().memory_size();
+            let size =
+                crate::memory::estimate_keyed_object(key.len(), s.read().memory_size());
             self.memory_tracker
                 .deallocate(size, MemoryCategory::Streams);
             true
