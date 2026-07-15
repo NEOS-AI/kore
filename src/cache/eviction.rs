@@ -1,11 +1,13 @@
-use crate::entry::SharedEntry;
 use crate::error::{Error, Result};
 use crate::memory::MemoryCategory;
 use bytes::Bytes;
+use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::time;
 
+use super::storage::KeyType;
 use super::Cache;
 
 /// Redis-compatible maxmemory eviction policies.
@@ -83,6 +85,25 @@ impl EvictionPolicy {
             Self::VolatileLru | Self::VolatileLfu | Self::VolatileRandom | Self::VolatileTtl
         )
     }
+
+    fn allkeys(self) -> bool {
+        matches!(
+            self,
+            Self::AllKeysLru | Self::AllKeysLfu | Self::AllKeysRandom
+        )
+    }
+}
+
+/// Unified eviction candidate across string and typed keyspaces.
+#[derive(Clone)]
+struct EvictCandidate {
+    key: Bytes,
+    key_type: KeyType,
+    /// Approximate bytes freed if this key is removed.
+    size: usize,
+    last_access: Instant,
+    lfu_freq: u64,
+    expires_at: Option<Instant>,
 }
 
 impl Cache {
@@ -111,7 +132,11 @@ impl Cache {
     }
 
     /// Evict entries according to the configured maxmemory-policy until
-    /// approximately `needed` bytes are freed (string KV pool only).
+    /// approximately `needed` bytes are freed.
+    ///
+    /// Samples **all key types** (string, hash, list, set, zset, geo, stream)
+    /// under `allkeys-*` policies. Volatile policies still only consider string
+    /// keys with an expire (typed keys have no TTL support yet).
     pub(super) fn evict_memory(&self, needed: usize) -> Result<()> {
         let policy = self.eviction_policy();
         if policy == EvictionPolicy::NoEviction {
@@ -126,7 +151,6 @@ impl Cache {
             let candidates = self.sample_eviction_candidates(policy, sample_size);
             if candidates.is_empty() {
                 empty_rounds += 1;
-                // No eligible keys (e.g. volatile policy with no TTLs)
                 if empty_rounds >= 3 {
                     return Err(Error::OutOfMemory);
                 }
@@ -135,23 +159,21 @@ impl Cache {
             empty_rounds = 0;
 
             let victim = Self::pick_victim(candidates, policy);
-            if let Some((key, entry)) = victim {
+            if let Some(c) = victim {
                 tracing::debug!(
-                    "Evicting key {:?} policy={} last_access={:?} lfu={} ttl={:?}",
-                    key,
+                    "Evicting key {:?} type={:?} policy={} size={} lfu={} ttl={:?}",
+                    c.key,
+                    c.key_type,
                     policy.as_str(),
-                    entry.last_access_time(),
-                    entry.lfu_freq(),
-                    entry.expires_at
+                    c.size,
+                    c.lfu_freq,
+                    c.expires_at
                 );
 
-                let size = entry.size();
-                if self.map.remove(&key).is_some() {
-                    freed += size;
-                    self.memory_usage.fetch_sub(size, Ordering::Relaxed);
-                    self.memory_tracker.deallocate(size, MemoryCategory::Cache);
+                if let Some(bytes) = self.evict_candidate(&c) {
+                    freed += bytes;
                     self.stats.incr(&self.stats.evicted_lru);
-                    self.touch_watch_key(&key);
+                    self.touch_watch_key(&c.key);
                 }
             } else {
                 return Err(Error::OutOfMemory);
@@ -161,21 +183,87 @@ impl Cache {
         Ok(())
     }
 
+    /// Remove a sampled victim and return bytes freed (0 if race lost).
+    fn evict_candidate(&self, c: &EvictCandidate) -> Option<usize> {
+        match c.key_type {
+            KeyType::String => {
+                if let Some(entry) = self.map.remove(&c.key) {
+                    let size = entry.size();
+                    self.memory_usage.fetch_sub(size, Ordering::Relaxed);
+                    self.memory_tracker.deallocate(size, MemoryCategory::Cache);
+                    self.auto_remove_from_indices(&c.key);
+                    Some(size)
+                } else {
+                    None
+                }
+            }
+            KeyType::ZSet => {
+                if self.remove_sorted_set(&c.key) {
+                    self.auto_remove_from_indices(&c.key);
+                    Some(c.size)
+                } else {
+                    None
+                }
+            }
+            KeyType::Geo => {
+                if self.remove_geo_set(&c.key) {
+                    self.auto_remove_from_indices(&c.key);
+                    Some(c.size)
+                } else {
+                    None
+                }
+            }
+            KeyType::Hash => {
+                if self.remove_hash(&c.key) {
+                    self.auto_remove_from_indices(&c.key);
+                    Some(c.size)
+                } else {
+                    None
+                }
+            }
+            KeyType::List => {
+                if self.remove_list(&c.key) {
+                    self.auto_remove_from_indices(&c.key);
+                    Some(c.size)
+                } else {
+                    None
+                }
+            }
+            KeyType::Set => {
+                if self.remove_set(&c.key) {
+                    self.auto_remove_from_indices(&c.key);
+                    Some(c.size)
+                } else {
+                    None
+                }
+            }
+            KeyType::Stream => {
+                if self.remove_stream(&c.key) {
+                    self.auto_remove_from_indices(&c.key);
+                    Some(c.size)
+                } else {
+                    None
+                }
+            }
+            KeyType::None => None,
+        }
+    }
+
     fn sample_eviction_candidates(
         &self,
         policy: EvictionPolicy,
         sample_size: usize,
-    ) -> Vec<(Bytes, SharedEntry)> {
+    ) -> Vec<EvictCandidate> {
         let volatile_only = policy.volatile_only();
-        // Oversample when filtering to volatile keys.
         let draw = if volatile_only {
             (sample_size * 4).max(sample_size)
         } else {
             sample_size
         };
 
-        let mut out = Vec::with_capacity(sample_size);
-        // A few draws if first batch is sparse (volatile filter).
+        let mut out = Vec::with_capacity(sample_size.saturating_mul(2));
+
+        // --- String keys (LRU/LFU/TTL metadata available) ---
         for _ in 0..4 {
             for (k, e) in self.map.get_n_random(draw) {
                 if e.is_expired() {
@@ -184,48 +272,104 @@ impl Cache {
                 if volatile_only && e.expires_at.is_none() {
                     continue;
                 }
-                out.push((k, e));
-                if out.len() >= sample_size {
+                out.push(EvictCandidate {
+                    key: k,
+                    key_type: KeyType::String,
+                    size: e.size(),
+                    last_access: e.last_access_time(),
+                    lfu_freq: e.lfu_freq(),
+                    expires_at: e.expires_at,
+                });
+                if out.len() >= sample_size && volatile_only {
                     return out;
                 }
             }
-            if !volatile_only || out.len() >= sample_size {
+            if volatile_only {
+                if out.len() >= sample_size {
+                    break;
+                }
+            } else {
                 break;
             }
         }
+
+        // --- Typed keys: only under allkeys-* (no per-key TTL yet) ---
+        if policy.allkeys() {
+            let per_type = (sample_size / 3).max(1);
+
+            // Sharded maps (zset / geo)
+            for (k, z) in self.sorted_sets.get_n_random(per_type) {
+                let size = k.len() + z.read().memory_size();
+                out.push(typed_candidate(k, KeyType::ZSet, size));
+            }
+            for (k, g) in self.geo_sets.get_n_random(per_type) {
+                let size = k.len() + g.read().memory_usage();
+                out.push(typed_candidate(k, KeyType::Geo, size));
+            }
+
+            // Global maps (hash / list / set / stream)
+            sample_map_keys(&self.hashes, per_type, |k, h| {
+                let size = k.len() + h.read().memory_size();
+                out.push(typed_candidate(k, KeyType::Hash, size));
+            });
+            sample_map_keys(&self.lists, per_type, |k, l| {
+                let size = k.len() + l.read().memory_size();
+                out.push(typed_candidate(k, KeyType::List, size));
+            });
+            sample_map_keys(&self.sets, per_type, |k, s| {
+                let size = k.len() + s.read().memory_size();
+                out.push(typed_candidate(k, KeyType::Set, size));
+            });
+            sample_map_keys(&self.streams, per_type, |k, s| {
+                let size = k.len() + s.read().memory_size();
+                out.push(typed_candidate(k, KeyType::Stream, size));
+            });
+        }
+
+        // Cap sample for pick_victim work
+        if out.len() > sample_size.saturating_mul(2) {
+            use rand::seq::SliceRandom;
+            let mut rng = rand::thread_rng();
+            out.shuffle(&mut rng);
+            out.truncate(sample_size.saturating_mul(2));
+        }
+
         out
     }
 
     fn pick_victim(
-        candidates: Vec<(Bytes, SharedEntry)>,
+        candidates: Vec<EvictCandidate>,
         policy: EvictionPolicy,
-    ) -> Option<(Bytes, SharedEntry)> {
+    ) -> Option<EvictCandidate> {
         use rand::seq::SliceRandom;
         match policy {
             EvictionPolicy::NoEviction => None,
-            EvictionPolicy::AllKeysLru | EvictionPolicy::VolatileLru => candidates
-                .into_iter()
-                .min_by_key(|(_, e)| e.last_access_time()),
+            EvictionPolicy::AllKeysLru | EvictionPolicy::VolatileLru => {
+                // Oldest last_access wins. Typed keys use Instant::EPOCH (idle),
+                // so they compete as cold and free non-string memory under pressure.
+                candidates
+                    .into_iter()
+                    .min_by_key(|c| (c.last_access, std::cmp::Reverse(c.size)))
+            }
             EvictionPolicy::AllKeysLfu | EvictionPolicy::VolatileLfu => {
-                candidates.into_iter().min_by_key(|(_, e)| e.lfu_freq())
+                // Lowest frequency first; typed keys score 0 (cold).
+                candidates
+                    .into_iter()
+                    .min_by_key(|c| (c.lfu_freq, std::cmp::Reverse(c.size)))
             }
             EvictionPolicy::AllKeysRandom | EvictionPolicy::VolatileRandom => {
                 let mut rng = rand::thread_rng();
                 candidates.choose(&mut rng).cloned()
             }
-            EvictionPolicy::VolatileTtl => candidates.into_iter().min_by_key(|(_, e)| {
-                e.expires_at
+            EvictionPolicy::VolatileTtl => candidates.into_iter().min_by_key(|c| {
+                c.expires_at
                     .unwrap_or_else(|| Instant::now() + Duration::from_secs(u64::MAX / 4))
             }),
         }
     }
 
     /// Background task: Redis-style *active expire sampling* (not full-shard retain).
-    ///
-    /// Runs ~10 Hz with a short time budget so large keyspaces never stall on a
-    /// full `HashMap::retain` pass. Manual [`Self::sweep`] still does a full scan.
     pub(super) async fn background_sweep(&self) {
-        // 100ms tick ≈ Redis hz=10 active-expire cadence
         let mut interval = time::interval(Duration::from_millis(100));
 
         loop {
@@ -235,7 +379,6 @@ impl Cache {
                 continue;
             }
 
-            // Sampling cycle with 1ms budget (scaled by load via continue-ratio).
             let result = self.map.active_expire_cycle(
                 crate::hashmap::ACTIVE_EXPIRE_SAMPLES_PER_PASS,
                 crate::hashmap::ACTIVE_EXPIRE_MAX_PASSES,
@@ -268,7 +411,6 @@ impl Cache {
     }
 
     /// Manually trigger a **full** sweep of all shards (admin / SWEEP command).
-    /// Prefer [`Self::active_expire`] for incremental cleanup.
     pub fn sweep(&self) -> usize {
         let result = self.map.sweep_expired();
         if result.count > 0 {
@@ -317,6 +459,54 @@ impl Cache {
             }
         } else {
             self.set_eviction_policy(EvictionPolicy::NoEviction);
+        }
+    }
+}
+
+/// Approximate "never accessed" for typed keys without LRU metadata.
+fn cold_instant() -> Instant {
+    Instant::now()
+        .checked_sub(Duration::from_secs(86400 * 365 * 10))
+        .unwrap_or_else(Instant::now)
+}
+
+fn typed_candidate(key: Bytes, key_type: KeyType, size: usize) -> EvictCandidate {
+    // No access / expire metadata for typed keys yet: treat as cold (idle forever).
+    EvictCandidate {
+        key,
+        key_type,
+        size,
+        last_access: cold_instant(),
+        lfu_freq: 0,
+        expires_at: None,
+    }
+}
+
+fn sample_map_keys<V, F>(map: &RwLock<HashMap<Bytes, V>>, n: usize, mut push: F)
+where
+    V: Clone,
+    F: FnMut(Bytes, V),
+{
+    use rand::Rng;
+    use std::collections::HashSet;
+
+    let guard = map.read();
+    let len = guard.len();
+    if len == 0 || n == 0 {
+        return;
+    }
+    let mut rng = rand::thread_rng();
+    let mut seen = HashSet::new();
+    let attempts = n.saturating_mul(5).max(n);
+    for _ in 0..attempts {
+        if seen.len() >= n {
+            break;
+        }
+        let idx = rng.gen_range(0..len);
+        if let Some((k, v)) = guard.iter().nth(idx) {
+            if seen.insert(k.clone()) {
+                push(k.clone(), v.clone());
+            }
         }
     }
 }

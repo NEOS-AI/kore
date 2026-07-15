@@ -282,3 +282,225 @@ fn policy_parse_roundtrip() {
     }
     assert!(EvictionPolicy::parse("nope").is_err());
 }
+
+fn rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+fn handle(h: &mut CommandHandler, parts: &[&str]) -> RespValue {
+    let arr = parts
+        .iter()
+        .map(|p| RespValue::BulkString(Some(Bytes::from(p.to_string()))))
+        .collect();
+    rt().block_on(h.handle(RespValue::Array(arr))).unwrap()
+}
+
+#[test]
+fn allkeys_lru_evicts_hashes_when_no_string_keys() {
+    // Tiny maxmemory so HSET growth must free prior hash keys.
+    let cache = Cache::new_with_sweep(4, 6 * 1024, 1024 * 1024, false);
+    cache.set_eviction_policy(EvictionPolicy::AllKeysLru);
+    cache.set_eviction_sample_size(12).unwrap();
+
+    let config = Arc::new(Config {
+        host: "127.0.0.1".to_string(),
+        port: 6379,
+        threads: 1,
+        shards: 4,
+        maxmemory: 6 * 1024,
+        evict: true,
+        autosweep: false,
+        loadfactor: 0.75,
+        maxconns: 10,
+        auth: String::new(),
+        maxentrysize: 500 * 1024 * 1024,
+        verbosity: 0,
+        enable_redlock: false,
+        redlock_instances: String::new(),
+        redlock_retry_count: 3,
+        redlock_retry_delay_ms: 200,
+        enable_fair_queue: false,
+        fair_queue_max_size: 1024,
+        fair_queue_cleanup_ms: 500,
+        dir: "./data".to_string(),
+        dbfilename: "dump.rdb".to_string(),
+        appendonly: false,
+        appendfilename: "appendonly.aof".to_string(),
+        replicaof: String::new(),
+        save: "".to_string(),
+        maxmemory_policy: "allkeys-lru".to_string(),
+        databases: 16,
+        metrics_port: 0,
+        tls: false,
+        tls_cert: String::new(),
+        tls_key: String::new(),
+        aclfile: String::new(),
+        cluster_enabled: false,
+        unixsocket: String::new(),
+    });
+    let mut h = CommandHandler::new(cache.clone(), config);
+
+    let payload = "x".repeat(200);
+    let mut ok = 0usize;
+    for i in 0..60 {
+        let key = format!("hk{}", i);
+        let r = handle(&mut h, &["HSET", &key, "f", &payload]);
+        match r {
+            RespValue::Integer(_) => ok += 1,
+            RespValue::Error(_) => break,
+            other => panic!("unexpected {:?}", other),
+        }
+    }
+    assert!(ok >= 5, "should HSET several hashes, got {}", ok);
+
+    let before = cache
+        .stats
+        .evicted_lru
+        .load(std::sync::atomic::Ordering::Relaxed);
+    // More HSETs under pressure
+    for i in 60..120 {
+        let key = format!("hk{}", i);
+        let _ = handle(&mut h, &["HSET", &key, "f", &payload]);
+    }
+    let after = cache
+        .stats
+        .evicted_lru
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        after > before,
+        "expected typed (hash) eviction; before={} after={} hashes~dbsize={} tracked={}",
+        before,
+        after,
+        cache.dbsize(),
+        cache.tracked_memory()
+    );
+}
+
+#[test]
+fn allkeys_random_evicts_zsets_under_pressure() {
+    let cache = Cache::new_with_sweep(4, 5 * 1024, 1024 * 1024, false);
+    cache.set_eviction_policy(EvictionPolicy::AllKeysRandom);
+    cache.set_eviction_sample_size(10).unwrap();
+
+    let config = Arc::new(Config {
+        host: "127.0.0.1".to_string(),
+        port: 6379,
+        threads: 1,
+        shards: 4,
+        maxmemory: 5 * 1024,
+        evict: true,
+        autosweep: false,
+        loadfactor: 0.75,
+        maxconns: 10,
+        auth: String::new(),
+        maxentrysize: 500 * 1024 * 1024,
+        verbosity: 0,
+        enable_redlock: false,
+        redlock_instances: String::new(),
+        redlock_retry_count: 3,
+        redlock_retry_delay_ms: 200,
+        enable_fair_queue: false,
+        fair_queue_max_size: 1024,
+        fair_queue_cleanup_ms: 500,
+        dir: "./data".to_string(),
+        dbfilename: "dump.rdb".to_string(),
+        appendonly: false,
+        appendfilename: "appendonly.aof".to_string(),
+        replicaof: String::new(),
+        save: "".to_string(),
+        maxmemory_policy: "allkeys-random".to_string(),
+        databases: 16,
+        metrics_port: 0,
+        tls: false,
+        tls_cert: String::new(),
+        tls_key: String::new(),
+        aclfile: String::new(),
+        cluster_enabled: false,
+        unixsocket: String::new(),
+    });
+    let mut h = CommandHandler::new(cache.clone(), config);
+
+    let mut ok = 0usize;
+    for i in 0..40 {
+        let key = format!("zk{}", i);
+        // ZADD key 1.0 member — member payload padded
+        let member = format!("m{}", "y".repeat(80));
+        let r = handle(&mut h, &["ZADD", &key, "1.0", &member]);
+        if matches!(r, RespValue::Integer(_)) {
+            ok += 1;
+        } else {
+            break;
+        }
+    }
+    assert!(ok >= 3, "should ZADD several sets, got {}", ok);
+
+    let before = cache
+        .stats
+        .evicted_lru
+        .load(std::sync::atomic::Ordering::Relaxed);
+    for i in 40..100 {
+        let key = format!("zk{}", i);
+        let member = format!("m{}", "y".repeat(80));
+        let _ = handle(&mut h, &["ZADD", &key, "1.0", &member]);
+    }
+    let after = cache
+        .stats
+        .evicted_lru
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        after > before,
+        "expected zset eviction under allkeys-random; before={} after={}",
+        before,
+        after
+    );
+}
+
+#[test]
+fn allkeys_can_evict_string_or_typed_mixed() {
+    // Constructor sets maxmemory directly (no 1MB floor — that applies only to live CONFIG SET).
+    let cache = Cache::new_with_sweep(4, 8 * 1024, 1024 * 1024, false);
+    cache.set_eviction_policy(EvictionPolicy::AllKeysLru);
+    cache.set_eviction_sample_size(16).unwrap();
+
+    // Seed strings
+    for i in 0..15 {
+        store(&cache, &format!("s{}", i), &"s".repeat(100), None);
+    }
+    // Seed hashes via CommandHandler (HSET path uses typed memory accounting)
+    let config = Arc::new({
+        let mut c = Config::default();
+        c.shards = 4;
+        c.maxmemory = 8 * 1024;
+        c.evict = true;
+        c.autosweep = false;
+        c.maxmemory_policy = "allkeys-lru".to_string();
+        c
+    });
+    let mut h = CommandHandler::new(cache.clone(), config);
+    for i in 0..15 {
+        let key = format!("mh{}", i);
+        let _ = handle(&mut h, &["HSET", &key, "f", &"h".repeat(120)]);
+    }
+
+    let before = cache
+        .stats
+        .evicted_lru
+        .load(std::sync::atomic::Ordering::Relaxed);
+    for i in 0..40 {
+        store(&cache, &format!("n{}", i), &"n".repeat(150), None);
+    }
+    let after = cache
+        .stats
+        .evicted_lru
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        after > before,
+        "mixed string+hash workload should evict; before={} after={} dbsize={}",
+        before,
+        after,
+        cache.dbsize()
+    );
+}

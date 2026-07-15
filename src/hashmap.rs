@@ -630,6 +630,46 @@ impl<V: Clone> ShardedKeyMap<V> {
             }
         }
     }
+
+    /// Random entry from a random non-empty shard (for eviction sampling).
+    pub fn get_random(&self) -> Option<(Bytes, V)> {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        for _ in 0..10 {
+            let idx = rng.gen_range(0..self.num_shards);
+            let map = self.shards[idx].read();
+            let len = map.len();
+            if len == 0 {
+                continue;
+            }
+            let i = rng.gen_range(0..len);
+            if let Some((k, v)) = map.iter().nth(i) {
+                return Some((k.clone(), v.clone()));
+            }
+        }
+        None
+    }
+
+    /// Up to `n` unique random entries (approximated sampling for eviction).
+    pub fn get_n_random(&self, n: usize) -> Vec<(Bytes, V)> {
+        use std::collections::HashSet;
+        let mut result = Vec::with_capacity(n);
+        let mut seen: HashSet<Bytes> = HashSet::with_capacity(n);
+        let max_attempts = n.saturating_mul(5).max(n);
+        for _ in 0..max_attempts {
+            if result.len() >= n {
+                break;
+            }
+            if let Some((key, val)) = self.get_random() {
+                if seen.insert(key.clone()) {
+                    result.push((key, val));
+                }
+            } else {
+                break;
+            }
+        }
+        result
+    }
 }
 
 /// Simple glob-style pattern matching (supports * and ?)

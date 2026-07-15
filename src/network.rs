@@ -20,7 +20,7 @@ use tokio::net::UnixListener;
 use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub struct Server {
     databases: Arc<Databases>,
@@ -376,7 +376,7 @@ impl Server {
             }
         };
 
-        info!("New connection from {}", peer_label);
+        debug!("New connection from {}", peer_label);
 
         let databases = self.databases.clone();
         let config = self.config.clone();
@@ -416,9 +416,11 @@ impl Server {
                 .await
             };
             if let Err(e) = result {
-                warn!("Connection error from {}: {}", peer_label, e);
+                // Disconnects and short-lived clients are normal; avoid WARN noise.
+                debug!("Connection closed from {} with error: {}", peer_label, e);
+            } else {
+                debug!("Connection closed from {}", peer_label);
             }
-            info!("Connection closed from {}", peer_label);
         });
     }
 }

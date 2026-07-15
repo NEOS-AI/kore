@@ -88,14 +88,16 @@ Example: fix EXAT (`A` / `P0`) before RESP3 (`D` / `P1`) or HNSW benchmarks (`E`
 - [x] **`[P1]`** Implement `TYPE`
 - [x] **`[P1]`** Wire `CONFIG SET` through to live cache atomics (e.g. changing `maxmemory` should re-evict)
   - *Done*: `max_memory` is `AtomicUsize`; `CONFIG GET/SET maxmemory` + `maxentrysize`; best-effort re-evict on lower limit
-- [ ] **`[P2]`** Reduce connection-lifecycle log noise at default verbosity
+- [x] **`[P2]`** Reduce connection-lifecycle log noise at default verbosity
+  - *Done*: connection open/close (and close-with-error) demoted from `info!` → `debug!` so default verbosity stays quiet
 
 ### Networking / async
 
 - [x] **`[P1]`** Remove `block_in_place` + nested `block_on` from pub/sub command path; keep handlers fully async
 - [x] **`[P1]`** Align lock types (`parking_lot` vs `std::sync` vs `tokio::sync`) with sync vs async call sites
   - *Done*: sync keyspace / type maps / search indices use `parking_lot::RwLock` (no poison unwraps); `tokio::sync` kept for async pub/sub, network, replication channels; `parking_lot::Mutex` for short sync critical sections
-- [ ] **`[P2]`** Audit unused deps (`dashmap`, `crossbeam`): use deliberately or remove from `Cargo.toml`
+- [x] **`[P2]`** Audit unused deps (`dashmap`, `crossbeam`): use deliberately or remove from `Cargo.toml`
+  - *Done*: removed unused `dashmap` and `crossbeam` from `Cargo.toml` / lockfile
 
 ### Testing for Phase A
 
@@ -252,7 +254,7 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P1]`** Document and test `FT.SEARCH` end-to-end over RESP (not only programmatic indexing)
   - *Done*: `tests/search_resp_test.rs` — FT.CREATE / HSET auto-index / FT.SEARCH / FT.DROPINDEX via `CommandHandler`; DEL/UNLINK remove from indices
 - [x] **`[P1]`** Memory limits and eviction interaction for indexes
-  - *Done (MVP)*: `MemoryCategory::Search`; `index_document` / `auto_index_key` allocate approx size; remove/drop deallocate; counts toward maxmemory (rejects growth under limit). Eviction still samples string KV only — search memory not yet a victim source
+  - *Done (MVP)*: `MemoryCategory::Search`; `index_document` / `auto_index_key` allocate approx size; remove/drop deallocate; counts toward maxmemory (rejects growth under limit). Typed KV (hash/list/set/zset/geo/stream) are eviction victims; search index memory still not a victim source
 - [ ] **`[P2]`** HNSW correctness/performance benchmarks vs FLAT
 
 ### Pub/Sub
@@ -297,7 +299,8 @@ Highest urgency checklist (phase order preserved):
 - [x] Enforce `maxconns`
 - [x] Honor `--threads`
 - [x] Unified keyspace + type safety + cross-type ops + maxmemory for all types
-  - *Follow-ups*: true single-map keyspace, cross-type eviction (search/hash/… victims), auth network test
+  - *Done (Batch X)*: cross-type eviction samples string/hash/list/set/zset/geo/stream victims (volatile still TTL-on-string); search indices still not eviction victims
+  - *Follow-ups*: true single-map keyspace, search-as-eviction-victim, auth network test
 - [x] Phase A concurrency / memory / EXAT / network tests (incl. AUTH)
 
 **B**

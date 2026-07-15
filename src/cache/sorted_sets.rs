@@ -33,7 +33,7 @@ impl Cache {
             return Ok(());
         }
         if self.eviction_allowed() {
-            // Evict string KV to free room in the shared max_memory budget.
+            // Evict keys (any type) to free room in the shared max_memory budget.
             if self.evict_memory(needed).is_ok()
                 && self
                     .memory_tracker
