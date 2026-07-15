@@ -203,7 +203,9 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P1]`** Gossip / membership and failover
   - *Done (thin MVP)*: `CLUSTER MEET` over client RESP (MYID + `MEETPEER` handshake); periodic PING heartbeat; **single-observer** fail (not Redis quorum) → `fail` flag in `CLUSTER NODES`; on master fail, replica (`CLUSTER REPLICATE`) runs `promote_to_master` + claims slots. Gaps: no binary cluster bus, no multi-node quorum PFAIL/FAIL, no epoch election, no replica election among peers, no automatic reconfig of other nodes' views.
 - [x] **`[P1]`** Resharding / slot migration (thin MVP)
-  - *Done*: `keys_in_slot` / `string_keys_in_slot`; `CLUSTER MIGRATEKEYS <slot> <ip> <port>` moves string keys via RESP (ASKING+SET[PX]+DEL); non-string keys skipped; SETSLOT MIGRATING/IMPORTING/NODE/STABLE operator flow; MIGRATING miss → ASK; final NODE → MOVED. Gaps: no multi-type migrate, no atomic dual-end NODE, no Redis `MIGRATE`/`CLUSTER SETSLOT` batch orchestration, no slot-stable epoch gossip of ownership.
+  - *Done*: `keys_in_slot` / `string_keys_in_slot`; `CLUSTER MIGRATEKEYS <slot> <ip> <port>` moves **all key types** via RESP (ASKING + type-specific recreate + DEL: SET/HSET/RPUSH/SADD/ZADD/GEOADD/XADD+groups); SETSLOT MIGRATING/IMPORTING/NODE/STABLE operator flow; MIGRATING miss → ASK; final NODE → MOVED.
+  - *Done (Batch Y)*: multi-type MIGRATEKEYS (string/hash/list/set/zset/geo/stream)
+  - *Gaps*: no atomic dual-end NODE, no Redis `MIGRATE`/`CLUSTER SETSLOT` batch orchestration, no slot-stable epoch gossip of ownership.
 
 ### Protocol & clients
 
@@ -240,7 +242,7 @@ Also tracked in `docs/roadmap.md`.
 ### Redlock & locking
 
 - [x] **`[P1]`** Ensure Redlock CLI flags actually wire into the running server path
-  - *Done (MVP)*: `Redlock::from_config` + `Server::with_redlock`; INFO fields; N in-process `Cache` backends from address count. Remote RESP backends deferred.
+  - *Done (MVP + Batch Y)*: `Redlock::from_config` + `Server::with_redlock`; INFO fields; `LockBackend` trait with **remote RESP** backends (`SET NX PX` / GET+DEL / PEXPIRE) for `--redlock-instances`; injectable local `Cache` backends for tests.
 - [x] **`[P1]`** Fair lock queueing: production hardening, metrics, docs
   - *Done*: atomic `try_acquire` under write lock; `dequeue_client` front-safe pop; retry cleanup uses `max_attempts`; Drop stops cleanup thread; CLI `--enable-fair-queue` / max-size / cleanup-ms; INFO `# FairQueue` section; docs
 - [ ] **`[P2]`** Deadlock detection advanced (from roadmap)

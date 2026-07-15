@@ -475,3 +475,149 @@ async fn after_node_assignment_moved_to_dest() {
     let _ = ha.await;
     let _ = hb.await;
 }
+
+/// Multi-type MIGRATEKEYS: hash + list + set + zset + string on one hash-tagged slot.
+#[tokio::test(flavor = "multi_thread")]
+async fn migrate_multi_type_keys_one_slot_e2e() {
+    let port_a = 16730u16; // source
+    let port_b = 16731u16; // dest
+
+    let cs_a = ClusterState::single_node("127.0.0.1", port_a);
+    let cs_b = ClusterState::single_node("127.0.0.1", port_b);
+    let id_a = cs_a.my_id();
+    let id_b = cs_b.my_id();
+
+    let cache_a = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let cache_b = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+
+    let srv_a =
+        Server::new(cache_a, make_config(port_a, true)).with_cluster(Some(Arc::clone(&cs_a)));
+    let srv_b =
+        Server::new(cache_b, make_config(port_b, true)).with_cluster(Some(Arc::clone(&cs_b)));
+
+    let (shut_a_tx, shut_a_rx) = watch::channel(false);
+    let (shut_b_tx, shut_b_rx) = watch::channel(false);
+    let ha = tokio::spawn(async move {
+        let _ = srv_a.run_with_shutdown(shut_a_rx).await;
+    });
+    let hb = tokio::spawn(async move {
+        let _ = srv_b.run_with_shutdown(shut_b_rx).await;
+    });
+
+    wait_listen(port_a).await;
+    wait_listen(port_b).await;
+
+    let mut sa = TcpStream::connect(("127.0.0.1", port_a)).await.unwrap();
+    let mut sb = TcpStream::connect(("127.0.0.1", port_b)).await.unwrap();
+
+    assert!(is_ok(
+        &send_cmd(&mut sa, &["CLUSTER", "MEET", "127.0.0.1", &port_b.to_string()]).await
+    ));
+    assert!(is_ok(
+        &send_cmd(&mut sb, &["CLUSTER", "MEET", "127.0.0.1", &port_a.to_string()]).await
+    ));
+
+    // All keys share the same hash tag → same slot
+    let k_str = "{mt}.s";
+    let k_hash = "{mt}.h";
+    let k_list = "{mt}.l";
+    let k_set = "{mt}.t";
+    let k_zset = "{mt}.z";
+    let slot = key_hash_slot(k_str.as_bytes());
+    assert_eq!(slot, key_hash_slot(k_hash.as_bytes()));
+    assert_eq!(slot, key_hash_slot(k_list.as_bytes()));
+    assert_eq!(slot, key_hash_slot(k_set.as_bytes()));
+    assert_eq!(slot, key_hash_slot(k_zset.as_bytes()));
+
+    cs_b.reassign_slot(slot, &id_a).unwrap();
+
+    assert!(is_ok(&send_cmd(&mut sa, &["SET", k_str, "sv"]).await));
+    assert!(matches!(
+        send_cmd(&mut sa, &["HSET", k_hash, "f1", "v1", "f2", "v2"]).await,
+        RespValue::Integer(2)
+    ));
+    assert!(matches!(
+        send_cmd(&mut sa, &["RPUSH", k_list, "a", "b", "c"]).await,
+        RespValue::Integer(3)
+    ));
+    assert!(matches!(
+        send_cmd(&mut sa, &["SADD", k_set, "m1", "m2"]).await,
+        RespValue::Integer(2)
+    ));
+    assert!(matches!(
+        send_cmd(&mut sa, &["ZADD", k_zset, "1.5", "zm"]).await,
+        RespValue::Integer(1)
+    ));
+
+    assert!(is_ok(
+        &send_cmd(
+            &mut sb,
+            &["CLUSTER", "SETSLOT", &slot.to_string(), "IMPORTING", &id_a]
+        )
+        .await
+    ));
+    assert!(is_ok(
+        &send_cmd(
+            &mut sa,
+            &["CLUSTER", "SETSLOT", &slot.to_string(), "MIGRATING", &id_b]
+        )
+        .await
+    ));
+
+    let resp = send_cmd(
+        &mut sa,
+        &[
+            "CLUSTER",
+            "MIGRATEKEYS",
+            &slot.to_string(),
+            "127.0.0.1",
+            &port_b.to_string(),
+        ],
+    )
+    .await;
+    match resp {
+        RespValue::Integer(n) => assert_eq!(n, 5, "expected 5 keys migrated, got {}", n),
+        other => panic!("MIGRATEKEYS failed: {:?}", other),
+    }
+
+    // Source miss → ASK
+    let err = as_err(&send_cmd(&mut sa, &["GET", k_str]).await);
+    assert!(
+        err.starts_with(&format!("ASK {} 127.0.0.1:{}", slot, port_b)),
+        "got {}",
+        err
+    );
+
+    // Dest has all types via ASKING
+    assert!(is_ok(&send_cmd(&mut sb, &["ASKING"]).await));
+    assert_eq!(as_bulk(&send_cmd(&mut sb, &["GET", k_str]).await), "sv");
+
+    assert!(is_ok(&send_cmd(&mut sb, &["ASKING"]).await));
+    assert_eq!(as_bulk(&send_cmd(&mut sb, &["HGET", k_hash, "f1"]).await), "v1");
+
+    assert!(is_ok(&send_cmd(&mut sb, &["ASKING"]).await));
+    match send_cmd(&mut sb, &["LRANGE", k_list, "0", "-1"]).await {
+        RespValue::Array(a) => assert_eq!(a.len(), 3),
+        other => panic!("LRANGE {:?}", other),
+    }
+
+    assert!(is_ok(&send_cmd(&mut sb, &["ASKING"]).await));
+    match send_cmd(&mut sb, &["SMEMBERS", k_set]).await {
+        RespValue::Array(a) => assert_eq!(a.len(), 2),
+        other => panic!("SMEMBERS {:?}", other),
+    }
+
+    assert!(is_ok(&send_cmd(&mut sb, &["ASKING"]).await));
+    match send_cmd(&mut sb, &["ZSCORE", k_zset, "zm"]).await {
+        RespValue::BulkString(Some(b)) => {
+            let s = String::from_utf8_lossy(&b);
+            assert!(s.starts_with("1.5") || s == "1.5", "score {}", s);
+        }
+        other => panic!("ZSCORE {:?}", other),
+    }
+
+    let _ = shut_a_tx.send(true);
+    let _ = shut_b_tx.send(true);
+    let _ = ha.await;
+    let _ = hb.await;
+}

@@ -1,8 +1,8 @@
-//! Redlock CLI flag → Server wiring (MVP).
+//! Redlock CLI flag → Server wiring.
 //!
 //! Verifies `Redlock::from_config` and that the server path can hold a
-//! constructed Redlock. Remote RESP backends are deferred; tests inject
-//! in-process `Cache` instances.
+//! constructed Redlock. Production path uses remote RESP backends; tests
+//! inject in-process `Cache` instances where locks must succeed offline.
 
 use kore::commands::CommandHandler;
 use kore::config::Config;
@@ -82,12 +82,15 @@ fn test_redlock_from_config_applies_retry_params() {
 }
 
 #[test]
-fn test_redlock_from_config_builds_local_backends_when_none_injected() {
+fn test_redlock_from_config_builds_remote_backends_when_none_injected() {
     let config = enabled_config(3, 200);
     let redlock = Redlock::from_config(&config, None)
         .unwrap()
-        .expect("should build local backends from instance count");
+        .expect("should build remote RESP backends from addresses");
     assert_eq!(redlock.instance_count(), 3);
+    // Addresses are not listening → acquire soft-fails (no panic)
+    let r = redlock.lock("offline", Bytes::from("v"), 100);
+    assert!(r.is_err());
 }
 
 #[test]

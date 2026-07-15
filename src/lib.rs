@@ -32,8 +32,8 @@ pub use acl::{AclStore, AclUser};
 pub use cache::{Cache, EvictionPolicy};
 pub use cluster::{
     crc16, force_mark_fail, gossip_tick, key_hash_slot, keys_in_slot, meet_peer,
-    migrate_slot_string_keys, run_cluster_gossip, string_keys_in_slot, ClusterState,
-    MigrateSlotResult, DEFAULT_NODE_TIMEOUT_MS, SLOT_COUNT,
+    migrate_slot_keys, migrate_slot_string_keys, run_cluster_gossip, string_keys_in_slot,
+    ClusterState, MigrateSlotResult, DEFAULT_NODE_TIMEOUT_MS, SLOT_COUNT,
 };
 pub use hashmap::{
     ActiveExpireResult, SweepResult, ACTIVE_EXPIRE_CONTINUE_RATIO, ACTIVE_EXPIRE_MAX_PASSES,
@@ -57,7 +57,7 @@ pub use stream_type::{
     StreamStateSnapshot,
 };
 pub use geospatial::{GeoSet, GeoPoint, DistanceUnit};
-pub use redlock::{Redlock, Lock};
+pub use redlock::{LocalCacheBackend, Lock, LockBackend, Redlock, RespBackend};
 pub use deadlock::{DeadlockDetector, DeadlockStatus, LockInfo};
 pub use fair_queue::{FairQueue, QueuedClient, FairQueueStats};
 pub use pubsub::{

@@ -148,15 +148,19 @@ redlock_retry_delay_ms:200
 - `--redlock-retry-count`: Number of retry attempts (default: 3)
 - `--redlock-retry-delay-ms`: Delay between retries (default: 200ms)
 
-### MVP backend wiring
+### Backend wiring
 
-**Remote RESP backends are deferred.** For this release, Kore creates **N
-in-process `Cache` backends** matching the number of listed addresses so the
-Redlock algorithm is fully wired end-to-end (quorum, retry, TTL). Addresses are
-used for count/validation and logging only—they do not open network connections
-to remote Redis/Kore processes yet.
+With `--enable-redlock`, Kore opens **remote RESP backends** to each address in
+`--redlock-instances` (Kore or Redis). Lock ops use:
 
-Programmatic / test usage can inject backends:
+- acquire: `SET lock:<resource> <token> NX PX <ttl>`
+- release: `GET` + `DEL` if token matches
+- extend: `GET` + `PEXPIRE` if token matches
+
+Unreachable instances fail soft (count as not-acquired). Fair queue and deadlock
+detection remain **in-process** on the coordinating Redlock.
+
+Programmatic / test usage can inject **local** `Cache` backends:
 
 ```rust
 use kore::{Config, Redlock, Cache};
@@ -164,16 +168,17 @@ use std::sync::Arc;
 
 let mut config = Config::default();
 config.enable_redlock = true;
-config.redlock_instances = "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3".into();
+config.redlock_instances = "127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003".into();
 config.redlock_retry_count = 5;
 
+// Inject local caches for unit tests (skip network):
 let backends = vec![
     Cache::new_with_sweep(16, 16 << 20, 1 << 20, false),
     Cache::new_with_sweep(16, 16 << 20, 1 << 20, false),
     Cache::new_with_sweep(16, 16 << 20, 1 << 20, false),
 ];
 let redlock = Redlock::from_config(&config, Some(backends))?.unwrap();
-// Or None → auto-create N local caches from address count
+// Or None → remote RESP backends for the listed addresses
 ```
 
 ## Architecture

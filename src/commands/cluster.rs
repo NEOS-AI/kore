@@ -2,7 +2,7 @@
 
 use super::CommandHandler;
 use crate::cluster::{
-    key_hash_slot, meet_peer, migrate_slot_string_keys, ClusterState, SLOT_COUNT,
+    key_hash_slot, meet_peer, migrate_slot_keys, ClusterState, SLOT_COUNT,
 };
 use crate::error::Result;
 use crate::protocol::RespValue;
@@ -111,8 +111,9 @@ impl CommandHandler {
 
     /// CLUSTER MIGRATEKEYS <slot> <dest-ip> <dest-port>
     ///
-    /// Move string keys in `slot` from this node to dest over RESP (ASKING+SET+DEL).
-    /// Does not change slot ownership — operator issues SETSLOT NODE afterward.
+    /// Move keys of all types in `slot` from this node to dest over RESP
+    /// (ASKING + type-specific recreate + DEL). Does not change slot ownership —
+    /// operator issues SETSLOT NODE afterward.
     async fn handle_cluster_migratekeys(
         &self,
         cluster: &ClusterState,
@@ -147,12 +148,10 @@ impl CommandHandler {
             ));
         }
 
-        match migrate_slot_string_keys(&self.cache, slot, &dest_ip, dest_port).await {
+        match migrate_slot_keys(&self.cache, slot, &dest_ip, dest_port).await {
             Ok(r) => {
-                // Integer reply = number of string keys migrated (Redis-style count).
-                // Non-string keys are skipped silently in the count; operators can
-                // inspect via KEYS / TYPE if needed.
-                let _ = r.skipped_non_string;
+                // Integer reply = number of keys migrated (all types).
+                let _ = r.skipped;
                 Ok(RespValue::Integer(r.migrated as i64))
             }
             Err(e) => Ok(RespValue::error(e)),

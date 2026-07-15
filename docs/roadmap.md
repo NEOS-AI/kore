@@ -8,7 +8,7 @@
 
 - [x] Cluster (kore cluster) — MVP: hash slots + MOVED/CROSSSLOT/ASK + CLUSTER/ASKING stubs (single-node)
 - [x] Cluster gossip / membership + thin failover (RESP MEET/PING, single-observer fail, replica claim slots)
-- [x] Cluster thin slot reshard (`CLUSTER MIGRATEKEYS` string keys + SETSLOT operator flow)
+- [x] Cluster thin slot reshard (`CLUSTER MIGRATEKEYS` multi-type keys + SETSLOT operator flow)
 - [ ] Cluster automatic reshard / full multi-type MIGRATE orchestration
 - [ ] 데드락 감지 고급 기능
     - [ ] 크로스 프로세스 감지
