@@ -59,7 +59,9 @@ async fn test_network_basic_commands() {
         tls: false,
         tls_cert: String::new(),
         tls_key: String::new(),
+        aclfile: String::new(),
         cluster_enabled: false,
+unixsocket: String::new(),
 });
 
     let cache = Cache::new(config.shards, config.maxmemory);
@@ -139,7 +141,9 @@ async fn test_network_concurrent_clients() {
         tls: false,
         tls_cert: String::new(),
         tls_key: String::new(),
+        aclfile: String::new(),
         cluster_enabled: false,
+unixsocket: String::new(),
 });
 
     let cache = Cache::new(config.shards, config.maxmemory);
@@ -249,7 +253,9 @@ async fn test_network_info_command() {
         tls: false,
         tls_cert: String::new(),
         tls_key: String::new(),
+        aclfile: String::new(),
         cluster_enabled: false,
+unixsocket: String::new(),
 });
 
     let cache = Cache::new(config.shards, config.maxmemory);
@@ -322,7 +328,9 @@ async fn test_network_maxconns() {
         tls: false,
         tls_cert: String::new(),
         tls_key: String::new(),
+        aclfile: String::new(),
         cluster_enabled: false,
+unixsocket: String::new(),
 });
 
     let cache = Cache::new(config.shards, config.maxmemory);
@@ -444,7 +452,9 @@ async fn test_network_auth() {
         tls: false,
         tls_cert: String::new(),
         tls_key: String::new(),
+        aclfile: String::new(),
         cluster_enabled: false,
+unixsocket: String::new(),
 });
 
     let cache = Cache::new(config.shards, config.maxmemory);

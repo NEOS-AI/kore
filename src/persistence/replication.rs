@@ -180,6 +180,8 @@ pub struct ReplicationManager {
     min_replicas_to_write: AtomicUsize,
     /// Max lag in seconds for a replica to count as good (Redis default 10).
     min_replicas_max_lag_secs: AtomicUsize,
+    /// Bumped when primary address changes so `sync_from_primary` reconnects.
+    primary_link_epoch: AtomicU64,
 }
 
 impl ReplicationManager {
@@ -203,7 +205,17 @@ impl ReplicationManager {
             failover_in_progress: AtomicBool::new(false),
             min_replicas_to_write: AtomicUsize::new(0),
             min_replicas_max_lag_secs: AtomicUsize::new(10),
+            primary_link_epoch: AtomicU64::new(0),
         })
+    }
+
+    pub fn primary_link_epoch(&self) -> u64 {
+        self.primary_link_epoch.load(Ordering::Relaxed)
+    }
+
+    fn bump_primary_link_epoch(&self) {
+        self.primary_link_epoch.fetch_add(1, Ordering::Relaxed);
+        self.master_link_up.store(false, Ordering::Relaxed);
     }
 
     pub fn is_replica(&self) -> bool {
@@ -623,7 +635,8 @@ impl ReplicationManager {
     /// 3. Unless `force`: wait until target ack ≥ frozen master offset
     ///    (live-link tracked ACK and/or `REPLCONF GETACK` on client port)
     /// 4. TCP connect to target and send bare `FAILOVER`
-    /// 5. On success, demote self via `set_replicaof(Some(host:port))`
+    /// 5. On success, best-effort redirect other replicas to the new master
+    /// 6. Demote self via `set_replicaof(Some(host:port))`
     ///
     /// `force` skips the catch-up wait (may promote a lagging replica).
     pub async fn coordinated_failover_to(
@@ -682,6 +695,8 @@ impl ReplicationManager {
 
         match result {
             Ok(()) => {
+                // Point sibling replicas at the new master (best-effort).
+                self.redirect_replicas_to_master(host, port).await;
                 // Demote self to replica of the newly promoted master.
                 self.set_replicaof(Some(format!("{}:{}", host, port)));
                 self.failover_in_progress.store(false, Ordering::Relaxed);
@@ -691,6 +706,132 @@ impl ReplicationManager {
                 self.failover_in_progress.store(false, Ordering::Relaxed);
                 Err(e)
             }
+        }
+    }
+
+    /// Encode `REPLICAOF host port` and try-send on all feeds except the promote target.
+    pub fn send_replicaof_to_feeds(
+        &self,
+        new_host: &str,
+        new_port: u16,
+        exclude_host: &str,
+        exclude_port: u16,
+    ) {
+        let cmd = RespValue::Array(vec![
+            RespValue::BulkString(Some(Bytes::from_static(b"REPLICAOF"))),
+            RespValue::BulkString(Some(Bytes::from(new_host.to_string()))),
+            RespValue::BulkString(Some(Bytes::from(new_port.to_string()))),
+        ])
+        .serialize();
+        let reps = self.replicas.lock();
+        for r in reps.iter() {
+            if replica_matches(r, exclude_host, exclude_port) {
+                continue;
+            }
+            let _ = r.tx.try_send(cmd.clone());
+        }
+    }
+
+    /// Best-effort: push REPLICAOF on feeds + client-port TCP to announced replicas.
+    pub async fn redirect_replicas_to_master(&self, new_host: &str, new_port: u16) {
+        self.send_replicaof_to_feeds(new_host, new_port, new_host, new_port);
+
+        // Snapshot announced identities for TCP fallback.
+        let targets: Vec<(String, u16)> = {
+            let reps = self.replicas.lock();
+            reps.iter()
+                .filter_map(|r| {
+                    if replica_matches(r, new_host, new_port) {
+                        return None;
+                    }
+                    let port = r.port?;
+                    let host = r
+                        .host
+                        .clone()
+                        .filter(|h| h != "?")
+                        .unwrap_or_else(|| "127.0.0.1".into());
+                    Some((host, port))
+                })
+                .collect()
+        };
+
+        for (h, p) in targets {
+            if let Err(e) = self
+                .send_replicaof_to_target(&h, p, new_host, new_port, Duration::from_millis(500))
+                .await
+            {
+                warn!(
+                    "FAILOVER TO: failed to redirect replica {}:{} → {}:{}: {}",
+                    h, p, new_host, new_port, e
+                );
+            } else {
+                info!(
+                    "FAILOVER TO: redirected replica {}:{} → {}:{}",
+                    h, p, new_host, new_port
+                );
+            }
+        }
+    }
+
+    async fn send_replicaof_to_target(
+        &self,
+        peer_host: &str,
+        peer_port: u16,
+        new_host: &str,
+        new_port: u16,
+        timeout: Duration,
+    ) -> std::result::Result<(), String> {
+        let addr = format!("{}:{}", peer_host, peer_port);
+        let connect = TcpStream::connect(&addr);
+        let mut stream = match tokio::time::timeout(timeout, connect).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                return Err(format!("connect {}: {}", addr, e));
+            }
+            Err(_) => {
+                return Err(format!("connect timeout {}", addr));
+            }
+        };
+
+        let cmd = RespValue::Array(vec![
+            RespValue::BulkString(Some(Bytes::from_static(b"REPLICAOF"))),
+            RespValue::BulkString(Some(Bytes::from(new_host.to_string()))),
+            RespValue::BulkString(Some(Bytes::from(new_port.to_string()))),
+        ])
+        .serialize();
+
+        match tokio::time::timeout(timeout, stream.write_all(&cmd)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(format!("write {}: {}", addr, e)),
+            Err(_) => return Err(format!("write timeout {}", addr)),
+        }
+
+        let mut parser = RespParser::new();
+        let mut buf = vec![0u8; 4096];
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!("read timeout {}", addr));
+            }
+            if let Some(val) = parser.parse().map_err(|e| e.to_string())? {
+                match val {
+                    RespValue::SimpleString(s) if s.as_ref() == b"OK" => return Ok(()),
+                    RespValue::Error(e) => {
+                        return Err(format!("target error: {}", String::from_utf8_lossy(&e)));
+                    }
+                    other => return Err(format!("unexpected reply: {:?}", other)),
+                }
+            }
+            let n = match tokio::time::timeout(remaining, stream.read(&mut buf)).await {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return Err(format!("read {}: {}", addr, e)),
+                Err(_) => return Err(format!("read timeout {}", addr)),
+            };
+            if n == 0 {
+                return Err(format!("closed {}", addr));
+            }
+            parser.feed(&buf[..n]);
         }
     }
 
@@ -953,10 +1094,18 @@ impl ReplicationManager {
     pub fn set_replicaof(&self, addr: Option<String>) {
         match addr {
             Some(a) => {
+                let changed = {
+                    let mut primary = self.primary_addr.lock();
+                    let changed = primary.as_ref() != Some(&a);
+                    *primary = Some(a);
+                    changed
+                };
                 self.is_replica.store(true, Ordering::Relaxed);
                 self.readonly.store(true, Ordering::Relaxed);
-                *self.primary_addr.lock() = Some(a);
                 self.master_link_up.store(false, Ordering::Relaxed);
+                if changed {
+                    self.bump_primary_link_epoch();
+                }
             }
             None => {
                 self.promote_to_master();
@@ -1009,6 +1158,8 @@ impl ReplicationManager {
         self.replica_offset.store(0, Ordering::Relaxed);
         *self.primary_addr.lock() = None;
         self.master_link_up.store(false, Ordering::Relaxed);
+        // Force any in-flight sync_from_primary loop to exit.
+        self.bump_primary_link_epoch();
 
         // Enable writes last
         self.is_replica.store(false, Ordering::Relaxed);
@@ -1149,6 +1300,7 @@ impl Default for ReplicationManager {
             failover_in_progress: AtomicBool::new(false),
             min_replicas_to_write: AtomicUsize::new(0),
             min_replicas_max_lag_secs: AtomicUsize::new(10),
+            primary_link_epoch: AtomicU64::new(0),
         }
     }
 }
@@ -1268,6 +1420,7 @@ async fn sync_from_primary(
     repl: Arc<ReplicationManager>,
     addr: &str,
 ) -> Result<()> {
+    let link_epoch = repl.primary_link_epoch();
     let mut stream = TcpStream::connect(addr)
         .await
         .map_err(|e| Error::NetworkError(format!("connect primary: {}", e)))?;
@@ -1397,6 +1550,16 @@ async fn sync_from_primary(
     // Apply remaining buffered data + stream; count exact wire bytes toward replica_offset.
     // Also handle master `REPLCONF GETACK` probes by replying `REPLCONF ACK <offset>` on this link.
     loop {
+        // Primary address / epoch changed (FAILOVER re-follow or promote) → reconnect.
+        if repl.primary_link_epoch() != link_epoch {
+            info!("Replica primary link epoch changed; reconnecting");
+            return Ok(());
+        }
+        if repl.primary_addr().as_deref() != Some(addr) {
+            info!("Replica primary address changed; reconnecting");
+            return Ok(());
+        }
+
         while let Some((val, consumed)) = parser.parse_with_consumed()? {
             if is_replconf_getack(&val) {
                 // GETACK is part of the master stream — count it, then reply with current offset.
@@ -1408,6 +1571,22 @@ async fn sync_from_primary(
                 })?;
                 continue;
             }
+            // Master may push REPLICAOF on the feed after FAILOVER TO (sibling re-follow).
+            if let Some(new_primary) = parse_replicaof_command(&val) {
+                repl.replica_offset
+                    .fetch_add(consumed as u64, Ordering::Relaxed);
+                match new_primary {
+                    Some(a) => {
+                        info!("Replica received REPLICAOF {} on link; switching", a);
+                        repl.set_replicaof(Some(a));
+                    }
+                    None => {
+                        info!("Replica received REPLICAOF NO ONE on link; promoting");
+                        repl.set_replicaof(None);
+                    }
+                }
+                return Ok(());
+            }
             apply_replicated_command(&databases, &mut current_db, val)?;
             repl.replica_offset
                 .fetch_add(consumed as u64, Ordering::Relaxed);
@@ -1418,6 +1597,29 @@ async fn sync_from_primary(
         }
         parser.feed(&buf[..n]);
     }
+}
+
+/// Parse `REPLICAOF host port` / `REPLICAOF NO ONE` / `SLAVEOF …` from a stream command.
+/// Returns `Some(None)` for NO ONE, `Some(Some(addr))` for host:port, `None` if not REPLICAOF.
+fn parse_replicaof_command(val: &RespValue) -> Option<Option<String>> {
+    let arr = match val {
+        RespValue::Array(a) if a.len() >= 3 => a,
+        _ => return None,
+    };
+    let cmd = arr[0].as_bulk_string()?;
+    if !cmd.eq_ignore_ascii_case(b"REPLICAOF") && !cmd.eq_ignore_ascii_case(b"SLAVEOF") {
+        return None;
+    }
+    let a1 = arr[1].as_bulk_string()?;
+    let a2 = arr[2].as_bulk_string()?;
+    if a1.eq_ignore_ascii_case(b"NO") && a2.eq_ignore_ascii_case(b"ONE") {
+        return Some(None);
+    }
+    let host = std::str::from_utf8(a1).ok()?;
+    let port = std::str::from_utf8(a2).ok()?;
+    // Validate port is numeric
+    let _: u16 = port.parse().ok()?;
+    Some(Some(format!("{}:{}", host, port)))
 }
 
 /// True if value is `REPLCONF GETACK …` (master offset probe).
@@ -2741,5 +2943,64 @@ mod tests {
         assert!(info.contains("min_slaves_to_write:2"), "{}", info);
         assert!(info.contains("min_slaves_max_lag:5"), "{}", info);
         assert!(info.contains("min_slaves_good:"), "{}", info);
+    }
+
+    #[test]
+    fn send_replicaof_to_feeds_excludes_target() {
+        let repl = ReplicationManager::new();
+        let mut keep = repl.register_replica_announced(Some("127.0.0.1".into()), Some(7001));
+        let mut exclude = repl.register_replica_announced(Some("127.0.0.1".into()), Some(7002));
+        repl.send_replicaof_to_feeds("127.0.0.1", 7002, "127.0.0.1", 7002);
+        // sibling should receive REPLICAOF
+        let msg = keep.try_recv().expect("sibling feed should get REPLICAOF");
+        let s = String::from_utf8_lossy(&msg);
+        assert!(s.contains("REPLICAOF") || s.contains("7002"), "got {:?}", s);
+        // promote target must not receive
+        assert!(exclude.try_recv().is_err(), "target feed must be excluded");
+    }
+
+    #[test]
+    fn primary_link_epoch_bumps_on_set_replicaof_change() {
+        let repl = ReplicationManager::new();
+        let e0 = repl.primary_link_epoch();
+        repl.set_replicaof(Some("127.0.0.1:1".into()));
+        let e1 = repl.primary_link_epoch();
+        assert!(e1 > e0);
+        // same addr → no bump
+        repl.set_replicaof(Some("127.0.0.1:1".into()));
+        assert_eq!(repl.primary_link_epoch(), e1);
+        // change addr → bump
+        repl.set_replicaof(Some("127.0.0.1:2".into()));
+        assert!(repl.primary_link_epoch() > e1);
+        // promote → bump
+        let e2 = repl.primary_link_epoch();
+        repl.set_replicaof(None);
+        assert!(repl.primary_link_epoch() > e2);
+        assert!(!repl.is_replica());
+    }
+
+    #[test]
+    fn parse_replicaof_command_variants() {
+        let of = RespValue::Array(vec![
+            RespValue::BulkString(Some(Bytes::from_static(b"REPLICAOF"))),
+            RespValue::BulkString(Some(Bytes::from_static(b"10.0.0.1"))),
+            RespValue::BulkString(Some(Bytes::from_static(b"6380"))),
+        ]);
+        assert_eq!(
+            parse_replicaof_command(&of),
+            Some(Some("10.0.0.1:6380".into()))
+        );
+        let no = RespValue::Array(vec![
+            RespValue::BulkString(Some(Bytes::from_static(b"SLAVEOF"))),
+            RespValue::BulkString(Some(Bytes::from_static(b"NO"))),
+            RespValue::BulkString(Some(Bytes::from_static(b"ONE"))),
+        ]);
+        assert_eq!(parse_replicaof_command(&no), Some(None));
+        let set = RespValue::Array(vec![
+            RespValue::BulkString(Some(Bytes::from_static(b"SET"))),
+            RespValue::BulkString(Some(Bytes::from_static(b"k"))),
+            RespValue::BulkString(Some(Bytes::from_static(b"v"))),
+        ]);
+        assert_eq!(parse_replicaof_command(&set), None);
     }
 }

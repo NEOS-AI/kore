@@ -24,68 +24,85 @@ pub struct PublishOutcome {
     pub messages_dropped: usize,
 }
 
-/// Pattern matching utility for Redis-style glob patterns
+/// Pattern matching utility for Redis-style glob patterns.
+///
+/// Implemented iteratively (with star backtracking) so pathological patterns
+/// cannot blow the call stack.
 pub struct PatternMatcher;
 
 impl PatternMatcher {
     /// Check if a channel matches a pattern (Redis-style glob matching)
-    /// Supports: * (any chars), ? (single char), [...] (char class), \x (escape)
+    /// Supports: `*` (any chars), `?` (single char), `[...]` (char class), `\x` (escape)
     pub fn matches(pattern: &[u8], channel: &[u8]) -> bool {
-        Self::matches_recursive(pattern, channel, 0, 0)
+        Self::matches_iter(pattern, channel)
     }
 
-    fn matches_recursive(pattern: &[u8], text: &[u8], p_idx: usize, t_idx: usize) -> bool {
-        if p_idx >= pattern.len() {
-            return t_idx >= text.len();
+    /// Iterative glob match with a single star-backtrack checkpoint.
+    fn matches_iter(pattern: &[u8], text: &[u8]) -> bool {
+        let mut pi = 0usize;
+        let mut ti = 0usize;
+        // Last `*` position in pattern / corresponding text index for backtrack.
+        let mut star_pi: Option<usize> = None;
+        let mut star_ti = 0usize;
+
+        while ti < text.len() {
+            if pi < pattern.len() {
+                match pattern[pi] {
+                    b'*' => {
+                        star_pi = Some(pi);
+                        star_ti = ti;
+                        pi += 1;
+                        continue;
+                    }
+                    b'?' => {
+                        pi += 1;
+                        ti += 1;
+                        continue;
+                    }
+                    b'[' => {
+                        let (matched, next_pi) =
+                            Self::match_char_class(pattern, pi, text[ti]);
+                        if matched {
+                            pi = next_pi;
+                            ti += 1;
+                            continue;
+                        }
+                        // fall through to backtrack
+                    }
+                    b'\\' => {
+                        if pi + 1 < pattern.len() && pattern[pi + 1] == text[ti] {
+                            pi += 2;
+                            ti += 1;
+                            continue;
+                        }
+                        // fall through to backtrack
+                    }
+                    c if c == text[ti] => {
+                        pi += 1;
+                        ti += 1;
+                        continue;
+                    }
+                    _ => {
+                        // mismatch — try backtrack
+                    }
+                }
+            }
+
+            if let Some(sp) = star_pi {
+                // Expand `*` to consume one more text byte and retry.
+                pi = sp + 1;
+                star_ti += 1;
+                ti = star_ti;
+            } else {
+                return false;
+            }
         }
 
-        match pattern[p_idx] {
-            b'*' => {
-                // Try matching zero or more characters
-                if Self::matches_recursive(pattern, text, p_idx + 1, t_idx) {
-                    return true;
-                }
-                if t_idx < text.len() {
-                    return Self::matches_recursive(pattern, text, p_idx, t_idx + 1);
-                }
-                false
-            }
-            b'?' => {
-                // Match any single character
-                if t_idx >= text.len() {
-                    return false;
-                }
-                Self::matches_recursive(pattern, text, p_idx + 1, t_idx + 1)
-            }
-            b'[' => {
-                // Character class matching
-                if t_idx >= text.len() {
-                    return false;
-                }
-                let (matched, next_p_idx) = Self::match_char_class(pattern, p_idx, text[t_idx]);
-                if !matched {
-                    return false;
-                }
-                Self::matches_recursive(pattern, text, next_p_idx, t_idx + 1)
-            }
-            b'\\' => {
-                // Escape character
-                if p_idx + 1 >= pattern.len() {
-                    return false;
-                }
-                if t_idx >= text.len() || pattern[p_idx + 1] != text[t_idx] {
-                    return false;
-                }
-                Self::matches_recursive(pattern, text, p_idx + 2, t_idx + 1)
-            }
-            c => {
-                // Literal character match
-                if t_idx >= text.len() || c != text[t_idx] {
-                    return false;
-                }
-                Self::matches_recursive(pattern, text, p_idx + 1, t_idx + 1)
-            }
+        // Text exhausted: remaining pattern may only be stars (and empty classes not needed).
+        while pi < pattern.len() && pattern[pi] == b'*' {
+            pi += 1;
         }
+        pi == pattern.len()
     }
 
     fn match_char_class(pattern: &[u8], start: usize, ch: u8) -> (bool, usize) {
@@ -98,8 +115,13 @@ impl PatternMatcher {
             idx += 1;
         }
 
+        // Empty / unclosed class: treat as non-match, advance past what we scanned.
+        if idx >= pattern.len() {
+            return (false, idx);
+        }
+
         while idx < pattern.len() && pattern[idx] != b']' {
-            if idx + 2 < pattern.len() && pattern[idx + 1] == b'-' {
+            if idx + 2 < pattern.len() && pattern[idx + 1] == b'-' && pattern[idx + 2] != b']' {
                 // Range: a-z
                 if ch >= pattern[idx] && ch <= pattern[idx + 2] {
                     matched = true;
@@ -114,8 +136,11 @@ impl PatternMatcher {
             }
         }
 
-        if idx < pattern.len() {
+        if idx < pattern.len() && pattern[idx] == b']' {
             idx += 1; // Skip closing ]
+        } else {
+            // Unclosed '[' — not a valid class match
+            return (false, start + 1);
         }
 
         if negated {
@@ -168,6 +193,10 @@ pub struct PubSub {
 
     /// Messages dropped due to full buffers (overwrites) or failed sends.
     messages_dropped: AtomicU64,
+
+    /// Negotiated RESP protocol version per client (2 default; 3 after HELLO 3).
+    /// Used so fan-out can emit RESP3 push frames for RESP3 clients.
+    client_protocol: Arc<RwLock<HashMap<ClientId, u8>>>,
 }
 
 impl PubSub {
@@ -191,7 +220,23 @@ impl PubSub {
             next_client_id: Arc::new(RwLock::new(0)),
             client_buffer_capacity: AtomicUsize::new(capacity.max(1)),
             messages_dropped: AtomicU64::new(0),
+            client_protocol: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    /// Record the negotiated RESP protocol version for a client (2 or 3).
+    pub async fn set_client_protocol(&self, client_id: ClientId, version: u8) {
+        let v = if version >= 3 { 3 } else { 2 };
+        self.client_protocol.write().await.insert(client_id, v);
+    }
+
+    /// Build a pub/sub delivery frame (array for RESP2, push for RESP3).
+    fn pubsub_frame(proto: u8, elements: Vec<RespValue>) -> RespValue {
+        if proto >= 3 {
+            RespValue::Push(elements)
+        } else {
+            RespValue::Array(elements)
+        }
     }
 
     /// Current per-client broadcast buffer capacity (messages).
@@ -304,6 +349,7 @@ impl PubSub {
         
         let mut clients = self.clients.write().await;
         clients.insert(client_id, tx);
+        self.client_protocol.write().await.insert(client_id, 2);
         
         (client_id, rx)
     }
@@ -365,8 +411,9 @@ impl PubSub {
             }
         }
 
-        // Remove client sender
+        // Remove client sender + protocol version
         self.clients.write().await.remove(&client_id);
+        self.client_protocol.write().await.remove(&client_id);
 
         // Take remaining pending buffer accounting for this client
         let pending = self
@@ -609,17 +656,22 @@ impl PubSub {
     ) -> PublishOutcome {
         let message_size = message.len();
         let clients = self.clients.read().await;
+        let protos = self.client_protocol.read().await;
         let mut delivered: Vec<ClientId> = Vec::new();
         let mut messages_dropped = 0usize;
 
         if let Some(subscribers) = self.shard_channels.read().await.get(channel) {
             for &client_id in subscribers {
                 if let Some(sender) = clients.get(&client_id) {
-                    let msg = RespValue::Array(vec![
-                        RespValue::BulkString(Some(Bytes::from_static(b"smessage"))),
-                        RespValue::BulkString(Some(channel.clone())),
-                        RespValue::BulkString(Some(message.clone())),
-                    ]);
+                    let proto = protos.get(&client_id).copied().unwrap_or(2);
+                    let msg = Self::pubsub_frame(
+                        proto,
+                        vec![
+                            RespValue::BulkString(Some(Bytes::from_static(b"smessage"))),
+                            RespValue::BulkString(Some(channel.clone())),
+                            RespValue::BulkString(Some(message.clone())),
+                        ],
+                    );
                     match sender.send(msg) {
                         Ok(_) => delivered.push(client_id),
                         Err(_) => messages_dropped += 1,
@@ -627,6 +679,7 @@ impl PubSub {
                 }
             }
         }
+        drop(protos);
         drop(clients);
 
         self.account_deliveries(&delivered, message_size, messages_dropped)
@@ -676,6 +729,7 @@ impl PubSub {
     ) -> PublishOutcome {
         let message_size = message.len();
         let clients = self.clients.read().await;
+        let protos = self.client_protocol.read().await;
         let mut delivered: Vec<ClientId> = Vec::new();
         let mut messages_dropped = 0usize;
 
@@ -683,11 +737,15 @@ impl PubSub {
         if let Some(subscribers) = self.channels.read().await.get(channel) {
             for &client_id in subscribers {
                 if let Some(sender) = clients.get(&client_id) {
-                    let msg = RespValue::Array(vec![
-                        RespValue::BulkString(Some(Bytes::from_static(b"message"))),
-                        RespValue::BulkString(Some(channel.clone())),
-                        RespValue::BulkString(Some(message.clone())),
-                    ]);
+                    let proto = protos.get(&client_id).copied().unwrap_or(2);
+                    let msg = Self::pubsub_frame(
+                        proto,
+                        vec![
+                            RespValue::BulkString(Some(Bytes::from_static(b"message"))),
+                            RespValue::BulkString(Some(channel.clone())),
+                            RespValue::BulkString(Some(message.clone())),
+                        ],
+                    );
                     // Full buffers do not panic: send overwrites the oldest slot.
                     match sender.send(msg) {
                         Ok(_) => delivered.push(client_id),
@@ -703,12 +761,16 @@ impl PubSub {
             if PatternMatcher::matches(pattern, channel) {
                 for &client_id in subscribers {
                     if let Some(sender) = clients.get(&client_id) {
-                        let msg = RespValue::Array(vec![
-                            RespValue::BulkString(Some(Bytes::from_static(b"pmessage"))),
-                            RespValue::BulkString(Some(pattern.clone())),
-                            RespValue::BulkString(Some(channel.clone())),
-                            RespValue::BulkString(Some(message.clone())),
-                        ]);
+                        let proto = protos.get(&client_id).copied().unwrap_or(2);
+                        let msg = Self::pubsub_frame(
+                            proto,
+                            vec![
+                                RespValue::BulkString(Some(Bytes::from_static(b"pmessage"))),
+                                RespValue::BulkString(Some(pattern.clone())),
+                                RespValue::BulkString(Some(channel.clone())),
+                                RespValue::BulkString(Some(message.clone())),
+                            ],
+                        );
                         match sender.send(msg) {
                             Ok(_) => delivered.push(client_id),
                             Err(_) => messages_dropped += 1,
@@ -718,6 +780,7 @@ impl PubSub {
             }
         }
         drop(patterns);
+        drop(protos);
         drop(clients);
 
         self.account_deliveries(&delivered, message_size, messages_dropped)
@@ -825,6 +888,7 @@ impl Default for PubSub {
             next_client_id: Arc::new(RwLock::new(0)),
             client_buffer_capacity: AtomicUsize::new(DEFAULT_CLIENT_BUFFER_CAPACITY),
             messages_dropped: AtomicU64::new(0),
+            client_protocol: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -855,10 +919,49 @@ mod tests {
         assert!(PatternMatcher::matches(b"h[a-z]llo", b"hello"));
         assert!(!PatternMatcher::matches(b"h[a-z]llo", b"h1llo"));
 
+        // Negated class
+        assert!(PatternMatcher::matches(b"h[^e]llo", b"hallo"));
+        assert!(!PatternMatcher::matches(b"h[^e]llo", b"hello"));
+
+        // Escape
+        assert!(PatternMatcher::matches(b"h\\*llo", b"h*llo"));
+        assert!(!PatternMatcher::matches(b"h\\*llo", b"hello"));
+
         // Complex patterns
         assert!(PatternMatcher::matches(b"news.*", b"news.tech"));
         assert!(PatternMatcher::matches(b"news.*", b"news.sports.football"));
         assert!(!PatternMatcher::matches(b"news.*", b"tech.news"));
+    }
+
+    #[test]
+    fn pattern_matcher_pathological_stars_no_stack_overflow() {
+        // Recursive matchers blow the stack on patterns like a*a*a*… vs long text.
+        let mut pat = vec![b'*'; 64];
+        pat.push(b'x');
+        let text = vec![b'a'; 10_000];
+        assert!(!PatternMatcher::matches(&pat, &text));
+        // Many stars that can still match
+        let pat2 = b"********************************";
+        let text2 = b"anything-goes-here-with-length";
+        assert!(PatternMatcher::matches(pat2, text2));
+    }
+
+    #[tokio::test]
+    async fn publish_uses_push_for_resp3_clients() {
+        let pubsub = PubSub::new();
+        let (c2, mut rx2) = pubsub.register_client().await;
+        let (c3, mut rx3) = pubsub.register_client().await;
+        pubsub.set_client_protocol(c3, 3).await;
+
+        let ch = Bytes::from("ch");
+        pubsub.subscribe(c2, ch.clone()).await;
+        pubsub.subscribe(c3, ch.clone()).await;
+        pubsub.publish(&ch, &Bytes::from("m")).await;
+
+        let m2 = rx2.recv().await.unwrap();
+        let m3 = rx3.recv().await.unwrap();
+        assert!(matches!(m2, RespValue::Array(_)), "resp2 got {:?}", m2);
+        assert!(matches!(m3, RespValue::Push(_)), "resp3 got {:?}", m3);
     }
 
     #[tokio::test]

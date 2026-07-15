@@ -41,7 +41,9 @@ fn make_handler_with_auth(cache: Arc<Cache>, auth: &str) -> CommandHandler {
         tls: false,
         tls_cert: String::new(),
         tls_key: String::new(),
+        aclfile: String::new(),
         cluster_enabled: false,
+    unixsocket: String::new(),
     };
     let mut h = CommandHandler::new(cache, Arc::new(config));
     h.set_client_id(42);
@@ -96,9 +98,46 @@ fn hello_basic_resp2() {
 }
 
 #[test]
-fn hello_proto3_rejected() {
+fn hello_basic_resp3() {
     let mut h = make_handler_with_auth(make_cache(), "");
-    match handle(&mut h, cmd(&["HELLO", "3"])) {
+    let resp = handle(&mut h, cmd(&["HELLO", "3"]));
+    match &resp {
+        RespValue::Map(pairs) => {
+            let mut map = std::collections::HashMap::new();
+            for (k, v) in pairs {
+                if let Some(kb) = k.as_bulk_string() {
+                    map.insert(String::from_utf8_lossy(kb).into_owned(), v.clone());
+                }
+            }
+            assert_eq!(map.get("server"), Some(&bulk("kore")));
+            assert_eq!(map.get("proto"), Some(&RespValue::Integer(3)));
+            assert_eq!(map.get("mode"), Some(&bulk("standalone")));
+            assert_eq!(map.get("role"), Some(&bulk("master")));
+        }
+        other => panic!("expected RESP3 map, got {:?}", other),
+    }
+    assert_eq!(h.protocol_version(), 3);
+    // Wire starts with %
+    let wire = resp.serialize();
+    assert!(wire.starts_with(b"%"), "expected map wire, got {:?}", wire);
+
+    // CLIENT INFO reflects proto 3
+    let info = handle(&mut h, cmd(&["CLIENT", "INFO"]));
+    match info {
+        RespValue::BulkString(Some(b)) => {
+            let s = String::from_utf8_lossy(&b);
+            assert!(s.contains("resp=3"), "{}", s);
+        }
+        other => panic!("{:?}", other),
+    }
+
+    // HELLO 2 switches back
+    let r2 = handle(&mut h, cmd(&["HELLO", "2"]));
+    assert!(matches!(r2, RespValue::Array(_)));
+    assert_eq!(h.protocol_version(), 2);
+
+    // Unsupported version still NOPROTO
+    match handle(&mut h, cmd(&["HELLO", "4"])) {
         RespValue::Error(e) => assert!(String::from_utf8_lossy(&e).contains("NOPROTO")),
         other => panic!("expected NOPROTO, got {:?}", other),
     }
@@ -223,4 +262,119 @@ fn reset_clears_client_name() {
         RespValue::SimpleString(Bytes::from_static(b"RESET"))
     );
     assert_eq!(handle(&mut h, cmd(&["CLIENT", "GETNAME"])), RespValue::null());
+}
+
+#[test]
+fn resp3_hgetall_returns_map() {
+    let mut h = make_handler_with_auth(make_cache(), "");
+    assert!(matches!(
+        handle(&mut h, cmd(&["HELLO", "3"])),
+        RespValue::Map(_)
+    ));
+    assert_eq!(
+        handle(&mut h, cmd(&["HSET", "u", "a", "1", "b", "2"])),
+        RespValue::Integer(2)
+    );
+    match handle(&mut h, cmd(&["HGETALL", "u"])) {
+        RespValue::Map(pairs) => {
+            assert_eq!(pairs.len(), 2);
+            let mut map = std::collections::HashMap::new();
+            for (k, v) in pairs {
+                let kb = k.as_bulk_string().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap();
+                let vb = v.as_bulk_string().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap();
+                map.insert(kb, vb);
+            }
+            assert_eq!(map.get("a").map(|s| s.as_str()), Some("1"));
+            assert_eq!(map.get("b").map(|s| s.as_str()), Some("2"));
+        }
+        other => panic!("expected map, got {:?}", other),
+    }
+    // Empty hash key → empty map
+    match handle(&mut h, cmd(&["HGETALL", "missing"])) {
+        RespValue::Map(p) => assert!(p.is_empty()),
+        other => panic!("{:?}", other),
+    }
+    // RESP2 still flat array
+    assert!(matches!(handle(&mut h, cmd(&["HELLO", "2"])), RespValue::Array(_)));
+    match handle(&mut h, cmd(&["HGETALL", "u"])) {
+        RespValue::Array(a) => assert_eq!(a.len(), 4),
+        other => panic!("{:?}", other),
+    }
+}
+
+#[test]
+fn resp3_config_get_returns_map() {
+    let mut h = make_handler_with_auth(make_cache(), "");
+    handle(&mut h, cmd(&["HELLO", "3"]));
+    match handle(&mut h, cmd(&["CONFIG", "GET", "maxmemory"])) {
+        RespValue::Map(pairs) => {
+            assert_eq!(pairs.len(), 1);
+            assert_eq!(
+                pairs[0].0.as_bulk_string().map(|b| b.as_ref()),
+                Some(&b"maxmemory"[..])
+            );
+        }
+        other => panic!("expected map, got {:?}", other),
+    }
+    handle(&mut h, cmd(&["HELLO", "2"]));
+    match handle(&mut h, cmd(&["CONFIG", "GET", "maxmemory"])) {
+        RespValue::Array(a) => assert_eq!(a.len(), 2),
+        other => panic!("{:?}", other),
+    }
+}
+
+#[test]
+fn resp3_subscribe_confirmation_is_push() {
+    let cache = make_cache();
+    let mut h = make_handler_with_auth(Arc::clone(&cache), "");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (cid, _rx) = rt.block_on(cache.pubsub.register_client());
+    h.set_client_id(cid);
+    handle(&mut h, cmd(&["HELLO", "3"]));
+    let conf = handle(&mut h, cmd(&["SUBSCRIBE", "ch"]));
+    let wire = conf.serialize();
+    assert!(wire.starts_with(b">"), "push wire {:?}", wire);
+    match conf {
+        RespValue::Push(arr) => {
+            assert_eq!(
+                arr[0].as_bulk_string().map(|b| b.as_ref()),
+                Some(&b"subscribe"[..])
+            );
+            assert_eq!(arr[2], RespValue::Integer(1));
+        }
+        other => panic!("expected Push confirmation, got {:?}", other),
+    }
+    // RESP2 still array
+    handle(&mut h, cmd(&["HELLO", "2"]));
+    match handle(&mut h, cmd(&["SUBSCRIBE", "ch2"])) {
+        RespValue::Array(arr) => {
+            assert_eq!(
+                arr[0].as_bulk_string().map(|b| b.as_ref()),
+                Some(&b"subscribe"[..])
+            );
+        }
+        other => panic!("expected Array confirmation, got {:?}", other),
+    }
+}
+
+#[test]
+fn mixed_case_command_dispatch_no_heap_path() {
+    let mut h = make_handler_with_auth(make_cache(), "");
+    // Lower/mixed case must resolve via stack uppercase path
+    assert_eq!(
+        handle(&mut h, cmd(&["ping"])),
+        RespValue::SimpleString(Bytes::from_static(b"PONG"))
+    );
+    assert_eq!(
+        handle(&mut h, cmd(&["PiNg"])),
+        RespValue::SimpleString(Bytes::from_static(b"PONG"))
+    );
+    assert!(matches!(
+        handle(&mut h, cmd(&["sEt", "k", "v"])),
+        RespValue::SimpleString(_)
+    ));
+    assert_eq!(handle(&mut h, cmd(&["gEt", "k"])), bulk("v"));
 }

@@ -259,7 +259,9 @@ async fn tcp_psync_full_resync_transfers_non_zero_dbs() {
         tls: false,
         tls_cert: String::new(),
         tls_key: String::new(),
+        aclfile: String::new(),
         cluster_enabled: false,
+unixsocket: String::new(),
 });
     let mgr = make_persistence(&dir);
     let databases = make_databases(16);

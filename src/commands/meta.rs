@@ -131,6 +131,15 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     CmdSpec { name: "replconf", arity: -1, flags: &["admin", "noscript", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "role", arity: 1, flags: &["readonly", "fast", "noscript", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "wait", arity: 3, flags: &["noscript"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "setbit", arity: 4, flags: &["write", "denyoom"], first_key: 1, last_key: 1, step: 1 },
+    CmdSpec { name: "getbit", arity: 3, flags: &["readonly", "fast"], first_key: 1, last_key: 1, step: 1 },
+    CmdSpec { name: "bitcount", arity: -2, flags: &["readonly"], first_key: 1, last_key: 1, step: 1 },
+    CmdSpec { name: "bitpos", arity: -3, flags: &["readonly"], first_key: 1, last_key: 1, step: 1 },
+    CmdSpec { name: "bitop", arity: -4, flags: &["write", "denyoom"], first_key: 2, last_key: -1, step: 1 },
+    CmdSpec { name: "bitfield", arity: -2, flags: &["write", "denyoom"], first_key: 1, last_key: 1, step: 1 },
+    CmdSpec { name: "pfadd", arity: -2, flags: &["write", "denyoom", "fast"], first_key: 1, last_key: 1, step: 1 },
+    CmdSpec { name: "pfcount", arity: -2, flags: &["readonly", "random"], first_key: 1, last_key: -1, step: 1 },
+    CmdSpec { name: "pfmerge", arity: -2, flags: &["write", "denyoom"], first_key: 1, last_key: -1, step: 1 },
 ];
 
 fn bulk(s: impl Into<Bytes>) -> RespValue {
@@ -168,8 +177,8 @@ pub(super) fn command_key_spec(name: &str) -> Option<(i64, i64, i64)> {
 
 impl CommandHandler {
     /// HELLO [protover] [AUTH password | AUTH user password] [SETNAME name]
-    /// RESP2 only (proto 2). RESP3 (proto 3) is rejected until implemented.
-    pub(super) fn handle_hello(&mut self, args: &[RespValue]) -> Result<RespValue> {
+    /// Supports RESP2 (proto 2) and RESP3 (proto 3). Other versions → NOPROTO.
+    pub(super) async fn handle_hello(&mut self, args: &[RespValue]) -> Result<RespValue> {
         let mut i = 0;
         let mut proto: i64 = 2;
 
@@ -181,12 +190,7 @@ impl CommandHandler {
             }
         }
 
-        if proto == 3 {
-            return Ok(RespValue::error(
-                "NOPROTO sorry, this protocol version is not supported",
-            ));
-        }
-        if proto != 2 {
+        if proto != 2 && proto != 3 {
             return Ok(RespValue::error(
                 "NOPROTO sorry, this protocol version is not supported",
             ));
@@ -274,6 +278,14 @@ impl CommandHandler {
             return Ok(RespValue::error("NOAUTH Authentication required."));
         }
 
+        self.protocol_version = proto as u8;
+        // Fan-out path uses per-client protocol for push vs array.
+        if let Some(id) = self.client_id {
+            self.cache
+                .pubsub
+                .set_client_protocol(id, self.protocol_version)
+                .await;
+        }
         Ok(self.hello_reply(proto))
     }
 
@@ -297,6 +309,19 @@ impl CommandHandler {
         } else {
             "standalone"
         };
+
+        if proto == 3 {
+            // RESP3 map
+            return RespValue::Map(vec![
+                (bulk("server"), bulk("kore")),
+                (bulk("version"), bulk(version)),
+                (bulk("proto"), RespValue::Integer(proto)),
+                (bulk("id"), RespValue::Integer(id)),
+                (bulk("mode"), bulk(mode)),
+                (bulk("role"), bulk(role)),
+                (bulk("modules"), RespValue::Array(vec![])),
+            ]);
+        }
 
         // RESP2: flat array of key/value pairs (map-like)
         RespValue::Array(vec![
@@ -388,8 +413,11 @@ impl CommandHandler {
                     .map(|n| String::from_utf8_lossy(n).into_owned())
                     .unwrap_or_default();
                 let info = format!(
-                    "id={}\nname={}\ndb=0\nsub={}\npsub=0\nresp=2\n",
-                    id, name, self.pubsub_subscriptions
+                    "id={}\nname={}\ndb=0\nsub={}\npsub=0\nresp={}\n",
+                    id,
+                    name,
+                    self.pubsub_subscriptions,
+                    self.protocol_version
                 );
                 Ok(bulk(info))
             }

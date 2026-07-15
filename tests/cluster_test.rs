@@ -37,7 +37,9 @@ fn make_config(cluster_enabled: bool) -> Arc<Config> {
         tls: false,
         tls_cert: String::new(),
         tls_key: String::new(),
+        aclfile: String::new(),
         cluster_enabled,
+        unixsocket: String::new(),
     })
 }
 

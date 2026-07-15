@@ -1,15 +1,19 @@
-//! ACL (Access Control List) — users, passwords, command & key permissions.
+//! ACL (Access Control List) — users, passwords, command, key & channel permissions.
 //!
-//! MVP subset of Redis ACL: no LOAD/SAVE, DELUSER, GENPASS, or channel ACL.
+//! Subset of Redis ACL including LOAD/SAVE, DELUSER, and channel patterns.
+//! GENPASS is not implemented.
 
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Shared ACL state for all connections on a server.
 #[derive(Debug)]
 pub struct AclStore {
     inner: RwLock<AclInner>,
+    /// Path used by ACL LOAD / ACL SAVE (empty = not configured).
+    aclfile: RwLock<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -33,9 +37,14 @@ pub struct AclUser {
     pub all_keys: bool,
     /// Glob-style key patterns (without leading `~`).
     pub key_patterns: Vec<String>,
+    /// When true, all pub/sub channels allowed.
+    pub all_channels: bool,
+    /// Glob-style channel patterns (without leading `&`).
+    pub channel_patterns: Vec<String>,
     /// Rule fragments for LIST / GETUSER display.
     pub command_desc: String,
     pub keys_desc: String,
+    pub channels_desc: String,
 }
 
 impl AclUser {
@@ -50,19 +59,24 @@ impl AclUser {
             disallowed_commands: HashSet::new(),
             all_keys: false,
             key_patterns: Vec::new(),
+            all_channels: false,
+            channel_patterns: Vec::new(),
             command_desc: String::new(),
             keys_desc: String::new(),
+            channels_desc: String::new(),
         }
     }
 
-    /// Superuser-style default: on, all commands, all keys.
+    /// Superuser-style default: on, all commands, all keys, all channels.
     fn default_superuser(auth: &str) -> Self {
         let mut u = Self::new("default");
         u.enabled = true;
         u.all_commands = true;
         u.all_keys = true;
+        u.all_channels = true;
         u.command_desc = "+@all".to_string();
         u.keys_desc = "~*".to_string();
+        u.channels_desc = "&*".to_string();
         if auth.is_empty() {
             u.nopass = true;
         } else {
@@ -103,6 +117,31 @@ impl AclUser {
         self.key_patterns.iter().any(|p| glob_match(p, key))
     }
 
+    pub fn can_access_channel(&self, channel: &str) -> bool {
+        if self.all_channels {
+            return true;
+        }
+        if self.channel_patterns.is_empty() {
+            return false;
+        }
+        self.channel_patterns
+            .iter()
+            .any(|p| glob_match(p, channel))
+    }
+
+    fn rebuild_channels_desc(&mut self) {
+        if self.all_channels {
+            self.channels_desc = "&*".to_string();
+        } else {
+            self.channels_desc = self
+                .channel_patterns
+                .iter()
+                .map(|p| format!("&{}", p))
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+    }
+
     /// Apply a single SETUSER rule token.
     fn apply_rule(&mut self, rule: &str) -> Result<(), String> {
         if rule.is_empty() {
@@ -139,6 +178,18 @@ impl AclUser {
                 self.keys_desc = "~*".to_string();
                 Ok(())
             }
+            "allchannels" => {
+                self.all_channels = true;
+                self.channel_patterns.clear();
+                self.channels_desc = "&*".to_string();
+                Ok(())
+            }
+            "resetchannels" => {
+                self.all_channels = false;
+                self.channel_patterns.clear();
+                self.channels_desc.clear();
+                Ok(())
+            }
             "allcommands" | "+@all" => {
                 self.all_commands = true;
                 self.allowed_commands.clear();
@@ -158,6 +209,8 @@ impl AclUser {
                 *self = Self::new(name);
                 Ok(())
             }
+            // Payload flags are accepted and ignored (Redis compatibility).
+            "sanitize-payload" | "skip-sanitize-payload" => Ok(()),
             r if r.starts_with('>') => {
                 let pass = &r[1..];
                 if pass.is_empty() {
@@ -193,6 +246,21 @@ impl AclUser {
                         .map(|p| format!("~{}", p))
                         .collect::<Vec<_>>()
                         .join(" ");
+                }
+                Ok(())
+            }
+            r if r.starts_with('&') => {
+                let pattern = &r[1..];
+                if pattern == "*" {
+                    self.all_channels = true;
+                    self.channel_patterns.clear();
+                    self.channels_desc = "&*".to_string();
+                } else {
+                    self.all_channels = false;
+                    if !self.channel_patterns.iter().any(|p| p == pattern) {
+                        self.channel_patterns.push(pattern.to_string());
+                    }
+                    self.rebuild_channels_desc();
                 }
                 Ok(())
             }
@@ -259,10 +327,6 @@ impl AclUser {
                 append_cmd_desc(&mut self.command_desc, r);
                 Ok(())
             }
-            // Skip channel rules silently for MVP (&*, resetchannels, …)
-            r if r.starts_with('&') || r == "allchannels" || r == "resetchannels" || r == "sanitize-payload" || r == "skip-sanitize-payload" => {
-                Ok(())
-            }
             _ => Err(format!("ERR Error in ACL SETUSER modifier '{}'", rule)),
         }
     }
@@ -288,6 +352,13 @@ impl AclUser {
             }
         } else {
             parts.push(self.keys_desc.clone());
+        }
+        if self.channels_desc.is_empty() {
+            if self.all_channels {
+                parts.push("&*".into());
+            }
+        } else {
+            parts.push(self.channels_desc.clone());
         }
         if self.command_desc.is_empty() {
             if self.all_commands {
@@ -315,6 +386,7 @@ impl AclStore {
             inner: RwLock::new(AclInner {
                 users: HashMap::new(),
             }),
+            aclfile: RwLock::new(PathBuf::new()),
         }
     }
 
@@ -332,6 +404,15 @@ impl AclStore {
 
     pub fn from_auth_arc(auth: &str) -> Arc<Self> {
         Arc::new(Self::from_auth(auth))
+    }
+
+    /// Set the ACL file path used by LOAD / SAVE.
+    pub fn set_aclfile(&self, path: impl Into<PathBuf>) {
+        *self.aclfile.write() = path.into();
+    }
+
+    pub fn aclfile(&self) -> PathBuf {
+        self.aclfile.read().clone()
     }
 
     pub fn authenticate(&self, username: &str, password: &str) -> Result<(), AuthError> {
@@ -391,6 +472,15 @@ impl AclStore {
             .unwrap_or(false)
     }
 
+    pub fn can_access_channel(&self, username: &str, channel: &str) -> bool {
+        self.inner
+            .read()
+            .users
+            .get(username)
+            .map(|u| u.can_access_channel(channel))
+            .unwrap_or(false)
+    }
+
     /// Apply SETUSER rules. Creates the user if missing.
     pub fn setuser(&self, username: &str, rules: &[&str]) -> Result<(), String> {
         if username.is_empty() {
@@ -405,6 +495,25 @@ impl AclStore {
             user.apply_rule(rule)?;
         }
         Ok(())
+    }
+
+    /// Delete users. Returns how many were removed.
+    /// The `default` user cannot be deleted (Redis behavior).
+    pub fn deluser(&self, usernames: &[&str]) -> Result<usize, String> {
+        let mut inner = self.inner.write();
+        let mut deleted = 0usize;
+        for name in usernames {
+            if *name == "default" {
+                return Err("ERR The 'default' user cannot be removed".into());
+            }
+            if name.is_empty() {
+                continue;
+            }
+            if inner.users.remove(*name).is_some() {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
     }
 
     pub fn list_users(&self) -> Vec<String> {
@@ -422,6 +531,109 @@ impl AclStore {
         let mut names: Vec<_> = inner.users.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    /// Save ACL rules to the configured aclfile (Redis ACL SAVE format).
+    pub fn save(&self) -> Result<(), String> {
+        let path = self.aclfile.read().clone();
+        if path.as_os_str().is_empty() {
+            return Err(
+                "ERR This server is not configured to use an ACL file. You may want to specify users via the ACL SETUSER command and then issue a CONFIG SET aclfile <filename> (or use Redis 6+ with aclfile in conf) / restart with --aclfile".into(),
+            );
+        }
+        self.save_to_path(&path)
+    }
+
+    pub fn save_to_path(&self, path: &Path) -> Result<(), String> {
+        let content = self.list_users().join("\n") + "\n";
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!("ERR Can't create ACL file directory: {}", e)
+                })?;
+            }
+        }
+        std::fs::write(path, content)
+            .map_err(|e| format!("ERR There was an error trying to save the ACLs: {}", e))?;
+        Ok(())
+    }
+
+    /// Load ACL rules from the configured aclfile, replacing current users.
+    /// Requires a valid `default` user in the file (Redis behavior).
+    pub fn load(&self) -> Result<(), String> {
+        let path = self.aclfile.read().clone();
+        if path.as_os_str().is_empty() {
+            return Err(
+                "ERR This server is not configured to use an ACL file. You may want to specify users via the ACL SETUSER command and then issue a CONFIG SET aclfile <filename> (or use Redis 6+ with aclfile in conf) / restart with --aclfile".into(),
+            );
+        }
+        self.load_from_path(&path)
+    }
+
+    pub fn load_from_path(&self, path: &Path) -> Result<(), String> {
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            format!(
+                "ERR / This server is not configured to use an ACL file. ({})",
+                e
+            )
+        })?;
+        self.load_from_str(&content)
+    }
+
+    /// Parse Redis-style ACL file content and replace the user table.
+    pub fn load_from_str(&self, content: &str) -> Result<(), String> {
+        let mut users: HashMap<String, AclUser> = HashMap::new();
+        for (lineno, raw_line) in content.lines().enumerate() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            if tokens.is_empty() {
+                continue;
+            }
+            if !tokens[0].eq_ignore_ascii_case("user") {
+                return Err(format!(
+                    "ERR Error in ACL file line {}: expected 'user'",
+                    lineno + 1
+                ));
+            }
+            if tokens.len() < 2 {
+                return Err(format!(
+                    "ERR Error in ACL file line {}: missing username",
+                    lineno + 1
+                ));
+            }
+            let username = tokens[1];
+            let mut user = AclUser::new(username);
+            for rule in &tokens[2..] {
+                user.apply_rule(rule).map_err(|e| {
+                    format!("ERR Error in ACL file line {}: {}", lineno + 1, e)
+                })?;
+            }
+            users.insert(username.to_string(), user);
+        }
+        if !users.contains_key("default") {
+            return Err(
+                "ERR The ACL file doesn't contain a 'default' user definition. Aborting.".into(),
+            );
+        }
+        *self.inner.write() = AclInner { users };
+        Ok(())
+    }
+
+    /// Best-effort boot load: if aclfile is set and exists, load it.
+    /// Returns Ok(false) when skipped (empty path or missing file).
+    pub fn try_load_on_boot(&self) -> Result<bool, String> {
+        let path = self.aclfile.read().clone();
+        if path.as_os_str().is_empty() {
+            return Ok(false);
+        }
+        if !path.exists() {
+            return Ok(false);
+        }
+        self.load_from_path(&path)?;
+        Ok(true)
     }
 }
 
@@ -512,7 +724,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "lindex", "smembers", "sismember", "scard", "sinter", "zrange", "zrevrange", "zcard",
             "zscore", "zrank", "zrevrank", "xlen", "xrange", "xrevrange", "xread", "xpending",
             "geopos", "geodist", "geohash", "geosearch", "info", "role", "lastsave", "object",
-            "memory", "dump", "strlen",
+            "memory", "dump", "strlen", "getbit", "bitcount", "bitpos", "pfcount",
         ],
         "write" => &[
             "set", "del", "mset", "append", "setex", "getset", "unlink", "rename", "renamenx",
@@ -520,6 +732,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "hset", "hdel", "hincrby", "lpush", "rpush", "lpop", "rpop", "blpop", "brpop", "lset",
             "sadd", "srem", "zadd", "zrem", "xadd", "xdel", "xtrim", "xgroup", "xack", "xreadgroup",
             "geoadd", "geosearchstore", "georadius", "georadiusbymember", "flushdb", "flushall",
+            "setbit", "bitop", "bitfield", "pfadd", "pfmerge",
         ],
         "admin" => &[
             "acl", "config", "save", "bgsave", "bgrewriteaof", "lastsave", "replicaof", "slaveof",
@@ -545,6 +758,10 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "get", "set", "mget", "mset", "append", "strlen", "setex", "setnx", "getset", "getdel",
             "getex", "incr", "decr", "incrby", "decrby",
         ],
+        "bitmap" => &[
+            "setbit", "getbit", "bitcount", "bitpos", "bitop", "bitfield",
+        ],
+        "hyperloglog" => &["pfadd", "pfcount", "pfmerge"],
         "hash" => &[
             "hset", "hget", "hmget", "hdel", "hgetall", "hlen", "hexists", "hkeys", "hvals",
             "hincrby",
@@ -565,7 +782,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "georadiusbymember",
         ],
         "transaction" => &["multi", "exec", "discard", "watch", "unwatch"],
-        "fast" | "slow" | "blocking" | "bitmap" | "hyperloglog" | "scripting" => &[],
+        "fast" | "slow" | "blocking" | "scripting" => &[],
         _ => return Err(format!("ERR Unknown category '{}'", cat)),
     };
     Ok(list.iter().map(|s| (*s).to_string()).collect())
@@ -587,6 +804,8 @@ fn all_known_commands() -> Vec<String> {
         "list",
         "hash",
         "string",
+        "bitmap",
+        "hyperloglog",
         "keyspace",
         "dangerous",
     ] {

@@ -16,6 +16,8 @@ mod transaction;
 mod meta;
 mod acl;
 mod cluster;
+mod bitmap;
+mod hyperloglog;
 
 use crate::acl::AclStore;
 use crate::cache::Cache;
@@ -75,6 +77,8 @@ pub struct CommandHandler {
     cluster: Option<Arc<ClusterState>>,
     /// ASKING one-shot flag (allows next command against IMPORTING slots).
     asking: bool,
+    /// Negotiated RESP protocol version (2 default; 3 after HELLO 3).
+    protocol_version: u8,
 }
 
 impl CommandHandler {
@@ -107,6 +111,10 @@ impl CommandHandler {
         persistence: Option<Arc<PersistenceManager>>,
         acl: Arc<AclStore>,
     ) -> Self {
+        // Wire configured ACL file path (LOAD/SAVE) without clobbering a path already set.
+        if !config.aclfile.is_empty() && acl.aclfile().as_os_str().is_empty() {
+            acl.set_aclfile(&config.aclfile);
+        }
         // Auto-auth as default only when live ACL allows nopass (not just startup --auth).
         let authenticated = acl.default_allows_nopass();
         let username = if authenticated {
@@ -139,7 +147,38 @@ impl CommandHandler {
             replica_announce_port: None,
             cluster: None,
             asking: false,
+            protocol_version: 2,
         }
+    }
+
+    /// Current RESP protocol version (2 or 3).
+    pub fn protocol_version(&self) -> u8 {
+        self.protocol_version
+    }
+
+    /// CONFIG GET style key/value reply: flat array (RESP2) or map (RESP3).
+    pub(super) fn config_kv_reply(&self, key: &str, value: &str) -> RespValue {
+        let k = RespValue::BulkString(Some(Bytes::from(key.to_string())));
+        let v = RespValue::BulkString(Some(Bytes::from(value.to_string())));
+        if self.protocol_version >= 3 {
+            RespValue::Map(vec![(k, v)])
+        } else {
+            RespValue::Array(vec![k, v])
+        }
+    }
+
+    /// Convert subscribe confirmation frames to Push when on RESP3.
+    fn maybe_pubsub_push_frames(&self, responses: Vec<RespValue>) -> Vec<RespValue> {
+        if self.protocol_version < 3 {
+            return responses;
+        }
+        responses
+            .into_iter()
+            .map(|r| match r {
+                RespValue::Array(a) => RespValue::Push(a),
+                other => other,
+            })
+            .collect()
     }
 
     /// Attach cluster state (server path when `--cluster-enabled`).
@@ -242,14 +281,17 @@ impl CommandHandler {
             None => return Ok(RespValue::error("ERR invalid command")),
         };
 
-        let cmd_upper = String::from_utf8_lossy(cmd).to_uppercase();
+        // Stack buffer for ASCII uppercase — avoids heap alloc on the hot path.
+        let mut cmd_buf = [0u8; 64];
+        let cmd_upper_cow = ascii_uppercase_cmd(cmd, &mut cmd_buf);
+        let cmd_upper = cmd_upper_cow.as_ref();
 
         // AUTH / HELLO don't require prior authentication (HELLO may AUTH inline)
         if cmd_upper == "AUTH" {
             return self.handle_auth(&args[1..]);
         }
         if cmd_upper == "HELLO" {
-            return self.handle_hello(&args[1..]);
+            return self.handle_hello(&args[1..]).await;
         }
 
         // Check authentication
@@ -258,7 +300,7 @@ impl CommandHandler {
         }
 
         // ACL: command + key permission checks (after auth)
-        if let Some(deny) = self.check_acl_permission(&cmd_upper, &args[1..]) {
+        if let Some(deny) = self.check_acl_permission(cmd_upper, &args[1..]) {
             return Ok(deny);
         }
 
@@ -270,13 +312,13 @@ impl CommandHandler {
 
         // Cluster gate (after ACL): CROSSSLOT / MOVED / ASK
         if let Some(redir) =
-            self.check_cluster_redirect(&cmd_upper, &args[1..], asking_flag)
+            self.check_cluster_redirect(cmd_upper, &args[1..], asking_flag)
         {
             return Ok(redir);
         }
 
         // ── Transaction control (always immediate; never queued) ───────────────
-        match cmd_upper.as_str() {
+        match cmd_upper {
             "MULTI" => return self.handle_multi(),
             "EXEC" => return self.handle_exec().await,
             "DISCARD" => return self.handle_discard(),
@@ -286,7 +328,7 @@ impl CommandHandler {
         }
 
         // Reject writes on readonly replica (except SYNC is primary-only)
-        if is_write_command(&cmd_upper) {
+        if is_write_command(cmd_upper) {
             if let Some(p) = self.persistence.as_ref() {
                 if p.replication.readonly() {
                     return Ok(RespValue::error(
@@ -304,14 +346,14 @@ impl CommandHandler {
 
         // Queue non-control commands while inside MULTI (unless replaying EXEC).
         if self.in_multi && !self.executing_multi {
-            return self.queue_multi_command(&cmd_upper, value);
+            return self.queue_multi_command(cmd_upper, value);
         }
 
         // ── Pub/Sub mode enforcement (Redis spec) ──────────────────────────────
         // Once a client has at least one active subscription only the listed
         // commands are accepted.  PING has a special array-reply in this mode.
         if self.in_pubsub_mode() {
-            match cmd_upper.as_str() {
+            match cmd_upper {
                 "SUBSCRIBE" | "UNSUBSCRIBE" | "PSUBSCRIBE" | "PUNSUBSCRIBE"
                 | "SSUBSCRIBE" | "SUNSUBSCRIBE"
                 | "RESET" | "QUIT" => {}
@@ -335,7 +377,7 @@ impl CommandHandler {
             }
         }
 
-        let result = match cmd_upper.as_str() {
+        let result = match cmd_upper {
             // Basic commands
             "PING" => self.handle_ping(&args[1..]),
             "ECHO" => self.handle_echo(&args[1..]),
@@ -362,6 +404,11 @@ impl CommandHandler {
                 self.client_name = None;
                 self.selected_db = 0;
                 self.cache = self.databases.db0();
+                self.protocol_version = 2;
+                self.asking = false;
+                if let Some(id) = self.client_id {
+                    self.cache.pubsub.set_client_protocol(id, 2).await;
+                }
                 Ok(RespValue::SimpleString(bytes::Bytes::from_static(b"RESET")))
             }
 
@@ -391,6 +438,19 @@ impl CommandHandler {
             "DECR" => self.handle_decr(&args[1..]),
             "INCRBY" => self.handle_incrby(&args[1..]),
             "DECRBY" => self.handle_decrby(&args[1..]),
+
+            // Bitmap commands
+            "SETBIT" => self.handle_setbit(&args[1..]),
+            "GETBIT" => self.handle_getbit(&args[1..]),
+            "BITCOUNT" => self.handle_bitcount(&args[1..]),
+            "BITPOS" => self.handle_bitpos(&args[1..]),
+            "BITOP" => self.handle_bitop(&args[1..]),
+            "BITFIELD" => self.handle_bitfield(&args[1..]),
+
+            // HyperLogLog
+            "PFADD" => self.handle_pfadd(&args[1..]),
+            "PFCOUNT" => self.handle_pfcount(&args[1..]),
+            "PFMERGE" => self.handle_pfmerge(&args[1..]),
 
             // Expiration commands
             "EXPIRE" => self.handle_expire(&args[1..]),
@@ -512,18 +572,18 @@ impl CommandHandler {
         };
 
         if let Ok(ref resp) = result {
-            self.maybe_persist_write(&cmd_upper, &args[1..], resp);
-            if is_write_command(&cmd_upper)
+            self.maybe_persist_write(cmd_upper, &args[1..], resp);
+            if is_write_command(cmd_upper)
                 && response_indicates_success(resp)
-                && !is_noop_write(&cmd_upper, resp)
+                && !is_noop_write(cmd_upper, resp)
             {
-                self.notify_watch_after_write(&cmd_upper, &args[1..]);
+                self.notify_watch_after_write(cmd_upper, &args[1..]);
             }
         }
         result
     }
 
-    /// Check ACL command + key permissions for the authenticated user.
+    /// Check ACL command + key + channel permissions for the authenticated user.
     /// Returns `Some(error)` when denied, `None` when allowed.
     fn check_acl_permission(&self, cmd_upper: &str, args: &[RespValue]) -> Option<RespValue> {
         let username = self.username.as_deref().unwrap_or("default");
@@ -546,6 +606,17 @@ impl CommandHandler {
                             "NOPERM this user has no permissions to access one of the keys used as arguments",
                         ));
                     }
+                }
+            }
+        }
+
+        // Channel permission checks for pub/sub commands.
+        if let Some(channels) = extract_pubsub_channels(cmd_upper, args) {
+            for ch in channels {
+                if !self.acl.can_access_channel(username, &ch) {
+                    return Some(RespValue::error(
+                        "NOPERM this user has no permissions to access one of the channels used as arguments",
+                    ));
                 }
             }
         }
@@ -660,15 +731,13 @@ impl CommandHandler {
             Error::InvalidArgument("client not registered for pub/sub".into())
         })?;
 
-        let responses = self.cache.cmd_subscribe(client_id, args).await?;
+        let responses = self.maybe_pubsub_push_frames(
+            self.cache.cmd_subscribe(client_id, args).await?,
+        );
 
         // Track subscription count from the last response's integer field.
-        if let Some(last) = responses.last() {
-            if let RespValue::Array(arr) = last {
-                if let Some(RespValue::Integer(n)) = arr.get(2) {
-                    self.pubsub_subscriptions = *n as usize;
-                }
-            }
+        if let Some(n) = pubsub_count_from_frame(responses.last()) {
+            self.pubsub_subscriptions = n as usize;
         }
 
         // Each confirmation must be sent as a separate top-level RESP frame.
@@ -684,14 +753,12 @@ impl CommandHandler {
             Error::InvalidArgument("client not registered for pub/sub".into())
         })?;
 
-        let responses = self.cache.cmd_unsubscribe(client_id, args).await?;
+        let responses = self.maybe_pubsub_push_frames(
+            self.cache.cmd_unsubscribe(client_id, args).await?,
+        );
 
-        if let Some(last) = responses.last() {
-            if let RespValue::Array(arr) = last {
-                if let Some(RespValue::Integer(n)) = arr.get(2) {
-                    self.pubsub_subscriptions = *n as usize;
-                }
-            }
+        if let Some(n) = pubsub_count_from_frame(responses.last()) {
+            self.pubsub_subscriptions = n as usize;
         }
 
         if responses.len() == 1 {
@@ -706,14 +773,12 @@ impl CommandHandler {
             Error::InvalidArgument("client not registered for pub/sub".into())
         })?;
 
-        let responses = self.cache.cmd_psubscribe(client_id, args).await?;
+        let responses = self.maybe_pubsub_push_frames(
+            self.cache.cmd_psubscribe(client_id, args).await?,
+        );
 
-        if let Some(last) = responses.last() {
-            if let RespValue::Array(arr) = last {
-                if let Some(RespValue::Integer(n)) = arr.get(2) {
-                    self.pubsub_subscriptions = *n as usize;
-                }
-            }
+        if let Some(n) = pubsub_count_from_frame(responses.last()) {
+            self.pubsub_subscriptions = n as usize;
         }
 
         if responses.len() == 1 {
@@ -728,14 +793,12 @@ impl CommandHandler {
             Error::InvalidArgument("client not registered for pub/sub".into())
         })?;
 
-        let responses = self.cache.cmd_punsubscribe(client_id, args).await?;
+        let responses = self.maybe_pubsub_push_frames(
+            self.cache.cmd_punsubscribe(client_id, args).await?,
+        );
 
-        if let Some(last) = responses.last() {
-            if let RespValue::Array(arr) = last {
-                if let Some(RespValue::Integer(n)) = arr.get(2) {
-                    self.pubsub_subscriptions = *n as usize;
-                }
-            }
+        if let Some(n) = pubsub_count_from_frame(responses.last()) {
+            self.pubsub_subscriptions = n as usize;
         }
 
         if responses.len() == 1 {
@@ -754,15 +817,13 @@ impl CommandHandler {
             Error::InvalidArgument("client not registered for pub/sub".into())
         })?;
 
-        let responses = self.cache.cmd_ssubscribe(client_id, args).await?;
+        let responses = self.maybe_pubsub_push_frames(
+            self.cache.cmd_ssubscribe(client_id, args).await?,
+        );
 
-        if let Some(last) = responses.last() {
-            if let RespValue::Array(arr) = last {
-                if let Some(RespValue::Integer(n)) = arr.get(2) {
-                    // n is the absolute total shard-channel count for this client
-                    self.shard_subscriptions = *n as usize;
-                }
-            }
+        if let Some(n) = pubsub_count_from_frame(responses.last()) {
+            // n is the absolute total shard-channel count for this client
+            self.shard_subscriptions = n as usize;
         }
 
         if responses.len() == 1 {
@@ -777,15 +838,13 @@ impl CommandHandler {
             Error::InvalidArgument("client not registered for pub/sub".into())
         })?;
 
-        let responses = self.cache.cmd_sunsubscribe(client_id, args).await?;
+        let responses = self.maybe_pubsub_push_frames(
+            self.cache.cmd_sunsubscribe(client_id, args).await?,
+        );
 
-        if let Some(last) = responses.last() {
-            if let RespValue::Array(arr) = last {
-                if let Some(RespValue::Integer(n)) = arr.get(2) {
-                    // n is the remaining absolute shard-channel count for this client
-                    self.shard_subscriptions = *n as usize;
-                }
-            }
+        if let Some(n) = pubsub_count_from_frame(responses.last()) {
+            // n is the remaining absolute shard-channel count for this client
+            self.shard_subscriptions = n as usize;
         }
 
         if responses.len() == 1 {
@@ -797,6 +856,33 @@ impl CommandHandler {
 
     async fn handle_spublish(&self, args: &[RespValue]) -> Result<RespValue> {
         self.cache.cmd_spublish(args).await
+    }
+}
+
+/// Uppercase an ASCII command name into `buf` when it fits (no heap).
+/// Falls back to a heap `String` only for oversized names.
+fn ascii_uppercase_cmd<'a>(cmd: &[u8], buf: &'a mut [u8; 64]) -> std::borrow::Cow<'a, str> {
+    if cmd.len() <= buf.len() {
+        for (i, &b) in cmd.iter().enumerate() {
+            buf[i] = b.to_ascii_uppercase();
+        }
+        // ASCII uppercase is always valid UTF-8.
+        let s = std::str::from_utf8(&buf[..cmd.len()]).unwrap_or("");
+        std::borrow::Cow::Borrowed(s)
+    } else {
+        std::borrow::Cow::Owned(String::from_utf8_lossy(cmd).to_uppercase())
+    }
+}
+
+/// Read the subscription count (3rd element) from a subscribe confirmation frame.
+fn pubsub_count_from_frame(frame: Option<&RespValue>) -> Option<i64> {
+    let arr = match frame? {
+        RespValue::Array(a) | RespValue::Push(a) => a,
+        _ => return None,
+    };
+    match arr.get(2) {
+        Some(RespValue::Integer(n)) => Some(*n),
+        _ => None,
     }
 }
 
@@ -846,6 +932,11 @@ fn is_write_command(cmd: &str) -> bool {
             | "XACK"
             // XREADGROUP mutates PEL / last_delivered
             | "XREADGROUP"
+            | "SETBIT"
+            | "BITOP"
+            | "BITFIELD"
+            | "PFADD"
+            | "PFMERGE"
     )
 }
 
@@ -879,6 +970,40 @@ fn extract_command_keys(
         .into_iter()
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .collect()
+}
+
+/// Extract channel names for pub/sub ACL checks.
+/// Returns `None` when the command is not channel-scoped.
+fn extract_pubsub_channels(cmd_upper: &str, args: &[RespValue]) -> Option<Vec<String>> {
+    let channels: Vec<String> = match cmd_upper {
+        // All args are channel names
+        "SUBSCRIBE" | "UNSUBSCRIBE" | "SSUBSCRIBE" | "SUNSUBSCRIBE" | "SPUBLISH" => args
+            .iter()
+            .filter_map(|a| {
+                a.as_bulk_string()
+                    .map(|b| String::from_utf8_lossy(b).into_owned())
+            })
+            .collect(),
+        // Patterns are treated as channel patterns for ACL (same glob rules)
+        "PSUBSCRIBE" | "PUNSUBSCRIBE" => args
+            .iter()
+            .filter_map(|a| {
+                a.as_bulk_string()
+                    .map(|b| String::from_utf8_lossy(b).into_owned())
+            })
+            .collect(),
+        // First arg is channel
+        "PUBLISH" => {
+            if let Some(b) = args.first().and_then(|a| a.as_bulk_string()) {
+                vec![String::from_utf8_lossy(b).into_owned()]
+            } else {
+                Vec::new()
+            }
+        }
+        _ => return None,
+    };
+    // Empty UNSUBSCRIBE (no args) unsubscribes all — no channel check needed.
+    Some(channels)
 }
 
 /// Extract key argument bytes using Redis COMMAND first_key/last_key/step.

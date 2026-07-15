@@ -186,6 +186,7 @@ impl CommandHandler {
     }
 
     /// HGETALL key
+    /// RESP2: flat array of field/value pairs. RESP3: map.
     pub(super) fn handle_hgetall(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.len() != 1 {
             return Ok(RespValue::error(
@@ -202,14 +203,34 @@ impl CommandHandler {
         match self.cache.get_hash(key) {
             Some(h) => {
                 let hash = h.read().unwrap();
-                let mut out = Vec::new();
-                for (f, v) in hash.hgetall() {
-                    out.push(RespValue::BulkString(Some(f)));
-                    out.push(RespValue::BulkString(Some(v)));
+                if self.protocol_version() >= 3 {
+                    let pairs: Vec<(RespValue, RespValue)> = hash
+                        .hgetall()
+                        .into_iter()
+                        .map(|(f, v)| {
+                            (
+                                RespValue::BulkString(Some(f)),
+                                RespValue::BulkString(Some(v)),
+                            )
+                        })
+                        .collect();
+                    Ok(RespValue::Map(pairs))
+                } else {
+                    let mut out = Vec::new();
+                    for (f, v) in hash.hgetall() {
+                        out.push(RespValue::BulkString(Some(f)));
+                        out.push(RespValue::BulkString(Some(v)));
+                    }
+                    Ok(RespValue::Array(out))
                 }
-                Ok(RespValue::Array(out))
             }
-            None => Ok(RespValue::Array(vec![])),
+            None => {
+                if self.protocol_version() >= 3 {
+                    Ok(RespValue::Map(vec![]))
+                } else {
+                    Ok(RespValue::Array(vec![]))
+                }
+            }
         }
     }
 

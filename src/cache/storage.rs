@@ -120,7 +120,7 @@ impl Cache {
     }
 
     /// Update both memory_usage and memory_tracker after a successful map mutation.
-    fn account_replace(&self, old_size: usize, new_size: usize) {
+    pub(super) fn account_replace(&self, old_size: usize, new_size: usize) {
         if old_size > 0 {
             self.memory_usage.fetch_sub(old_size, Ordering::Relaxed);
             self.memory_tracker

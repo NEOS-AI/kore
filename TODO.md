@@ -133,7 +133,7 @@ Also tracked in `docs/roadmap.md`.
   - *Done*: readonly replica rejects writes (`READONLY …`); serves reads (GET/EXISTS/TYPE/…); `ROLE`; `INFO` `# Replication` section (role, offsets, backlog, master_host)
 - [x] **`[P1]`** Failover story (external Sentinel-compatible or built-in later)
   - *Done (minimal + coordinated MVP-lite)*: honest promote via `REPLICAOF NO ONE` / bare `FAILOVER` on replica — new replid, offset 0, backlog clear, drop feeds, clear replica metadata, `master_replid2` in INFO; idempotent when already master.
-  - *Coordinated* `FAILOVER TO <host> <port> [TIMEOUT ms] [FORCE]` (master only, default timeout 5000ms): write pause, soft match against REPLCONF `listening-port`/`ip-address` when tracked, wait until target ack ≥ frozen `master_repl_offset` (unless **FORCE**), then TCP bare `FAILOVER` + demote self via `set_replicaof`. Catch-up sources: live-link tracked ACK (`REPLCONF ACK` on feed + periodic feed GETACK probe), then client-port GETACK fallback. Replica offset uses exact wire bytes via `parse_with_consumed` and replies to master GETACK on the repl link. Catch-up timeout leaves master writable. Full Sentinel not implemented.
+  - *Coordinated* `FAILOVER TO <host> <port> [TIMEOUT ms] [FORCE]` (master only, default timeout 5000ms): write pause, soft match against REPLCONF `listening-port`/`ip-address` when tracked, wait until target ack ≥ frozen `master_repl_offset` (unless **FORCE**), then TCP bare `FAILOVER`, best-effort sibling re-follow (`REPLICAOF` on feeds + client-port TCP), demote self via `set_replicaof`. Replicas honor in-stream `REPLICAOF` and reconnect on `primary_link_epoch` / primary addr change. Catch-up sources: live-link tracked ACK (`REPLCONF ACK` on feed + periodic feed GETACK probe), then client-port GETACK fallback. Replica offset uses exact wire bytes via `parse_with_consumed` and replies to master GETACK on the repl link. Catch-up timeout leaves master writable. Full Sentinel not implemented.
 - [x] **`[P1]`** Client durability: `WAIT` + min-replicas write gate
   - *Done*: `WAIT numreplicas timeout_ms` freezes `master_repl_offset`, probes feed GETACK, returns count of replicas with ack ≥ offset (`timeout 0` = forever). `CONFIG GET|SET min-replicas-to-write` / `min-replicas-max-lag` (aliases `min-slaves-*`); writes return `NOREPLICAS` when good replica count is below threshold. INFO exposes `min_slaves_*`.
 
@@ -155,14 +155,15 @@ Also tracked in `docs/roadmap.md`.
   - *Done*: per-connection queue; WATCH via key generation counters; UNWATCH; EXECABORT on queue errors
 - [x] **`[P1]`** Streams + consumer groups
   - *Done*: XADD (auto/`*` + explicit ID, MAXLEN), XLEN, XRANGE/XREVRANGE, XDEL, XTRIM, XREAD / XREADGROUP with **BLOCK** (ms; 0=forever; `$` fixed at wait start; stream_blockers + XADD notify), XGROUP CREATE/DESTROY (+MKSTREAM), XACK, XPENDING summary; TYPE/DEL/KEYS/DBSIZE/RENAME wired; RDB v3 + AOF stream persistence (entries, groups, PEL via XCLAIM FORCE on rewrite)
-- [ ] **`[P2]`** Bitmaps / bitfields, HyperLogLog
+- [x] **`[P2]`** Bitmaps / bitfields, HyperLogLog
+  - *Done (MVP)*: `SETBIT`/`GETBIT`/`BITCOUNT`/`BITPOS`/`BITOP` (AND/OR/XOR/NOT)/`BITFIELD` (GET/SET/INCRBY + OVERFLOW WRAP|SAT|FAIL); `PFADD`/`PFCOUNT`/`PFMERGE` dense HLL (p=14, Kore `KHLL` format). String-key backed; ACL `@bitmap`/`@hyperloglog`.
 
 ### Command coverage
 
 - [x] **`[P1]`** Common string ops: `APPEND`, `STRLEN`, `SETEX`, `GETSET`, `UNLINK`, `RENAME` / `RENAMENX`
   - *Done*: atomic APPEND; UNLINK = sync DEL; RENAME/RENAMENX across all key types
 - [x] **`[P1]`** `CLIENT`, `COMMAND`, `HELLO`
-  - *Done*: HELLO (RESP2 only; AUTH/SETNAME); CLIENT ID/SETNAME/GETNAME/SETINFO/LIST/INFO; COMMAND / COUNT / LIST / INFO catalog
+  - *Done*: HELLO (RESP2 + RESP3; AUTH/SETNAME); CLIENT ID/SETNAME/GETNAME/SETINFO/LIST/INFO; COMMAND / COUNT / LIST / INFO catalog
 - [x] **`[P1]`** Multi-DB: `SELECT` (or explicitly document single-DB only)
   - *Done*: `--databases` (default 16); per-connection `SELECT`; key isolation; `FLUSHDB` vs `FLUSHALL`; shared pub/sub+stats; **RDB v3 multi-DB + AOF SELECT** on save/rewrite/load/startup
 - [ ] **`[P2]`** Lua scripting / functions
@@ -203,17 +204,21 @@ Also tracked in `docs/roadmap.md`.
 
 ### Protocol & clients
 
-- [ ] **`[P1]`** RESP3 support (`HELLO 3`, maps, bools, push)
-- [ ] **`[P1]`** Zero/low-alloc command dispatch (avoid per-command `String` uppercasing; static table / perfect hash)
-- [ ] **`[P2]`** Pipelining / write batching optimizations under load
+- [x] **`[P1]`** RESP3 support (`HELLO 3`, maps, bools, push)
+  - *Done*: `RespValue::{Map,Bool,Null,Push}` serialize+parse; `HELLO 3` map + `protocol_version`; `HGETALL`/`CONFIG GET` as maps on proto 3; pub/sub confirmations + fan-out as **push** for RESP3 clients; `CLIENT INFO` `resp=`; `RESET` → proto 2.
+- [x] **`[P1]`** Zero/low-alloc command dispatch (avoid per-command `String` uppercasing; static table / perfect hash)
+  - *Done (MVP)*: stack `[u8;64]` ASCII uppercase via `ascii_uppercase_cmd` (heap only if name > 64 bytes); mixed-case dispatch covered by tests. Perfect-hash / enum dispatch still optional later.
+- [x] **`[P2]`** Pipelining / write batching optimizations under load
+  - *Done*: coalesce pipeline replies into fewer response-channel sends per read; write task drains/`try_recv` into up to 64KiB `write_all` batches.
 
 ### Security
 
-- [x] **`[P1]`** ACL (users, command/key permissions)
-  - *Partial MVP*: default user from `--auth` (empty→nopass+all; set→password); `AUTH` password / username+password; `ACL SETUSER` (on/off, >pass/nopass, +@all/-@all, +cmd/-cmd, ~*/~prefix*), `GETUSER`/`LIST`/`WHOAMI`/`CAT` (static categories); per-connection username; command+key checks; HELLO AUTH uses real user lookup. No LOAD/SAVE, DELUSER, GENPASS, channel ACL.
+- [x] **`[P1]`** ACL (users, command/key/channel permissions)
+  - *Done (MVP)*: default user from `--auth`; `AUTH` password / username+password; `ACL SETUSER` (on/off, >pass/nopass, +@all/-@all, +cmd/-cmd, ~*/~prefix*, `&*`/`&pat`/allchannels/resetchannels), `GETUSER`/`LIST`/`WHOAMI`/`CAT`/`DELUSER`/`LOAD`/`SAVE`; `--aclfile` + boot load; per-connection username; command+key+channel checks; HELLO AUTH uses real user lookup. GENPASS still deferred.
 - [x] **`[P1]`** TLS
   - *Done (MVP)*: `--tls` / `--tls-cert` / `--tls-key`; tokio-rustls server wrap on accept; fail-fast cert/key load; plaintext path unchanged; no mTLS / dual listener / replica link TLS
-- [ ] **`[P2]`** Unix domain socket option
+- [x] **`[P2]`** Unix domain socket option
+  - *Done*: `--unixsocket <path>` binds UDS in addition to TCP; stale socket unlink on bind; remove on shutdown; no TLS on UDS.
 
 ### Observability
 
@@ -252,7 +257,8 @@ Also tracked in `docs/roadmap.md`.
 
 - [x] **`[P1]`** Slow-client and memory limits under fan-out load
   - *Done (MVP)*: configurable client buffer capacity (default 1024); fan-out admission `message_size * max(1, N)` against maxmemory; pending PubSub memory until deliver/unregister; `RecvError::Lagged` disconnects slow clients; full broadcast buffer overwrites without panic + `messages_dropped` stat. See `docs/pubsub.md` policy notes; tests in `tests/pubsub_test.rs`
-- [ ] **`[P1]`** Pattern matcher: iterative (or bounded) matching to avoid deep recursion stack risk
+- [x] **`[P1]`** Pattern matcher: iterative (or bounded) matching to avoid deep recursion stack risk
+  - *Done*: `PatternMatcher::matches` is iterative star-backtrack (supports `*` `?` `[]` `\`); pathological `*` stress test.
 
 ---
 
@@ -265,7 +271,8 @@ Also tracked in `docs/roadmap.md`.
   - *Done*: `.github/workflows/ci.yml` — build + `cargo test --all-targets -- --test-threads=1`
 - [x] **`[P1]`** **Benchmarks**: expand `docs/benchmarks.md` with methodology and numbers vs Redis/Valkey (`redis-benchmark`, same hardware)
   - *Done*: methodology runbook; result tables TBD until measured
-- [ ] **`[P1]`** **Fuzz** RESP parser and command argument parsing
+- [x] **`[P1]`** **Fuzz** RESP parser and command argument parsing
+  - *Done*: in-tree smoke fuzz unit tests (random + structured); `fuzz/` crate with `resp_parse` + `command_dispatch` targets (`cargo +nightly fuzz run …` when cargo-fuzz installed).
 - [ ] **`[P1]`** **Concurrency / loom or stress** jobs for shard RMW paths
 - [ ] **`[P2]`** Align version strings in docs/`INFO` examples with `Cargo.toml` (currently 0.6.0)
 - [ ] **`[P2]`** Consistent locking and error handling guidelines in contributor docs

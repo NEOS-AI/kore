@@ -15,6 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
@@ -33,9 +35,11 @@ pub struct Server {
 }
 
 const BUFFER_SIZE: usize = 8192;
-const RESPONSE_QUEUE_SIZE: usize = 100; // Maximum pending responses per client
-const SLOW_CLIENT_THRESHOLD: usize = 80; // Trigger warning at 80% full
+const RESPONSE_QUEUE_SIZE: usize = 256; // Pending response buffers per client
+const SLOW_CLIENT_THRESHOLD: usize = 200; // Warn when free capacity drops below this
 const WRITE_TIMEOUT_SECS: u64 = 5; // Timeout for write operations
+/// Cap coalesced write size so one slow flush cannot hold unbounded memory.
+const WRITE_BATCH_MAX_BYTES: usize = 64 * 1024;
 const MAX_CLIENTS_ERR: &[u8] = b"-ERR max number of clients reached\r\n";
 
 /// Load a rustls server acceptor from PEM cert/key paths.
@@ -74,6 +78,14 @@ impl Server {
         persistence: Option<Arc<PersistenceManager>>,
     ) -> Self {
         let acl = AclStore::from_auth_arc(&config.auth);
+        if !config.aclfile.is_empty() {
+            acl.set_aclfile(&config.aclfile);
+            match acl.try_load_on_boot() {
+                Ok(true) => info!("Loaded ACL rules from {}", config.aclfile),
+                Ok(false) => {}
+                Err(e) => warn!("Failed to load ACL file '{}': {}", config.aclfile, e),
+            }
+        }
         let cluster = if config.cluster_enabled {
             Some(ClusterState::single_node(config.host.clone(), config.port))
         } else {
@@ -150,6 +162,54 @@ impl Server {
         let addr = self.config.socket_addr();
         let listener = TcpListener::bind(&addr).await?;
 
+        // Optional Unix domain socket (in addition to TCP).
+        #[cfg(unix)]
+        let unix_listener = {
+            if self.config.unixsocket.is_empty() {
+                None
+            } else {
+                let path = std::path::Path::new(&self.config.unixsocket);
+                if path.exists() {
+                    // Stale socket from a previous crash — remove so bind succeeds.
+                    let _ = std::fs::remove_file(path);
+                }
+                if let Some(parent) = path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent).map_err(|e| {
+                            anyhow::anyhow!(
+                                "Failed to create unix socket directory '{}': {}",
+                                parent.display(),
+                                e
+                            )
+                        })?;
+                    }
+                }
+                match UnixListener::bind(path) {
+                    Ok(l) => {
+                        info!("Kore server listening on unix socket {}", self.config.unixsocket);
+                        Some(l)
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!(
+                            "Failed to bind unix socket '{}': {}",
+                            self.config.unixsocket,
+                            e
+                        ));
+                    }
+                }
+            }
+        };
+        #[cfg(not(unix))]
+        let _unix_listener: Option<()> = {
+            if !self.config.unixsocket.is_empty() {
+                warn!(
+                    "--unixsocket is not supported on this platform; ignoring '{}'",
+                    self.config.unixsocket
+                );
+            }
+            None
+        };
+
         // Load TLS material once at server start (fail fast on invalid cert/key).
         let tls_acceptor = if self.config.tls {
             let acceptor = load_tls_acceptor(&self.config.tls_cert, &self.config.tls_key)?;
@@ -193,88 +253,79 @@ impl Server {
         // Limit concurrent connections with a semaphore (race-free vs post-accept stats check)
         let conn_limit = Arc::new(Semaphore::new(self.config.maxconns));
 
+        // Track unix path for cleanup on shutdown.
+        #[cfg(unix)]
+        let unix_path = if self.config.unixsocket.is_empty() {
+            None
+        } else {
+            Some(self.config.unixsocket.clone())
+        };
+
         loop {
-            tokio::select! {
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
-                        info!("Shutdown signal received — stopping accept loop");
-                        break;
+            #[cfg(unix)]
+            {
+                tokio::select! {
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            info!("Shutdown signal received — stopping accept loop");
+                            break;
+                        }
+                    }
+                    accept = listener.accept() => {
+                        match accept {
+                            Ok((socket, peer_addr)) => {
+                                if let Err(e) = socket.set_nodelay(true) {
+                                    warn!("Failed to set TCP_NODELAY for {}: {}", peer_addr, e);
+                                }
+                                self.spawn_client(
+                                    socket,
+                                    peer_addr.to_string(),
+                                    conn_limit.clone(),
+                                    tls_acceptor.clone(),
+                                );
+                            }
+                            Err(e) => error!("Failed to accept connection: {}", e),
+                        }
+                    }
+                    accept = accept_unix_optional(&unix_listener) => {
+                        match accept {
+                            Ok(socket) => {
+                                let peer = format!("unix:{}", self.config.unixsocket);
+                                self.spawn_client(
+                                    socket,
+                                    peer,
+                                    conn_limit.clone(),
+                                    None,
+                                );
+                            }
+                            Err(e) => error!("Failed to accept unix connection: {}", e),
+                        }
                     }
                 }
-                accept = listener.accept() => {
-                    match accept {
-                        Ok((mut socket, peer_addr)) => {
-                            // Try to reserve a connection slot before spawning the handler
-                            let permit = match conn_limit.clone().try_acquire_owned() {
-                                Ok(permit) => permit,
-                                Err(_) => {
-                                    warn!(
-                                        "Max connections reached ({}), rejecting connection from {}",
-                                        self.config.maxconns, peer_addr
-                                    );
-                                    // Redis-like error, then close without full handler
-                                    let _ = socket.write_all(MAX_CLIENTS_ERR).await;
-                                    let _ = socket.shutdown().await;
-                                    continue;
-                                }
-                            };
-
-                            // Disable Nagle before optional TLS wrap
-                            if let Err(e) = socket.set_nodelay(true) {
-                                warn!("Failed to set TCP_NODELAY for {}: {}", peer_addr, e);
-                            }
-
-                            info!("New connection from {}", peer_addr);
-
-                            let databases = self.databases.clone();
-                            let config = self.config.clone();
-                            let persistence = self.persistence.clone();
-                            let acl = self.acl.clone();
-                            let cluster = self.cluster.clone();
-                            let tls_acceptor = tls_acceptor.clone();
-
-                            // Spawn a new task to handle the connection
-                            // Tokio will schedule this on its thread pool (number of threads configured at runtime)
-                            // Permit is held for the lifetime of the connection task
-                            tokio::spawn(async move {
-                                let _permit = permit;
-                                let result = if let Some(acceptor) = tls_acceptor {
-                                    match acceptor.accept(socket).await {
-                                        Ok(tls_stream) => {
-                                            handle_connection(
-                                                tls_stream,
-                                                databases,
-                                                config,
-                                                persistence,
-                                                acl,
-                                                cluster,
-                                            )
-                                            .await
-                                        }
-                                        Err(e) => Err(anyhow::anyhow!(
-                                            "TLS handshake failed: {}",
-                                            e
-                                        )),
-                                    }
-                                } else {
-                                    handle_connection(
-                                        socket,
-                                        databases,
-                                        config,
-                                        persistence,
-                                        acl,
-                                        cluster,
-                                    )
-                                    .await
-                                };
-                                if let Err(e) = result {
-                                    warn!("Connection error from {}: {}", peer_addr, e);
-                                }
-                                info!("Connection closed from {}", peer_addr);
-                            });
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::select! {
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            info!("Shutdown signal received — stopping accept loop");
+                            break;
                         }
-                        Err(e) => {
-                            error!("Failed to accept connection: {}", e);
+                    }
+                    accept = listener.accept() => {
+                        match accept {
+                            Ok((socket, peer_addr)) => {
+                                if let Err(e) = socket.set_nodelay(true) {
+                                    warn!("Failed to set TCP_NODELAY for {}: {}", peer_addr, e);
+                                }
+                                self.spawn_client(
+                                    socket,
+                                    peer_addr.to_string(),
+                                    conn_limit.clone(),
+                                    tls_acceptor.clone(),
+                                );
+                            }
+                            Err(e) => error!("Failed to accept connection: {}", e),
                         }
                     }
                 }
@@ -290,8 +341,112 @@ impl Server {
             }
         }
 
+        // Remove unix socket file so the next bind is clean.
+        #[cfg(unix)]
+        if let Some(path) = unix_path {
+            let _ = std::fs::remove_file(&path);
+        }
+
         info!("Kore server shut down cleanly");
         Ok(())
+    }
+
+    /// Spawn a connection handler task (TCP or UDS).
+    fn spawn_client<S>(
+        &self,
+        mut socket: S,
+        peer_label: String,
+        conn_limit: Arc<Semaphore>,
+        tls_acceptor: Option<TlsAcceptor>,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let permit = match conn_limit.try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                warn!(
+                    "Max connections reached ({}), rejecting connection from {}",
+                    self.config.maxconns, peer_label
+                );
+                tokio::spawn(async move {
+                    let _ = socket.write_all(MAX_CLIENTS_ERR).await;
+                    let _ = socket.shutdown().await;
+                });
+                return;
+            }
+        };
+
+        info!("New connection from {}", peer_label);
+
+        let databases = self.databases.clone();
+        let config = self.config.clone();
+        let persistence = self.persistence.clone();
+        let acl = self.acl.clone();
+        let cluster = self.cluster.clone();
+
+        tokio::spawn(async move {
+            let _permit = permit;
+            let result = if let Some(acceptor) = tls_acceptor {
+                match acceptor.accept(socket).await {
+                    Ok(tls_stream) => {
+                        handle_connection(
+                            tls_stream,
+                            databases,
+                            config,
+                            persistence,
+                            acl,
+                            cluster,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(anyhow::anyhow!("TLS handshake failed: {}", e)),
+                }
+            } else {
+                handle_connection(socket, databases, config, persistence, acl, cluster).await
+            };
+            if let Err(e) = result {
+                warn!("Connection error from {}: {}", peer_label, e);
+            }
+            info!("Connection closed from {}", peer_label);
+        });
+    }
+}
+
+/// Accept on an optional Unix listener; pending forever when `None`.
+#[cfg(unix)]
+async fn accept_unix_optional(
+    listener: &Option<UnixListener>,
+) -> std::io::Result<tokio::net::UnixStream> {
+    match listener {
+        Some(l) => l.accept().await.map(|(s, _)| s),
+        None => std::future::pending().await,
+    }
+}
+
+
+
+/// Enqueue a response buffer with backpressure / slow-client detection.
+async fn send_response_buf(
+    tx: &mpsc::Sender<Vec<u8>>,
+    data: Vec<u8>,
+) -> Result<(), ()> {
+    let current_capacity = tx.capacity();
+    if current_capacity < (RESPONSE_QUEUE_SIZE.saturating_sub(SLOW_CLIENT_THRESHOLD)) {
+        warn!(
+            "Response queue filling up: {}/{} capacity remaining - slow client detected",
+            current_capacity, RESPONSE_QUEUE_SIZE
+        );
+    }
+    match timeout(Duration::from_millis(100), tx.send(data)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(_)) => {
+            warn!("Response channel closed");
+            Err(())
+        }
+        Err(_) => {
+            warn!("Response queue send timeout - client not consuming responses fast enough");
+            Err(())
+        }
     }
 }
 
@@ -327,7 +482,8 @@ where
     // Split socket into reader and writer (works for TcpStream and TlsStream)
     let (mut reader, mut writer) = tokio::io::split(socket);
 
-    // Spawn a task to handle outgoing messages (both responses and pub/sub messages)
+    // Spawn a task to handle outgoing messages (both responses and pub/sub messages).
+    // Response path coalesces queued buffers into larger writes (pipeline-friendly).
     let cache_clone = cache.clone();
     let write_task = tokio::spawn(async move {
         let mut slow_client_warnings = 0;
@@ -375,12 +531,21 @@ where
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
-                // Handle command responses
+                // Handle command responses — drain/coalesce for pipelined clients
                 Some(data) = response_rx.recv() => {
-                    // Write with timeout
-                    match timeout(Duration::from_secs(WRITE_TIMEOUT_SECS), writer.write_all(&data)).await {
+                    let mut batch = data;
+                    while batch.len() < WRITE_BATCH_MAX_BYTES {
+                        match response_rx.try_recv() {
+                            Ok(more) => {
+                                batch.extend_from_slice(&more);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+
+                    match timeout(Duration::from_secs(WRITE_TIMEOUT_SECS), writer.write_all(&batch)).await {
                         Ok(Ok(_)) => {
-                            cache_clone.stats.incr_bytes_sent(data.len());
+                            cache_clone.stats.incr_bytes_sent(batch.len());
                         }
                         Ok(Err(e)) => {
                             warn!("Failed to write response: {}", e);
@@ -415,7 +580,11 @@ where
         // Track bytes received
         cache.stats.incr_bytes_received(n);
 
-        // Parse and handle commands
+        // Parse and handle all complete commands available after this read
+        // (Redis pipelining). Coalesce serialized replies into fewer channel sends.
+        let mut pipeline_buf: Vec<u8> = Vec::new();
+        let mut entered_replica_feed = false;
+
         while let Some(value) = parser.parse()? {
             let response = match handler.handle(value).await {
                 Ok(resp) => resp,
@@ -425,14 +594,19 @@ where
                 }
             };
 
-            // SYNC / PSYNC: send pre-serialized handshake (+ RDB or CONTINUE+backlog),
-            // then stream live write commands to the replica socket while reading
-            // REPLCONF ACK replies for catch-up tracking.
+            // SYNC / PSYNC: flush any prior pipeline bytes, then handshake + feed.
             if let Some(raw) = handler.take_raw_response() {
+                if !pipeline_buf.is_empty() {
+                    if send_response_buf(&response_tx, pipeline_buf).await.is_err() {
+                        break 'conn Ok(());
+                    }
+                    pipeline_buf = Vec::new();
+                }
                 let feed_rx = handler.take_replica_feed();
                 let _ = response_tx.send(raw.to_vec()).await;
                 if let Some(mut feed_rx) = feed_rx {
                     info!("Connection entered replica feed mode");
+                    entered_replica_feed = true;
                     let repl: Option<Arc<crate::persistence::replication::ReplicationManager>> =
                         handler
                             .persistence()
@@ -515,35 +689,24 @@ where
                 continue;
             }
 
-            // Send response through channel
-            let data = response.serialize().to_vec();
-
-            // Check if response queue is getting full (backpressure detection)
-            let current_capacity = response_tx.capacity();
-            if current_capacity < (RESPONSE_QUEUE_SIZE - SLOW_CLIENT_THRESHOLD) {
-                warn!(
-                    "Response queue filling up: {}/{} capacity remaining - slow client detected",
-                    current_capacity, RESPONSE_QUEUE_SIZE
-                );
+            let serialized = response.serialize();
+            pipeline_buf.extend_from_slice(&serialized);
+            // Bound memory if a huge pipeline arrives in one read.
+            if pipeline_buf.len() >= WRITE_BATCH_MAX_BYTES {
+                if send_response_buf(&response_tx, std::mem::take(&mut pipeline_buf))
+                    .await
+                    .is_err()
+                {
+                    break 'conn Ok(());
+                }
             }
+        }
 
-            // Try to send response with timeout to avoid blocking on slow clients
-            match timeout(Duration::from_millis(100), response_tx.send(data)).await {
-                Ok(Ok(_)) => {
-                    // Successfully sent
-                }
-                Ok(Err(_)) => {
-                    // Channel closed
-                    warn!("Response channel closed");
-                    break;
-                }
-                Err(_) => {
-                    // Timeout - client is too slow to accept responses
-                    warn!(
-                        "Response queue send timeout - client not consuming responses fast enough"
-                    );
-                    break;
-                }
+        if entered_replica_feed {
+            // already exited via break 'conn
+        } else if !pipeline_buf.is_empty() {
+            if send_response_buf(&response_tx, pipeline_buf).await.is_err() {
+                break Ok(());
             }
         }
     };
@@ -590,7 +753,9 @@ mod tests {
             tls: false,
             tls_cert: String::new(),
             tls_key: String::new(),
+            aclfile: String::new(),
             cluster_enabled: false,
+                unixsocket: String::new(),
         });
 
         let cache = Cache::new(config.shards, config.maxmemory);

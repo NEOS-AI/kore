@@ -285,7 +285,9 @@ async fn test_config_set_save_updates_rules() {
         tls: false,
         tls_cert: String::new(),
         tls_key: String::new(),
+        aclfile: String::new(),
         cluster_enabled: false,
+    unixsocket: String::new(),
     };
     let mut h = CommandHandler::with_persistence(cache, Arc::new(config), Some(mgr.clone()));
 

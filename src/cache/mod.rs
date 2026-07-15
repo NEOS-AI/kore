@@ -10,6 +10,10 @@ mod sets;
 mod streams;
 mod config;
 mod search;
+mod bitmap;
+mod hyperloglog;
+
+pub use bitmap::{BitOpKind, BitfieldOp, BitfieldOverflow};
 
 use crate::hashmap::{ShardedHashMap, ShardedKeyMap};
 use crate::sorted_set::SharedSortedSet;

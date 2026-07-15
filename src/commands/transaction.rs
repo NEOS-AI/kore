@@ -154,7 +154,22 @@ fn write_keys(cmd: &str, args: &[RespValue]) -> Vec<Bytes> {
         "SET" | "SETNX" | "GETDEL" | "GETEX" | "APPEND" | "SETEX" | "GETSET" | "INCR"
         | "DECR" | "INCRBY" | "DECRBY" | "EXPIRE" | "PEXPIRE" | "ZADD" | "ZREM" | "GEOADD"
         | "GEOSEARCHSTORE" | "HSET" | "HDEL" | "HINCRBY" | "LPUSH" | "RPUSH" | "LPOP"
-        | "RPOP" | "LSET" | "SADD" | "SREM" | "XADD" | "XDEL" | "XTRIM" | "XACK" => args
+        | "RPOP" | "LSET" | "SADD" | "SREM" | "XADD" | "XDEL" | "XTRIM" | "XACK"
+        | "SETBIT" | "BITFIELD" | "PFADD" => args
+            .first()
+            .and_then(|a| a.as_bulk_string())
+            .cloned()
+            .into_iter()
+            .collect(),
+        // BITOP dest key [key ...] — dest is first arg after command
+        "BITOP" => args
+            .get(1)
+            .and_then(|a| a.as_bulk_string())
+            .cloned()
+            .into_iter()
+            .collect(),
+        // PFMERGE dest source [source ...]
+        "PFMERGE" => args
             .first()
             .and_then(|a| a.as_bulk_string())
             .cloned()

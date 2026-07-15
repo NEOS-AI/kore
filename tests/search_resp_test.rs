@@ -42,7 +42,9 @@ fn make_handler(cache: Arc<Cache>) -> CommandHandler {
         tls: false,
         tls_cert: String::new(),
         tls_key: String::new(),
+        aclfile: String::new(),
         cluster_enabled: false,
+    unixsocket: String::new(),
     };
     CommandHandler::new(cache, Arc::new(config))
 }

@@ -121,9 +121,17 @@ pub struct Config {
     #[arg(long, default_value = "")]
     pub tls_key: String,
 
+    /// Path to ACL rules file for ACL LOAD / ACL SAVE (empty = not configured).
+    #[arg(long, default_value = "")]
+    pub aclfile: String,
+
     /// Enable Redis Cluster mode (hash slots, MOVED/ASK redirects). Default: false.
     #[arg(long, default_value = "false")]
     pub cluster_enabled: bool,
+
+    /// Unix domain socket path (empty = disabled). Listens in addition to TCP.
+    #[arg(long, default_value = "")]
+    pub unixsocket: String,
 }
 
 impl Default for Config {
@@ -157,7 +165,9 @@ impl Default for Config {
             tls: false,
             tls_cert: String::new(),
             tls_key: String::new(),
+            aclfile: String::new(),
             cluster_enabled: false,
+            unixsocket: String::new(),
         }
     }
 }

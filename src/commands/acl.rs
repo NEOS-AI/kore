@@ -1,4 +1,4 @@
-//! ACL command handlers: SETUSER, GETUSER, LIST, WHOAMI, CAT.
+//! ACL command handlers: SETUSER, GETUSER, LIST, WHOAMI, CAT, DELUSER, LOAD, SAVE.
 
 use super::CommandHandler;
 use crate::acl::{category_commands, category_names, AclUser};
@@ -29,6 +29,9 @@ impl CommandHandler {
             "USERS" => self.acl_users(&args[1..]),
             "WHOAMI" => self.acl_whoami(&args[1..]),
             "CAT" => self.acl_cat(&args[1..]),
+            "DELUSER" => self.acl_deluser(&args[1..]),
+            "LOAD" => self.acl_load(&args[1..]),
+            "SAVE" => self.acl_save(&args[1..]),
             "HELP" => Ok(acl_help()),
             _ => Ok(RespValue::error(format!(
                 "ERR Unknown subcommand or wrong number of arguments for '{}'. Try ACL HELP.",
@@ -130,6 +133,50 @@ impl CommandHandler {
             Err(e) => Ok(RespValue::error(e)),
         }
     }
+
+    fn acl_deluser(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'acl|deluser' command",
+            ));
+        }
+        let mut names: Vec<String> = Vec::new();
+        for a in args {
+            match a.as_bulk_string() {
+                Some(b) => names.push(String::from_utf8_lossy(b).into_owned()),
+                None => return Ok(RespValue::error("ERR invalid username")),
+            }
+        }
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        match self.acl.deluser(&refs) {
+            Ok(n) => Ok(RespValue::Integer(n as i64)),
+            Err(e) => Ok(RespValue::error(e)),
+        }
+    }
+
+    fn acl_load(&self, args: &[RespValue]) -> Result<RespValue> {
+        if !args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'acl|load' command",
+            ));
+        }
+        match self.acl.load() {
+            Ok(()) => Ok(RespValue::ok()),
+            Err(e) => Ok(RespValue::error(e)),
+        }
+    }
+
+    fn acl_save(&self, args: &[RespValue]) -> Result<RespValue> {
+        if !args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'acl|save' command",
+            ));
+        }
+        match self.acl.save() {
+            Ok(()) => Ok(RespValue::ok()),
+            Err(e) => Ok(RespValue::error(e)),
+        }
+    }
 }
 
 fn getuser_reply(user: &AclUser) -> RespValue {
@@ -147,6 +194,9 @@ fn getuser_reply(user: &AclUser) -> RespValue {
     }
     if user.all_commands {
         flags.push(bulk("allcommands"));
+    }
+    if user.all_channels {
+        flags.push(bulk("allchannels"));
     }
 
     let passwords: Vec<RespValue> = if user.nopass {
@@ -179,6 +229,15 @@ fn getuser_reply(user: &AclUser) -> RespValue {
             .collect()
     };
 
+    let channels: Vec<RespValue> = if user.all_channels {
+        vec![bulk("&*")]
+    } else {
+        user.channel_patterns
+            .iter()
+            .map(|p| bulk(format!("&{}", p)))
+            .collect()
+    };
+
     RespValue::Array(vec![
         bulk("flags"),
         RespValue::Array(flags),
@@ -189,7 +248,7 @@ fn getuser_reply(user: &AclUser) -> RespValue {
         bulk("keys"),
         RespValue::Array(keys),
         bulk("channels"),
-        RespValue::Array(vec![bulk("&*")]),
+        RespValue::Array(channels),
         bulk("selectors"),
         RespValue::Array(vec![]),
     ])
@@ -201,10 +260,16 @@ fn acl_help() -> RespValue {
             "ACL <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
             "CAT [<category>]",
             "    List categories or commands in a category.",
+            "DELUSER <username> [<username> ...]",
+            "    Delete one or more users. The default user cannot be removed.",
             "GETUSER <username>",
             "    Return the rules for a user.",
             "LIST",
             "    Show user details as ACL configuration rules.",
+            "LOAD",
+            "    Reload users from the configured ACL file.",
+            "SAVE",
+            "    Save the current ACL rules to the configured ACL file.",
             "SETUSER <username> [rules...]",
             "    Create or modify a user.",
             "USERS",

@@ -68,7 +68,9 @@ fn base_config(port: u16) -> Config {
         tls: false,
         tls_cert: String::new(),
         tls_key: String::new(),
+        aclfile: String::new(),
         cluster_enabled: false,
+    unixsocket: String::new(),
     }
 }
 

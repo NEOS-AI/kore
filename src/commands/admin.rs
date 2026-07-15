@@ -366,17 +366,14 @@ impl CommandHandler {
                 match param.as_str() {
                     "maxentrysize" | "max-entry-size" => {
                         let value = self.cache.get_max_entry_size();
-                        Ok(RespValue::Array(vec![
-                            RespValue::BulkString(Some(Bytes::from("maxentrysize"))),
-                            RespValue::BulkString(Some(Bytes::from(value.to_string()))),
-                        ]))
+                        Ok(self.config_kv_reply(
+                            "maxentrysize",
+                            &value.to_string(),
+                        ))
                     }
                     "maxmemory" | "max-memory" => {
                         let value = self.cache.max_memory();
-                        Ok(RespValue::Array(vec![
-                            RespValue::BulkString(Some(Bytes::from("maxmemory"))),
-                            RespValue::BulkString(Some(Bytes::from(value.to_string()))),
-                        ]))
+                        Ok(self.config_kv_reply("maxmemory", &value.to_string()))
                     }
                     "save" => {
                         let value = self
@@ -384,34 +381,26 @@ impl CommandHandler {
                             .as_ref()
                             .map(|p| p.save_rules_string())
                             .unwrap_or_default();
-                        Ok(RespValue::Array(vec![
-                            RespValue::BulkString(Some(Bytes::from("save"))),
-                            RespValue::BulkString(Some(Bytes::from(value))),
-                        ]))
+                        Ok(self.config_kv_reply("save", &value))
                     }
                     "maxmemory-policy" | "maxmemory_policy" => {
                         let value = self.cache.eviction_policy().as_str();
-                        Ok(RespValue::Array(vec![
-                            RespValue::BulkString(Some(Bytes::from("maxmemory-policy"))),
-                            RespValue::BulkString(Some(Bytes::from(value))),
-                        ]))
+                        Ok(self.config_kv_reply("maxmemory-policy", value))
                     }
-                    "databases" => Ok(RespValue::Array(vec![
-                        RespValue::BulkString(Some(Bytes::from("databases"))),
-                        RespValue::BulkString(Some(Bytes::from(
-                            self.databases.len().to_string(),
-                        ))),
-                    ])),
+                    "databases" => Ok(self.config_kv_reply(
+                        "databases",
+                        &self.databases.len().to_string(),
+                    )),
                     "min-replicas-to-write" | "min-slaves-to-write" => {
                         let n = self
                             .persistence
                             .as_ref()
                             .map(|p| p.replication.min_replicas_to_write())
                             .unwrap_or(0);
-                        Ok(RespValue::Array(vec![
-                            RespValue::BulkString(Some(Bytes::from("min-replicas-to-write"))),
-                            RespValue::BulkString(Some(Bytes::from(n.to_string()))),
-                        ]))
+                        Ok(self.config_kv_reply(
+                            "min-replicas-to-write",
+                            &n.to_string(),
+                        ))
                     }
                     "min-replicas-max-lag" | "min-slaves-max-lag" => {
                         let n = self
@@ -419,14 +408,19 @@ impl CommandHandler {
                             .as_ref()
                             .map(|p| p.replication.min_replicas_max_lag())
                             .unwrap_or(10);
-                        Ok(RespValue::Array(vec![
-                            RespValue::BulkString(Some(Bytes::from("min-replicas-max-lag"))),
-                            RespValue::BulkString(Some(Bytes::from(n.to_string()))),
-                        ]))
+                        Ok(self.config_kv_reply(
+                            "min-replicas-max-lag",
+                            &n.to_string(),
+                        ))
                     }
                     _ => {
-                        // Return empty array for unknown parameters (Redis behavior)
-                        Ok(RespValue::Array(vec![]))
+                        // Empty reply for unknown parameters (Redis behavior).
+                        // RESP3 uses an empty map.
+                        if self.protocol_version() >= 3 {
+                            Ok(RespValue::Map(vec![]))
+                        } else {
+                            Ok(RespValue::Array(vec![]))
+                        }
                     }
                 }
             }

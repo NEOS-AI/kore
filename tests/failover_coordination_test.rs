@@ -67,7 +67,9 @@ fn make_config(dir: &PathBuf, port: u16) -> Arc<Config> {
         tls: false,
         tls_cert: String::new(),
         tls_key: String::new(),
+        aclfile: String::new(),
         cluster_enabled: false,
+    unixsocket: String::new(),
     })
 }
 
@@ -104,6 +106,19 @@ async fn read_one(stream: &mut TcpStream) -> RespValue {
             .expect("read err");
         assert!(n > 0, "connection closed while waiting for response");
         parser.feed(&buf[..n]);
+    }
+}
+
+async fn wait_listen(port: u16) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match TcpStream::connect(format!("127.0.0.1:{}", port)).await {
+            Ok(_) => return,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => panic!("server on port {} never became ready: {}", port, e),
+        }
     }
 }
 
@@ -842,4 +857,232 @@ async fn coordinated_failover_timeout() {
     handle.abort();
     sleep(Duration::from_millis(50)).await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Three-node FAILOVER TO: sibling replica is redirected to the new master.
+#[tokio::test(flavor = "multi_thread")]
+async fn failover_to_redirects_sibling_replica() {
+    // Distinct from other tests in this file (16610–16622) to avoid parallel races.
+    let master_port = 16630u16;
+    let r1_port = 16631u16; // promote target
+    let r2_port = 16632u16; // sibling that must re-follow
+
+    let master_dir = unique_dir("refollow-m");
+    let r1_dir = unique_dir("refollow-r1");
+    let r2_dir = unique_dir("refollow-r2");
+
+    let master_cfg = make_config(&master_dir, master_port);
+    let mut r1_cfg = (*make_config(&r1_dir, r1_port)).clone();
+    r1_cfg.replicaof = format!("127.0.0.1:{}", master_port);
+    let r1_cfg = Arc::new(r1_cfg);
+    let mut r2_cfg = (*make_config(&r2_dir, r2_port)).clone();
+    r2_cfg.replicaof = format!("127.0.0.1:{}", master_port);
+    let r2_cfg = Arc::new(r2_cfg);
+
+    let master_mgr = make_persistence(&master_dir);
+    master_mgr.replication.set_announce_port(master_port);
+    let r1_mgr = make_persistence(&r1_dir);
+    r1_mgr.replication.set_announce_port(r1_port);
+    r1_mgr
+        .replication
+        .set_replicaof(Some(format!("127.0.0.1:{}", master_port)));
+    let r2_mgr = make_persistence(&r2_dir);
+    r2_mgr.replication.set_announce_port(r2_port);
+    r2_mgr
+        .replication
+        .set_replicaof(Some(format!("127.0.0.1:{}", master_port)));
+
+    let master_cache = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let r1_cache = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let r2_cache = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+
+    let master = Server::with_persistence(
+        Arc::clone(&master_cache),
+        Arc::clone(&master_cfg),
+        Arc::clone(&master_mgr),
+    );
+    let r1 = Server::with_persistence(
+        Arc::clone(&r1_cache),
+        Arc::clone(&r1_cfg),
+        Arc::clone(&r1_mgr),
+    );
+    let r2 = Server::with_persistence(
+        Arc::clone(&r2_cache),
+        Arc::clone(&r2_cfg),
+        Arc::clone(&r2_mgr),
+    );
+
+    let (m_tx, m_rx) = watch::channel(false);
+    let (r1_tx, r1_rx) = watch::channel(false);
+    let (r2_tx, r2_rx) = watch::channel(false);
+
+    let mh = tokio::spawn(async move {
+        let _ = master.run_with_shutdown(m_rx).await;
+    });
+    let r1h = tokio::spawn(async move {
+        let _ = r1.run_with_shutdown(r1_rx).await;
+    });
+    let r2h = tokio::spawn(async move {
+        let _ = r2.run_with_shutdown(r2_rx).await;
+    });
+
+    let r1_dbs = kore::Databases::single(Arc::clone(&r1_cache));
+    let r1_loop = {
+        let mgr = Arc::clone(&r1_mgr);
+        let sh = r1_tx.subscribe();
+        tokio::spawn(async move {
+            run_replica_loop(r1_dbs, mgr.replication.clone(), sh).await;
+        })
+    };
+    let r2_dbs = kore::Databases::single(Arc::clone(&r2_cache));
+    let r2_loop = {
+        let mgr = Arc::clone(&r2_mgr);
+        let sh = r2_tx.subscribe();
+        tokio::spawn(async move {
+            run_replica_loop(r2_dbs, mgr.replication.clone(), sh).await;
+        })
+    };
+
+    wait_listen(master_port).await;
+    wait_listen(r1_port).await;
+    wait_listen(r2_port).await;
+
+    let mut master_cli = timeout(
+        Duration::from_secs(2),
+        TcpStream::connect(format!("127.0.0.1:{}", master_port)),
+    )
+    .await
+    .expect("master connect timeout")
+    .expect("master connect");
+    assert_eq!(
+        send_cmd(&mut master_cli, &["SET", "rf_key", "v1"]).await,
+        RespValue::ok()
+    );
+
+    // Wait until both replicas have the key
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let mut ok = 0;
+        for port in [r1_port, r2_port] {
+            if let Ok(mut c) = TcpStream::connect(format!("127.0.0.1:{}", port)).await {
+                let got = send_cmd(&mut c, &["GET", "rf_key"]).await;
+                if got == RespValue::BulkString(Some(Bytes::from_static(b"v1"))) {
+                    ok += 1;
+                }
+            }
+        }
+        if ok == 2 {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("replicas did not sync rf_key (ok={})", ok);
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    let fo = send_cmd(
+        &mut master_cli,
+        &[
+            "FAILOVER",
+            "TO",
+            "127.0.0.1",
+            &r1_port.to_string(),
+            "TIMEOUT",
+            "5000",
+        ],
+    )
+    .await;
+    assert_eq!(fo, RespValue::ok(), "FAILOVER TO should succeed");
+
+    // r1 becomes master
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut c = TcpStream::connect(format!("127.0.0.1:{}", r1_port))
+            .await
+            .expect("r1 connect");
+        let role = send_cmd(&mut c, &["ROLE"]).await;
+        match &role {
+            RespValue::Array(arr)
+                if arr.first()
+                    == Some(&RespValue::BulkString(Some(Bytes::from_static(b"master")))) =>
+            {
+                break;
+            }
+            _ => {}
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("r1 did not become master; ROLE={:?}", role);
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    // r2 should re-follow r1 (primary_addr points at r1)
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let expected = format!("127.0.0.1:{}", r1_port);
+    loop {
+        if let Some(addr) = r2_mgr.replication.primary_addr() {
+            if addr == expected || addr.ends_with(&format!(":{}", r1_port)) {
+                break;
+            }
+        }
+        // Also accept via ROLE slave listing
+        if let Ok(mut c) = TcpStream::connect(format!("127.0.0.1:{}", r2_port)).await {
+            let role = send_cmd(&mut c, &["ROLE"]).await;
+            if let RespValue::Array(arr) = &role {
+                // ROLE slave: ["slave", host, port_int, state, offset]
+                if arr.first()
+                    == Some(&RespValue::BulkString(Some(Bytes::from_static(b"slave"))))
+                {
+                    let port_ok = matches!(arr.get(2), Some(RespValue::Integer(p)) if *p == r1_port as i64);
+                    if port_ok {
+                        break;
+                    }
+                }
+            }
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!(
+                "r2 did not re-follow r1; primary_addr={:?} is_replica={}",
+                r2_mgr.replication.primary_addr(),
+                r2_mgr.replication.is_replica()
+            );
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    // Write on new master and observe on r2
+    let mut r1_cli = TcpStream::connect(format!("127.0.0.1:{}", r1_port))
+        .await
+        .expect("r1 connect");
+    assert_eq!(
+        send_cmd(&mut r1_cli, &["SET", "rf_key2", "after"]).await,
+        RespValue::ok()
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Ok(mut c) = TcpStream::connect(format!("127.0.0.1:{}", r2_port)).await {
+            let got = send_cmd(&mut c, &["GET", "rf_key2"]).await;
+            if got == RespValue::BulkString(Some(Bytes::from_static(b"after"))) {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("r2 did not receive write from new master after re-follow");
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    let _ = m_tx.send(true);
+    let _ = r1_tx.send(true);
+    let _ = r2_tx.send(true);
+    mh.abort();
+    r1h.abort();
+    r2h.abort();
+    r1_loop.abort();
+    r2_loop.abort();
+    sleep(Duration::from_millis(50)).await;
+    let _ = std::fs::remove_dir_all(&master_dir);
+    let _ = std::fs::remove_dir_all(&r1_dir);
+    let _ = std::fs::remove_dir_all(&r2_dir);
 }

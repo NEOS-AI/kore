@@ -41,7 +41,9 @@ fn make_handler(auth: &str) -> CommandHandler {
         tls: false,
         tls_cert: String::new(),
         tls_key: String::new(),
+        aclfile: String::new(),
         cluster_enabled: false,
+    unixsocket: String::new(),
     };
     CommandHandler::new(make_cache(), Arc::new(config))
 }
@@ -468,7 +470,9 @@ fn acl_auto_auth_respects_live_default_nopass() {
         tls: false,
         tls_cert: String::new(),
         tls_key: String::new(),
+        aclfile: String::new(),
         cluster_enabled: false,
+    unixsocket: String::new(),
     };
     let config = Arc::new(config);
     let dbs = Databases::create(16, 16, 1024 * 1024 * 50, 500 * 1024 * 1024, false, 0.75);
@@ -488,4 +492,191 @@ fn acl_auto_auth_respects_live_default_nopass() {
     // AUTH with password works
     assert_eq!(handle(&mut client, cmd(&["AUTH", "secret"])), RespValue::ok());
     assert_eq!(handle(&mut client, cmd(&["PING"])), RespValue::SimpleString(Bytes::from_static(b"PONG")));
+}
+
+#[test]
+fn acl_deluser_removes_user() {
+    let mut h = make_handler("");
+    assert!(is_ok(&handle(
+        &mut h,
+        cmd(&["ACL", "SETUSER", "temp", "on", ">tpass", "+@all", "~*", "&*"])
+    )));
+    let users = array_as_strings(&handle(&mut h, cmd(&["ACL", "USERS"])));
+    assert!(users.iter().any(|u| u == "temp"), "{:?}", users);
+
+    let n = handle(&mut h, cmd(&["ACL", "DELUSER", "temp"]));
+    assert_eq!(n, RespValue::Integer(1));
+    let users = array_as_strings(&handle(&mut h, cmd(&["ACL", "USERS"])));
+    assert!(!users.iter().any(|u| u == "temp"), "{:?}", users);
+
+    // default cannot be deleted
+    let bad = handle(&mut h, cmd(&["ACL", "DELUSER", "default"]));
+    assert!(err_contains(&bad, "default"), "{:?}", bad);
+
+    // missing user → 0
+    assert_eq!(
+        handle(&mut h, cmd(&["ACL", "DELUSER", "nope"])),
+        RespValue::Integer(0)
+    );
+}
+
+#[test]
+fn acl_channel_pattern_deny() {
+    let mut h = make_handler("adminpass");
+    assert!(is_ok(&handle(&mut h, cmd(&["AUTH", "adminpass"]))));
+
+    assert!(is_ok(&handle(
+        &mut h,
+        cmd(&[
+            "ACL",
+            "SETUSER",
+            "chuser",
+            "on",
+            ">cpass",
+            "+@all",
+            "~*",
+            "resetchannels",
+            "&news:*"
+        ])
+    )));
+
+    assert!(is_ok(&handle(
+        &mut h,
+        cmd(&["AUTH", "chuser", "cpass"])
+    )));
+
+    // Allowed channel
+    let ok_pub = handle(&mut h, cmd(&["PUBLISH", "news:1", "hi"]));
+    assert!(
+        matches!(ok_pub, RespValue::Integer(_)),
+        "expected integer publish, got {:?}",
+        ok_pub
+    );
+
+    // Denied channel
+    let deny = handle(&mut h, cmd(&["PUBLISH", "secret", "no"]));
+    assert!(
+        err_contains(&deny, "NOPERM") && err_contains(&deny, "channel"),
+        "expected NOPERM channel, got {:?}",
+        deny
+    );
+
+    let deny_sub = handle(&mut h, cmd(&["SUBSCRIBE", "secret"]));
+    assert!(
+        err_contains(&deny_sub, "NOPERM") && err_contains(&deny_sub, "channel"),
+        "expected NOPERM channel subscribe, got {:?}",
+        deny_sub
+    );
+}
+
+#[test]
+fn acl_load_save_roundtrip() {
+    use kore::acl::AclStore;
+    use kore::databases::Databases;
+    use std::path::PathBuf;
+
+    let dir = std::env::temp_dir().join(format!(
+        "kore-acl-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let acl_path: PathBuf = dir.join("users.acl");
+
+    let config = Config {
+        host: "127.0.0.1".to_string(),
+        port: 6379,
+        threads: 1,
+        shards: 16,
+        maxmemory: 1024 * 1024 * 50,
+        evict: true,
+        autosweep: false,
+        loadfactor: 0.75,
+        maxconns: 100,
+        auth: String::new(),
+        maxentrysize: 500 * 1024 * 1024,
+        verbosity: 0,
+        enable_redlock: false,
+        redlock_instances: String::new(),
+        redlock_retry_count: 3,
+        redlock_retry_delay_ms: 200,
+        dir: dir.to_string_lossy().to_string(),
+        dbfilename: "dump.rdb".to_string(),
+        appendonly: false,
+        appendfilename: "appendonly.aof".to_string(),
+        replicaof: String::new(),
+        save: "".to_string(),
+        maxmemory_policy: "allkeys-lru".to_string(),
+        databases: 16,
+        metrics_port: 0,
+        tls: false,
+        tls_cert: String::new(),
+        tls_key: String::new(),
+        aclfile: acl_path.to_string_lossy().to_string(),
+        cluster_enabled: false,
+    unixsocket: String::new(),
+    };
+    let config = Arc::new(config);
+    let dbs = Databases::create(16, 16, 1024 * 1024 * 50, 500 * 1024 * 1024, false, 0.75);
+    let acl = AclStore::from_auth_arc("");
+    acl.set_aclfile(&acl_path);
+
+    let mut h = CommandHandler::with_databases_and_acl(dbs.clone(), config.clone(), None, acl.clone());
+    assert!(is_ok(&handle(
+        &mut h,
+        cmd(&[
+            "ACL",
+            "SETUSER",
+            "fileuser",
+            "on",
+            ">fpass",
+            "+@read",
+            "+@connection",
+            "+acl",
+            "~cached:*",
+            "&news:*"
+        ])
+    )));
+    assert!(is_ok(&handle(&mut h, cmd(&["ACL", "SAVE"]))));
+    assert!(acl_path.exists(), "aclfile should exist after SAVE");
+
+    // Wipe user and reload
+    assert_eq!(
+        handle(&mut h, cmd(&["ACL", "DELUSER", "fileuser"])),
+        RespValue::Integer(1)
+    );
+    assert!(!array_as_strings(&handle(&mut h, cmd(&["ACL", "USERS"])))
+        .iter()
+        .any(|u| u == "fileuser"));
+
+    assert!(is_ok(&handle(&mut h, cmd(&["ACL", "LOAD"]))));
+    let users = array_as_strings(&handle(&mut h, cmd(&["ACL", "USERS"])));
+    assert!(
+        users.iter().any(|u| u == "fileuser"),
+        "LOAD should restore fileuser: {:?}",
+        users
+    );
+
+    // Auth as restored user
+    assert!(is_ok(&handle(
+        &mut h,
+        cmd(&["AUTH", "fileuser", "fpass"])
+    )));
+    assert_eq!(handle(&mut h, cmd(&["ACL", "WHOAMI"])), bulk("fileuser"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn acl_save_errors_without_aclfile() {
+    let mut h = make_handler("");
+    let resp = handle(&mut h, cmd(&["ACL", "SAVE"]));
+    assert!(
+        err_contains(&resp, "ACL file") || err_contains(&resp, "aclfile"),
+        "{:?}",
+        resp
+    );
 }

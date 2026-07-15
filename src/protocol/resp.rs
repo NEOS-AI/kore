@@ -19,6 +19,14 @@ pub enum RespValue {
     /// Multiple top-level RESP messages concatenated (used for Pub/Sub multi-channel responses).
     /// Each element is serialized as its own independent top-level frame — NOT wrapped in an array.
     Multiple(Vec<RespValue>),
+    /// RESP3 map: %n\r\n key val key val …
+    Map(Vec<(RespValue, RespValue)>),
+    /// RESP3 boolean: #t\r\n / #f\r\n
+    Bool(bool),
+    /// RESP3 null: _\r\n
+    Null,
+    /// RESP3 push: >n\r\n … (pubsub / out-of-band)
+    Push(Vec<RespValue>),
 }
 
 impl RespValue {
@@ -72,6 +80,26 @@ impl RespValue {
             RespValue::Multiple(values) => {
                 // Serialize each value as an independent top-level RESP frame.
                 for val in values {
+                    val.write_to(buf);
+                }
+            }
+            RespValue::Map(pairs) => {
+                buf.put_u8(b'%');
+                buf.extend_from_slice(pairs.len().to_string().as_bytes());
+                buf.put_slice(b"\r\n");
+                for (k, v) in pairs {
+                    k.write_to(buf);
+                    v.write_to(buf);
+                }
+            }
+            RespValue::Bool(true) => buf.put_slice(b"#t\r\n"),
+            RespValue::Bool(false) => buf.put_slice(b"#f\r\n"),
+            RespValue::Null => buf.put_slice(b"_\r\n"),
+            RespValue::Push(arr) => {
+                buf.put_u8(b'>');
+                buf.extend_from_slice(arr.len().to_string().as_bytes());
+                buf.put_slice(b"\r\n");
+                for val in arr {
                     val.write_to(buf);
                 }
             }
@@ -182,11 +210,82 @@ impl RespParser {
             b':' => self.parse_integer(cursor),
             b'$' => self.parse_bulk_string(cursor),
             b'*' => self.parse_array(cursor),
+            b'%' => self.parse_map(cursor),
+            b'#' => self.parse_bool(cursor),
+            b'_' => {
+                // Null is `_\r\n` — type byte already consumed; need trailing \r\n
+                self.expect_crlf(cursor)?;
+                Ok(RespValue::Null)
+            }
+            b'>' => self.parse_push(cursor),
             _ => Err(Error::ParseError(format!(
                 "invalid RESP type byte: {}",
                 type_byte
             ))),
         }
+    }
+
+    fn expect_crlf(&self, cursor: &mut std::io::Cursor<&[u8]>) -> Result<()> {
+        if cursor.remaining() < 2 {
+            return Err(Error::ParseError("incomplete data".into()));
+        }
+        let cr = cursor.get_u8();
+        let lf = cursor.get_u8();
+        if cr != b'\r' || lf != b'\n' {
+            return Err(Error::ParseError("expected CRLF".into()));
+        }
+        Ok(())
+    }
+
+    fn parse_bool(&self, cursor: &mut std::io::Cursor<&[u8]>) -> Result<RespValue> {
+        if !cursor.has_remaining() {
+            return Err(Error::ParseError("incomplete bool".into()));
+        }
+        let b = cursor.get_u8();
+        self.expect_crlf(cursor)?;
+        match b {
+            b't' | b'T' => Ok(RespValue::Bool(true)),
+            b'f' | b'F' => Ok(RespValue::Bool(false)),
+            _ => Err(Error::ParseError("invalid bool".into())),
+        }
+    }
+
+    fn parse_map(&self, cursor: &mut std::io::Cursor<&[u8]>) -> Result<RespValue> {
+        let line = self.read_line(cursor)?;
+        let s = std::str::from_utf8(line)
+            .map_err(|_| Error::ParseError("invalid UTF-8 in map length".into()))?;
+        let len = s
+            .parse::<i64>()
+            .map_err(|_| Error::ParseError("invalid map length".into()))?;
+        if len < 0 {
+            return Err(Error::ParseError("negative map length".into()));
+        }
+        let len = len as usize;
+        let mut pairs = Vec::with_capacity(len);
+        for _ in 0..len {
+            let k = self.parse_value(cursor)?;
+            let v = self.parse_value(cursor)?;
+            pairs.push((k, v));
+        }
+        Ok(RespValue::Map(pairs))
+    }
+
+    fn parse_push(&self, cursor: &mut std::io::Cursor<&[u8]>) -> Result<RespValue> {
+        let line = self.read_line(cursor)?;
+        let s = std::str::from_utf8(line)
+            .map_err(|_| Error::ParseError("invalid UTF-8 in push length".into()))?;
+        let len = s
+            .parse::<i64>()
+            .map_err(|_| Error::ParseError("invalid push length".into()))?;
+        if len < 0 {
+            return Err(Error::ParseError("negative push length".into()));
+        }
+        let len = len as usize;
+        let mut arr = Vec::with_capacity(len);
+        for _ in 0..len {
+            arr.push(self.parse_value(cursor)?);
+        }
+        Ok(RespValue::Push(arr))
     }
 
     fn parse_simple_string(&self, cursor: &mut std::io::Cursor<&[u8]>) -> Result<RespValue> {
@@ -384,6 +483,39 @@ mod tests {
     }
 
     #[test]
+    fn resp3_map_bool_null_push_roundtrip() {
+        let map = RespValue::Map(vec![
+            (
+                RespValue::BulkString(Some(Bytes::from_static(b"server"))),
+                RespValue::BulkString(Some(Bytes::from_static(b"kore"))),
+            ),
+            (
+                RespValue::BulkString(Some(Bytes::from_static(b"proto"))),
+                RespValue::Integer(3),
+            ),
+        ]);
+        let raw = map.serialize();
+        assert!(raw.starts_with(b"%2\r\n"), "{:?}", raw);
+        let mut p = RespParser::new();
+        p.feed(&raw);
+        assert_eq!(p.parse().unwrap().unwrap(), map);
+
+        assert_eq!(RespValue::Bool(true).serialize(), Bytes::from("#t\r\n"));
+        assert_eq!(RespValue::Bool(false).serialize(), Bytes::from("#f\r\n"));
+        assert_eq!(RespValue::Null.serialize(), Bytes::from("_\r\n"));
+
+        let push = RespValue::Push(vec![
+            RespValue::BulkString(Some(Bytes::from_static(b"message"))),
+            RespValue::BulkString(Some(Bytes::from_static(b"ch"))),
+        ]);
+        let raw = push.serialize();
+        assert!(raw.starts_with(b">2\r\n"));
+        let mut p = RespParser::new();
+        p.feed(&raw);
+        assert_eq!(p.parse().unwrap().unwrap(), push);
+    }
+
+    #[test]
     fn parse_with_consumed_matches_wire_len() {
         let samples: &[&[u8]] = &[
             b"+OK\r\n",
@@ -469,5 +601,59 @@ mod tests {
             second,
             RespValue::BulkString(Some(Bytes::from_static(b"RDB")))
         );
+    }
+
+    /// Fuzz smoke: random bytes must never panic the parser (Ok/Err only).
+    #[test]
+    fn fuzz_smoke_random_bytes_no_panic() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0FFEE);
+        let mut parser = RespParser::new();
+        for _ in 0..2_000 {
+            let len = rng.gen_range(0..384);
+            let mut data = vec![0u8; len];
+            rng.fill(&mut data[..]);
+            parser.feed(&data);
+            // Drain whatever is parseable; errors are fine, panics are not.
+            loop {
+                match parser.parse() {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => break,
+                    Err(_) => {
+                        // Reset parser state after a hard error so the next
+                        // iteration starts clean.
+                        parser = RespParser::new();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Structured fuzz: well-formed frames with random bulk/array content.
+    #[test]
+    fn fuzz_structured_commands_roundtrip_or_err() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        for _ in 0..500 {
+            let n_args = rng.gen_range(1..6usize);
+            let mut parts: Vec<RespValue> = Vec::with_capacity(n_args);
+            for _ in 0..n_args {
+                let len = rng.gen_range(0..48usize);
+                let mut b = vec![0u8; len];
+                rng.fill(&mut b[..]);
+                // Keep mostly printable so we also exercise normal paths.
+                for x in &mut b {
+                    *x = b'A' + (*x % 26);
+                }
+                parts.push(RespValue::BulkString(Some(Bytes::from(b))));
+            }
+            let frame = RespValue::Array(parts);
+            let wire = frame.serialize();
+            let mut p = RespParser::new();
+            p.feed(&wire);
+            let parsed = p.parse().expect("parse should not fail hard").expect("complete");
+            assert_eq!(parsed, frame);
+        }
     }
 }
