@@ -398,3 +398,91 @@ fn test_search_index_respects_maxmemory() {
         cache.category_memory(MemoryCategory::Search)
     );
 }
+
+#[test]
+fn test_search_docs_are_eviction_victims_under_allkeys() {
+    use kore::EvictionPolicy;
+
+    // Budget small enough that search docs dominate; eviction must free Search
+    // category so later writes can proceed.
+    let maxmemory = 16 * 1024;
+    let cache = make_cache(maxmemory);
+    cache.set_eviction_policy(EvictionPolicy::AllKeysLru);
+    cache.set_eviction_sample_size(16).unwrap();
+
+    let mut h = make_handler(cache.clone());
+
+    handle(
+        &mut h,
+        cmd(&[
+            "FT.CREATE",
+            "evict_idx",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "s:",
+            "SCHEMA",
+            "blob",
+            "TEXT",
+        ]),
+    );
+
+    let big = "Y".repeat(400);
+    let mut indexed = 0usize;
+    for i in 0..80 {
+        let key = format!("s:{}", i);
+        let resp = handle(&mut h, cmd(&["HSET", &key, "blob", &big]));
+        if matches!(resp, RespValue::Integer(_)) {
+            indexed += 1;
+        }
+        assert!(
+            cache.tracked_memory() <= maxmemory,
+            "tracked {} > maxmemory {}",
+            cache.tracked_memory(),
+            maxmemory
+        );
+    }
+    assert!(indexed >= 5, "expected several indexed hashes, got {}", indexed);
+
+    let search_before = cache.category_memory(MemoryCategory::Search);
+    assert!(search_before > 0, "search memory should be non-zero after HSET auto-index");
+
+    let evicted_before = cache
+        .stats
+        .evicted_lru
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    // More HSETs under pressure — should free prior search docs and/or keys.
+    let mut more_ok = 0usize;
+    for i in 80..160 {
+        let key = format!("s:{}", i);
+        let resp = handle(&mut h, cmd(&["HSET", &key, "blob", &big]));
+        if matches!(resp, RespValue::Integer(_)) {
+            more_ok += 1;
+        }
+        assert!(
+            cache.tracked_memory() <= maxmemory,
+            "tracked {} exceeded maxmemory during eviction path",
+            cache.tracked_memory()
+        );
+    }
+
+    let evicted_after = cache
+        .stats
+        .evicted_lru
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    assert!(
+        more_ok > 0,
+        "expected further HSETs to succeed via eviction under allkeys-lru"
+    );
+    assert!(
+        evicted_after > evicted_before,
+        "expected eviction counter to rise (before={} after={}); search_mem={} total={}",
+        evicted_before,
+        evicted_after,
+        cache.category_memory(MemoryCategory::Search),
+        cache.tracked_memory()
+    );
+}

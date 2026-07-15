@@ -491,6 +491,47 @@ impl SearchIndexManager {
             .cloned()
             .collect()
     }
+
+    /// Sample up to `n` documents across all indices for maxmemory eviction.
+    ///
+    /// Returns `(index_name, doc_id, approx_size)` triples. Used so search
+    /// category memory can be reclaimed under `allkeys-*` policies without
+    /// deleting the underlying hash key.
+    ///
+    /// `exclude_doc` skips a document currently being re-indexed so accounting
+    /// does not double-free it while holding a stale size snapshot.
+    pub fn sample_documents_for_eviction(
+        &self,
+        n: usize,
+        exclude_doc: Option<&Bytes>,
+    ) -> Vec<(String, Bytes, usize)> {
+        if n == 0 {
+            return Vec::new();
+        }
+        use rand::seq::SliceRandom;
+        let indices = self.indices.read();
+        let mut pool: Vec<(String, Bytes, usize)> = Vec::new();
+        for (name, idx) in indices.iter() {
+            let guard = idx.read();
+            for (doc_id, fields) in guard.document_data.iter() {
+                if exclude_doc.is_some_and(|ex| ex == doc_id) {
+                    continue;
+                }
+                let size = SearchIndex::document_approx_size(doc_id, fields);
+                if size > 0 {
+                    pool.push((name.clone(), doc_id.clone(), size));
+                }
+            }
+        }
+        drop(indices);
+        if pool.len() <= n {
+            return pool;
+        }
+        let mut rng = rand::thread_rng();
+        pool.shuffle(&mut rng);
+        pool.truncate(n);
+        pool
+    }
 }
 
 #[cfg(test)]

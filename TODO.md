@@ -259,7 +259,7 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P1]`** Document and test `FT.SEARCH` end-to-end over RESP (not only programmatic indexing)
   - *Done*: `tests/search_resp_test.rs` — FT.CREATE / HSET auto-index / FT.SEARCH / FT.DROPINDEX via `CommandHandler`; DEL/UNLINK remove from indices
 - [x] **`[P1]`** Memory limits and eviction interaction for indexes
-  - *Done (MVP)*: `MemoryCategory::Search`; `index_document` / `auto_index_key` allocate approx size; remove/drop deallocate; counts toward maxmemory (rejects growth under limit). Typed KV (hash/list/set/zset/geo/stream) are eviction victims; search index memory still not a victim source
+  - *Done (MVP + Batch AD)*: `MemoryCategory::Search`; `index_document` / `auto_index_key` allocate approx size; remove/drop deallocate; counts toward maxmemory. Under `allkeys-*`, sampled **search documents** are eviction victims (drop index entry + free Search bytes; underlying hash key kept). Account path may `evict_memory` before OOM. Volatile policies still string-TTL only; search not a victim there.
 - [ ] **`[P2]`** HNSW correctness/performance benchmarks vs FLAT
 
 ### Pub/Sub
@@ -304,8 +304,9 @@ Highest urgency checklist (phase order preserved):
 - [x] Enforce `maxconns`
 - [x] Honor `--threads`
 - [x] Unified keyspace + type safety + cross-type ops + maxmemory for all types
-  - *Done (Batch X)*: cross-type eviction samples string/hash/list/set/zset/geo/stream victims (volatile still TTL-on-string); search indices still not eviction victims
-  - *Follow-ups*: true single-map keyspace, search-as-eviction-victim, auth network test
+  - *Done (Batch X)*: cross-type eviction samples string/hash/list/set/zset/geo/stream victims (volatile still TTL-on-string)
+  - *Done (Batch AD)*: search documents are allkeys eviction victims
+  - *Follow-ups*: true single-map keyspace, auth network test
 - [x] Phase A concurrency / memory / EXAT / network tests (incl. AUTH)
 
 **B**

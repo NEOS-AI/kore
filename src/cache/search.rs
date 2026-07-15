@@ -92,7 +92,17 @@ impl Cache {
                 .memory_tracker
                 .can_allocate(delta, MemoryCategory::Search)
             {
-                return Err("OOM: cannot allocate search index memory".into());
+                // Under maxmemory pressure, try reclaiming (including other
+                // search docs — never the doc we are about to re-account).
+                if self.eviction_allowed() {
+                    let _ = self.evict_memory_excluding(delta, Some(doc_id));
+                }
+                if !self
+                    .memory_tracker
+                    .can_allocate(delta, MemoryCategory::Search)
+                {
+                    return Err("OOM: cannot allocate search index memory".into());
+                }
             }
         }
 
@@ -118,10 +128,14 @@ impl Cache {
             .get_index(index_name)
             .ok_or_else(|| format!("Index '{}' not found", index_name))?;
 
-        let mut index_guard = index.write();
-        let old_fields = index_guard.get_document_data(&doc_id).cloned();
+        // Snapshot under lock, then drop before accounting (eviction may need
+        // the same index write lock to free search docs).
+        let old_fields = {
+            let index_guard = index.read();
+            index_guard.get_document_data(&doc_id).cloned()
+        };
         self.account_search_index_write(&doc_id, old_fields.as_ref(), &fields)?;
-        index_guard.index_document(doc_id, fields);
+        index.write().index_document(doc_id, fields);
         Ok(())
     }
 
@@ -242,8 +256,12 @@ impl Cache {
         let matching_indices = self.search_index_manager.find_matching_indices(&key_str);
 
         for index_arc in matching_indices {
-            let mut index = index_arc.write();
-            let old_fields = index.get_document_data(key).cloned();
+            // Drop the lock before accounting so eviction can remove other
+            // (or even the same) search docs without deadlock.
+            let old_fields = {
+                let index = index_arc.read();
+                index.get_document_data(key).cloned()
+            };
             if self
                 .account_search_index_write(key, old_fields.as_ref(), &fields)
                 .is_err()
@@ -251,7 +269,7 @@ impl Cache {
                 // Leave prior index entry in place if update would OOM; for new docs, skip.
                 continue;
             }
-            index.index_document(key.clone(), fields.clone());
+            index_arc.write().index_document(key.clone(), fields.clone());
         }
     }
 

@@ -94,7 +94,7 @@ impl EvictionPolicy {
     }
 }
 
-/// Unified eviction candidate across string and typed keyspaces.
+/// Unified eviction candidate across string, typed keyspaces, and search docs.
 #[derive(Clone)]
 struct EvictCandidate {
     key: Bytes,
@@ -104,6 +104,9 @@ struct EvictCandidate {
     last_access: Instant,
     lfu_freq: u64,
     expires_at: Option<Instant>,
+    /// When set, `key` is a search document id in this index (not a keyspace key).
+    /// Eviction removes the index entry only (frees `MemoryCategory::Search`).
+    search_index: Option<String>,
 }
 
 impl Cache {
@@ -135,9 +138,20 @@ impl Cache {
     /// approximately `needed` bytes are freed.
     ///
     /// Samples **all key types** (string, hash, list, set, zset, geo, stream)
-    /// under `allkeys-*` policies. Volatile policies still only consider string
-    /// keys with an expire (typed keys have no TTL support yet).
+    /// and **search index documents** under `allkeys-*` policies. Volatile
+    /// policies still only consider string keys with an expire (typed keys and
+    /// search docs have no TTL support yet).
     pub(super) fn evict_memory(&self, needed: usize) -> Result<()> {
+        self.evict_memory_excluding(needed, None)
+    }
+
+    /// Like [`evict_memory`], but never selects `exclude_search_doc` as a
+    /// search-index victim (avoids double-free while re-indexing that doc).
+    pub(super) fn evict_memory_excluding(
+        &self,
+        needed: usize,
+        exclude_search_doc: Option<&Bytes>,
+    ) -> Result<()> {
         let policy = self.eviction_policy();
         if policy == EvictionPolicy::NoEviction {
             return Err(Error::OutOfMemory);
@@ -148,7 +162,8 @@ impl Cache {
         let mut empty_rounds = 0;
 
         while freed < needed {
-            let candidates = self.sample_eviction_candidates(policy, sample_size);
+            let candidates =
+                self.sample_eviction_candidates(policy, sample_size, exclude_search_doc);
             if candidates.is_empty() {
                 empty_rounds += 1;
                 if empty_rounds >= 3 {
@@ -161,19 +176,23 @@ impl Cache {
             let victim = Self::pick_victim(candidates, policy);
             if let Some(c) = victim {
                 tracing::debug!(
-                    "Evicting key {:?} type={:?} policy={} size={} lfu={} ttl={:?}",
+                    "Evicting key {:?} type={:?} policy={} size={} lfu={} ttl={:?} search={:?}",
                     c.key,
                     c.key_type,
                     policy.as_str(),
                     c.size,
                     c.lfu_freq,
-                    c.expires_at
+                    c.expires_at,
+                    c.search_index
                 );
 
                 if let Some(bytes) = self.evict_candidate(&c) {
                     freed += bytes;
                     self.stats.incr(&self.stats.evicted_lru);
-                    self.touch_watch_key(&c.key);
+                    // Search-only victims are not WATCH keys.
+                    if c.search_index.is_none() {
+                        self.touch_watch_key(&c.key);
+                    }
                 }
             } else {
                 return Err(Error::OutOfMemory);
@@ -185,6 +204,9 @@ impl Cache {
 
     /// Remove a sampled victim and return bytes freed (0 if race lost).
     fn evict_candidate(&self, c: &EvictCandidate) -> Option<usize> {
+        if let Some(ref index_name) = c.search_index {
+            return self.evict_search_document(index_name, &c.key);
+        }
         match c.key_type {
             KeyType::String => {
                 if let Some(entry) = self.map.remove(&c.key) {
@@ -253,6 +275,7 @@ impl Cache {
         &self,
         policy: EvictionPolicy,
         sample_size: usize,
+        exclude_search_doc: Option<&Bytes>,
     ) -> Vec<EvictCandidate> {
         let volatile_only = policy.volatile_only();
         let draw = if volatile_only {
@@ -280,6 +303,7 @@ impl Cache {
                     last_access: e.last_access_time(),
                     lfu_freq: e.lfu_freq(decay),
                     expires_at: e.expires_at,
+                    search_index: None,
                 });
                 if out.len() >= sample_size && volatile_only {
                     return out;
@@ -333,6 +357,23 @@ impl Cache {
                     crate::memory::estimate_keyed_object(k.len(), s.read().memory_size());
                 out.push(typed_candidate(k, KeyType::Stream, size));
             });
+
+            // Search index documents (MemoryCategory::Search victims)
+            let search_n = per_type.max(2);
+            for (index_name, doc_id, size) in self
+                .search_index_manager
+                .sample_documents_for_eviction(search_n, exclude_search_doc)
+            {
+                out.push(EvictCandidate {
+                    key: doc_id,
+                    key_type: KeyType::None,
+                    size,
+                    last_access: cold_instant(),
+                    lfu_freq: 0,
+                    expires_at: None,
+                    search_index: Some(index_name),
+                });
+            }
         }
 
         // Cap sample for pick_victim work
@@ -344,6 +385,21 @@ impl Cache {
         }
 
         out
+    }
+
+    /// Remove one document from a search index and free its tracked memory.
+    fn evict_search_document(&self, index_name: &str, doc_id: &Bytes) -> Option<usize> {
+        let index = self.search_index_manager.get_index(index_name)?;
+        let mut guard = index.write();
+        let fields = guard.get_document_data(doc_id)?.clone();
+        let size = crate::search_index::SearchIndex::document_approx_size(doc_id, &fields);
+        guard.remove_document(doc_id);
+        drop(guard);
+        if size > 0 {
+            self.memory_tracker
+                .deallocate(size, MemoryCategory::Search);
+        }
+        Some(size)
     }
 
     fn pick_victim(
@@ -488,6 +544,7 @@ fn typed_candidate(key: Bytes, key_type: KeyType, size: usize) -> EvictCandidate
         last_access: cold_instant(),
         lfu_freq: 0,
         expires_at: None,
+        search_index: None,
     }
 }
 
