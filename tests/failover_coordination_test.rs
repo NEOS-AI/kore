@@ -181,14 +181,32 @@ fn failover_to_syntax() {
         ),
         &["timeout"],
     );
+    // FORCE is a valid option (skips catch-up); without a live target it fails on connect.
+    assert_err_contains(
+        handle(
+            &mut h,
+            cmd(&[
+                "FAILOVER",
+                "TO",
+                "127.0.0.1",
+                "16613",
+                "TIMEOUT",
+                "100",
+                "FORCE",
+            ]),
+        ),
+        &["FAILOVER"],
+    );
     // Unknown option after TO host port
     assert_err_contains(
         handle(
             &mut h,
-            cmd(&["FAILOVER", "TO", "127.0.0.1", "16613", "FORCE"]),
+            cmd(&["FAILOVER", "TO", "127.0.0.1", "16613", "NOPE"]),
         ),
         &["syntax"],
     );
+    // Bare FORCE without TO
+    assert_err_contains(handle(&mut h, cmd(&["FAILOVER", "FORCE"])), &["FORCE"]);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -637,6 +655,128 @@ async fn failover_to_catchup_preserves_all_writes() {
     sleep(Duration::from_millis(50)).await;
     let _ = std::fs::remove_dir_all(&master_dir);
     let _ = std::fs::remove_dir_all(&replica_dir);
+}
+
+/// FORCE skips catch-up: lagging standalone target is promoted even when offset is 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn failover_to_force_skips_catchup_and_promotes() {
+    let master_port = 16621u16;
+    let lag_port = 16622u16;
+
+    let master_dir = unique_dir("force-master");
+    let lag_dir = unique_dir("force-lag");
+
+    let master_cfg = make_config(&master_dir, master_port);
+    let lag_cfg = make_config(&lag_dir, lag_port);
+
+    let master_mgr = make_persistence(&master_dir);
+    master_mgr.replication.set_announce_port(master_port);
+    let lag_mgr = make_persistence(&lag_dir);
+    lag_mgr.replication.set_announce_port(lag_port);
+    // Target is a replica (can accept bare FAILOVER) but not linked — offset 0.
+    lag_mgr
+        .replication
+        .set_replicaof(Some(format!("127.0.0.1:{}", master_port)));
+
+    let master_cache = Cache::new_with_sweep(8, 1024 * 1024 * 10, 500 * 1024 * 1024, false);
+    let lag_cache = Cache::new_with_sweep(8, 1024 * 1024 * 10, 500 * 1024 * 1024, false);
+
+    let master = Server::with_persistence(
+        Arc::clone(&master_cache),
+        Arc::clone(&master_cfg),
+        Arc::clone(&master_mgr),
+    );
+    let lag = Server::with_persistence(
+        Arc::clone(&lag_cache),
+        Arc::clone(&lag_cfg),
+        Arc::clone(&lag_mgr),
+    );
+
+    let (m_tx, m_rx) = watch::channel(false);
+    let (l_tx, l_rx) = watch::channel(false);
+    let m_h = tokio::spawn(async move {
+        let _ = master.run_with_shutdown(m_rx).await;
+    });
+    let l_h = tokio::spawn(async move {
+        let _ = lag.run_with_shutdown(l_rx).await;
+    });
+    sleep(Duration::from_millis(250)).await;
+
+    let mut cli = timeout(
+        Duration::from_secs(2),
+        TcpStream::connect(format!("127.0.0.1:{}", master_port)),
+    )
+    .await
+    .expect("connect timeout")
+    .expect("connect");
+
+    assert_eq!(
+        send_cmd(&mut cli, &["SET", "only_on_master", "x"]).await,
+        RespValue::ok()
+    );
+    assert!(master_mgr.replication.master_repl_offset() > 0);
+
+    // Without FORCE this would catch-up-timeout; with FORCE it promotes the lagging target.
+    let resp = send_cmd(
+        &mut cli,
+        &[
+            "FAILOVER",
+            "TO",
+            "127.0.0.1",
+            &lag_port.to_string(),
+            "TIMEOUT",
+            "2000",
+            "FORCE",
+        ],
+    )
+    .await;
+    assert_eq!(resp, RespValue::ok(), "FORCE FAILOVER TO should succeed");
+    assert!(
+        master_mgr.replication.is_replica(),
+        "old master demoted after FORCE"
+    );
+    assert!(
+        !lag_mgr.replication.is_replica(),
+        "lag target promoted despite missing catch-up"
+    );
+
+    let mut lag_cli = TcpStream::connect(format!("127.0.0.1:{}", lag_port))
+        .await
+        .expect("lag connect");
+    let role = send_cmd(&mut lag_cli, &["ROLE"]).await;
+    match role {
+        RespValue::Array(arr) => {
+            assert_eq!(
+                arr[0],
+                RespValue::BulkString(Some(Bytes::from_static(b"master")))
+            );
+        }
+        other => panic!("expected master ROLE on promoted lag, {:?}", other),
+    }
+
+    let _ = m_tx.send(true);
+    let _ = l_tx.send(true);
+    m_h.abort();
+    l_h.abort();
+    sleep(Duration::from_millis(50)).await;
+    let _ = std::fs::remove_dir_all(&master_dir);
+    let _ = std::fs::remove_dir_all(&lag_dir);
+}
+
+/// Live-link ACK via REPLCONF ACK on a registered feed satisfies catch-up without client GETACK.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_catchup_uses_note_replica_ack_from_client_path() {
+    // Unit-style integration through the manager: register feed + note ack + wait.
+    use kore::persistence::replication::ReplicationManager;
+    use tokio::time::Instant;
+
+    let repl = ReplicationManager::new();
+    let _feed = repl.register_replica_announced(Some("127.0.0.1".into()), Some(16623));
+    repl.note_replica_ack(Some("127.0.0.1"), Some(16623), 1000);
+    let deadline = Instant::now() + Duration::from_millis(300);
+    repl.wait_replica_offset_catchup("127.0.0.1", 16623, 1000, deadline)
+        .await
+        .expect("tracked ACK must satisfy catch-up");
 }
 
 /// Unreachable target: timeout, master remains master.

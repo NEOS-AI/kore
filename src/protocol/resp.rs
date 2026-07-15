@@ -142,6 +142,13 @@ impl RespParser {
 
     /// Try to parse a complete RESP value from the buffer
     pub fn parse(&mut self) -> Result<Option<RespValue>> {
+        Ok(self.parse_with_consumed()?.map(|(v, _)| v))
+    }
+
+    /// Parse one RESP value and return how many buffer bytes it consumed.
+    ///
+    /// Used for exact replication-offset accounting (wire bytes, not re-serialize).
+    pub fn parse_with_consumed(&mut self) -> Result<Option<(RespValue, usize)>> {
         if self.buffer.is_empty() {
             return Ok(None);
         }
@@ -152,7 +159,7 @@ impl RespParser {
             Ok(value) => {
                 let pos = cursor.position() as usize;
                 self.buffer.advance(pos);
-                Ok(Some(value))
+                Ok(Some((value, pos)))
             }
             Err(Error::ParseError(_)) => {
                 // Need more data
@@ -374,6 +381,63 @@ mod tests {
 
         let value = RespValue::BulkString(Some(Bytes::from("hello")));
         assert_eq!(value.serialize(), Bytes::from("$5\r\nhello\r\n"));
+    }
+
+    #[test]
+    fn parse_with_consumed_matches_wire_len() {
+        let samples: &[&[u8]] = &[
+            b"+OK\r\n",
+            b"-ERR x\r\n",
+            b":42\r\n",
+            b"$5\r\nhello\r\n",
+            b"$-1\r\n",
+            b"*2\r\n$3\r\nSET\r\n$1\r\nk\r\n",
+            b"*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n",
+        ];
+        for raw in samples {
+            let mut parser = RespParser::new();
+            parser.feed(raw);
+            let (val, consumed) = parser
+                .parse_with_consumed()
+                .unwrap()
+                .expect("complete value");
+            assert_eq!(
+                consumed,
+                raw.len(),
+                "consumed {} != wire {} for {:?}",
+                consumed,
+                raw.len(),
+                val
+            );
+            // Re-serialize may differ for some forms; wire bytes are authoritative.
+            assert!(parser.parse_with_consumed().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn parse_with_consumed_partial_then_complete() {
+        let full = b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\nb\r\n";
+        let mut parser = RespParser::new();
+        parser.feed(&full[..5]);
+        assert!(parser.parse_with_consumed().unwrap().is_none());
+        parser.feed(&full[5..]);
+        let (_val, consumed) = parser.parse_with_consumed().unwrap().unwrap();
+        assert_eq!(consumed, full.len());
+    }
+
+    #[test]
+    fn parse_with_consumed_multiple_values() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"+OK\r\n");
+        buf.extend_from_slice(b":1\r\n");
+        buf.extend_from_slice(b"$3\r\nfoo\r\n");
+        let mut parser = RespParser::new();
+        parser.feed(&buf);
+        let mut total = 0usize;
+        while let Some((_v, n)) = parser.parse_with_consumed().unwrap() {
+            total += n;
+        }
+        assert_eq!(total, buf.len());
     }
 
     #[test]

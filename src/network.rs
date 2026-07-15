@@ -426,15 +426,88 @@ where
             };
 
             // SYNC / PSYNC: send pre-serialized handshake (+ RDB or CONTINUE+backlog),
-            // then stream live write commands to the replica socket.
+            // then stream live write commands to the replica socket while reading
+            // REPLCONF ACK replies for catch-up tracking.
             if let Some(raw) = handler.take_raw_response() {
                 let feed_rx = handler.take_replica_feed();
                 let _ = response_tx.send(raw.to_vec()).await;
                 if let Some(mut feed_rx) = feed_rx {
                     info!("Connection entered replica feed mode");
-                    while let Some(cmd_bytes) = feed_rx.recv().await {
-                        if response_tx.send(cmd_bytes.to_vec()).await.is_err() {
-                            break;
+                    let repl: Option<Arc<crate::persistence::replication::ReplicationManager>> =
+                        handler
+                            .persistence()
+                            .map(|p| Arc::clone(&p.replication));
+                    let announce_host = handler.replica_announce_ip().map(|s| s.to_string());
+                    let announce_port = handler.replica_announce_port();
+                    let mut ack_parser = RespParser::new();
+                    let mut ack_buf = vec![0u8; 4096];
+                    let mut getack_tick =
+                        tokio::time::interval(Duration::from_secs(1));
+                    getack_tick.set_missed_tick_behavior(
+                        tokio::time::MissedTickBehavior::Delay,
+                    );
+                    // Skip the immediate first tick so we don't probe before the
+                    // handshake bytes have left the write queue.
+                    getack_tick.tick().await;
+
+                    loop {
+                        tokio::select! {
+                            cmd = feed_rx.recv() => {
+                                match cmd {
+                                    Some(cmd_bytes) => {
+                                        if response_tx.send(cmd_bytes.to_vec()).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    None => break,
+                                }
+                            }
+                            read_res = reader.read(&mut ack_buf) => {
+                                match read_res {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        ack_parser.feed(&ack_buf[..n]);
+                                        loop {
+                                            match ack_parser.parse() {
+                                                Ok(Some(val)) => {
+                                                    if let Some(off) =
+                                                        crate::persistence::replication::parse_replconf_ack_offset(
+                                                            &val,
+                                                        )
+                                                    {
+                                                        if let Some(ref r) = repl {
+                                                            r.note_replica_ack(
+                                                                announce_host.as_deref(),
+                                                                announce_port,
+                                                                off,
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                Ok(None) => break,
+                                                Err(e) => {
+                                                    warn!("replica feed ACK parse error: {}", e);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("replica feed read error: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                            _ = getack_tick.tick() => {
+                                // Probe without backlog so master_repl_offset stays
+                                // stable for FAILOVER TO catch-up.
+                                if let Some(ref r) = repl {
+                                    r.send_getack_probe_to_feeds(
+                                        announce_host.as_deref(),
+                                        announce_port,
+                                    );
+                                }
+                            }
                         }
                     }
                     break 'conn Ok(());

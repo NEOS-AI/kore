@@ -156,6 +156,24 @@ impl CommandHandler {
                 RespValue::BulkString(Some(Bytes::from(off.to_string()))),
             ]));
         }
+        // Replica → master ACK on a normal connection (also handled on live feed).
+        if sub == "ACK" {
+            if let Some(off_arg) = args.get(1).and_then(|v| v.as_bulk_string()) {
+                if let Ok(s) = std::str::from_utf8(off_arg) {
+                    if let Ok(off) = s.parse::<u64>() {
+                        if let Some(p) = self.persistence.as_ref() {
+                            p.replication.note_replica_ack(
+                                self.replica_announce_ip.as_deref(),
+                                self.replica_announce_port,
+                                off,
+                            );
+                        }
+                    }
+                }
+            }
+            // Redis does not reply to ACK; return OK for client-path convenience.
+            return Ok(RespValue::ok());
+        }
         if sub == "LISTENING-PORT" {
             if let Some(port_arg) = args.get(1).and_then(|v| v.as_bulk_string()) {
                 if let Ok(s) = std::str::from_utf8(port_arg) {
@@ -229,9 +247,9 @@ impl CommandHandler {
     /// FAILOVER — bare promote on replica, or coordinated `FAILOVER TO` on master.
     ///
     /// - Bare `FAILOVER` (replica only): local `promote_to_master()`.
-    /// - `FAILOVER TO <host> <port> [TIMEOUT ms]` (master only): pause writes,
-    ///   wait until target `REPLCONF GETACK` ≥ frozen master offset, then send
-    ///   bare FAILOVER and demote self on success.
+    /// - `FAILOVER TO <host> <port> [TIMEOUT ms] [FORCE]` (master only): pause
+    ///   writes, wait until target ack ≥ frozen master offset (unless FORCE),
+    ///   then bare FAILOVER + demote self.
     pub(super) async fn handle_failover(&self, args: &[RespValue]) -> Result<RespValue> {
         let Some(p) = self.persistence.as_ref() else {
             return Ok(RespValue::error("ERR persistence not configured"));
@@ -257,9 +275,16 @@ impl CommandHandler {
             return self.handle_failover_to(&p.replication, &args[1..]).await;
         }
 
-        if sub == "ABORT" || sub == "TIMEOUT" || sub == "FORCE" {
+        if sub == "ABORT" || sub == "TIMEOUT" {
             return Ok(RespValue::error(
                 "ERR FAILOVER options other than bare FAILOVER or FAILOVER TO are not supported",
+            ));
+        }
+
+        // Bare FORCE without TO is not supported (use FAILOVER TO … FORCE).
+        if sub == "FORCE" {
+            return Ok(RespValue::error(
+                "ERR FAILOVER FORCE requires TO host port; use FAILOVER TO <host> <port> FORCE",
             ));
         }
 
@@ -268,7 +293,7 @@ impl CommandHandler {
         ))
     }
 
-    /// Parse and run `FAILOVER TO host port [TIMEOUT ms]`.
+    /// Parse and run `FAILOVER TO host port [TIMEOUT ms] [FORCE]`.
     async fn handle_failover_to(
         &self,
         repl: &ReplicationManager,
@@ -305,6 +330,7 @@ impl CommandHandler {
         };
 
         let mut timeout_ms = ReplicationManager::FAILOVER_DEFAULT_TIMEOUT_MS;
+        let mut force = false;
         let mut i = 2;
         while i < args.len() {
             let opt = args[i]
@@ -342,6 +368,9 @@ impl CommandHandler {
                 };
                 timeout_ms = ms;
                 i += 2;
+            } else if opt == "FORCE" {
+                force = true;
+                i += 1;
             } else {
                 return Ok(RespValue::error(
                     "ERR syntax error: unsupported FAILOVER TO option",
@@ -349,7 +378,10 @@ impl CommandHandler {
             }
         }
 
-        match repl.coordinated_failover_to(&host, port, timeout_ms).await {
+        match repl
+            .coordinated_failover_to(&host, port, timeout_ms, force)
+            .await
+        {
             Ok(()) => Ok(RespValue::ok()),
             Err(e) => Ok(RespValue::error(e)),
         }

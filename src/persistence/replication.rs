@@ -35,6 +35,8 @@ struct ReplicaFeed {
     host: Option<String>,
     /// Announced listening port from `REPLCONF listening-port`, if any.
     port: Option<u16>,
+    /// Last ACK offset reported by this replica (live repl link or GETACK).
+    ack_offset: AtomicU64,
 }
 
 /// Circular replication backlog: retains recent write stream for partial resync.
@@ -281,7 +283,12 @@ impl ReplicationManager {
         port: Option<u16>,
     ) -> mpsc::Receiver<Bytes> {
         let (tx, rx) = mpsc::channel(REPLICA_CHANNEL_CAP);
-        self.replicas.lock().push(ReplicaFeed { tx, host, port });
+        self.replicas.lock().push(ReplicaFeed {
+            tx,
+            host,
+            port,
+            ack_offset: AtomicU64::new(0),
+        });
         self.connected_replicas.fetch_add(1, Ordering::Relaxed);
         rx
     }
@@ -295,6 +302,74 @@ impl ReplicationManager {
     /// True if at least one connected replica has announced a listening port.
     pub fn any_replica_identity_known(&self) -> bool {
         self.replicas.lock().iter().any(|r| r.port.is_some())
+    }
+
+    /// Record an ACK offset from a replica (live feed link or client GETACK).
+    ///
+    /// Matches by announced `host`/`port` when provided; otherwise updates all
+    /// feeds that have no identity (best-effort single-replica case).
+    pub fn note_replica_ack(&self, host: Option<&str>, port: Option<u16>, offset: u64) {
+        let mut reps = self.replicas.lock();
+        let mut matched = false;
+        for r in reps.iter_mut() {
+            let host_ok = match (host, r.host.as_deref()) {
+                (None, _) => true,
+                (Some(h), Some(rh)) => hosts_equal(h, rh),
+                (Some(_), None) => port.is_some() && r.port == port,
+            };
+            let port_ok = match (port, r.port) {
+                (None, _) => true,
+                (Some(p), Some(rp)) => p == rp,
+                (Some(_), None) => false,
+            };
+            if host_ok && port_ok && (host.is_some() || port.is_some() || r.port.is_none()) {
+                // Monotonic: never decrease a known ack.
+                r.ack_offset.fetch_max(offset, Ordering::Relaxed);
+                matched = true;
+            }
+        }
+        // Fallback: single anonymous feed
+        if !matched && reps.len() == 1 {
+            reps[0].ack_offset.fetch_max(offset, Ordering::Relaxed);
+        }
+    }
+
+    /// Highest tracked ACK for a replica at `host:port`, if any feed matches.
+    pub fn tracked_ack_for(&self, host: &str, port: u16) -> Option<u64> {
+        let reps = self.replicas.lock();
+        let mut best: Option<u64> = None;
+        for r in reps.iter() {
+            if replica_matches(r, host, port) {
+                let ack = r.ack_offset.load(Ordering::Relaxed);
+                best = Some(best.map_or(ack, |b| b.max(ack)));
+            }
+        }
+        best
+    }
+
+    /// Encode and try-send `REPLCONF GETACK *` on matching replica feeds (no backlog).
+    ///
+    /// Used to probe the live repl link without advancing `master_repl_offset`.
+    pub fn send_getack_probe_to_feeds(&self, host: Option<&str>, port: Option<u16>) {
+        let getack = RespValue::Array(vec![
+            RespValue::BulkString(Some(Bytes::from_static(b"REPLCONF"))),
+            RespValue::BulkString(Some(Bytes::from_static(b"GETACK"))),
+            RespValue::BulkString(Some(Bytes::from_static(b"*"))),
+        ])
+        .serialize();
+        let reps = self.replicas.lock();
+        for r in reps.iter() {
+            let matches = match (host, port, r.host.as_deref(), r.port) {
+                (None, None, _, _) => true,
+                (Some(h), Some(p), _, _) => replica_matches(r, h, p),
+                (None, Some(p), _, Some(rp)) => p == rp,
+                (Some(h), None, Some(rh), _) => hosts_equal(h, rh),
+                _ => r.port.is_none() && r.host.is_none(),
+            };
+            if matches {
+                let _ = r.tx.try_send(getack.clone());
+            }
+        }
     }
 
     /// Propagate a write command (as RESP array bytes) to all replicas and backlog.
@@ -388,6 +463,7 @@ impl ReplicationManager {
                         tx,
                         host: replica_host,
                         port: replica_port,
+                        ack_offset: AtomicU64::new(0),
                     });
                     self.connected_replicas.fetch_add(1, Ordering::Relaxed);
 
@@ -432,17 +508,18 @@ impl ReplicationManager {
     ///
     /// 1. Pause writes (`failover_in_progress`)
     /// 2. If replica identities are known and none match `host:port`, error
-    /// 3. **Wait until the target's replication offset ≥ frozen master offset**
-    ///    (poll `REPLCONF GETACK` on the target client port)
+    /// 3. Unless `force`: wait until target ack ≥ frozen master offset
+    ///    (live-link tracked ACK and/or `REPLCONF GETACK` on client port)
     /// 4. TCP connect to target and send bare `FAILOVER`
     /// 5. On success, demote self via `set_replicaof(Some(host:port))`
     ///
-    /// The catch-up wait uses the remaining timeout budget before promote.
+    /// `force` skips the catch-up wait (may promote a lagging replica).
     pub async fn coordinated_failover_to(
         &self,
         host: &str,
         port: u16,
         timeout_ms: u64,
+        force: bool,
     ) -> std::result::Result<(), String> {
         if self.is_replica() {
             return Err("ERR FAILOVER TO is only allowed on the master".into());
@@ -461,21 +538,32 @@ impl ReplicationManager {
 
         // Freeze the offset we require the replica to have applied before promote.
         let target_offset = self.master_repl_offset();
-        if let Err(e) = self
-            .wait_replica_offset_catchup(host, port, target_offset, deadline)
-            .await
-        {
-            self.failover_in_progress.store(false, Ordering::Relaxed);
-            return Err(e);
+        if !force {
+            if let Err(e) = self
+                .wait_replica_offset_catchup(host, port, target_offset, deadline)
+                .await
+            {
+                self.failover_in_progress.store(false, Ordering::Relaxed);
+                return Err(e);
+            }
+        } else {
+            info!(
+                "FAILOVER TO FORCE: skipping catch-up (master offset {})",
+                target_offset
+            );
         }
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             self.failover_in_progress.store(false, Ordering::Relaxed);
-            return Err(format!(
-                "ERR FAILOVER TO timed out waiting for replica catch-up (need offset {})",
-                target_offset
-            ));
+            return Err(if force {
+                "ERR FAILOVER TO timed out".into()
+            } else {
+                format!(
+                    "ERR FAILOVER TO timed out waiting for replica catch-up (need offset {})",
+                    target_offset
+                )
+            });
         }
 
         let result = self.send_failover_to_target(host, port, remaining).await;
@@ -494,8 +582,12 @@ impl ReplicationManager {
         }
     }
 
-    /// Poll target with `REPLCONF GETACK *` until its ack offset ≥ `target_offset`
-    /// or `deadline` is reached.
+    /// Wait until the target's replication offset ≥ `target_offset` or deadline.
+    ///
+    /// Sources (in order each poll):
+    /// 1. Live-link tracked ACK (`note_replica_ack` / feed GETACK replies)
+    /// 2. Probe GETACK on matching replica feed channels (no backlog bump)
+    /// 3. Client-port `REPLCONF GETACK *` fallback
     ///
     /// When `target_offset == 0` there is nothing to wait for.
     pub async fn wait_replica_offset_catchup(
@@ -528,22 +620,58 @@ impl ReplicationManager {
                 });
             }
 
+            // 1) Live-link tracked ACK
+            if let Some(ack) = self.tracked_ack_for(host, port) {
+                last_ack = Some(ack);
+                if ack >= target_offset {
+                    info!(
+                        "FAILOVER TO catch-up ok (live ack): replica {} ack {} >= master {}",
+                        addr, ack, target_offset
+                    );
+                    return Ok(());
+                }
+            }
+
+            // 2) Probe on feed channels (replica replies on live link → note_replica_ack)
+            self.send_getack_probe_to_feeds(Some(host), Some(port));
+
+            // Brief yield so feed write + replica ACK can land
             let slice = deadline.saturating_duration_since(Instant::now());
             if slice.is_zero() {
                 continue;
             }
-            // Cap each poll attempt so we can retry within the budget.
-            let attempt = slice.min(Duration::from_millis(200));
+            tokio::time::sleep(slice.min(Duration::from_millis(10))).await;
 
+            if let Some(ack) = self.tracked_ack_for(host, port) {
+                last_ack = Some(ack);
+                if ack >= target_offset {
+                    info!(
+                        "FAILOVER TO catch-up ok (after feed probe): {} ack {} >= {}",
+                        addr, ack, target_offset
+                    );
+                    return Ok(());
+                }
+            }
+
+            // 3) Client-port GETACK fallback
+            let attempt = deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(200));
+            if attempt.is_zero() {
+                continue;
+            }
             match self.query_replica_ack(&addr, attempt).await {
                 Ok(ack) if ack >= target_offset => {
+                    // Keep live table warm for subsequent probes
+                    self.note_replica_ack(Some(host), Some(port), ack);
                     info!(
-                        "FAILOVER TO catch-up ok: replica {} ack {} >= master {}",
+                        "FAILOVER TO catch-up ok (client GETACK): replica {} ack {} >= master {}",
                         addr, ack, target_offset
                     );
                     return Ok(());
                 }
                 Ok(ack) => {
+                    self.note_replica_ack(Some(host), Some(port), ack);
                     last_ack = Some(ack);
                     last_err = None;
                 }
@@ -925,7 +1053,7 @@ fn split_host_port(addr: &str) -> (String, u16) {
 }
 
 /// Parse `*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$N\r\n<offset>\r\n` style reply.
-fn parse_replconf_ack_offset(reply: &RespValue) -> Option<u64> {
+pub fn parse_replconf_ack_offset(reply: &RespValue) -> Option<u64> {
     let arr = match reply {
         RespValue::Array(a) if a.len() >= 3 => a,
         _ => return None,
@@ -1138,13 +1266,23 @@ async fn sync_from_primary(
     repl.master_link_up.store(true, Ordering::Relaxed);
     info!("Replica linked; applying command stream");
 
-    // Apply remaining buffered data + stream; count bytes toward replica_offset
+    // Apply remaining buffered data + stream; count exact wire bytes toward replica_offset.
+    // Also handle master `REPLCONF GETACK` probes by replying `REPLCONF ACK <offset>` on this link.
     loop {
-        while let Some(val) = parser.parse()? {
-            let raw_len = estimate_resp_size(&val);
+        while let Some((val, consumed)) = parser.parse_with_consumed()? {
+            if is_replconf_getack(&val) {
+                // GETACK is part of the master stream — count it, then reply with current offset.
+                repl.replica_offset
+                    .fetch_add(consumed as u64, Ordering::Relaxed);
+                let ack = encode_replconf_ack(repl.replica_offset());
+                stream.write_all(&ack).await.map_err(|e| {
+                    Error::NetworkError(format!("write REPLCONF ACK: {}", e))
+                })?;
+                continue;
+            }
             apply_replicated_command(&databases, &mut current_db, val)?;
             repl.replica_offset
-                .fetch_add(raw_len as u64, Ordering::Relaxed);
+                .fetch_add(consumed as u64, Ordering::Relaxed);
         }
         let n = stream.read(&mut buf).await?;
         if n == 0 {
@@ -1152,6 +1290,32 @@ async fn sync_from_primary(
         }
         parser.feed(&buf[..n]);
     }
+}
+
+/// True if value is `REPLCONF GETACK …` (master offset probe).
+fn is_replconf_getack(val: &RespValue) -> bool {
+    let arr = match val {
+        RespValue::Array(a) if a.len() >= 2 => a,
+        _ => return false,
+    };
+    let cmd = match arr[0].as_bulk_string() {
+        Some(b) => b,
+        None => return false,
+    };
+    let sub = match arr[1].as_bulk_string() {
+        Some(b) => b,
+        None => return false,
+    };
+    cmd.eq_ignore_ascii_case(b"REPLCONF") && sub.eq_ignore_ascii_case(b"GETACK")
+}
+
+fn encode_replconf_ack(offset: u64) -> Bytes {
+    RespValue::Array(vec![
+        RespValue::BulkString(Some(Bytes::from_static(b"REPLCONF"))),
+        RespValue::BulkString(Some(Bytes::from_static(b"ACK"))),
+        RespValue::BulkString(Some(Bytes::from(offset.to_string()))),
+    ])
+    .serialize()
 }
 
 async fn read_one_value(
@@ -1171,12 +1335,6 @@ async fn read_one_value(
         }
         parser.feed(&buf[..n]);
     }
-}
-
-/// Best-effort size of a RESP value for offset accounting (matches encode size
-/// for arrays of bulk strings; approximate otherwise).
-fn estimate_resp_size(val: &RespValue) -> usize {
-    val.serialize().len()
 }
 
 fn apply_replicated_command(
@@ -2154,5 +2312,192 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    #[test]
+    fn note_replica_ack_tracks_by_host_port() {
+        let repl = ReplicationManager::new();
+        let _rx = repl.register_replica_announced(
+            Some("127.0.0.1".into()),
+            Some(7001),
+        );
+        assert_eq!(repl.tracked_ack_for("127.0.0.1", 7001), Some(0));
+        repl.note_replica_ack(Some("127.0.0.1"), Some(7001), 42);
+        assert_eq!(repl.tracked_ack_for("127.0.0.1", 7001), Some(42));
+        // Monotonic: lower ack does not decrease
+        repl.note_replica_ack(Some("127.0.0.1"), Some(7001), 10);
+        assert_eq!(repl.tracked_ack_for("127.0.0.1", 7001), Some(42));
+        // Higher wins
+        repl.note_replica_ack(Some("127.0.0.1"), Some(7001), 100);
+        assert_eq!(repl.tracked_ack_for("127.0.0.1", 7001), Some(100));
+        // Localhost alias matches
+        assert_eq!(repl.tracked_ack_for("localhost", 7001), Some(100));
+        // Wrong port
+        assert_eq!(repl.tracked_ack_for("127.0.0.1", 7002), None);
+    }
+
+    #[test]
+    fn note_replica_ack_port_only_when_host_unknown_on_feed() {
+        let repl = ReplicationManager::new();
+        let _rx = repl.register_replica_announced(None, Some(6380));
+        repl.note_replica_ack(Some("10.0.0.5"), Some(6380), 77);
+        assert_eq!(repl.tracked_ack_for("10.0.0.5", 6380), Some(77));
+        assert_eq!(repl.tracked_ack_for("other", 6380), Some(77));
+    }
+
+    #[test]
+    fn note_replica_ack_single_anonymous_feed_fallback() {
+        let repl = ReplicationManager::new();
+        let _rx = repl.register_replica_announced(None, None);
+        // No identity on either side — single-feed fallback
+        repl.note_replica_ack(Some("127.0.0.1"), Some(1), 55);
+        // tracked_ack_for needs port match on feed; anonymous has no port
+        assert_eq!(repl.tracked_ack_for("127.0.0.1", 1), None);
+        // But note_replica_ack did update the anonymous feed via fallback —
+        // verify via a second note with no identity reading through port-less path:
+        // register a second feed with identity and ensure anonymous was the one updated
+        // by checking send_getack still targets it (smoke).
+        repl.send_getack_probe_to_feeds(None, None);
+    }
+
+    #[test]
+    fn send_getack_probe_delivers_to_matching_feed() {
+        let repl = ReplicationManager::new();
+        let mut rx = repl.register_replica_announced(
+            Some("127.0.0.1".into()),
+            Some(6400),
+        );
+        let mut other = repl.register_replica_announced(
+            Some("127.0.0.1".into()),
+            Some(6401),
+        );
+        repl.send_getack_probe_to_feeds(Some("127.0.0.1"), Some(6400));
+        let msg = rx.try_recv().expect("GETACK on matching feed");
+        let s = String::from_utf8_lossy(&msg);
+        assert!(s.to_ascii_uppercase().contains("GETACK"), "got {}", s);
+        assert!(other.try_recv().is_err(), "other feed must not get probe");
+    }
+
+    #[test]
+    fn is_replconf_getack_detects_probe() {
+        let getack = RespValue::Array(vec![
+            RespValue::BulkString(Some(Bytes::from_static(b"REPLCONF"))),
+            RespValue::BulkString(Some(Bytes::from_static(b"GETACK"))),
+            RespValue::BulkString(Some(Bytes::from_static(b"*"))),
+        ]);
+        assert!(is_replconf_getack(&getack));
+        let ack = encode_replconf_ack(99);
+        // encode is serialized bytes — parse back
+        let mut p = RespParser::new();
+        p.feed(&ack);
+        let val = p.parse().unwrap().unwrap();
+        assert!(!is_replconf_getack(&val));
+        assert_eq!(parse_replconf_ack_offset(&val), Some(99));
+    }
+
+    #[test]
+    fn encode_replconf_ack_roundtrip() {
+        for off in [0u64, 1, 42, 999_999] {
+            let raw = encode_replconf_ack(off);
+            let mut p = RespParser::new();
+            p.feed(&raw);
+            let val = p.parse().unwrap().unwrap();
+            assert_eq!(parse_replconf_ack_offset(&val), Some(off));
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_catchup_succeeds_via_live_tracked_ack() {
+        let repl = ReplicationManager::new();
+        let _rx = repl.register_replica_announced(
+            Some("127.0.0.1".into()),
+            Some(16690),
+        );
+        // Pretend the live link already reported catch-up
+        repl.note_replica_ack(Some("127.0.0.1"), Some(16690), 500);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        repl.wait_replica_offset_catchup("127.0.0.1", 16690, 500, deadline)
+            .await
+            .expect("live ack should satisfy catch-up without network");
+    }
+
+    #[tokio::test]
+    async fn wait_catchup_live_ack_below_target_still_times_out() {
+        let repl = ReplicationManager::new();
+        let _rx = repl.register_replica_announced(
+            Some("127.0.0.1".into()),
+            Some(16691),
+        );
+        repl.note_replica_ack(Some("127.0.0.1"), Some(16691), 10);
+        let deadline = Instant::now() + Duration::from_millis(120);
+        let err = repl
+            .wait_replica_offset_catchup("127.0.0.1", 16691, 9999, deadline)
+            .await
+            .expect_err("ack 10 < 9999 must time out");
+        assert!(
+            err.to_ascii_lowercase().contains("catch-up")
+                || err.contains("9999")
+                || err.contains("10"),
+            "unexpected: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinated_failover_force_skips_catchup_then_fails_connect() {
+        // FORCE skips wait; unreachable target → connect error, master stays master.
+        let repl = ReplicationManager::new();
+        repl.propagate_command(&[
+            Bytes::from_static(b"SET"),
+            Bytes::from_static(b"k"),
+            Bytes::from_static(b"v"),
+        ]);
+        assert!(repl.master_repl_offset() > 0);
+        let err = repl
+            .coordinated_failover_to("127.0.0.1", 1, 200, true)
+            .await
+            .expect_err("unreachable target");
+        assert!(
+            err.to_ascii_lowercase().contains("failover"),
+            "unexpected: {}",
+            err
+        );
+        assert!(
+            !err.to_ascii_lowercase().contains("catch-up"),
+            "FORCE must not fail on catch-up: {}",
+            err
+        );
+        assert!(!repl.is_replica());
+        assert!(!repl.failover_in_progress());
+    }
+
+    #[tokio::test]
+    async fn coordinated_failover_without_force_reports_catchup_timeout() {
+        let repl = ReplicationManager::new();
+        repl.propagate_command(&[
+            Bytes::from_static(b"SET"),
+            Bytes::from_static(b"a"),
+            Bytes::from_static(b"b"),
+        ]);
+        let err = repl
+            .coordinated_failover_to("127.0.0.1", 1, 150, false)
+            .await
+            .expect_err("must fail catch-up");
+        assert!(
+            err.to_ascii_lowercase().contains("catch-up"),
+            "expected catch-up error, got: {}",
+            err
+        );
+        assert!(!repl.is_replica());
+    }
+
+    #[test]
+    fn parse_replconf_ack_case_insensitive() {
+        let reply = RespValue::Array(vec![
+            RespValue::BulkString(Some(Bytes::from_static(b"replconf"))),
+            RespValue::BulkString(Some(Bytes::from_static(b"ack"))),
+            RespValue::BulkString(Some(Bytes::from_static(b"7"))),
+        ]);
+        assert_eq!(parse_replconf_ack_offset(&reply), Some(7));
     }
 }

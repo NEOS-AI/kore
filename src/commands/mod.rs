@@ -181,6 +181,21 @@ impl CommandHandler {
         self.pending_replica_feed.take()
     }
 
+    /// Shared persistence manager for this connection (if configured).
+    pub fn persistence(&self) -> Option<&Arc<PersistenceManager>> {
+        self.persistence.as_ref()
+    }
+
+    /// Pending `REPLCONF ip-address` for the next SYNC/PSYNC on this connection.
+    pub fn replica_announce_ip(&self) -> Option<&str> {
+        self.replica_announce_ip.as_deref()
+    }
+
+    /// Pending `REPLCONF listening-port` for the next SYNC/PSYNC on this connection.
+    pub fn replica_announce_port(&self) -> Option<u16> {
+        self.replica_announce_port
+    }
+
     /// Log write to AOF + replicas when the command mutated data successfully.
     fn maybe_persist_write(&self, cmd: &str, args: &[RespValue], response: &RespValue) {
         if !is_write_command(cmd) {

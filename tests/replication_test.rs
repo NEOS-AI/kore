@@ -349,6 +349,46 @@ fn replconf_ok_and_getack() {
 }
 
 #[test]
+fn replconf_ack_updates_tracked_offset() {
+    let dir = unique_dir("replconf-ack");
+    let mgr = make_persistence(&dir);
+    let cache = Cache::new_with_sweep(8, 1024 * 1024 * 10, 500 * 1024 * 1024, false);
+    let mut h = CommandHandler::with_persistence(cache, make_config(&dir), Some(mgr.clone()));
+
+    // Announce identity then register a feed so note_replica_ack has a target.
+    assert_eq!(
+        handle(&mut h, cmd(&["REPLCONF", "listening-port", "6391"])),
+        RespValue::ok()
+    );
+    assert_eq!(
+        handle(&mut h, cmd(&["REPLCONF", "ip-address", "127.0.0.1"])),
+        RespValue::ok()
+    );
+    let _feed = mgr
+        .replication
+        .register_replica_announced(Some("127.0.0.1".into()), Some(6391));
+
+    let resp = handle(&mut h, cmd(&["REPLCONF", "ACK", "1234"]));
+    assert_eq!(resp, RespValue::ok());
+    assert_eq!(
+        mgr.replication.tracked_ack_for("127.0.0.1", 6391),
+        Some(1234)
+    );
+
+    // Monotonic bump
+    assert_eq!(
+        handle(&mut h, cmd(&["REPLCONF", "ACK", "2000"])),
+        RespValue::ok()
+    );
+    assert_eq!(
+        mgr.replication.tracked_ack_for("127.0.0.1", 6391),
+        Some(2000)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn psync_command_via_handler_sets_pending() {
     let dir = unique_dir("handler");
     let mgr = make_persistence(&dir);

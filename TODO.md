@@ -133,7 +133,7 @@ Also tracked in `docs/roadmap.md`.
   - *Done*: readonly replica rejects writes (`READONLY …`); serves reads (GET/EXISTS/TYPE/…); `ROLE`; `INFO` `# Replication` section (role, offsets, backlog, master_host)
 - [x] **`[P1]`** Failover story (external Sentinel-compatible or built-in later)
   - *Done (minimal + coordinated MVP-lite)*: honest promote via `REPLICAOF NO ONE` / bare `FAILOVER` on replica — new replid, offset 0, backlog clear, drop feeds, clear replica metadata, `master_replid2` in INFO; idempotent when already master.
-  - *Coordinated* `FAILOVER TO <host> <port> [TIMEOUT ms]` (master only, default timeout 5000ms): write pause, soft match against REPLCONF `listening-port`/`ip-address` when tracked, **wait until target `REPLCONF GETACK` ≥ frozen `master_repl_offset`**, then TCP bare `FAILOVER` + demote self via `set_replicaof`. Catch-up timeout leaves master writable. Full Sentinel not implemented.
+  - *Coordinated* `FAILOVER TO <host> <port> [TIMEOUT ms] [FORCE]` (master only, default timeout 5000ms): write pause, soft match against REPLCONF `listening-port`/`ip-address` when tracked, wait until target ack ≥ frozen `master_repl_offset` (unless **FORCE**), then TCP bare `FAILOVER` + demote self via `set_replicaof`. Catch-up sources: live-link tracked ACK (`REPLCONF ACK` on feed + periodic feed GETACK probe), then client-port GETACK fallback. Replica offset uses exact wire bytes via `parse_with_consumed` and replies to master GETACK on the repl link. Catch-up timeout leaves master writable. Full Sentinel not implemented.
 
 ---
 
