@@ -782,7 +782,8 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "georadiusbymember",
         ],
         "transaction" => &["multi", "exec", "discard", "watch", "unwatch"],
-        "fast" | "slow" | "blocking" | "scripting" => &[],
+        "scripting" => &["eval", "evalsha", "script"],
+        "fast" | "slow" | "blocking" => &[],
         _ => return Err(format!("ERR Unknown category '{}'", cat)),
     };
     Ok(list.iter().map(|s| (*s).to_string()).collect())
@@ -808,6 +809,7 @@ fn all_known_commands() -> Vec<String> {
         "hyperloglog",
         "keyspace",
         "dangerous",
+        "scripting",
     ] {
         if let Ok(cmds) = category_commands(cat) {
             set.extend(cmds);

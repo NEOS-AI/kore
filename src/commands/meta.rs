@@ -140,6 +140,10 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     CmdSpec { name: "pfadd", arity: -2, flags: &["write", "denyoom", "fast"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "pfcount", arity: -2, flags: &["readonly", "random"], first_key: 1, last_key: -1, step: 1 },
     CmdSpec { name: "pfmerge", arity: -2, flags: &["write", "denyoom"], first_key: 1, last_key: -1, step: 1 },
+    // Lua scripting (keys are dynamic via numkeys; movablekeys in full Redis)
+    CmdSpec { name: "eval", arity: -3, flags: &["noscript", "movablekeys"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "evalsha", arity: -3, flags: &["noscript", "movablekeys"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "script", arity: -2, flags: &["noscript"], first_key: 0, last_key: 0, step: 0 },
 ];
 
 fn bulk(s: impl Into<Bytes>) -> RespValue {

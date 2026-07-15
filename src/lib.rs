@@ -27,6 +27,7 @@ pub mod query_engine;
 pub mod vector_search;
 pub mod persistence;
 pub mod metrics;
+pub mod scripting;
 
 pub use acl::{AclStore, AclUser};
 pub use cache::{Cache, EvictionPolicy};
@@ -67,4 +68,5 @@ pub use memory::{MemoryTracker, MemoryCategory};
 pub use search_index::{SearchIndexManager, IndexDefinition, FieldDefinition, FieldType, DocumentField, DistanceMetric, VectorAlgorithm};
 pub use query_engine::{Query, QueryFilter, QueryExecutor};
 pub use vector_search::{VectorIndex, VectorSearchResult};
+pub use scripting::{script_sha1, ScriptCache};
 

@@ -18,6 +18,7 @@ mod acl;
 mod cluster;
 mod bitmap;
 mod hyperloglog;
+mod scripting;
 
 use crate::acl::AclStore;
 use crate::cache::Cache;
@@ -29,6 +30,7 @@ use crate::persistence::PersistenceManager;
 use crate::protocol::RespValue;
 use crate::pubsub::ClientId;
 use crate::redlock::Redlock;
+use crate::scripting::ScriptCache;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -82,6 +84,8 @@ pub struct CommandHandler {
     protocol_version: u8,
     /// Optional Redlock (for INFO fair-queue metrics).
     redlock: Option<Arc<Redlock>>,
+    /// Shared SCRIPT LOAD / EVALSHA cache (server-wide).
+    script_cache: Arc<ScriptCache>,
 }
 
 impl CommandHandler {
@@ -152,6 +156,7 @@ impl CommandHandler {
             asking: false,
             protocol_version: 2,
             redlock: None,
+            script_cache: ScriptCache::shared(),
         }
     }
 
@@ -159,6 +164,17 @@ impl CommandHandler {
     pub fn with_redlock(mut self, redlock: Option<Arc<Redlock>>) -> Self {
         self.redlock = redlock;
         self
+    }
+
+    /// Share a SCRIPT LOAD cache across connections (server path).
+    pub fn with_script_cache(mut self, script_cache: Arc<ScriptCache>) -> Self {
+        self.script_cache = script_cache;
+        self
+    }
+
+    /// Shared Lua script cache.
+    pub fn script_cache(&self) -> &Arc<ScriptCache> {
+        &self.script_cache
     }
 
     /// Redlock reference if present.
@@ -583,6 +599,11 @@ impl CommandHandler {
             "SUNSUBSCRIBE" => self.handle_sunsubscribe(&args[1..]).await,
             "SPUBLISH" => self.handle_spublish(&args[1..]).await,
 
+            // Lua scripting
+            "EVAL" => self.handle_eval(&args[1..]),
+            "EVALSHA" => self.handle_evalsha(&args[1..]),
+            "SCRIPT" => self.handle_script(&args[1..]),
+
             _ => Ok(RespValue::error(format!("ERR unknown command '{}'", cmd_upper))),
         };
 
@@ -612,7 +633,17 @@ impl CommandHandler {
         }
 
         // Key permission checks using COMMAND_SPECS first_key/last_key/step when available.
-        if let Some((first_key, last_key, step)) = meta::command_key_spec(&cmd_lower) {
+        // EVAL/EVALSHA: keys are dynamic (numkeys after script/sha).
+        let script_keys = extract_eval_keys(cmd_upper, args);
+        if let Some(keys) = script_keys {
+            for key in keys {
+                if !self.acl.can_access_key(username, &key) {
+                    return Some(RespValue::error(
+                        "NOPERM this user has no permissions to access one of the keys used as arguments",
+                    ));
+                }
+            }
+        } else if let Some((first_key, last_key, step)) = meta::command_key_spec(&cmd_lower) {
             if first_key > 0 {
                 let keys = extract_command_keys(args, first_key, last_key, step);
                 for key in keys {
@@ -656,14 +687,18 @@ impl CommandHandler {
             ));
         }
 
-        // Commands without key specs (or first_key=0) are not redirected.
-        let cmd_lower = cmd_upper.to_ascii_lowercase();
-        let (first_key, last_key, step) = meta::command_key_spec(&cmd_lower)?;
-        if first_key <= 0 {
-            return None;
-        }
-
-        let keys = extract_command_key_bytes(args, first_key, last_key, step);
+        // EVAL/EVALSHA: keys follow numkeys (args: script/sha, numkeys, key…).
+        let keys = if let Some(k) = extract_eval_key_bytes(cmd_upper, args) {
+            k
+        } else {
+            // Commands without key specs (or first_key=0) are not redirected.
+            let cmd_lower = cmd_upper.to_ascii_lowercase();
+            let (first_key, last_key, step) = meta::command_key_spec(&cmd_lower)?;
+            if first_key <= 0 {
+                return None;
+            }
+            extract_command_key_bytes(args, first_key, last_key, step)
+        };
         if keys.is_empty() {
             return None;
         }
@@ -952,6 +987,9 @@ fn is_write_command(cmd: &str) -> bool {
             | "BITFIELD"
             | "PFADD"
             | "PFMERGE"
+            // Scripts may mutate; propagate whole EVAL/EVALSHA (Redis-style).
+            | "EVAL"
+            | "EVALSHA"
     )
 }
 
@@ -971,6 +1009,47 @@ fn is_noop_write(cmd: &str, response: &RespValue) -> bool {
         ("SETNX", RespValue::Integer(0)) => true,
         _ => false,
     }
+}
+
+/// EVAL / EVALSHA key arguments as strings for ACL.
+fn extract_eval_keys(cmd_upper: &str, args: &[RespValue]) -> Option<Vec<String>> {
+    extract_eval_key_bytes(cmd_upper, args).map(|keys| {
+        keys.into_iter()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .collect()
+    })
+}
+
+/// EVAL / EVALSHA: args are [script|sha, numkeys, key1..keyN, arg…].
+fn extract_eval_key_bytes(cmd_upper: &str, args: &[RespValue]) -> Option<Vec<Bytes>> {
+    if cmd_upper != "EVAL" && cmd_upper != "EVALSHA" {
+        return None;
+    }
+    if args.len() < 2 {
+        return Some(Vec::new());
+    }
+    let numkeys = match args[1].as_integer() {
+        Some(n) if n >= 0 => n as usize,
+        Some(_) => return Some(Vec::new()),
+        None => match args[1].as_bulk_string() {
+            Some(s) => match std::str::from_utf8(s).ok().and_then(|t| t.parse::<i64>().ok()) {
+                Some(n) if n >= 0 => n as usize,
+                _ => return Some(Vec::new()),
+            },
+            None => return Some(Vec::new()),
+        },
+    };
+    let key_slice = &args[2..];
+    if key_slice.len() < numkeys {
+        return Some(Vec::new());
+    }
+    let mut keys = Vec::with_capacity(numkeys);
+    for k in &key_slice[..numkeys] {
+        if let Some(b) = k.as_bulk_string() {
+            keys.push(b.clone());
+        }
+    }
+    Some(keys)
 }
 
 /// Extract key argument strings using Redis COMMAND first_key/last_key/step.

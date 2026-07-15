@@ -7,6 +7,7 @@ use crate::databases::Databases;
 use crate::persistence::PersistenceManager;
 use crate::protocol::{RespParser, RespValue};
 use crate::redlock::Redlock;
+use crate::scripting::ScriptCache;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig as RustlsServerConfig;
 use std::fs::File;
@@ -32,6 +33,8 @@ pub struct Server {
     redlock: Option<Arc<Redlock>>,
     /// Cluster topology when `--cluster-enabled`.
     cluster: Option<Arc<ClusterState>>,
+    /// Shared SCRIPT LOAD / EVALSHA cache for all connections.
+    script_cache: Arc<ScriptCache>,
 }
 
 const BUFFER_SIZE: usize = 8192;
@@ -98,6 +101,7 @@ impl Server {
             acl,
             redlock: None,
             cluster,
+            script_cache: ScriptCache::shared(),
         }
     }
 
@@ -384,6 +388,7 @@ impl Server {
         let acl = self.acl.clone();
         let cluster = self.cluster.clone();
         let redlock = self.redlock.clone();
+        let script_cache = self.script_cache.clone();
 
         tokio::spawn(async move {
             let _permit = permit;
@@ -398,6 +403,7 @@ impl Server {
                             acl,
                             cluster,
                             redlock,
+                            script_cache,
                         )
                         .await
                     }
@@ -412,6 +418,7 @@ impl Server {
                     acl,
                     cluster,
                     redlock,
+                    script_cache,
                 )
                 .await
             };
@@ -471,6 +478,7 @@ async fn handle_connection<S>(
     acl: Arc<AclStore>,
     cluster: Option<Arc<ClusterState>>,
     redlock: Option<Arc<Redlock>>,
+    script_cache: Arc<ScriptCache>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -487,7 +495,8 @@ where
     let mut handler =
         CommandHandler::with_databases_and_acl(databases, config, persistence, acl)
             .with_cluster(cluster)
-            .with_redlock(redlock);
+            .with_redlock(redlock)
+            .with_script_cache(script_cache);
     handler.set_client_id(client_id);
     let mut buf = vec![0u8; BUFFER_SIZE]; // 8KB buffer
 
