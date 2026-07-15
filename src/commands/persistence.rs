@@ -229,10 +229,9 @@ impl CommandHandler {
     /// FAILOVER — bare promote on replica, or coordinated `FAILOVER TO` on master.
     ///
     /// - Bare `FAILOVER` (replica only): local `promote_to_master()`.
-    /// - `FAILOVER TO <host> <port> [TIMEOUT ms]` (master only): connect to target,
-    ///   send bare FAILOVER, demote self on success.
-    ///
-    /// **MVP-lite race**: no offset catch-up wait before promoting the target.
+    /// - `FAILOVER TO <host> <port> [TIMEOUT ms]` (master only): pause writes,
+    ///   wait until target `REPLCONF GETACK` ≥ frozen master offset, then send
+    ///   bare FAILOVER and demote self on success.
     pub(super) async fn handle_failover(&self, args: &[RespValue]) -> Result<RespValue> {
         let Some(p) = self.persistence.as_ref() else {
             return Ok(RespValue::error("ERR persistence not configured"));

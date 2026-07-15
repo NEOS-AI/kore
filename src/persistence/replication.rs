@@ -21,6 +21,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::time::{Duration, Instant};
 use tracing::{info, warn};
 
 const REPLICA_CHANNEL_CAP: usize = 1024;
@@ -424,15 +425,19 @@ impl ReplicationManager {
     /// Default timeout for coordinated `FAILOVER TO` (milliseconds).
     pub const FAILOVER_DEFAULT_TIMEOUT_MS: u64 = 5000;
 
-    /// Master-initiated coordinated failover (MVP-lite).
+    /// How often to poll the target with `REPLCONF GETACK` during catch-up.
+    const FAILOVER_CATCHUP_POLL_MS: u64 = 25;
+
+    /// Master-initiated coordinated failover.
     ///
-    /// 1. Optionally pause writes (`failover_in_progress`)
+    /// 1. Pause writes (`failover_in_progress`)
     /// 2. If replica identities are known and none match `host:port`, error
-    /// 3. TCP connect to target and send bare `FAILOVER`
-    /// 4. On success, demote self via `set_replicaof(Some(host:port))`
+    /// 3. **Wait until the target's replication offset ≥ frozen master offset**
+    ///    (poll `REPLCONF GETACK` on the target client port)
+    /// 4. TCP connect to target and send bare `FAILOVER`
+    /// 5. On success, demote self via `set_replicaof(Some(host:port))`
     ///
-    /// **Known race / gap**: no replication-offset catch-up wait. The target may
-    /// promote before applying the latest backlog entries that were still in flight.
+    /// The catch-up wait uses the remaining timeout budget before promote.
     pub async fn coordinated_failover_to(
         &self,
         host: &str,
@@ -451,18 +456,33 @@ impl ReplicationManager {
             ));
         }
 
-        let timeout = std::time::Duration::from_millis(timeout_ms.max(1));
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
         self.failover_in_progress.store(true, Ordering::Relaxed);
 
-        let result = self
-            .send_failover_to_target(host, port, timeout)
-            .await;
+        // Freeze the offset we require the replica to have applied before promote.
+        let target_offset = self.master_repl_offset();
+        if let Err(e) = self
+            .wait_replica_offset_catchup(host, port, target_offset, deadline)
+            .await
+        {
+            self.failover_in_progress.store(false, Ordering::Relaxed);
+            return Err(e);
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            self.failover_in_progress.store(false, Ordering::Relaxed);
+            return Err(format!(
+                "ERR FAILOVER TO timed out waiting for replica catch-up (need offset {})",
+                target_offset
+            ));
+        }
+
+        let result = self.send_failover_to_target(host, port, remaining).await;
 
         match result {
             Ok(()) => {
                 // Demote self to replica of the newly promoted master.
-                // set_replicaof clears failover_in_progress via readonly path...
-                // we clear the flag after demotion so readonly stays true as replica.
                 self.set_replicaof(Some(format!("{}:{}", host, port)));
                 self.failover_in_progress.store(false, Ordering::Relaxed);
                 Ok(())
@@ -474,11 +494,133 @@ impl ReplicationManager {
         }
     }
 
+    /// Poll target with `REPLCONF GETACK *` until its ack offset ≥ `target_offset`
+    /// or `deadline` is reached.
+    ///
+    /// When `target_offset == 0` there is nothing to wait for.
+    pub async fn wait_replica_offset_catchup(
+        &self,
+        host: &str,
+        port: u16,
+        target_offset: u64,
+        deadline: Instant,
+    ) -> std::result::Result<(), String> {
+        if target_offset == 0 {
+            return Ok(());
+        }
+
+        let addr = format!("{}:{}", host, port);
+        let mut last_ack: Option<u64> = None;
+        let mut last_err: Option<String> = None;
+
+        loop {
+            if Instant::now() >= deadline {
+                return Err(match last_ack {
+                    Some(ack) => format!(
+                        "ERR FAILOVER TO timed out waiting for replica catch-up (need offset {}, last ack {})",
+                        target_offset, ack
+                    ),
+                    None => format!(
+                        "ERR FAILOVER TO timed out waiting for replica catch-up (need offset {}, {})",
+                        target_offset,
+                        last_err.unwrap_or_else(|| "no ack received".into())
+                    ),
+                });
+            }
+
+            let slice = deadline.saturating_duration_since(Instant::now());
+            if slice.is_zero() {
+                continue;
+            }
+            // Cap each poll attempt so we can retry within the budget.
+            let attempt = slice.min(Duration::from_millis(200));
+
+            match self.query_replica_ack(&addr, attempt).await {
+                Ok(ack) if ack >= target_offset => {
+                    info!(
+                        "FAILOVER TO catch-up ok: replica {} ack {} >= master {}",
+                        addr, ack, target_offset
+                    );
+                    return Ok(());
+                }
+                Ok(ack) => {
+                    last_ack = Some(ack);
+                    last_err = None;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+
+            let sleep_for = Duration::from_millis(Self::FAILOVER_CATCHUP_POLL_MS)
+                .min(deadline.saturating_duration_since(Instant::now()));
+            if !sleep_for.is_zero() {
+                tokio::time::sleep(sleep_for).await;
+            }
+        }
+    }
+
+    /// Open a short-lived client connection and send `REPLCONF GETACK *`.
+    /// Returns the replica's reported offset.
+    async fn query_replica_ack(
+        &self,
+        addr: &str,
+        timeout: Duration,
+    ) -> std::result::Result<u64, String> {
+        let connect = TcpStream::connect(addr.to_string());
+        let mut stream = match tokio::time::timeout(timeout, connect).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                return Err(format!("connect {}: {}", addr, e));
+            }
+            Err(_) => {
+                return Err(format!("connect timeout {}", addr));
+            }
+        };
+        let _ = stream.set_nodelay(true);
+
+        let getack = RespValue::Array(vec![
+            RespValue::BulkString(Some(Bytes::from_static(b"REPLCONF"))),
+            RespValue::BulkString(Some(Bytes::from_static(b"GETACK"))),
+            RespValue::BulkString(Some(Bytes::from_static(b"*"))),
+        ])
+        .serialize();
+
+        match tokio::time::timeout(timeout, stream.write_all(&getack)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(format!("write GETACK {}: {}", addr, e)),
+            Err(_) => return Err(format!("write GETACK timeout {}", addr)),
+        }
+
+        let mut parser = RespParser::new();
+        let mut buf = vec![0u8; 4096];
+        let reply = loop {
+            if let Some(val) = parser
+                .parse()
+                .map_err(|e| format!("parse GETACK reply: {}", e))?
+            {
+                break val;
+            }
+            let n = match tokio::time::timeout(timeout, stream.read(&mut buf)).await {
+                Ok(Ok(0)) => {
+                    return Err(format!("GETACK: {} closed connection", addr));
+                }
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return Err(format!("read GETACK {}: {}", addr, e)),
+                Err(_) => return Err(format!("read GETACK timeout {}", addr)),
+            };
+            parser.feed(&buf[..n]);
+        };
+
+        parse_replconf_ack_offset(&reply)
+            .ok_or_else(|| format!("unexpected GETACK reply from {}: {:?}", addr, reply))
+    }
+
     async fn send_failover_to_target(
         &self,
         host: &str,
         port: u16,
-        timeout: std::time::Duration,
+        timeout: Duration,
     ) -> std::result::Result<(), String> {
         let addr = format!("{}:{}", host, port);
         let connect = TcpStream::connect(addr.clone());
@@ -780,6 +922,22 @@ fn split_host_port(addr: &str) -> (String, u16) {
     } else {
         (addr.to_string(), 0)
     }
+}
+
+/// Parse `*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$N\r\n<offset>\r\n` style reply.
+fn parse_replconf_ack_offset(reply: &RespValue) -> Option<u64> {
+    let arr = match reply {
+        RespValue::Array(a) if a.len() >= 3 => a,
+        _ => return None,
+    };
+    let cmd = arr[0].as_bulk_string()?;
+    let ack = arr[1].as_bulk_string()?;
+    if !cmd.eq_ignore_ascii_case(b"REPLCONF") || !ack.eq_ignore_ascii_case(b"ACK") {
+        return None;
+    }
+    let off_b = arr[2].as_bulk_string()?;
+    let s = std::str::from_utf8(off_b).ok()?;
+    s.parse::<u64>().ok()
 }
 
 fn replica_matches(r: &ReplicaFeed, host: &str, port: u16) -> bool {
@@ -1950,5 +2108,51 @@ mod tests {
         ]);
         assert!(feed.try_recv().is_err());
         let _ = cache; // silence unused
+    }
+
+    #[test]
+    fn parse_replconf_ack_offset_ok() {
+        let reply = RespValue::Array(vec![
+            RespValue::BulkString(Some(Bytes::from_static(b"REPLCONF"))),
+            RespValue::BulkString(Some(Bytes::from_static(b"ACK"))),
+            RespValue::BulkString(Some(Bytes::from_static(b"12345"))),
+        ]);
+        assert_eq!(parse_replconf_ack_offset(&reply), Some(12345));
+
+        let bad = RespValue::Array(vec![
+            RespValue::BulkString(Some(Bytes::from_static(b"REPLCONF"))),
+            RespValue::BulkString(Some(Bytes::from_static(b"ACK"))),
+        ]);
+        assert_eq!(parse_replconf_ack_offset(&bad), None);
+
+        let wrong = RespValue::ok();
+        assert_eq!(parse_replconf_ack_offset(&wrong), None);
+    }
+
+    #[tokio::test]
+    async fn wait_catchup_zero_offset_is_immediate() {
+        let repl = ReplicationManager::new();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        // No server needed when target_offset is 0
+        repl.wait_replica_offset_catchup("127.0.0.1", 1, 0, deadline)
+            .await
+            .expect("zero offset must succeed without network");
+    }
+
+    #[tokio::test]
+    async fn wait_catchup_times_out_when_ack_never_reaches_target() {
+        // Nothing listening → polls fail until deadline
+        let repl = ReplicationManager::new();
+        let deadline = Instant::now() + Duration::from_millis(150);
+        let err = repl
+            .wait_replica_offset_catchup("127.0.0.1", 1, 999, deadline)
+            .await
+            .expect_err("must time out");
+        assert!(
+            err.to_ascii_lowercase().contains("catch-up")
+                || err.to_ascii_lowercase().contains("catchup"),
+            "unexpected error: {}",
+            err
+        );
     }
 }

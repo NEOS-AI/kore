@@ -386,6 +386,259 @@ async fn coordinated_failover_to_promotes_replica() {
     let _ = std::fs::remove_dir_all(&replica_dir);
 }
 
+/// Target that never reaches master offset: catch-up wait times out; master stays master.
+#[tokio::test(flavor = "multi_thread")]
+async fn failover_to_catchup_timeout_when_target_lags() {
+    // Master has writes (offset > 0). Target is a standalone server with ack 0 forever.
+    let master_port = 16617u16;
+    let lag_port = 16618u16;
+
+    let master_dir = unique_dir("catchup-master");
+    let lag_dir = unique_dir("catchup-lag");
+
+    let master_cfg = make_config(&master_dir, master_port);
+    let lag_cfg = make_config(&lag_dir, lag_port);
+
+    let master_mgr = make_persistence(&master_dir);
+    master_mgr.replication.set_announce_port(master_port);
+    let lag_mgr = make_persistence(&lag_dir);
+    lag_mgr.replication.set_announce_port(lag_port);
+
+    let master_cache = Cache::new_with_sweep(8, 1024 * 1024 * 10, 500 * 1024 * 1024, false);
+    let lag_cache = Cache::new_with_sweep(8, 1024 * 1024 * 10, 500 * 1024 * 1024, false);
+
+    let master = Server::with_persistence(
+        Arc::clone(&master_cache),
+        Arc::clone(&master_cfg),
+        Arc::clone(&master_mgr),
+    );
+    let lag = Server::with_persistence(
+        Arc::clone(&lag_cache),
+        Arc::clone(&lag_cfg),
+        Arc::clone(&lag_mgr),
+    );
+
+    let (m_tx, m_rx) = watch::channel(false);
+    let (l_tx, l_rx) = watch::channel(false);
+    let m_h = tokio::spawn(async move {
+        let _ = master.run_with_shutdown(m_rx).await;
+    });
+    let l_h = tokio::spawn(async move {
+        let _ = lag.run_with_shutdown(l_rx).await;
+    });
+    sleep(Duration::from_millis(250)).await;
+
+    let mut cli = timeout(
+        Duration::from_secs(2),
+        TcpStream::connect(format!("127.0.0.1:{}", master_port)),
+    )
+    .await
+    .expect("connect timeout")
+    .expect("connect");
+
+    // Bump master_repl_offset above 0 (no replica applying)
+    assert_eq!(
+        send_cmd(&mut cli, &["SET", "k", "v"]).await,
+        RespValue::ok()
+    );
+    assert!(
+        master_mgr.replication.master_repl_offset() > 0,
+        "master offset must be > 0 after write"
+    );
+
+    // Soft identity: no replica announced, so connect to lag_port is still attempted.
+    // Lag server is not a replica of this master → GETACK stays 0 → catch-up timeout.
+    let start = std::time::Instant::now();
+    let resp = send_cmd(
+        &mut cli,
+        &[
+            "FAILOVER",
+            "TO",
+            "127.0.0.1",
+            &lag_port.to_string(),
+            "TIMEOUT",
+            "400",
+        ],
+    )
+    .await;
+    let elapsed = start.elapsed();
+    assert_err_contains(resp, &["catch-up"]);
+    assert!(
+        elapsed >= Duration::from_millis(300),
+        "should spend budget waiting for catch-up, took {:?}",
+        elapsed
+    );
+    assert!(
+        !master_mgr.replication.is_replica(),
+        "master must remain master after catch-up timeout"
+    );
+    // Target must NOT have been promoted (still accepts writes as master)
+    let mut lag_cli = TcpStream::connect(format!("127.0.0.1:{}", lag_port))
+        .await
+        .expect("lag connect");
+    let role = send_cmd(&mut lag_cli, &["ROLE"]).await;
+    match role {
+        RespValue::Array(arr) => {
+            assert_eq!(
+                arr[0],
+                RespValue::BulkString(Some(Bytes::from_static(b"master"))),
+                "lag target must not receive FAILOVER when catch-up fails"
+            );
+        }
+        other => panic!("expected ROLE array, {:?}", other),
+    }
+
+    let _ = m_tx.send(true);
+    let _ = l_tx.send(true);
+    m_h.abort();
+    l_h.abort();
+    sleep(Duration::from_millis(50)).await;
+    let _ = std::fs::remove_dir_all(&master_dir);
+    let _ = std::fs::remove_dir_all(&lag_dir);
+}
+
+/// After many writes, FAILOVER TO waits for catch-up so all keys are on the new master.
+#[tokio::test(flavor = "multi_thread")]
+async fn failover_to_catchup_preserves_all_writes() {
+    let master_port = 16619u16;
+    let replica_port = 16620u16;
+
+    let master_dir = unique_dir("catchup-all-master");
+    let replica_dir = unique_dir("catchup-all-replica");
+
+    let master_cfg = make_config(&master_dir, master_port);
+    let mut replica_cfg = (*make_config(&replica_dir, replica_port)).clone();
+    replica_cfg.replicaof = format!("127.0.0.1:{}", master_port);
+    let replica_cfg = Arc::new(replica_cfg);
+
+    let master_mgr = make_persistence(&master_dir);
+    master_mgr.replication.set_announce_port(master_port);
+    let replica_mgr = make_persistence(&replica_dir);
+    replica_mgr.replication.set_announce_port(replica_port);
+    replica_mgr
+        .replication
+        .set_replicaof(Some(format!("127.0.0.1:{}", master_port)));
+
+    let master_cache = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let replica_cache = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+
+    let master = Server::with_persistence(
+        Arc::clone(&master_cache),
+        Arc::clone(&master_cfg),
+        Arc::clone(&master_mgr),
+    );
+    let replica = Server::with_persistence(
+        Arc::clone(&replica_cache),
+        Arc::clone(&replica_cfg),
+        Arc::clone(&replica_mgr),
+    );
+
+    let (m_shutdown_tx, m_shutdown_rx) = watch::channel(false);
+    let (r_shutdown_tx, r_shutdown_rx) = watch::channel(false);
+    let master_handle = tokio::spawn(async move {
+        let _ = master.run_with_shutdown(m_shutdown_rx).await;
+    });
+    let replica_handle = tokio::spawn(async move {
+        let _ = replica.run_with_shutdown(r_shutdown_rx).await;
+    });
+
+    let repl_dbs = kore::Databases::single(Arc::clone(&replica_cache));
+    let repl_mgr_loop = Arc::clone(&replica_mgr);
+    let repl_shutdown = r_shutdown_tx.subscribe();
+    let replica_loop = tokio::spawn(async move {
+        run_replica_loop(repl_dbs, repl_mgr_loop.replication.clone(), repl_shutdown).await;
+    });
+
+    sleep(Duration::from_millis(300)).await;
+
+    let mut master_cli = timeout(
+        Duration::from_secs(2),
+        TcpStream::connect(format!("127.0.0.1:{}", master_port)),
+    )
+    .await
+    .expect("master connect timeout")
+    .expect("master connect");
+
+    // Wait for link, then burst writes
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if replica_mgr.replication.master_link_up() {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("replica link never came up");
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    const N: usize = 40;
+    for i in 0..N {
+        let key = format!("ck{}", i);
+        let val = format!("v{}", i);
+        let r = send_cmd(&mut master_cli, &["SET", &key, &val]).await;
+        assert_eq!(r, RespValue::ok());
+    }
+
+    let fo = send_cmd(
+        &mut master_cli,
+        &[
+            "FAILOVER",
+            "TO",
+            "127.0.0.1",
+            &replica_port.to_string(),
+            "TIMEOUT",
+            "5000",
+        ],
+    )
+    .await;
+    assert_eq!(fo, RespValue::ok(), "FAILOVER TO should succeed after catch-up");
+
+    // All keys readable on new master
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let mut rcli = TcpStream::connect(format!("127.0.0.1:{}", replica_port))
+            .await
+            .expect("replica connect");
+        let role = send_cmd(&mut rcli, &["ROLE"]).await;
+        let is_master = matches!(
+            &role,
+            RespValue::Array(arr)
+                if arr.first()
+                    == Some(&RespValue::BulkString(Some(Bytes::from_static(b"master"))))
+        );
+        if is_master {
+            let mut ok = true;
+            for i in 0..N {
+                let key = format!("ck{}", i);
+                let val = format!("v{}", i);
+                let got = send_cmd(&mut rcli, &["GET", &key]).await;
+                if got != RespValue::BulkString(Some(Bytes::from(val.clone()))) {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("not all keys present on new master after catch-up failover");
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(master_mgr.replication.is_replica());
+
+    let _ = m_shutdown_tx.send(true);
+    let _ = r_shutdown_tx.send(true);
+    master_handle.abort();
+    replica_handle.abort();
+    replica_loop.abort();
+    sleep(Duration::from_millis(50)).await;
+    let _ = std::fs::remove_dir_all(&master_dir);
+    let _ = std::fs::remove_dir_all(&replica_dir);
+}
+
 /// Unreachable target: timeout, master remains master.
 #[tokio::test(flavor = "multi_thread")]
 async fn coordinated_failover_timeout() {
