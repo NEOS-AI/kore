@@ -154,9 +154,10 @@ fn write_keys(cmd: &str, args: &[RespValue]) -> Vec<Bytes> {
         "SET" | "SETNX" | "GETDEL" | "GETEX" | "APPEND" | "SETRANGE" | "SETEX" | "GETSET" | "INCR"
         | "DECR" | "INCRBY" | "DECRBY" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "PERSIST" | "ZADD" | "ZREM" | "ZINCRBY"
         | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "ZREMRANGEBYLEX" | "ZPOPMIN" | "ZPOPMAX" | "GEOADD"
-        | "GEOSEARCHSTORE" | "GEORADIUS" | "GEORADIUSBYMEMBER" | "HSET" | "HMSET" | "HDEL" | "HINCRBY"
+        | "GEOSEARCHSTORE" | "GEORADIUS" | "GEORADIUSBYMEMBER" | "HSET" | "HSETNX" | "HMSET" | "HDEL" | "HINCRBY"
         | "HINCRBYFLOAT" | "LPUSH" | "RPUSH" | "LPOP"
-        | "RPOP" | "LSET" | "LREM" | "LTRIM" | "LINSERT" | "SADD" | "SREM" | "SPOP" | "XADD" | "XDEL" | "XTRIM" | "XACK"
+        | "RPOP" | "LSET" | "LREM" | "LTRIM" | "LINSERT"
+        | "SADD" | "SREM" | "SPOP" | "XADD" | "XDEL" | "XTRIM" | "XACK"
         | "XCLAIM" | "XAUTOCLAIM" | "XSETID"
         | "SETBIT" | "BITFIELD" | "PFADD" | "TOUCH" | "MOVE" => args
             .first()
@@ -173,8 +174,8 @@ fn write_keys(cmd: &str, args: &[RespValue]) -> Vec<Bytes> {
             .cloned()
             .into_iter()
             .collect(),
-        // SMOVE / LMOVE / BLMOVE: source + destination
-        "SMOVE" | "LMOVE" | "BLMOVE" => args
+        // SMOVE / LMOVE / BLMOVE / RPOPLPUSH / BRPOPLPUSH: source + destination
+        "SMOVE" | "LMOVE" | "BLMOVE" | "RPOPLPUSH" | "BRPOPLPUSH" => args
             .iter()
             .take(2)
             .filter_map(|a| a.as_bulk_string().cloned())
@@ -205,10 +206,10 @@ fn write_keys(cmd: &str, args: &[RespValue]) -> Vec<Bytes> {
                     .collect()
             }
         }
-        // ZMPOP numkeys key [key ...] MIN|MAX [COUNT n]
-        "ZMPOP" => numkeys_keys(args, 0),
-        // BZMPOP timeout numkeys key [key ...] MIN|MAX [COUNT n]
-        "BZMPOP" => numkeys_keys(args, 1),
+        // ZMPOP / LMPOP numkeys key [key ...] …
+        "ZMPOP" | "LMPOP" => numkeys_keys(args, 0),
+        // BZMPOP / BLMPOP timeout numkeys key [key ...] …
+        "BZMPOP" | "BLMPOP" => numkeys_keys(args, 1),
         // XGROUP CREATE/DESTROY key …
         "XGROUP" => args
             .get(1)

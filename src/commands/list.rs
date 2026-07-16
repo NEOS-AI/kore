@@ -797,6 +797,27 @@ impl CommandHandler {
         }
     }
 
+    /// RPOPLPUSH source destination — legacy alias of LMOVE source dest RIGHT LEFT.
+    pub(super) fn handle_rpoplpush(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'rpoplpush' command",
+            ));
+        }
+        let source = match args[0].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid source key")),
+        };
+        let dest = match args[1].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid destination key")),
+        };
+        match self.do_lmove(&source, &dest, false, true) {
+            Ok(v) => Ok(v),
+            Err(e) => Ok(RespValue::error(e)),
+        }
+    }
+
     /// BLMOVE source destination LEFT|RIGHT LEFT|RIGHT timeout
     pub(super) async fn handle_blmove(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.len() != 5 {
@@ -824,7 +845,40 @@ impl CommandHandler {
             Ok(t) => t,
             Err(e) => return Ok(RespValue::error(e)),
         };
+        self.do_blmove(source, dest, from_left, to_left, timeout_secs)
+            .await
+    }
 
+    /// BRPOPLPUSH source destination timeout — legacy alias of BLMOVE … RIGHT LEFT.
+    pub(super) async fn handle_brpoplpush(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 3 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'brpoplpush' command",
+            ));
+        }
+        let source = match args[0].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid source key")),
+        };
+        let dest = match args[1].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid destination key")),
+        };
+        let timeout_secs = match Self::parse_timeout_seconds(&args[2]) {
+            Ok(t) => t,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+        self.do_blmove(source, dest, false, true, timeout_secs).await
+    }
+
+    async fn do_blmove(
+        &self,
+        source: Bytes,
+        dest: Bytes,
+        from_left: bool,
+        to_left: bool,
+        timeout_secs: f64,
+    ) -> Result<RespValue> {
         // Type-check before blocking.
         if let Err(Error::WrongType) = self.ensure_list_key(&source) {
             return Ok(RespValue::error(Error::WrongType.to_resp_string()));
@@ -879,6 +933,129 @@ impl CommandHandler {
 
         self.cache.list_blockers.unregister(waiter_id, &keys);
         result
+    }
+
+    /// LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT count]
+    pub(super) fn handle_lmpop(&self, args: &[RespValue]) -> Result<RespValue> {
+        match parse_lmpop_args(self, args, "lmpop") {
+            Ok((keys, from_left, count)) => {
+                for key in &keys {
+                    if let Err(Error::WrongType) = self.ensure_list_key(key) {
+                        return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+                    }
+                }
+                match self.try_lmpop(&keys, from_left, count) {
+                    Some((key, elems)) => Ok(lmpop_reply(key, elems)),
+                    None => Ok(RespValue::null()),
+                }
+            }
+            Err(e) => Ok(RespValue::error(e)),
+        }
+    }
+
+    /// BLMPOP timeout numkeys key [key ...] LEFT|RIGHT [COUNT count]
+    pub(super) async fn handle_blmpop(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() < 4 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'blmpop' command",
+            ));
+        }
+        let timeout_secs = match Self::parse_timeout_seconds(&args[0]) {
+            Ok(t) => t,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+        let (keys, from_left, count) = match parse_lmpop_args(self, &args[1..], "blmpop") {
+            Ok(v) => v,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+
+        for key in &keys {
+            if let Err(Error::WrongType) = self.ensure_list_key(key) {
+                return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+            }
+        }
+
+        if let Some((key, elems)) = self.try_lmpop(&keys, from_left, count) {
+            return Ok(lmpop_reply(key, elems));
+        }
+
+        if self.executing_multi {
+            return Ok(RespValue::null());
+        }
+
+        let block_forever = timeout_secs == 0.0;
+        let deadline = if block_forever {
+            None
+        } else {
+            Some(Instant::now() + Duration::from_secs_f64(timeout_secs))
+        };
+
+        let (waiter_id, notify) = self.cache.list_blockers.register(&keys);
+
+        let result = loop {
+            if let Some((key, elems)) = self.try_lmpop(&keys, from_left, count) {
+                break Ok(lmpop_reply(key, elems));
+            }
+
+            if let Some(dl) = deadline {
+                let now = Instant::now();
+                if now >= dl {
+                    break Ok(RespValue::null());
+                }
+                let remaining = dl - now;
+                match tokio::time::timeout(remaining, notify.notified()).await {
+                    Ok(()) => continue,
+                    Err(_) => break Ok(RespValue::null()),
+                }
+            } else {
+                notify.notified().await;
+            }
+        };
+
+        self.cache.list_blockers.unregister(waiter_id, &keys);
+        result
+    }
+
+    /// Pop up to `count` elements from the first non-empty list (left-to-right keys).
+    fn try_lmpop(
+        &self,
+        keys: &[Bytes],
+        from_left: bool,
+        count: usize,
+    ) -> Option<(Bytes, Vec<Bytes>)> {
+        if count == 0 {
+            return None;
+        }
+        for key in keys {
+            if !matches!(self.cache.key_type(key), KeyType::List) {
+                continue;
+            }
+            let Some(list) = self.cache.get_list(key) else {
+                continue;
+            };
+            let mut l = list.write();
+            if l.is_empty() {
+                continue;
+            }
+            let before = crate::memory::estimate_keyed_object(key.len(), l.memory_size());
+            let elems = if from_left {
+                l.lpop_count(count)
+            } else {
+                l.rpop_count(count)
+            };
+            if elems.is_empty() {
+                continue;
+            }
+            let empty = l.is_empty();
+            let after = crate::memory::estimate_keyed_object(key.len(), l.memory_size());
+            drop(l);
+            self.cache.account_list_delta(before, after);
+            if empty {
+                self.cache.remove_list(key);
+            }
+            return Some((key.clone(), elems));
+        }
+        None
     }
 
     /// Core LMOVE: pop from `source` and push onto `dest`.
@@ -987,4 +1164,82 @@ fn parse_list_side(value: &RespValue) -> std::result::Result<bool, String> {
         },
         None => Err("ERR syntax error".into()),
     }
+}
+
+/// LMPOP / BLMPOP reply: `[key, [elem, …]]`.
+fn lmpop_reply(key: Bytes, elems: Vec<Bytes>) -> RespValue {
+    RespValue::Array(vec![
+        RespValue::BulkString(Some(key)),
+        RespValue::Array(
+            elems
+                .into_iter()
+                .map(|e| RespValue::BulkString(Some(e)))
+                .collect(),
+        ),
+    ])
+}
+
+/// Parse `numkeys key [key ...] LEFT|RIGHT [COUNT count]` for LMPOP/BLMPOP.
+fn parse_lmpop_args(
+    handler: &CommandHandler,
+    args: &[RespValue],
+    name: &str,
+) -> std::result::Result<(Vec<Bytes>, bool, usize), String> {
+    if args.len() < 3 {
+        return Err(format!(
+            "ERR wrong number of arguments for '{}' command",
+            name
+        ));
+    }
+    let numkeys = match handler.parse_integer(&args[0]) {
+        Ok(n) if n > 0 => n as usize,
+        _ => {
+            return Err(format!(
+                "ERR numkeys should be greater than 0"
+            ))
+        }
+    };
+    if args.len() < 1 + numkeys + 1 {
+        return Err(format!(
+            "ERR wrong number of arguments for '{}' command",
+            name
+        ));
+    }
+
+    let mut keys = Vec::with_capacity(numkeys);
+    for a in &args[1..1 + numkeys] {
+        match a.as_bulk_string() {
+            Some(k) => keys.push(k.clone()),
+            None => return Err("ERR invalid key".into()),
+        }
+    }
+
+    let from_left = parse_list_side(&args[1 + numkeys])?;
+    let mut count = 1usize;
+    let mut i = 2 + numkeys;
+    while i < args.len() {
+        let opt = match args[i].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+            None => return Err("ERR syntax error".into()),
+        };
+        match opt.as_str() {
+            "COUNT" => {
+                if i + 1 >= args.len() {
+                    return Err("ERR syntax error".into());
+                }
+                count = match handler.parse_integer(&args[i + 1]) {
+                    Ok(n) if n > 0 => n as usize,
+                    Ok(_) => {
+                        return Err("ERR COUNT must be a positive integer".into());
+                    }
+                    Err(_) => {
+                        return Err("ERR value is not an integer or out of range".into());
+                    }
+                };
+                i += 2;
+            }
+            _ => return Err("ERR syntax error".into()),
+        }
+    }
+    Ok((keys, from_left, count))
 }

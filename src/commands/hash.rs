@@ -107,6 +107,87 @@ impl CommandHandler {
         Ok(RespValue::Integer(added))
     }
 
+    /// HSETNX key field value — set field only if it does not already exist.
+    pub(super) fn handle_hsetnx(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 3 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'hsetnx' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        let field = match args[1].as_bulk_string() {
+            Some(f) => f.clone(),
+            None => return Ok(RespValue::error("ERR invalid field")),
+        };
+        let value = match args[2].as_bulk_string() {
+            Some(v) => v.clone(),
+            None => return Ok(RespValue::error("ERR invalid value")),
+        };
+
+        // Fast path: field already present → 0 without capacity growth.
+        if let Some(h) = self.cache.get_hash(&key) {
+            let hash = h.read();
+            if hash.hexists(&field) {
+                return Ok(RespValue::Integer(0));
+            }
+        } else if let Err(Error::WrongType) = self.ensure_hash_key(&key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+
+        let est = field.len() + value.len() + 32;
+        if let Err(e) = self.cache.ensure_non_string_capacity(est) {
+            return Ok(RespValue::error(e.to_resp_string()));
+        }
+
+        let hash = match self.cache.get_or_create_hash(&key) {
+            Ok(h) => h,
+            Err(Error::WrongType) => {
+                return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+            }
+            Err(e) => return Ok(RespValue::error(e.to_resp_string())),
+        };
+
+        let (before, after, added, index_fields) = {
+            let mut h = hash.write();
+            if h.hexists(&field) {
+                return Ok(RespValue::Integer(0));
+            }
+            let before = crate::memory::estimate_keyed_object(key.len(), h.memory_size());
+            let added = h.hset(field.clone(), value);
+            let after = crate::memory::estimate_keyed_object(key.len(), h.memory_size());
+            let mut index_fields = HashMap::new();
+            for (f, v) in h.hgetall() {
+                let fname = String::from_utf8_lossy(&f).into_owned();
+                let fval = String::from_utf8_lossy(&v).into_owned();
+                index_fields.insert(fname, DocumentField::Text(fval));
+            }
+            (before, after, added, index_fields)
+        };
+
+        if !added {
+            return Ok(RespValue::Integer(0));
+        }
+
+        if let Err(e) = self.cache.account_hash_delta(before, after) {
+            // Roll back the new field.
+            {
+                let mut h = hash.write();
+                let _ = h.hdel(&[field]);
+                if h.is_empty() {
+                    drop(h);
+                    self.cache.remove_hash(&key);
+                }
+            }
+            return Ok(RespValue::error(e.to_resp_string()));
+        }
+
+        self.cache.auto_index_key(&key, index_fields);
+        Ok(RespValue::Integer(1))
+    }
+
     /// HGET key field
     pub(super) fn handle_hget(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.len() != 2 {

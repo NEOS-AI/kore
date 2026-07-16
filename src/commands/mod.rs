@@ -574,6 +574,7 @@ impl CommandHandler {
 
             // Hash commands
             "HSET" => self.handle_hset(&args[1..]),
+            "HSETNX" => self.handle_hsetnx(&args[1..]),
             "HGET" => self.handle_hget(&args[1..]),
             "HMGET" => self.handle_hmget(&args[1..]),
             "HDEL" => self.handle_hdel(&args[1..]),
@@ -606,6 +607,10 @@ impl CommandHandler {
             "LPOS" => self.handle_lpos(&args[1..]),
             "LMOVE" => self.handle_lmove(&args[1..]),
             "BLMOVE" => self.handle_blmove(&args[1..]).await,
+            "RPOPLPUSH" => self.handle_rpoplpush(&args[1..]),
+            "BRPOPLPUSH" => self.handle_brpoplpush(&args[1..]).await,
+            "LMPOP" => self.handle_lmpop(&args[1..]),
+            "BLMPOP" => self.handle_blmpop(&args[1..]).await,
 
             // Set commands
             "SADD" => self.handle_sadd(&args[1..]),
@@ -1056,6 +1061,7 @@ fn is_write_command(cmd: &str) -> bool {
             | "GEORADIUS"
             | "GEORADIUSBYMEMBER"
             | "HSET"
+            | "HSETNX"
             | "HMSET"
             | "HDEL"
             | "HINCRBY"
@@ -1072,6 +1078,10 @@ fn is_write_command(cmd: &str) -> bool {
             | "LINSERT"
             | "LMOVE"
             | "BLMOVE"
+            | "RPOPLPUSH"
+            | "BRPOPLPUSH"
+            | "LMPOP"
+            | "BLMPOP"
             | "SADD"
             | "SREM"
             | "SINTERSTORE"

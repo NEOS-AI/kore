@@ -17,10 +17,10 @@ const SCRIPT_CALL_ALLOWLIST: &[&str] = &[
     "GETSET", "UNLINK", "RENAME", "RENAMENX", "SETNX", "GETDEL", "GETEX", //
     "INCR", "DECR", "INCRBY", "DECRBY", //
     "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST", "TTL", "PTTL", "EXPIRETIME", "PEXPIRETIME", //
-    "HSET", "HMSET", "HGET", "HMGET", "HDEL", "HGETALL", "HLEN", "HEXISTS", "HKEYS", "HVALS", //
+    "HSET", "HSETNX", "HMSET", "HGET", "HMGET", "HDEL", "HGETALL", "HLEN", "HEXISTS", "HKEYS", "HVALS", //
     "HINCRBY", "HINCRBYFLOAT", "HSTRLEN", "HRANDFIELD", "HSCAN", //
     "LPUSH", "RPUSH", "LPOP", "RPOP", "LRANGE", "LLEN", "LINDEX", "LSET", "LREM", "LTRIM", "LINSERT", //
-    "LPOS", "LMOVE", //
+    "LPOS", "LMOVE", "RPOPLPUSH", "LMPOP", //
     "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SMISMEMBER", "SCARD", "SINTER", "SINTERCARD", "SUNION", "SDIFF", //
     "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE", "SMOVE", "SPOP", "SRANDMEMBER", "SSCAN", //
     "ZADD", "ZRANGE", "ZREVRANGE", "ZCARD", "ZSCORE", "ZMSCORE", "ZREM", "ZRANK", "ZREVRANK", //
@@ -370,6 +370,7 @@ impl CommandHandler {
             "EXPIRETIME" => self.handle_expiretime(args),
             "PEXPIRETIME" => self.handle_pexpiretime(args),
             "HSET" => self.handle_hset(args),
+            "HSETNX" => self.handle_hsetnx(args),
             "HMSET" => self.handle_hmset(args),
             "HGET" => self.handle_hget(args),
             "HMGET" => self.handle_hmget(args),
@@ -397,6 +398,8 @@ impl CommandHandler {
             "LINSERT" => self.handle_linsert(args),
             "LPOS" => self.handle_lpos(args),
             "LMOVE" => self.handle_lmove(args),
+            "RPOPLPUSH" => self.handle_rpoplpush(args),
+            "LMPOP" => self.handle_lmpop(args),
             "SADD" => self.handle_sadd(args),
             "SREM" => self.handle_srem(args),
             "SMEMBERS" => self.handle_smembers(args),

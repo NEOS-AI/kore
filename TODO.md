@@ -156,10 +156,12 @@ Also tracked in `docs/roadmap.md`.
   - *Done*: separate hash map + type registry; HSET/HGET/HMGET/HDEL/HGETALL/HLEN/HEXISTS/HKEYS/HVALS/HINCRBY
   - *Batch AO*: `HINCRBYFLOAT` (bulk float reply), `HSTRLEN`, `HMSET` (OK alias of HSET)
   - *Batch AV*: `HRANDFIELD` (count / WITHVALUES)
+  - *Batch AW*: `HSETNX`
 - [x] **`[P0]`** **Lists** (`LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, …)
   - *Done*: LPUSH/RPUSH/LPOP/RPOP/LRANGE/LLEN/LINDEX/LSET; **BLPOP/BRPOP** (blocking via `ListBlockers` + `Notify`; timeout 0 = forever; multi-key left-to-right; null array on timeout)
   - *Batch AK*: `LREM` (count signed), `LTRIM`, `LINSERT` BEFORE|AFTER; empty list key deleted
   - *Batch AN*: `LPOS` (RANK/COUNT/MAXLEN), `LMOVE` / `BLMOVE` (LEFT|RIGHT sides; timeout 0 = forever; null bulk on BLMOVE timeout)
+  - *Batch AW*: `RPOPLPUSH` / `BRPOPLPUSH` (legacy LMOVE RIGHT→LEFT); `LMPOP` / `BLMPOP` (`LEFT|RIGHT`, `COUNT`; multi-key left-to-right; nested `[key, [elems…]]`)
 - [x] **`[P0]`** **Sets** (`SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SINTER`, …)
   - *Done*: SADD/SREM/SMEMBERS/SISMEMBER/SCARD/SINTER
   - *Batch AH*: SUNION/SDIFF + *STORE (SINTERSTORE/SUNIONSTORE/SDIFFSTORE); SMOVE; SPOP/SRANDMEMBER (optional count)
