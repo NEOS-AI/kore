@@ -659,4 +659,332 @@ impl CommandHandler {
             None => Ok(RespValue::Integer(-1)),
         }
     }
+
+    /// LPOS key element [RANK rank] [COUNT num] [MAXLEN len]
+    pub(super) fn handle_lpos(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() < 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'lpos' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_list_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+        let element = match args[1].as_bulk_string() {
+            Some(e) => e,
+            None => return Ok(RespValue::error("ERR invalid value")),
+        };
+
+        let mut rank: i64 = 1;
+        let mut count: Option<usize> = None;
+        let mut maxlen: usize = 0;
+        let mut i = 2;
+        while i < args.len() {
+            let opt = match args[i].as_bulk_string() {
+                Some(b) => String::from_utf8_lossy(b).to_ascii_uppercase(),
+                None => return Ok(RespValue::error("ERR syntax error")),
+            };
+            i += 1;
+            if i >= args.len() {
+                return Ok(RespValue::error("ERR syntax error"));
+            }
+            match opt.as_str() {
+                "RANK" => {
+                    rank = match self.parse_integer(&args[i]) {
+                        Ok(r) if r != 0 => r,
+                        Ok(_) => {
+                            return Ok(RespValue::error(
+                                "ERR RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list",
+                            ))
+                        }
+                        Err(_) => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ))
+                        }
+                    };
+                }
+                "COUNT" => {
+                    let c = match self.parse_integer(&args[i]) {
+                        Ok(c) if c >= 0 => c as usize,
+                        Ok(_) => {
+                            return Ok(RespValue::error(
+                                "ERR COUNT can't be negative",
+                            ))
+                        }
+                        Err(_) => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ))
+                        }
+                    };
+                    count = Some(c);
+                }
+                "MAXLEN" => {
+                    maxlen = match self.parse_integer(&args[i]) {
+                        Ok(m) if m >= 0 => m as usize,
+                        Ok(_) => {
+                            return Ok(RespValue::error(
+                                "ERR MAXLEN can't be negative",
+                            ))
+                        }
+                        Err(_) => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ))
+                        }
+                    };
+                }
+                _ => return Ok(RespValue::error("ERR syntax error")),
+            }
+            i += 1;
+        }
+
+        let indices = match self.cache.get_list(key) {
+            Some(list) => {
+                let l = list.read();
+                // Without COUNT, request a single match (count=1).
+                let want = count.unwrap_or(1);
+                l.lpos(element, rank, want, maxlen)
+            }
+            None => Vec::new(),
+        };
+
+        match count {
+            None => match indices.first() {
+                Some(&idx) => Ok(RespValue::Integer(idx as i64)),
+                None => Ok(RespValue::null()),
+            },
+            Some(_) => Ok(RespValue::Array(
+                indices
+                    .into_iter()
+                    .map(|idx| RespValue::Integer(idx as i64))
+                    .collect(),
+            )),
+        }
+    }
+
+    /// LMOVE source destination LEFT|RIGHT LEFT|RIGHT
+    pub(super) fn handle_lmove(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 4 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'lmove' command",
+            ));
+        }
+        let source = match args[0].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid source key")),
+        };
+        let dest = match args[1].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid destination key")),
+        };
+        let from_left = match parse_list_side(&args[2]) {
+            Ok(v) => v,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+        let to_left = match parse_list_side(&args[3]) {
+            Ok(v) => v,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+        match self.do_lmove(&source, &dest, from_left, to_left) {
+            Ok(v) => Ok(v),
+            Err(e) => Ok(RespValue::error(e)),
+        }
+    }
+
+    /// BLMOVE source destination LEFT|RIGHT LEFT|RIGHT timeout
+    pub(super) async fn handle_blmove(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 5 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'blmove' command",
+            ));
+        }
+        let source = match args[0].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid source key")),
+        };
+        let dest = match args[1].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid destination key")),
+        };
+        let from_left = match parse_list_side(&args[2]) {
+            Ok(v) => v,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+        let to_left = match parse_list_side(&args[3]) {
+            Ok(v) => v,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+        let timeout_secs = match Self::parse_timeout_seconds(&args[4]) {
+            Ok(t) => t,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+
+        // Type-check before blocking.
+        if let Err(Error::WrongType) = self.ensure_list_key(&source) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+        match self.cache.key_type(&dest) {
+            KeyType::None | KeyType::List => {}
+            _ => return Ok(RespValue::error(Error::WrongType.to_resp_string())),
+        }
+
+        // Immediate try
+        match self.do_lmove(&source, &dest, from_left, to_left) {
+            Ok(RespValue::BulkString(None)) => {}
+            Ok(v) => return Ok(v),
+            Err(e) => return Ok(RespValue::error(e)),
+        }
+
+        if self.executing_multi {
+            return Ok(RespValue::null());
+        }
+
+        let block_forever = timeout_secs == 0.0;
+        let deadline = if block_forever {
+            None
+        } else {
+            Some(Instant::now() + Duration::from_secs_f64(timeout_secs))
+        };
+
+        let keys = [source.clone()];
+        let (waiter_id, notify) = self.cache.list_blockers.register(&keys);
+
+        let result = loop {
+            match self.do_lmove(&source, &dest, from_left, to_left) {
+                Ok(RespValue::BulkString(None)) => {}
+                Ok(v) => break Ok(v),
+                Err(e) => break Ok(RespValue::error(e)),
+            }
+
+            if let Some(dl) = deadline {
+                let now = Instant::now();
+                if now >= dl {
+                    break Ok(RespValue::null());
+                }
+                let remaining = dl - now;
+                match tokio::time::timeout(remaining, notify.notified()).await {
+                    Ok(()) => continue,
+                    Err(_) => break Ok(RespValue::null()),
+                }
+            } else {
+                notify.notified().await;
+            }
+        };
+
+        self.cache.list_blockers.unregister(waiter_id, &keys);
+        result
+    }
+
+    /// Core LMOVE: pop from `source` and push onto `dest`.
+    /// Returns bulk element, null if source empty, or Err string for WRONGTYPE/OOM.
+    fn do_lmove(
+        &self,
+        source: &Bytes,
+        dest: &Bytes,
+        from_left: bool,
+        to_left: bool,
+    ) -> std::result::Result<RespValue, String> {
+        match self.cache.key_type(source) {
+            KeyType::None => return Ok(RespValue::null()),
+            KeyType::List => {}
+            _ => return Err(Error::WrongType.to_resp_string()),
+        }
+        match self.cache.key_type(dest) {
+            KeyType::None | KeyType::List => {}
+            _ => return Err(Error::WrongType.to_resp_string()),
+        }
+
+        // Same key: rotate under one lock.
+        if source == dest {
+            let list = match self.cache.get_list(source) {
+                Some(l) => l,
+                None => return Ok(RespValue::null()),
+            };
+            let mut l = list.write();
+            if l.is_empty() {
+                return Ok(RespValue::null());
+            }
+            let before = crate::memory::estimate_keyed_object(source.len(), l.memory_size());
+            let val = if from_left {
+                l.lpop().unwrap()
+            } else {
+                l.rpop().unwrap()
+            };
+            if to_left {
+                let _ = l.lpush([val.clone()]);
+            } else {
+                let _ = l.rpush([val.clone()]);
+            }
+            let after = crate::memory::estimate_keyed_object(source.len(), l.memory_size());
+            drop(l);
+            self.cache.account_list_delta(before, after);
+            self.cache.list_blockers.notify_key(source);
+            return Ok(RespValue::BulkString(Some(val)));
+        }
+
+        // Different keys: pop source, then push dest.
+        let src_list = match self.cache.get_list(source) {
+            Some(l) => l,
+            None => return Ok(RespValue::null()),
+        };
+
+        let val = {
+            let mut l = src_list.write();
+            if l.is_empty() {
+                return Ok(RespValue::null());
+            }
+            let before = crate::memory::estimate_keyed_object(source.len(), l.memory_size());
+            let v = if from_left { l.lpop() } else { l.rpop() }.unwrap();
+            let empty = l.is_empty();
+            let after = crate::memory::estimate_keyed_object(source.len(), l.memory_size());
+            drop(l);
+            self.cache.account_list_delta(before, after);
+            if empty {
+                self.cache.remove_list(source);
+            }
+            v
+        };
+
+        let est = val.len() + 16;
+        if let Err(e) = self.cache.ensure_non_string_capacity(est) {
+            // Best-effort: element already left source (same as Redis single-thread
+            // atomicity — we accept rare OOM after pop under multi-thread pressure).
+            return Err(e.to_resp_string());
+        }
+
+        let dest_list = match self.cache.get_or_create_list(dest) {
+            Ok(l) => l,
+            Err(Error::WrongType) => return Err(Error::WrongType.to_resp_string()),
+            Err(e) => return Err(e.to_resp_string()),
+        };
+        let mut d = dest_list.write();
+        let before = crate::memory::estimate_keyed_object(dest.len(), d.memory_size());
+        if to_left {
+            let _ = d.lpush([val.clone()]);
+        } else {
+            let _ = d.rpush([val.clone()]);
+        }
+        let after = crate::memory::estimate_keyed_object(dest.len(), d.memory_size());
+        drop(d);
+        self.cache.account_list_delta(before, after);
+        self.cache.list_blockers.notify_key(dest);
+        Ok(RespValue::BulkString(Some(val)))
+    }
+}
+
+fn parse_list_side(value: &RespValue) -> std::result::Result<bool, String> {
+    match value.as_bulk_string() {
+        Some(b) => match String::from_utf8_lossy(b).to_ascii_uppercase().as_str() {
+            "LEFT" => Ok(true),
+            "RIGHT" => Ok(false),
+            _ => Err("ERR syntax error".into()),
+        },
+        None => Err("ERR syntax error".into()),
+    }
 }

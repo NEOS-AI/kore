@@ -170,8 +170,8 @@ fn write_keys(cmd: &str, args: &[RespValue]) -> Vec<Bytes> {
             .cloned()
             .into_iter()
             .collect(),
-        // SMOVE source destination member
-        "SMOVE" => args
+        // SMOVE / LMOVE / BLMOVE: source + destination
+        "SMOVE" | "LMOVE" | "BLMOVE" => args
             .iter()
             .take(2)
             .filter_map(|a| a.as_bulk_string().cloned())

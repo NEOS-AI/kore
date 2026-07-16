@@ -582,6 +582,9 @@ impl CommandHandler {
             "LREM" => self.handle_lrem(&args[1..]),
             "LTRIM" => self.handle_ltrim(&args[1..]),
             "LINSERT" => self.handle_linsert(&args[1..]),
+            "LPOS" => self.handle_lpos(&args[1..]),
+            "LMOVE" => self.handle_lmove(&args[1..]),
+            "BLMOVE" => self.handle_blmove(&args[1..]).await,
 
             // Set commands
             "SADD" => self.handle_sadd(&args[1..]),
@@ -1028,6 +1031,8 @@ fn is_write_command(cmd: &str) -> bool {
             | "LREM"
             | "LTRIM"
             | "LINSERT"
+            | "LMOVE"
+            | "BLMOVE"
             | "SADD"
             | "SREM"
             | "SINTERSTORE"

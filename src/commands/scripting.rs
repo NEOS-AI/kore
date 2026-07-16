@@ -19,6 +19,7 @@ const SCRIPT_CALL_ALLOWLIST: &[&str] = &[
     "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST", "TTL", "PTTL", "EXPIRETIME", "PEXPIRETIME", //
     "HSET", "HGET", "HMGET", "HDEL", "HGETALL", "HLEN", "HEXISTS", "HKEYS", "HVALS", "HINCRBY", "HSCAN", //
     "LPUSH", "RPUSH", "LPOP", "RPOP", "LRANGE", "LLEN", "LINDEX", "LSET", "LREM", "LTRIM", "LINSERT", //
+    "LPOS", "LMOVE", //
     "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD", "SINTER", "SUNION", "SDIFF", //
     "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE", "SMOVE", "SPOP", "SRANDMEMBER", "SSCAN", //
     "ZADD", "ZRANGE", "ZREVRANGE", "ZCARD", "ZSCORE", "ZREM", "ZRANK", "ZREVRANK", //
@@ -387,6 +388,8 @@ impl CommandHandler {
             "LREM" => self.handle_lrem(args),
             "LTRIM" => self.handle_ltrim(args),
             "LINSERT" => self.handle_linsert(args),
+            "LPOS" => self.handle_lpos(args),
+            "LMOVE" => self.handle_lmove(args),
             "SADD" => self.handle_sadd(args),
             "SREM" => self.handle_srem(args),
             "SMEMBERS" => self.handle_smembers(args),

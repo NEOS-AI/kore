@@ -211,6 +211,70 @@ impl RedisList {
         Some(self.items.len())
     }
 
+    /// Find indices of `element` (Redis `LPOS`).
+    ///
+    /// * `rank > 0`: start at the `rank`-th match from the head, scan right
+    /// * `rank < 0`: start at the `|rank|`-th match from the tail, scan left
+    /// * `count == 0`: collect all matches from the rank start in that direction
+    /// * `count > 0`: collect at most `count` matches
+    /// * `maxlen == 0`: compare the whole list; else only the first `maxlen`
+    ///   elements in the scan direction
+    ///
+    /// Returns indices in encounter order (empty if none).
+    pub fn lpos(
+        &self,
+        element: &Bytes,
+        rank: i64,
+        count: usize,
+        maxlen: usize,
+    ) -> Vec<usize> {
+        if rank == 0 || self.items.is_empty() {
+            return Vec::new();
+        }
+        let len = self.items.len();
+        let reverse = rank < 0;
+        let mut rank_left = rank.unsigned_abs() as usize;
+        let unlimited = count == 0;
+        let mut remaining = count;
+        let mut compared = 0usize;
+        let mut out = Vec::new();
+
+        let mut i: isize = if reverse {
+            (len as isize) - 1
+        } else {
+            0
+        };
+
+        while i >= 0 && (i as usize) < len {
+            if maxlen > 0 && compared >= maxlen {
+                break;
+            }
+            compared += 1;
+            if &self.items[i as usize] == element {
+                if rank_left > 1 {
+                    rank_left -= 1;
+                } else {
+                    // At or past the rank-th match.
+                    out.push(i as usize);
+                    if !unlimited {
+                        remaining -= 1;
+                        if remaining == 0 {
+                            break;
+                        }
+                    }
+                    // After first capture, rank is satisfied; keep collecting.
+                    rank_left = 1;
+                }
+            }
+            if reverse {
+                i -= 1;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
@@ -326,5 +390,28 @@ mod tests {
             list.linsert(true, &Bytes::from("missing"), Bytes::from("z")),
             None
         );
+    }
+
+    #[test]
+    fn test_lpos() {
+        let mut list = RedisList::new();
+        list.rpush([
+            Bytes::from("a"),
+            Bytes::from("b"),
+            Bytes::from("a"),
+            Bytes::from("c"),
+            Bytes::from("a"),
+        ]);
+        let e = Bytes::from("a");
+        assert_eq!(list.lpos(&e, 1, 1, 0), vec![0]);
+        assert_eq!(list.lpos(&e, 2, 1, 0), vec![2]);
+        assert_eq!(list.lpos(&e, -1, 1, 0), vec![4]);
+        assert_eq!(list.lpos(&e, -2, 1, 0), vec![2]);
+        assert_eq!(list.lpos(&e, 1, 0, 0), vec![0, 2, 4]);
+        assert_eq!(list.lpos(&e, 2, 2, 0), vec![2, 4]);
+        assert_eq!(list.lpos(&e, 1, 0, 3), vec![0, 2]); // only first 3 elems
+        assert_eq!(list.lpos(&Bytes::from("x"), 1, 1, 0), Vec::<usize>::new());
+        // rank past matches
+        assert_eq!(list.lpos(&e, 10, 1, 0), Vec::<usize>::new());
     }
 }

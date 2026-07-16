@@ -721,7 +721,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
         "read" => &[
             "get", "mget", "exists", "type", "strlen", "getrange", "ttl", "pttl", "keys", "scan", "dbsize",
             "hget", "hmget", "hgetall", "hlen", "hexists", "hkeys", "hvals", "lrange", "llen",
-            "lindex", "smembers", "sismember", "scard", "sinter", "sunion", "sdiff", "srandmember", "sscan",
+            "lindex", "lpos", "smembers", "sismember", "scard", "sinter", "sunion", "sdiff", "srandmember", "sscan",
             "zrange", "zrevrange", "zcard",
             "zscore", "zrank", "zrevrank", "zrangebyscore", "zrevrangebyscore", "zcount", "zscan",
             "hscan",
@@ -733,7 +733,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "set", "del", "mset", "msetnx", "append", "setrange", "setex", "getset", "unlink", "rename", "renamenx",
             "setnx", "getdel", "getex", "incr", "decr", "incrby", "decrby", "expire", "pexpire", "expireat", "pexpireat", "persist", "expiretime", "pexpiretime",
             "hset", "hdel", "hincrby", "lpush", "rpush", "lpop", "rpop", "blpop", "brpop", "lset",
-            "lrem", "ltrim", "linsert",
+            "lrem", "ltrim", "linsert", "lmove", "blmove",
             "sadd", "srem", "sinterstore", "sunionstore", "sdiffstore", "smove", "spop",
             "zadd", "zrem", "zincrby", "zremrangebyrank", "zremrangebyscore",
             "zunionstore", "zinterstore",
@@ -776,7 +776,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
         ],
         "list" => &[
             "lpush", "rpush", "lpop", "rpop", "blpop", "brpop", "lrange", "llen", "lindex", "lset",
-            "lrem", "ltrim", "linsert",
+            "lrem", "ltrim", "linsert", "lpos", "lmove", "blmove",
         ],
         "set" => &[
             "sadd", "srem", "smembers", "sismember", "scard", "sinter", "sunion", "sdiff",
