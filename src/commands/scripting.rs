@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Blocking / multi / admin / nested-script commands are excluded.
 const SCRIPT_CALL_ALLOWLIST: &[&str] = &[
     "PING", "ECHO", //
-    "GET", "SET", "DEL", "EXISTS", "TYPE", "MGET", "MSET", "APPEND", "STRLEN", "SETEX",
+    "GET", "SET", "DEL", "EXISTS", "TYPE", "MGET", "MSET", "MSETNX", "APPEND", "STRLEN",
+    "GETRANGE", "SETRANGE", "SETEX",
     "GETSET", "UNLINK", "RENAME", "RENAMENX", "SETNX", "GETDEL", "GETEX", //
     "INCR", "DECR", "INCRBY", "DECRBY", //
     "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST", "TTL", "PTTL", "EXPIRETIME", "PEXPIRETIME", //
@@ -337,8 +338,11 @@ impl CommandHandler {
             "TYPE" => self.handle_type(args),
             "MGET" => self.handle_mget(args),
             "MSET" => self.handle_mset(args),
+            "MSETNX" => self.handle_msetnx(args),
             "APPEND" => self.handle_append(args),
             "STRLEN" => self.handle_strlen(args),
+            "GETRANGE" => self.handle_getrange(args),
+            "SETRANGE" => self.handle_setrange(args),
             "SETEX" => self.handle_setex(args),
             "GETSET" => self.handle_getset(args),
             "UNLINK" => self.handle_unlink(args),

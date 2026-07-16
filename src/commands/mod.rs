@@ -451,8 +451,11 @@ impl CommandHandler {
             "TYPE" => self.handle_type(&args[1..]),
             "MGET" => self.handle_mget(&args[1..]),
             "MSET" => self.handle_mset(&args[1..]),
+            "MSETNX" => self.handle_msetnx(&args[1..]),
             "APPEND" => self.handle_append(&args[1..]),
             "STRLEN" => self.handle_strlen(&args[1..]),
+            "GETRANGE" => self.handle_getrange(&args[1..]),
+            "SETRANGE" => self.handle_setrange(&args[1..]),
             "SETEX" => self.handle_setex(&args[1..]),
             "GETSET" => self.handle_getset(&args[1..]),
             "UNLINK" => self.handle_unlink(&args[1..]),
@@ -976,6 +979,8 @@ fn is_write_command(cmd: &str) -> bool {
         "SET"
             | "DEL"
             | "MSET"
+            | "MSETNX"
+            | "SETRANGE"
             | "SETNX"
             | "GETDEL"
             | "GETEX"
@@ -1060,6 +1065,7 @@ fn is_noop_write(cmd: &str, response: &RespValue) -> bool {
         ("MOVE", RespValue::Integer(0)) => true,
         ("COPY", RespValue::Integer(0)) => true,
         ("SETNX", RespValue::Integer(0)) => true,
+        ("MSETNX", RespValue::Integer(0)) => true,
         ("SMOVE", RespValue::Integer(0)) => true,
         _ => false,
     }

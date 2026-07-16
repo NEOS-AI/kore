@@ -151,7 +151,7 @@ impl CommandHandler {
 /// Extract keys affected by a write command (best-effort for WATCH).
 fn write_keys(cmd: &str, args: &[RespValue]) -> Vec<Bytes> {
     match cmd {
-        "SET" | "SETNX" | "GETDEL" | "GETEX" | "APPEND" | "SETEX" | "GETSET" | "INCR"
+        "SET" | "SETNX" | "GETDEL" | "GETEX" | "APPEND" | "SETRANGE" | "SETEX" | "GETSET" | "INCR"
         | "DECR" | "INCRBY" | "DECRBY" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "PERSIST" | "ZADD" | "ZREM" | "ZINCRBY"
         | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "GEOADD"
         | "GEOSEARCHSTORE" | "HSET" | "HDEL" | "HINCRBY" | "LPUSH" | "RPUSH" | "LPOP"
@@ -225,7 +225,7 @@ fn write_keys(cmd: &str, args: &[RespValue]) -> Vec<Bytes> {
             .filter_map(|a| a.as_bulk_string())
             .cloned()
             .collect(),
-        "MSET" => args
+        "MSET" | "MSETNX" => args
             .iter()
             .step_by(2)
             .filter_map(|a| a.as_bulk_string())

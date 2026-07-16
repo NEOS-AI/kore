@@ -425,6 +425,127 @@ impl CommandHandler {
         }
     }
 
+    /// GETRANGE key start end — substring (inclusive Redis indices). Missing → empty bulk.
+    pub(super) fn handle_getrange(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 3 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'getrange' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        match self.cache.key_type(key) {
+            KeyType::None | KeyType::String => {}
+            _ => return Ok(RespValue::error(Error::WrongType.to_resp_string())),
+        }
+        let start = match self.parse_integer(&args[1]) {
+            Ok(i) => i as isize,
+            Err(_) => {
+                return Ok(RespValue::error(
+                    "ERR value is not an integer or out of range",
+                ));
+            }
+        };
+        let end = match self.parse_integer(&args[2]) {
+            Ok(i) => i as isize,
+            Err(_) => {
+                return Ok(RespValue::error(
+                    "ERR value is not an integer or out of range",
+                ));
+            }
+        };
+
+        let value = match self.cache.load(key, LoadOptions::default())? {
+            Some(entry) => entry.value.clone(),
+            None => return Ok(RespValue::BulkString(Some(Bytes::new()))),
+        };
+        Ok(RespValue::BulkString(Some(substr_range(&value, start, end))))
+    }
+
+    /// SETRANGE key offset value — overwrite/pad from offset; returns new length.
+    pub(super) fn handle_setrange(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 3 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'setrange' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        let offset = match self.parse_integer(&args[1]) {
+            Ok(n) if n >= 0 => n as usize,
+            Ok(_) => {
+                return Ok(RespValue::error(
+                    "ERR offset is out of range",
+                ));
+            }
+            Err(_) => {
+                return Ok(RespValue::error(
+                    "ERR value is not an integer or out of range",
+                ));
+            }
+        };
+        let value = match args[2].as_bulk_string() {
+            Some(v) => v,
+            None => return Ok(RespValue::error("ERR invalid value")),
+        };
+
+        match self.cache.setrange(key, offset, value) {
+            Ok(len) => Ok(RespValue::Integer(len as i64)),
+            Err(e) => Ok(RespValue::error(e.to_resp_string())),
+        }
+    }
+
+    /// MSETNX key value [key value ...] — set all only if none of the keys exist.
+    pub(super) fn handle_msetnx(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() || args.len() % 2 != 0 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'msetnx' command",
+            ));
+        }
+
+        let mut pairs: Vec<(Bytes, Bytes)> = Vec::with_capacity(args.len() / 2);
+        for i in (0..args.len()).step_by(2) {
+            let key = match args[i].as_bulk_string() {
+                Some(k) => k.clone(),
+                None => return Ok(RespValue::error("ERR invalid key")),
+            };
+            let value = match args[i + 1].as_bulk_string() {
+                Some(v) => v.clone(),
+                None => return Ok(RespValue::error("ERR invalid value")),
+            };
+            pairs.push((key, value));
+        }
+
+        // Any existing key (any type) aborts the whole op.
+        for (key, _) in &pairs {
+            if self.cache.exists(key) {
+                return Ok(RespValue::Integer(0));
+            }
+        }
+
+        for (key, value) in pairs {
+            // Re-check NX under store; best-effort atomicity across shards.
+            let opts = StoreOptions {
+                nx: true,
+                ..Default::default()
+            };
+            match self.cache.store(key, value, opts) {
+                Ok(old) if old.is_none() => {}
+                Ok(_) => {
+                    // Concurrent create raced; treat as failed NX for this key.
+                    // Already-written keys from this command remain (shard-local).
+                    return Ok(RespValue::Integer(0));
+                }
+                Err(e) => return Ok(RespValue::error(e.to_resp_string())),
+            }
+        }
+        Ok(RespValue::Integer(1))
+    }
+
     /// STRLEN key — length of string value (0 if missing).
     pub(super) fn handle_strlen(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.len() != 1 {
@@ -699,4 +820,27 @@ impl CommandHandler {
         }
         Ok(RespValue::Integer(self.cache.touch_keys(&keys) as i64))
     }
+}
+
+/// Inclusive Redis-style substring of `value` using `start`/`end` indices.
+fn substr_range(value: &Bytes, start: isize, end: isize) -> Bytes {
+    let len = value.len() as isize;
+    if len == 0 {
+        return Bytes::new();
+    }
+    let start_idx = if start < 0 {
+        (len + start).max(0)
+    } else {
+        start
+    };
+    let end_idx = if end < 0 {
+        (len + end).max(0)
+    } else {
+        end
+    };
+    if start_idx > end_idx || start_idx >= len {
+        return Bytes::new();
+    }
+    let end_idx = end_idx.min(len - 1);
+    value.slice(start_idx as usize..=end_idx as usize)
 }

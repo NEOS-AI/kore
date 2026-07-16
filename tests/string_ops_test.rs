@@ -188,3 +188,112 @@ fn rename_same_key_ok() {
     assert_eq!(handle(&mut h, cmd(&["RENAME", "k", "k"])), RespValue::ok());
     assert_eq!(as_bulk_str(&handle(&mut h, cmd(&["GET", "k"]))).as_deref(), Some("1"));
 }
+
+// ── Batch AL: GETRANGE / SETRANGE / MSETNX ───────────────────────────────────
+
+#[test]
+fn getrange_setrange() {
+    let mut h = make_handler(make_cache());
+    handle(&mut h, cmd(&["SET", "s", "Hello World"]));
+
+    assert_eq!(
+        as_bulk_str(&handle(&mut h, cmd(&["GETRANGE", "s", "0", "4"]))).unwrap(),
+        "Hello"
+    );
+    assert_eq!(
+        as_bulk_str(&handle(&mut h, cmd(&["GETRANGE", "s", "-5", "-1"]))).unwrap(),
+        "World"
+    );
+    assert_eq!(
+        as_bulk_str(&handle(&mut h, cmd(&["GETRANGE", "s", "6", "100"]))).unwrap(),
+        "World"
+    );
+    // Missing key → empty string
+    assert_eq!(
+        as_bulk_str(&handle(&mut h, cmd(&["GETRANGE", "missing", "0", "5"]))).unwrap(),
+        ""
+    );
+
+    // Overwrite middle
+    assert_eq!(
+        handle(&mut h, cmd(&["SETRANGE", "s", "6", "Redis"])),
+        RespValue::Integer(11)
+    );
+    assert_eq!(
+        as_bulk_str(&handle(&mut h, cmd(&["GET", "s"]))).unwrap(),
+        "Hello Redis"
+    );
+
+    // Zero-pad create
+    assert_eq!(
+        handle(&mut h, cmd(&["SETRANGE", "pad", "4", "ab"])),
+        RespValue::Integer(6)
+    );
+    let v = handle(&mut h, cmd(&["GET", "pad"]));
+    match v {
+        RespValue::BulkString(Some(b)) => {
+            assert_eq!(&b[..], b"\0\0\0\0ab");
+        }
+        other => panic!("expected padded bulk, got {:?}", other),
+    }
+}
+
+#[test]
+fn msetnx_basic() {
+    let mut h = make_handler(make_cache());
+    assert_eq!(
+        handle(&mut h, cmd(&["MSETNX", "a", "1", "b", "2"])),
+        RespValue::Integer(1)
+    );
+    assert_eq!(
+        as_bulk_str(&handle(&mut h, cmd(&["GET", "a"]))).unwrap(),
+        "1"
+    );
+    assert_eq!(
+        as_bulk_str(&handle(&mut h, cmd(&["GET", "b"]))).unwrap(),
+        "2"
+    );
+
+    // Any existing key → 0, no partial overwrite of new keys
+    assert_eq!(
+        handle(&mut h, cmd(&["MSETNX", "a", "x", "c", "3"])),
+        RespValue::Integer(0)
+    );
+    assert_eq!(
+        as_bulk_str(&handle(&mut h, cmd(&["GET", "a"]))).unwrap(),
+        "1"
+    );
+    assert_eq!(
+        handle(&mut h, cmd(&["EXISTS", "c"])),
+        RespValue::Integer(0)
+    );
+
+    // Non-string existing key also blocks
+    handle(&mut h, cmd(&["LPUSH", "lst", "x"]));
+    assert_eq!(
+        handle(&mut h, cmd(&["MSETNX", "lst", "v", "d", "4"])),
+        RespValue::Integer(0)
+    );
+    assert_eq!(
+        handle(&mut h, cmd(&["EXISTS", "d"])),
+        RespValue::Integer(0)
+    );
+}
+
+#[test]
+fn getrange_wrongtype() {
+    let mut h = make_handler(make_cache());
+    handle(&mut h, cmd(&["LPUSH", "l", "x"]));
+    match handle(&mut h, cmd(&["GETRANGE", "l", "0", "1"])) {
+        RespValue::Error(e) => {
+            assert!(String::from_utf8_lossy(&e).starts_with("WRONGTYPE"));
+        }
+        other => panic!("expected WRONGTYPE, got {:?}", other),
+    }
+    match handle(&mut h, cmd(&["SETRANGE", "l", "0", "y"])) {
+        RespValue::Error(e) => {
+            assert!(String::from_utf8_lossy(&e).starts_with("WRONGTYPE"));
+        }
+        other => panic!("expected WRONGTYPE, got {:?}", other),
+    }
+}

@@ -209,6 +209,109 @@ impl Cache {
         }
     }
 
+    /// SETRANGE: overwrite bytes starting at `offset` (zero-pad if needed).
+    /// Creates the key if missing. Returns the new string length. Preserves TTL/flags.
+    pub fn setrange(&self, key: &Bytes, offset: usize, value: &Bytes) -> Result<usize> {
+        self.ensure_string_or_absent(key)?;
+
+        enum SetRangeOutcome {
+            Ok {
+                len: usize,
+                old_size: usize,
+                new_size: usize,
+            },
+            TooLarge,
+        }
+
+        let existing = self.map.get(key);
+        let existing_size = existing
+            .as_ref()
+            .filter(|e| !e.is_expired())
+            .map(|e| e.size())
+            .unwrap_or(0);
+        let existing_val_len = existing
+            .as_ref()
+            .filter(|e| !e.is_expired())
+            .map(|e| e.value.len())
+            .unwrap_or(0);
+        let new_len = (offset + value.len()).max(existing_val_len);
+        let entry_sz = std::mem::size_of::<Entry>();
+        let logical = crate::memory::logical_string_entry(key.len(), new_len, entry_sz);
+        let max_entry_size = self.max_entry_size.load(Ordering::Relaxed);
+        if logical > max_entry_size {
+            return Err(Error::EntryTooLarge);
+        }
+        let projected =
+            crate::memory::estimate_string_entry(key.len(), new_len, entry_sz);
+        let net = projected.saturating_sub(existing_size);
+        self.ensure_capacity(net)?;
+
+        let outcome = self.map.mutate(key, |current, next_cas| {
+            let (old_val, expires_at, flags, old_size) = match current {
+                Some(entry) if !entry.is_expired() => (
+                    entry.value.clone(),
+                    entry.expires_at,
+                    entry.flags,
+                    entry.size(),
+                ),
+                Some(entry) => (Bytes::new(), None, 0u32, entry.size()),
+                None => (Bytes::new(), None, 0u32, 0usize),
+            };
+
+            let end = offset + value.len();
+            let mut buf = vec![0u8; old_val.len().max(end)];
+            buf[..old_val.len()].copy_from_slice(&old_val);
+            if !value.is_empty() {
+                buf[offset..end].copy_from_slice(value);
+            }
+            let new_val = Bytes::from(buf);
+            let len = new_val.len();
+
+            let logical_sz =
+                crate::memory::logical_string_entry(key.len(), len, entry_sz);
+            if logical_sz > max_entry_size {
+                return (EntryAction::Keep, SetRangeOutcome::TooLarge);
+            }
+
+            let mut entry = Entry::new(key.clone(), new_val);
+            entry.expires_at = expires_at;
+            entry = entry.with_flags(flags).with_cas(next_cas);
+            let new_size = entry.size();
+
+            (
+                EntryAction::Set(Arc::new(entry)),
+                SetRangeOutcome::Ok {
+                    len,
+                    old_size,
+                    new_size,
+                },
+            )
+        });
+
+        match outcome {
+            SetRangeOutcome::TooLarge => Err(Error::EntryTooLarge),
+            SetRangeOutcome::Ok {
+                len,
+                old_size,
+                new_size,
+            } => {
+                if old_size > 0 {
+                    self.memory_usage
+                        .fetch_sub(old_size, Ordering::Relaxed);
+                    self.memory_tracker
+                        .deallocate(old_size, MemoryCategory::Cache);
+                }
+                if new_size > 0 {
+                    self.memory_usage
+                        .fetch_add(new_size, Ordering::Relaxed);
+                    self.memory_tracker
+                        .account(new_size, MemoryCategory::Cache);
+                }
+                Ok(len)
+            }
+        }
+    }
+
     /// Rename `src` → `dst`. If `nx`, fail (return false) when `dst` exists.
     /// Works for all key types in the multi-map keyspace.
     pub fn rename(&self, src: &Bytes, dst: &Bytes, nx: bool) -> Result<bool> {

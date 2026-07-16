@@ -719,7 +719,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             return Ok(all_known_commands());
         }
         "read" => &[
-            "get", "mget", "exists", "type", "strlen", "ttl", "pttl", "keys", "scan", "dbsize",
+            "get", "mget", "exists", "type", "strlen", "getrange", "ttl", "pttl", "keys", "scan", "dbsize",
             "hget", "hmget", "hgetall", "hlen", "hexists", "hkeys", "hvals", "lrange", "llen",
             "lindex", "smembers", "sismember", "scard", "sinter", "sunion", "sdiff", "srandmember", "sscan",
             "zrange", "zrevrange", "zcard",
@@ -730,7 +730,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "memory", "dump", "strlen", "getbit", "bitcount", "bitpos", "pfcount",
         ],
         "write" => &[
-            "set", "del", "mset", "append", "setex", "getset", "unlink", "rename", "renamenx",
+            "set", "del", "mset", "msetnx", "append", "setrange", "setex", "getset", "unlink", "rename", "renamenx",
             "setnx", "getdel", "getex", "incr", "decr", "incrby", "decrby", "expire", "pexpire", "expireat", "pexpireat", "persist", "expiretime", "pexpiretime",
             "hset", "hdel", "hincrby", "lpush", "rpush", "lpop", "rpop", "blpop", "brpop", "lset",
             "lrem", "ltrim", "linsert",
@@ -761,7 +761,8 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "type", "unlink", "ttl", "pttl", "dbsize", "flushdb", "flushall",
         ],
         "string" => &[
-            "get", "set", "mget", "mset", "append", "strlen", "setex", "setnx", "getset", "getdel",
+            "get", "set", "mget", "mset", "msetnx", "append", "strlen", "getrange", "setrange",
+            "setex", "setnx", "getset", "getdel",
             "getex", "incr", "decr", "incrby", "decrby",
         ],
         "bitmap" => &[
