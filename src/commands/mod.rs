@@ -412,6 +412,7 @@ impl CommandHandler {
             // Basic commands
             "PING" => self.handle_ping(&args[1..]),
             "ECHO" => self.handle_echo(&args[1..]),
+            "TIME" => self.handle_time(&args[1..]),
             "QUIT" => Ok(RespValue::ok()),
 
             // Client handshake / introspection
@@ -455,8 +456,10 @@ impl CommandHandler {
             "APPEND" => self.handle_append(&args[1..]),
             "STRLEN" => self.handle_strlen(&args[1..]),
             "GETRANGE" => self.handle_getrange(&args[1..]),
+            "SUBSTR" => self.handle_substr(&args[1..]),
             "SETRANGE" => self.handle_setrange(&args[1..]),
             "SETEX" => self.handle_setex(&args[1..]),
+            "PSETEX" => self.handle_psetex(&args[1..]),
             "GETSET" => self.handle_getset(&args[1..]),
             "UNLINK" => self.handle_unlink(&args[1..]),
             "RENAME" => self.handle_rename(&args[1..]),
@@ -477,6 +480,7 @@ impl CommandHandler {
             "DECR" => self.handle_decr(&args[1..]),
             "INCRBY" => self.handle_incrby(&args[1..]),
             "DECRBY" => self.handle_decrby(&args[1..]),
+            "INCRBYFLOAT" => self.handle_incrbyfloat(&args[1..]),
 
             // Bitmap commands
             "SETBIT" => self.handle_setbit(&args[1..]),
@@ -532,6 +536,7 @@ impl CommandHandler {
             // Sorted Set commands
             "ZADD" => self.handle_zadd(&args[1..]),
             "ZRANGE" => self.handle_zrange(&args[1..]),
+            "ZRANGESTORE" => self.handle_zrangestore(&args[1..]),
             "ZREVRANGE" => self.handle_zrevrange(&args[1..]),
             "ZCARD" => self.handle_zcard(&args[1..]),
             "ZSCORE" => self.handle_zscore(&args[1..]),
@@ -597,6 +602,8 @@ impl CommandHandler {
             // List commands
             "LPUSH" => self.handle_lpush(&args[1..]),
             "RPUSH" => self.handle_rpush(&args[1..]),
+            "LPUSHX" => self.handle_lpushx(&args[1..]),
+            "RPUSHX" => self.handle_rpushx(&args[1..]),
             "LPOP" => self.handle_lpop(&args[1..]),
             "RPOP" => self.handle_rpop(&args[1..]),
             "BLPOP" => self.handle_blpop(&args[1..]).await,
@@ -1028,8 +1035,13 @@ fn is_write_command(cmd: &str) -> bool {
             | "HGETDEL"
             | "APPEND"
             | "SETEX"
+            | "PSETEX"
             | "GETSET"
+            | "INCRBYFLOAT"
             | "UNLINK"
+            | "ZRANGESTORE"
+            | "LPUSHX"
+            | "RPUSHX"
             | "RENAME"
             | "RENAMENX"
             | "MOVE"

@@ -1256,6 +1256,163 @@ impl CommandHandler {
         Ok(Some(snapshots))
     }
 
+    /// ZRANGESTORE destination source min max [BYSCORE|BYLEX] [REV] [LIMIT offset count]
+    /// Stores a range of `source` into `destination` (overwrites any type). Returns cardinality.
+    pub(super) fn handle_zrangestore(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() < 4 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'zrangestore' command",
+            ));
+        }
+        let dest = match args[0].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        let source = match args[1].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+
+        // Parse trailing options before interpreting min/max (need BYSCORE/BYLEX mode).
+        let mut by_score = false;
+        let mut by_lex = false;
+        let mut reverse = false;
+        let mut offset: usize = 0;
+        let mut count: Option<usize> = None;
+        let mut i = 4;
+        while i < args.len() {
+            let opt = match args[i].as_bulk_string() {
+                Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+                None => return Ok(RespValue::error("ERR syntax error")),
+            };
+            match opt.as_str() {
+                "BYSCORE" => {
+                    if by_lex {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    by_score = true;
+                    i += 1;
+                }
+                "BYLEX" => {
+                    if by_score {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    by_lex = true;
+                    i += 1;
+                }
+                "REV" => {
+                    reverse = true;
+                    i += 1;
+                }
+                "LIMIT" => {
+                    if i + 2 >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    offset = match self.parse_integer(&args[i + 1]) {
+                        Ok(n) if n >= 0 => n as usize,
+                        _ => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ));
+                        }
+                    };
+                    let c = match self.parse_integer(&args[i + 2]) {
+                        Ok(n) => n,
+                        _ => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ));
+                        }
+                    };
+                    count = if c < 0 { None } else { Some(c as usize) };
+                    i += 3;
+                }
+                _ => return Ok(RespValue::error("ERR syntax error")),
+            }
+        }
+
+        if let Err(Error::WrongType) = self.ensure_zset_key(source) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+
+        let members: Vec<ScoredMember> = match self.cache.get_sorted_set(source) {
+            None => Vec::new(),
+            Some(z) => {
+                let set = z.read();
+                if by_lex {
+                    let bound_a = match parse_lex_bound(&args[2]) {
+                        Ok(b) => b,
+                        Err(e) => return Ok(RespValue::error(e)),
+                    };
+                    let bound_b = match parse_lex_bound(&args[3]) {
+                        Ok(b) => b,
+                        Err(e) => return Ok(RespValue::error(e)),
+                    };
+                    // REV with BYLEX: args are max min — normalize like ZREVRANGEBYLEX.
+                    let (min, max) = if reverse {
+                        (bound_b, bound_a)
+                    } else {
+                        (bound_a, bound_b)
+                    };
+                    set.range_by_lex(&min, &max, reverse, offset, count)
+                } else if by_score {
+                    let bound_a = match parse_score_bound(&args[2]) {
+                        Ok(b) => b,
+                        Err(e) => return Ok(RespValue::error(e)),
+                    };
+                    let bound_b = match parse_score_bound(&args[3]) {
+                        Ok(b) => b,
+                        Err(e) => return Ok(RespValue::error(e)),
+                    };
+                    let (min, max) = if reverse {
+                        (bound_b, bound_a)
+                    } else {
+                        (bound_a, bound_b)
+                    };
+                    set.range_by_score(min, max, reverse, offset, count)
+                } else {
+                    // Rank range
+                    let start = match self.parse_integer(&args[2]) {
+                        Ok(s) => s as isize,
+                        Err(_) => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ));
+                        }
+                    };
+                    let stop = match self.parse_integer(&args[3]) {
+                        Ok(s) => s as isize,
+                        Err(_) => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ));
+                        }
+                    };
+                    let mut range = set.range(start, stop, reverse);
+                    // Apply LIMIT to rank results (Redis does support LIMIT with rank form).
+                    if offset > 0 || count.is_some() {
+                        if offset >= range.len() {
+                            range.clear();
+                        } else {
+                            let end = match count {
+                                Some(c) => (offset + c).min(range.len()),
+                                None => range.len(),
+                            };
+                            range = range[offset..end].to_vec();
+                        }
+                    }
+                    range
+                }
+            }
+        };
+
+        let pairs: Vec<(Bytes, f64)> = members
+            .into_iter()
+            .map(|sm| (sm.member, sm.score))
+            .collect();
+        self.store_zset_result(&dest, pairs)
+    }
+
     /// Overwrite `dest` with a zset of `members` (score pairs). Empty → delete key, return 0.
     fn store_zset_result(
         &self,

@@ -636,21 +636,37 @@ impl CommandHandler {
 
     /// SETEX key seconds value — SET with EX seconds.
     pub(super) fn handle_setex(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.set_with_ttl_args(args, true, "setex")
+    }
+
+    /// PSETEX key milliseconds value — SET with PX milliseconds.
+    pub(super) fn handle_psetex(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.set_with_ttl_args(args, false, "psetex")
+    }
+
+    fn set_with_ttl_args(
+        &self,
+        args: &[RespValue],
+        seconds: bool,
+        cmd: &str,
+    ) -> Result<RespValue> {
         if args.len() != 3 {
-            return Ok(RespValue::error(
-                "ERR wrong number of arguments for 'setex' command",
-            ));
+            return Ok(RespValue::error(format!(
+                "ERR wrong number of arguments for '{}' command",
+                cmd
+            )));
         }
         let key = match args[0].as_bulk_string() {
             Some(k) => k.clone(),
             None => return Ok(RespValue::error("ERR invalid key")),
         };
-        let seconds = match self.parse_integer(&args[1]) {
-            Ok(s) if s > 0 => s,
+        let ttl_raw = match self.parse_integer(&args[1]) {
+            Ok(s) if s > 0 => s as u64,
             Ok(_) => {
-                return Ok(RespValue::error(
-                    "ERR invalid expire time in 'setex' command",
-                ));
+                return Ok(RespValue::error(format!(
+                    "ERR invalid expire time in '{}' command",
+                    cmd
+                )));
             }
             Err(_) => {
                 return Ok(RespValue::error(
@@ -667,14 +683,30 @@ impl CommandHandler {
             return Ok(RespValue::error(Error::WrongType.to_resp_string()));
         }
 
+        let ttl_ms = if seconds {
+            ttl_raw.saturating_mul(1000)
+        } else {
+            ttl_raw
+        };
         let opts = StoreOptions {
-            ttl_ms: Some((seconds as u64) * 1000),
+            ttl_ms: Some(ttl_ms),
             ..Default::default()
         };
         match self.cache.store(key, value, opts) {
             Ok(_) => Ok(RespValue::ok()),
             Err(e) => Ok(RespValue::error(e.to_resp_string())),
         }
+    }
+
+    /// SUBSTR key start end — legacy alias of GETRANGE.
+    pub(super) fn handle_substr(&self, args: &[RespValue]) -> Result<RespValue> {
+        // Same arity/semantics as GETRANGE.
+        if args.len() != 3 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'substr' command",
+            ));
+        }
+        self.handle_getrange(args)
     }
 
     /// GETSET key value — set new value, return old (or null).

@@ -13,18 +13,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const SCRIPT_CALL_ALLOWLIST: &[&str] = &[
     "PING", "ECHO", //
     "GET", "SET", "DEL", "EXISTS", "TYPE", "MGET", "MSET", "MSETNX", "APPEND", "STRLEN", "LCS",
-    "GETRANGE", "SETRANGE", "SETEX",
+    "GETRANGE", "SUBSTR", "SETRANGE", "SETEX", "PSETEX",
     "GETSET", "UNLINK", "RENAME", "RENAMENX", "SETNX", "GETDEL", "GETEX", //
-    "INCR", "DECR", "INCRBY", "DECRBY", //
+    "INCR", "DECR", "INCRBY", "DECRBY", "INCRBYFLOAT", //
+    "TIME", //
     "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST", "TTL", "PTTL", "EXPIRETIME", "PEXPIRETIME", //
     "HSET", "HSETNX", "HMSET", "HGET", "HMGET", "HDEL", "HGETDEL", "HGETALL", "HLEN", "HEXISTS", "HKEYS", "HVALS", //
     "HINCRBY", "HINCRBYFLOAT", "HSTRLEN", "HRANDFIELD", "HSCAN", //
     "OBJECT", "MEMORY", //
-    "LPUSH", "RPUSH", "LPOP", "RPOP", "LRANGE", "LLEN", "LINDEX", "LSET", "LREM", "LTRIM", "LINSERT", //
+    "LPUSH", "RPUSH", "LPUSHX", "RPUSHX", "LPOP", "RPOP", "LRANGE", "LLEN", "LINDEX", "LSET", "LREM", "LTRIM", "LINSERT", //
     "LPOS", "LMOVE", "RPOPLPUSH", "LMPOP", //
     "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SMISMEMBER", "SCARD", "SINTER", "SINTERCARD", "SUNION", "SDIFF", //
     "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE", "SMOVE", "SPOP", "SRANDMEMBER", "SSCAN", //
-    "ZADD", "ZRANGE", "ZREVRANGE", "ZCARD", "ZSCORE", "ZMSCORE", "ZREM", "ZRANK", "ZREVRANK", //
+    "ZADD", "ZRANGE", "ZRANGESTORE", "ZREVRANGE", "ZCARD", "ZSCORE", "ZMSCORE", "ZREM", "ZRANK", "ZREVRANK", //
     "ZINCRBY", "ZRANGEBYSCORE", "ZREVRANGEBYSCORE", "ZCOUNT", "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", "ZSCAN", //
     "ZRANGEBYLEX", "ZREVRANGEBYLEX", "ZLEXCOUNT", "ZREMRANGEBYLEX", "ZRANDMEMBER", //
     "ZUNION", "ZINTER", "ZDIFF", "ZINTERCARD", "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE", //
@@ -348,8 +349,10 @@ impl CommandHandler {
             "APPEND" => self.handle_append(args),
             "STRLEN" => self.handle_strlen(args),
             "GETRANGE" => self.handle_getrange(args),
+            "SUBSTR" => self.handle_substr(args),
             "SETRANGE" => self.handle_setrange(args),
             "SETEX" => self.handle_setex(args),
+            "PSETEX" => self.handle_psetex(args),
             "GETSET" => self.handle_getset(args),
             "UNLINK" => self.handle_unlink(args),
             "RENAME" => self.handle_rename(args),
@@ -360,10 +363,12 @@ impl CommandHandler {
             "LCS" => self.handle_lcs(args),
             "OBJECT" => self.handle_object(args),
             "MEMORY" => self.handle_memory(args),
+            "TIME" => self.handle_time(args),
             "INCR" => self.handle_incr(args),
             "DECR" => self.handle_decr(args),
             "INCRBY" => self.handle_incrby(args),
             "DECRBY" => self.handle_decrby(args),
+            "INCRBYFLOAT" => self.handle_incrbyfloat(args),
             "EXPIRE" => self.handle_expire(args),
             "PEXPIRE" => self.handle_pexpire(args),
             "EXPIREAT" => self.handle_expireat(args),
@@ -392,6 +397,8 @@ impl CommandHandler {
             "HSCAN" => self.handle_hscan(args),
             "LPUSH" => self.handle_lpush(args),
             "RPUSH" => self.handle_rpush(args),
+            "LPUSHX" => self.handle_lpushx(args),
+            "RPUSHX" => self.handle_rpushx(args),
             "LPOP" => self.handle_lpop(args),
             "RPOP" => self.handle_rpop(args),
             "LRANGE" => self.handle_lrange(args),
@@ -424,6 +431,7 @@ impl CommandHandler {
             "SSCAN" => self.handle_sscan(args),
             "ZADD" => self.handle_zadd(args),
             "ZRANGE" => self.handle_zrange(args),
+            "ZRANGESTORE" => self.handle_zrangestore(args),
             "ZREVRANGE" => self.handle_zrevrange(args),
             "ZCARD" => self.handle_zcard(args),
             "ZSCORE" => self.handle_zscore(args),

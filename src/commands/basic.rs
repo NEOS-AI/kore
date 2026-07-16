@@ -2,6 +2,7 @@ use crate::acl::AuthError;
 use crate::error::Result;
 use crate::protocol::RespValue;
 use bytes::Bytes;
+use std::time::{SystemTime, UNIX_EPOCH};
 use super::CommandHandler;
 
 impl CommandHandler {
@@ -24,6 +25,24 @@ impl CommandHandler {
             Some(msg) => Ok(RespValue::BulkString(Some(msg.clone()))),
             None => Ok(RespValue::error("ERR invalid argument")),
         }
+    }
+
+    /// TIME — Redis wall-clock: array of two bulk strings [unix_sec, unix_usec].
+    pub(super) fn handle_time(&self, args: &[RespValue]) -> Result<RespValue> {
+        if !args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'time' command",
+            ));
+        }
+        let dur = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let secs = dur.as_secs().to_string();
+        let usecs = dur.subsec_micros().to_string();
+        Ok(RespValue::Array(vec![
+            RespValue::BulkString(Some(Bytes::from(secs))),
+            RespValue::BulkString(Some(Bytes::from(usecs))),
+        ]))
     }
 
     /// AUTH <password> | AUTH <username> <password>

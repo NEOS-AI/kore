@@ -23,6 +23,95 @@ impl Cache {
         self.incr_decr(key, -delta)
     }
 
+    /// Atomic float increment (INCRBYFLOAT). Preserves TTL/flags. Missing key → 0.0.
+    pub fn incr_by_float(&self, key: &Bytes, delta: f64) -> Result<f64> {
+        enum Outcome {
+            Ok {
+                value: f64,
+                old_size: usize,
+                new_size: usize,
+            },
+            NotFloat,
+            Nan,
+        }
+
+        let outcome = self.map.mutate(key, |current, next_cas| {
+            let (current_val, expires_at, flags) = match current {
+                Some(entry) if !entry.is_expired() => {
+                    let parsed = std::str::from_utf8(&entry.value)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<f64>().ok());
+                    match parsed {
+                        Some(v) if !v.is_nan() => (v, entry.expires_at, entry.flags),
+                        _ => return (EntryAction::Keep, Outcome::NotFloat),
+                    }
+                }
+                _ => (0.0f64, None, 0u32),
+            };
+
+            let new_value = current_val + delta;
+            if new_value.is_nan() {
+                return (EntryAction::Keep, Outcome::Nan);
+            }
+
+            // Redis-ish rendering: drop trailing .0 for exact integers.
+            let rendered = if new_value.fract() == 0.0
+                && new_value.is_finite()
+                && new_value.abs() < 1e15
+            {
+                format!("{}", new_value as i64)
+            } else {
+                format!("{}", new_value)
+            };
+            let value_bytes = Bytes::from(rendered);
+
+            let mut entry = Entry::new(key.clone(), value_bytes);
+            entry.expires_at = expires_at;
+            entry = entry.with_flags(flags).with_cas(next_cas);
+            let entry = Arc::new(entry);
+
+            let new_size = entry.size();
+            let old_size = current.map(|e| e.size()).unwrap_or(0);
+
+            (
+                EntryAction::Set(entry),
+                Outcome::Ok {
+                    value: new_value,
+                    old_size,
+                    new_size,
+                },
+            )
+        });
+
+        match outcome {
+            Outcome::NotFloat => Err(Error::InvalidArgument(
+                "value is not a valid float".into(),
+            )),
+            Outcome::Nan => Err(Error::InvalidArgument(
+                "increment would produce NaN".into(),
+            )),
+            Outcome::Ok {
+                value,
+                old_size,
+                new_size,
+            } => {
+                if old_size > 0 {
+                    self.memory_usage
+                        .fetch_sub(old_size, Ordering::Relaxed);
+                    self.memory_tracker
+                        .deallocate(old_size, MemoryCategory::Cache);
+                }
+                if new_size > 0 {
+                    self.memory_usage
+                        .fetch_add(new_size, Ordering::Relaxed);
+                    self.memory_tracker
+                        .account(new_size, MemoryCategory::Cache);
+                }
+                Ok(value)
+            }
+        }
+    }
+
     /// Shared single-lock get-parse-add-store for INCR/DECR.
     fn incr_decr(&self, key: &Bytes, delta: i64) -> Result<i64> {
         enum IncrOutcome {

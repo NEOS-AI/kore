@@ -151,11 +151,11 @@ impl CommandHandler {
 /// Extract keys affected by a write command (best-effort for WATCH).
 fn write_keys(cmd: &str, args: &[RespValue]) -> Vec<Bytes> {
     match cmd {
-        "SET" | "SETNX" | "GETDEL" | "GETEX" | "APPEND" | "SETRANGE" | "SETEX" | "GETSET" | "INCR"
-        | "DECR" | "INCRBY" | "DECRBY" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "PERSIST" | "ZADD" | "ZREM" | "ZINCRBY"
+        "SET" | "SETNX" | "GETDEL" | "GETEX" | "APPEND" | "SETRANGE" | "SETEX" | "PSETEX" | "GETSET" | "INCR"
+        | "DECR" | "INCRBY" | "DECRBY" | "INCRBYFLOAT" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "PERSIST" | "ZADD" | "ZREM" | "ZINCRBY"
         | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "ZREMRANGEBYLEX" | "ZPOPMIN" | "ZPOPMAX" | "GEOADD"
         | "GEOSEARCHSTORE" | "GEORADIUS" | "GEORADIUSBYMEMBER" | "HSET" | "HSETNX" | "HMSET" | "HDEL" | "HGETDEL" | "HINCRBY"
-        | "HINCRBYFLOAT" | "LPUSH" | "RPUSH" | "LPOP"
+        | "HINCRBYFLOAT" | "LPUSH" | "RPUSH" | "LPUSHX" | "RPUSHX" | "LPOP"
         | "RPOP" | "LSET" | "LREM" | "LTRIM" | "LINSERT"
         | "SADD" | "SREM" | "SPOP" | "XADD" | "XDEL" | "XTRIM" | "XACK"
         | "XCLAIM" | "XAUTOCLAIM" | "XSETID"
@@ -173,6 +173,12 @@ fn write_keys(cmd: &str, args: &[RespValue]) -> Vec<Bytes> {
             .and_then(|a| a.as_bulk_string())
             .cloned()
             .into_iter()
+            .collect(),
+        // ZRANGESTORE dest source … — both keys for WATCH
+        "ZRANGESTORE" => args
+            .iter()
+            .take(2)
+            .filter_map(|a| a.as_bulk_string().cloned())
             .collect(),
         // SMOVE / LMOVE / BLMOVE / RPOPLPUSH / BRPOPLPUSH: source + destination
         "SMOVE" | "LMOVE" | "BLMOVE" | "RPOPLPUSH" | "BRPOPLPUSH" => args

@@ -98,6 +98,62 @@ impl CommandHandler {
         Ok(RespValue::Integer(len))
     }
 
+    /// LPUSHX key element [element ...] — push left only if key already holds a list.
+    pub(super) fn handle_lpushx(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.pushx(args, true, "lpushx")
+    }
+
+    /// RPUSHX key element [element ...] — push right only if key already holds a list.
+    pub(super) fn handle_rpushx(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.pushx(args, false, "rpushx")
+    }
+
+    fn pushx(&self, args: &[RespValue], left: bool, cmd: &str) -> Result<RespValue> {
+        if args.len() < 2 {
+            return Ok(RespValue::error(format!(
+                "ERR wrong number of arguments for '{}' command",
+                cmd
+            )));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        let values = match Self::parse_list_values(&args[1..]) {
+            Ok(v) => v,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+
+        match self.cache.key_type(&key) {
+            KeyType::None => return Ok(RespValue::Integer(0)),
+            KeyType::List => {}
+            _ => return Ok(RespValue::error(Error::WrongType.to_resp_string())),
+        }
+
+        let list = match self.cache.get_list(&key) {
+            Some(l) => l,
+            None => return Ok(RespValue::Integer(0)),
+        };
+
+        let est: usize = values.iter().map(|v| v.len() + 16).sum();
+        if let Err(e) = self.cache.ensure_non_string_capacity(est) {
+            return Ok(RespValue::error(e.to_resp_string()));
+        }
+
+        let mut l = list.write();
+        let before = crate::memory::estimate_keyed_object(key.len(), l.memory_size());
+        let len = if left {
+            l.lpush(values) as i64
+        } else {
+            l.rpush(values) as i64
+        };
+        let after = crate::memory::estimate_keyed_object(key.len(), l.memory_size());
+        drop(l);
+        self.cache.account_list_delta(before, after);
+        self.cache.list_blockers.notify_key(&key);
+        Ok(RespValue::Integer(len))
+    }
+
     /// Try to pop one element from the first non-empty list among `keys`.
     /// Returns `Ok(Some((key, value)))` or `Ok(None)` if all empty/missing.
     /// Callers must have already rejected WrongType keys.
