@@ -458,6 +458,10 @@ impl CommandHandler {
             "UNLINK" => self.handle_unlink(&args[1..]),
             "RENAME" => self.handle_rename(&args[1..]),
             "RENAMENX" => self.handle_renamenx(&args[1..]),
+            "MOVE" => self.handle_move(&args[1..]),
+            "COPY" => self.handle_copy(&args[1..]),
+            "RANDOMKEY" => self.handle_randomkey(&args[1..]),
+            "TOUCH" => self.handle_touch(&args[1..]),
 
             // Distributed lock commands
             "SETNX" => self.handle_setnx(&args[1..]),
@@ -685,10 +689,15 @@ impl CommandHandler {
     ) -> Option<RespValue> {
         let cluster = self.cluster.as_ref()?;
 
-        // SELECT is rejected entirely in cluster mode (even with no key args).
+        // SELECT / MOVE are multi-DB; not allowed in cluster mode.
         if cmd_upper == "SELECT" {
             return Some(RespValue::error(
                 "ERR SELECT is not allowed in cluster mode",
+            ));
+        }
+        if cmd_upper == "MOVE" {
+            return Some(RespValue::error(
+                "ERR MOVE is not allowed in cluster mode",
             ));
         }
 
@@ -956,6 +965,9 @@ fn is_write_command(cmd: &str) -> bool {
             | "UNLINK"
             | "RENAME"
             | "RENAMENX"
+            | "MOVE"
+            | "COPY"
+            | "TOUCH"
             | "INCR"
             | "DECR"
             | "INCRBY"
@@ -1014,6 +1026,8 @@ fn response_indicates_success(response: &RespValue) -> bool {
 fn is_noop_write(cmd: &str, response: &RespValue) -> bool {
     match (cmd, response) {
         ("RENAMENX", RespValue::Integer(0)) => true,
+        ("MOVE", RespValue::Integer(0)) => true,
+        ("COPY", RespValue::Integer(0)) => true,
         ("SETNX", RespValue::Integer(0)) => true,
         _ => false,
     }

@@ -751,7 +751,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "ssubscribe", "sunsubscribe", "spublish",
         ],
         "keyspace" => &[
-            "del", "exists", "expire", "pexpire", "expireat", "pexpireat", "persist", "expiretime", "pexpiretime", "keys", "scan", "move", "rename", "renamenx",
+            "del", "exists", "expire", "pexpire", "expireat", "pexpireat", "persist", "expiretime", "pexpiretime", "keys", "scan", "move", "copy", "randomkey", "touch", "rename", "renamenx",
             "type", "unlink", "ttl", "pttl", "dbsize", "flushdb", "flushall",
         ],
         "string" => &[

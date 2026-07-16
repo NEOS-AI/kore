@@ -168,6 +168,7 @@ Also tracked in `docs/roadmap.md`.
 
 - [x] **`[P1]`** Common string ops: `APPEND`, `STRLEN`, `SETEX`, `GETSET`, `UNLINK`, `RENAME` / `RENAMENX`
   - *Done*: atomic APPEND; UNLINK = sync DEL; RENAME/RENAMENX across all key types
+  - *Batch AG*: `MOVE` (cross-DB), `COPY` (`DB` / `REPLACE`), `RANDOMKEY`, `TOUCH` — multi-type dump/restore; TTL preserved
 - [x] **`[P1]`** `CLIENT`, `COMMAND`, `HELLO`
   - *Done*: HELLO (RESP2 + RESP3; AUTH/SETNAME); CLIENT ID/SETNAME/GETNAME/SETINFO/LIST/INFO; COMMAND / COUNT / LIST / INFO catalog
 - [x] **`[P1]`** Multi-DB: `SELECT` (or explicitly document single-DB only)
@@ -311,6 +312,7 @@ Highest urgency checklist (phase order preserved):
   - *Done (Batch AD)*: search documents are allkeys eviction victims
   - *Done (Batch AE)*: typed-key TTL (`EXPIRE`/`PEXPIRE`/`TTL`/`PTTL`) via side `typed_expires` map; lazy + active expire; volatile policies sample typed keys with TTL; RDB v4 + AOF rewrite `PEXPIREAT`
   - *Done (Batch AF)*: full expire command family (`PERSIST`, `EXPIREAT`/`PEXPIREAT`, `EXPIRETIME`/`PEXPIRETIME`)
+  - *Done (Batch AG)*: `MOVE` / `COPY` / `RANDOMKEY` / `TOUCH`
   - *Follow-ups*: true single-map keyspace
 - [x] Phase A concurrency / memory / EXAT / network tests (incl. AUTH)
 

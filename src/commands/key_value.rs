@@ -578,3 +578,125 @@ impl CommandHandler {
         }
     }
 }
+
+
+impl CommandHandler {
+    /// MOVE key db — transfer key to another logical database.
+    pub(super) fn handle_move(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 2 {
+            return Ok(RespValue::error("ERR wrong number of arguments for 'move'"));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        let db = match self.parse_integer(&args[1]) {
+            Ok(n) if n >= 0 => n as usize,
+            _ => return Ok(RespValue::error("ERR index out of range")),
+        };
+        if db == self.selected_db() {
+            return Ok(RespValue::error(
+                "ERR source and destination objects are the same",
+            ));
+        }
+        let Some(dst) = self.databases().get(db) else {
+            return Ok(RespValue::error("ERR index out of range"));
+        };
+        match self.cache.move_key_to(key, &dst) {
+            Ok(moved) => Ok(RespValue::Integer(if moved { 1 } else { 0 })),
+            Err(e) => Ok(RespValue::error(e.to_resp_string())),
+        }
+    }
+
+    /// COPY source destination [DB destination-db] [REPLACE]
+    pub(super) fn handle_copy(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() < 2 {
+            return Ok(RespValue::error("ERR wrong number of arguments for 'copy'"));
+        }
+        let src = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid source key")),
+        };
+        let dst = match args[1].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid destination key")),
+        };
+
+        let mut dest_db: Option<usize> = None;
+        let mut replace = false;
+        let mut i = 2;
+        while i < args.len() {
+            let opt = match args[i].as_bulk_string() {
+                Some(s) => String::from_utf8_lossy(s).to_uppercase(),
+                None => return Ok(RespValue::error("ERR syntax error")),
+            };
+            match opt.as_str() {
+                "REPLACE" => {
+                    replace = true;
+                    i += 1;
+                }
+                "DB" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    match self.parse_integer(&args[i]) {
+                        Ok(n) if n >= 0 => dest_db = Some(n as usize),
+                        _ => return Ok(RespValue::error("ERR index out of range")),
+                    }
+                    i += 1;
+                }
+                _ => return Ok(RespValue::error("ERR syntax error")),
+            }
+        }
+
+        if dest_db.is_some() && self.cluster().is_some() {
+            return Ok(RespValue::error(
+                "ERR COPY to a different DB is not allowed in cluster mode",
+            ));
+        }
+
+        let dst_cache = if let Some(db) = dest_db {
+            match self.databases().get(db) {
+                Some(c) => Some(c),
+                None => return Ok(RespValue::error("ERR index out of range")),
+            }
+        } else {
+            None
+        };
+
+        let result = if let Some(ref target) = dst_cache {
+            self.cache.copy_key(src, dst, Some(target.as_ref()), replace)
+        } else {
+            self.cache.copy_key(src, dst, None, replace)
+        };
+
+        match result {
+            Ok(copied) => Ok(RespValue::Integer(if copied { 1 } else { 0 })),
+            Err(e) => Ok(RespValue::error(e.to_resp_string())),
+        }
+    }
+
+    /// RANDOMKEY — random key from the selected DB, or null.
+    pub(super) fn handle_randomkey(&self, _args: &[RespValue]) -> Result<RespValue> {
+        match self.cache.random_key() {
+            Some(k) => Ok(RespValue::BulkString(Some(k))),
+            None => Ok(RespValue::null()),
+        }
+    }
+
+    /// TOUCH key [key ...] — refresh LRU/LFU; return count of existing keys.
+    pub(super) fn handle_touch(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            return Ok(RespValue::error("ERR wrong number of arguments for 'touch'"));
+        }
+        let mut keys = Vec::with_capacity(args.len());
+        for a in args {
+            match a.as_bulk_string() {
+                Some(k) => keys.push(k.clone()),
+                None => return Ok(RespValue::error("ERR invalid key")),
+            }
+        }
+        Ok(RespValue::Integer(self.cache.touch_keys(&keys) as i64))
+    }
+}

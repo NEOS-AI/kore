@@ -12,6 +12,7 @@ mod config;
 mod search;
 mod bitmap;
 mod hyperloglog;
+mod key_xfer;
 
 pub use bitmap::{BitOpKind, BitfieldOp, BitfieldOverflow};
 
