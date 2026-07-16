@@ -721,9 +721,10 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
         "read" => &[
             "get", "mget", "exists", "type", "strlen", "ttl", "pttl", "keys", "scan", "dbsize",
             "hget", "hmget", "hgetall", "hlen", "hexists", "hkeys", "hvals", "lrange", "llen",
-            "lindex", "smembers", "sismember", "scard", "sinter", "sunion", "sdiff", "srandmember",
+            "lindex", "smembers", "sismember", "scard", "sinter", "sunion", "sdiff", "srandmember", "sscan",
             "zrange", "zrevrange", "zcard",
-            "zscore", "zrank", "zrevrank", "zrangebyscore", "zrevrangebyscore", "zcount",
+            "zscore", "zrank", "zrevrank", "zrangebyscore", "zrevrangebyscore", "zcount", "zscan",
+            "hscan",
             "xlen", "xrange", "xrevrange", "xread", "xpending",
             "geopos", "geodist", "geohash", "geosearch", "info", "role", "lastsave", "object",
             "memory", "dump", "strlen", "getbit", "bitcount", "bitpos", "pfcount",
@@ -768,19 +769,19 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
         "hyperloglog" => &["pfadd", "pfcount", "pfmerge"],
         "hash" => &[
             "hset", "hget", "hmget", "hdel", "hgetall", "hlen", "hexists", "hkeys", "hvals",
-            "hincrby",
+            "hincrby", "hscan",
         ],
         "list" => &[
             "lpush", "rpush", "lpop", "rpop", "blpop", "brpop", "lrange", "llen", "lindex", "lset",
         ],
         "set" => &[
             "sadd", "srem", "smembers", "sismember", "scard", "sinter", "sunion", "sdiff",
-            "sinterstore", "sunionstore", "sdiffstore", "smove", "spop", "srandmember",
+            "sinterstore", "sunionstore", "sdiffstore", "smove", "spop", "srandmember", "sscan",
         ],
         "sortedset" => &[
             "zadd", "zrange", "zrevrange", "zcard", "zscore", "zrem", "zrank", "zrevrank",
             "zincrby", "zrangebyscore", "zrevrangebyscore", "zcount",
-            "zremrangebyrank", "zremrangebyscore",
+            "zremrangebyrank", "zremrangebyscore", "zscan",
         ],
         "stream" => &[
             "xadd", "xlen", "xrange", "xrevrange", "xdel", "xtrim", "xread", "xgroup", "xreadgroup",

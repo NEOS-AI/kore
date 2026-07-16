@@ -44,51 +44,10 @@ impl CommandHandler {
             }
         };
 
-        let mut pattern: Option<String> = None;
-        let mut count: usize = 10; // Redis-compatible default
-
-        let mut i = 1;
-        while i < args.len() {
-            let opt = match args[i].as_bulk_string() {
-                Some(s) => String::from_utf8_lossy(s).to_uppercase(),
-                None => {
-                    return Ok(RespValue::error("ERR syntax error"));
-                }
-            };
-
-            match opt.as_str() {
-                "MATCH" => {
-                    i += 1;
-                    if i >= args.len() {
-                        return Ok(RespValue::error("ERR syntax error"));
-                    }
-                    match args[i].as_bulk_string() {
-                        Some(s) => {
-                            pattern = Some(String::from_utf8_lossy(s).into_owned());
-                        }
-                        None => return Ok(RespValue::error("ERR syntax error")),
-                    }
-                }
-                "COUNT" => {
-                    i += 1;
-                    if i >= args.len() {
-                        return Ok(RespValue::error("ERR syntax error"));
-                    }
-                    match self.parse_integer(&args[i]) {
-                        Ok(c) if c > 0 => count = c as usize,
-                        _ => {
-                            return Ok(RespValue::error(
-                                "ERR value is not an integer or out of range",
-                            ));
-                        }
-                    }
-                }
-                _ => {
-                    return Ok(RespValue::error("ERR syntax error"));
-                }
-            }
-            i += 1;
-        }
+        let (pattern, count) = match self.parse_scan_options(&args[1..]) {
+            Ok(v) => v,
+            Err(e) => return Ok(e),
+        };
 
         let pattern_ref = pattern.as_deref();
         let (next_cursor, keys) = self.cache.scan(cursor, pattern_ref, count);
@@ -98,10 +57,52 @@ impl CommandHandler {
             .map(|k| RespValue::BulkString(Some(k)))
             .collect();
 
-        Ok(RespValue::Array(vec![
-            RespValue::BulkString(Some(Bytes::from(next_cursor.to_string()))),
-            RespValue::Array(resp_keys),
-        ]))
+        Ok(scan_reply(next_cursor, resp_keys))
+    }
+
+    /// Parse optional `MATCH pattern` / `COUNT n` after the cursor (or key+cursor).
+    pub(super) fn parse_scan_options(
+        &self,
+        args: &[RespValue],
+    ) -> std::result::Result<(Option<String>, usize), RespValue> {
+        let mut pattern: Option<String> = None;
+        let mut count: usize = 10; // Redis-compatible default
+        let mut i = 0;
+        while i < args.len() {
+            let opt = match args[i].as_bulk_string() {
+                Some(s) => String::from_utf8_lossy(s).to_uppercase(),
+                None => return Err(RespValue::error("ERR syntax error")),
+            };
+            match opt.as_str() {
+                "MATCH" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err(RespValue::error("ERR syntax error"));
+                    }
+                    match args[i].as_bulk_string() {
+                        Some(s) => pattern = Some(String::from_utf8_lossy(s).into_owned()),
+                        None => return Err(RespValue::error("ERR syntax error")),
+                    }
+                }
+                "COUNT" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err(RespValue::error("ERR syntax error"));
+                    }
+                    match self.parse_integer(&args[i]) {
+                        Ok(c) if c > 0 => count = c as usize,
+                        _ => {
+                            return Err(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ));
+                        }
+                    }
+                }
+                _ => return Err(RespValue::error("ERR syntax error")),
+            }
+            i += 1;
+        }
+        Ok((pattern, count))
     }
 
     /// SELECT index — switch the connection to another logical database.
@@ -595,6 +596,37 @@ impl CommandHandler {
                 }
             }
             _ => Ok(RespValue::error("ERR Unknown subcommand or wrong number of arguments")),
+        }
+    }
+}
+
+/// Build Redis SCAN-family reply: `[next_cursor, [elements...]]`.
+pub(super) fn scan_reply(next_cursor: u64, elements: Vec<RespValue>) -> RespValue {
+    RespValue::Array(vec![
+        RespValue::BulkString(Some(Bytes::from(next_cursor.to_string()))),
+        RespValue::Array(elements),
+    ])
+}
+
+/// Stable cursor page over a sorted list of matched items.
+pub(super) fn cursor_page<T: Clone>(items: &[T], cursor: u64, count: usize) -> (u64, Vec<T>) {
+    let start = cursor as usize;
+    if start >= items.len() {
+        return (0, Vec::new());
+    }
+    let end = (start + count).min(items.len());
+    let batch = items[start..end].to_vec();
+    let next = if end >= items.len() { 0 } else { end as u64 };
+    (next, batch)
+}
+
+/// MATCH helper for type scans (field / member name).
+pub(super) fn scan_name_matches(pattern: Option<&str>, name: &[u8]) -> bool {
+    match pattern {
+        None => true,
+        Some(pat) => {
+            let text = std::str::from_utf8(name).unwrap_or("");
+            crate::hashmap::pattern_match(pat, text)
         }
     }
 }

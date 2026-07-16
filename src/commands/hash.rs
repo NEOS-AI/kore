@@ -432,4 +432,45 @@ impl CommandHandler {
             Err(msg) => Ok(RespValue::error(format!("ERR {}", msg))),
         }
     }
+
+    /// HSCAN key cursor [MATCH pattern] [COUNT count]
+    pub(super) fn handle_hscan(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() < 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'hscan' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_hash_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+        let cursor = match self.parse_integer(&args[1]) {
+            Ok(c) if c >= 0 => c as u64,
+            _ => return Ok(RespValue::error("ERR invalid cursor")),
+        };
+        let (pattern, count) = match self.parse_scan_options(&args[2..]) {
+            Ok(v) => v,
+            Err(e) => return Ok(e),
+        };
+
+        let mut pairs: Vec<(Bytes, Bytes)> = match self.cache.get_hash(key) {
+            Some(h) => h
+                .read()
+                .iter_fields()
+                .filter(|(f, _)| super::admin::scan_name_matches(pattern.as_deref(), f))
+                .collect(),
+            None => Vec::new(),
+        };
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let (next, batch) = super::admin::cursor_page(&pairs, cursor, count);
+        let mut elements = Vec::with_capacity(batch.len() * 2);
+        for (f, v) in batch {
+            elements.push(RespValue::BulkString(Some(f)));
+            elements.push(RespValue::BulkString(Some(v)));
+        }
+        Ok(super::admin::scan_reply(next, elements))
+    }
 }

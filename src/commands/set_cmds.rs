@@ -545,3 +545,45 @@ fn members_to_array(members: Vec<Bytes>) -> RespValue {
             .collect(),
     )
 }
+
+impl CommandHandler {
+    /// SSCAN key cursor [MATCH pattern] [COUNT count]
+    pub(super) fn handle_sscan(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() < 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'sscan' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_set_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+        let cursor = match self.parse_integer(&args[1]) {
+            Ok(c) if c >= 0 => c as u64,
+            _ => return Ok(RespValue::error("ERR invalid cursor")),
+        };
+        let (pattern, count) = match self.parse_scan_options(&args[2..]) {
+            Ok(v) => v,
+            Err(e) => return Ok(e),
+        };
+
+        let mut members: Vec<Bytes> = match self.cache.get_set(key) {
+            Some(s) => s
+                .read()
+                .iter_members()
+                .filter(|m| super::admin::scan_name_matches(pattern.as_deref(), m))
+                .collect(),
+            None => Vec::new(),
+        };
+        members.sort();
+        let (next, batch) = super::admin::cursor_page(&members, cursor, count);
+        let elements = batch
+            .into_iter()
+            .map(|m| RespValue::BulkString(Some(m)))
+            .collect();
+        Ok(super::admin::scan_reply(next, elements))
+    }
+}

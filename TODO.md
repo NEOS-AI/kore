@@ -87,6 +87,7 @@ Example: fix EXAT (`A` / `P0`) before RESP3 (`D` / `P1`) or HNSW benchmarks (`E`
 - [x] **`[P1]`** Graceful shutdown (SIGTERM/SIGINT): stop accepts, drain in-flight commands, flush persistence when present
   - *Done*: `tokio::signal` → watch channel → `Server::run_with_shutdown`; SAVE on stop when persistence present
 - [x] **`[P1]`** Implement `SCAN` (cursor-based); de-emphasize `KEYS` for production use
+  - *Batch AJ*: `HSCAN` / `SSCAN` / `ZSCAN` (MATCH/COUNT; stable sorted cursor; missing key → empty page)
 - [x] **`[P1]`** Implement `TYPE`
 - [x] **`[P1]`** Wire `CONFIG SET` through to live cache atomics (e.g. changing `maxmemory` should re-evict)
   - *Done*: `max_memory` is `AtomicUsize`; `CONFIG GET/SET maxmemory` + `maxentrysize`; best-effort re-evict on lower limit

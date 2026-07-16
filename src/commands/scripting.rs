@@ -16,12 +16,12 @@ const SCRIPT_CALL_ALLOWLIST: &[&str] = &[
     "GETSET", "UNLINK", "RENAME", "RENAMENX", "SETNX", "GETDEL", "GETEX", //
     "INCR", "DECR", "INCRBY", "DECRBY", //
     "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST", "TTL", "PTTL", "EXPIRETIME", "PEXPIRETIME", //
-    "HSET", "HGET", "HMGET", "HDEL", "HGETALL", "HLEN", "HEXISTS", "HKEYS", "HVALS", "HINCRBY", //
+    "HSET", "HGET", "HMGET", "HDEL", "HGETALL", "HLEN", "HEXISTS", "HKEYS", "HVALS", "HINCRBY", "HSCAN", //
     "LPUSH", "RPUSH", "LPOP", "RPOP", "LRANGE", "LLEN", "LINDEX", "LSET", //
     "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD", "SINTER", "SUNION", "SDIFF", //
-    "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE", "SMOVE", "SPOP", "SRANDMEMBER", //
+    "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE", "SMOVE", "SPOP", "SRANDMEMBER", "SSCAN", //
     "ZADD", "ZRANGE", "ZREVRANGE", "ZCARD", "ZSCORE", "ZREM", "ZRANK", "ZREVRANK", //
-    "ZINCRBY", "ZRANGEBYSCORE", "ZREVRANGEBYSCORE", "ZCOUNT", "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", //
+    "ZINCRBY", "ZRANGEBYSCORE", "ZREVRANGEBYSCORE", "ZCOUNT", "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", "ZSCAN", //
     "SETBIT", "GETBIT", "BITCOUNT", "BITPOS", "BITOP", //
     "PFADD", "PFCOUNT", "PFMERGE", //
     "DBSIZE", "KEYS", //
@@ -370,6 +370,7 @@ impl CommandHandler {
             "HKEYS" => self.handle_hkeys(args),
             "HVALS" => self.handle_hvals(args),
             "HINCRBY" => self.handle_hincrby(args),
+            "HSCAN" => self.handle_hscan(args),
             "LPUSH" => self.handle_lpush(args),
             "RPUSH" => self.handle_rpush(args),
             "LPOP" => self.handle_lpop(args),
@@ -392,6 +393,7 @@ impl CommandHandler {
             "SMOVE" => self.handle_smove(args),
             "SPOP" => self.handle_spop(args),
             "SRANDMEMBER" => self.handle_srandmember(args),
+            "SSCAN" => self.handle_sscan(args),
             "ZADD" => self.handle_zadd(args),
             "ZRANGE" => self.handle_zrange(args),
             "ZREVRANGE" => self.handle_zrevrange(args),
@@ -406,6 +408,7 @@ impl CommandHandler {
             "ZCOUNT" => self.handle_zcount(args),
             "ZREMRANGEBYRANK" => self.handle_zremrangebyrank(args),
             "ZREMRANGEBYSCORE" => self.handle_zremrangebyscore(args),
+            "ZSCAN" => self.handle_zscan(args),
             "SETBIT" => self.handle_setbit(args),
             "GETBIT" => self.handle_getbit(args),
             "BITCOUNT" => self.handle_bitcount(args),

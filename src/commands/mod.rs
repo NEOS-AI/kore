@@ -538,6 +538,7 @@ impl CommandHandler {
             "ZCOUNT" => self.handle_zcount(&args[1..]),
             "ZREMRANGEBYRANK" => self.handle_zremrangebyrank(&args[1..]),
             "ZREMRANGEBYSCORE" => self.handle_zremrangebyscore(&args[1..]),
+            "ZSCAN" => self.handle_zscan(&args[1..]),
 
             // Geospatial commands
             "GEOADD" => self.handle_geoadd(&args[1..]),
@@ -560,6 +561,7 @@ impl CommandHandler {
             "HKEYS" => self.handle_hkeys(&args[1..]),
             "HVALS" => self.handle_hvals(&args[1..]),
             "HINCRBY" => self.handle_hincrby(&args[1..]),
+            "HSCAN" => self.handle_hscan(&args[1..]),
 
             // List commands
             "LPUSH" => self.handle_lpush(&args[1..]),
@@ -588,6 +590,7 @@ impl CommandHandler {
             "SMOVE" => self.handle_smove(&args[1..]),
             "SPOP" => self.handle_spop(&args[1..]),
             "SRANDMEMBER" => self.handle_srandmember(&args[1..]),
+            "SSCAN" => self.handle_sscan(&args[1..]),
 
             // Stream commands
             "XADD" => self.handle_xadd(&args[1..]),

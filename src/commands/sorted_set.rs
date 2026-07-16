@@ -679,3 +679,46 @@ fn scored_members_to_resp(members: Vec<ScoredMember>, with_scores: bool) -> Resp
     }
     RespValue::Array(result)
 }
+
+impl CommandHandler {
+    /// ZSCAN key cursor [MATCH pattern] [COUNT count]
+    pub(super) fn handle_zscan(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() < 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'zscan' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_zset_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+        let cursor = match self.parse_integer(&args[1]) {
+            Ok(c) if c >= 0 => c as u64,
+            _ => return Ok(RespValue::error("ERR invalid cursor")),
+        };
+        let (pattern, count) = match self.parse_scan_options(&args[2..]) {
+            Ok(v) => v,
+            Err(e) => return Ok(e),
+        };
+
+        let mut members: Vec<(Bytes, f64)> = match self.cache.get_sorted_set(key) {
+            Some(z) => z
+                .read()
+                .iter_members()
+                .filter(|(m, _)| super::admin::scan_name_matches(pattern.as_deref(), m))
+                .collect(),
+            None => Vec::new(),
+        };
+        members.sort_by(|a, b| a.0.cmp(&b.0));
+        let (next, batch) = super::admin::cursor_page(&members, cursor, count);
+        let mut elements = Vec::with_capacity(batch.len() * 2);
+        for (m, score) in batch {
+            elements.push(RespValue::BulkString(Some(m)));
+            elements.push(RespValue::BulkString(Some(Bytes::from(format_score(score)))));
+        }
+        Ok(super::admin::scan_reply(next, elements))
+    }
+}
