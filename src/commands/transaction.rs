@@ -154,7 +154,8 @@ fn write_keys(cmd: &str, args: &[RespValue]) -> Vec<Bytes> {
         "SET" | "SETNX" | "GETDEL" | "GETEX" | "APPEND" | "SETRANGE" | "SETEX" | "GETSET" | "INCR"
         | "DECR" | "INCRBY" | "DECRBY" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "PERSIST" | "ZADD" | "ZREM" | "ZINCRBY"
         | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "ZREMRANGEBYLEX" | "ZPOPMIN" | "ZPOPMAX" | "GEOADD"
-        | "GEOSEARCHSTORE" | "HSET" | "HMSET" | "HDEL" | "HINCRBY" | "HINCRBYFLOAT" | "LPUSH" | "RPUSH" | "LPOP"
+        | "GEOSEARCHSTORE" | "GEORADIUS" | "GEORADIUSBYMEMBER" | "HSET" | "HMSET" | "HDEL" | "HINCRBY"
+        | "HINCRBYFLOAT" | "LPUSH" | "RPUSH" | "LPOP"
         | "RPOP" | "LSET" | "LREM" | "LTRIM" | "LINSERT" | "SADD" | "SREM" | "SPOP" | "XADD" | "XDEL" | "XTRIM" | "XACK"
         | "XCLAIM" | "XAUTOCLAIM" | "XSETID"
         | "SETBIT" | "BITFIELD" | "PFADD" | "TOUCH" | "MOVE" => args

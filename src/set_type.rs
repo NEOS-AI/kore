@@ -76,6 +76,33 @@ impl RedisSet {
             .collect()
     }
 
+    /// Count intersection cardinality; stop early when `limit` is reached.
+    /// `limit = None` means unlimited (Redis LIMIT 0).
+    pub fn sinter_count(sets: &[&RedisSet], limit: Option<usize>) -> usize {
+        if sets.is_empty() {
+            return 0;
+        }
+        // Scan the smallest set first for early exit under LIMIT.
+        let mut order: Vec<usize> = (0..sets.len()).collect();
+        order.sort_by_key(|&i| sets[i].members.len());
+        let first = order[0];
+        let mut n = 0usize;
+        'member: for m in &sets[first].members {
+            for &idx in &order[1..] {
+                if !sets[idx].members.contains(m) {
+                    continue 'member;
+                }
+            }
+            n += 1;
+            if let Some(lim) = limit {
+                if n >= lim {
+                    return n;
+                }
+            }
+        }
+        n
+    }
+
     /// Union of all provided sets.
     pub fn sunion(sets: &[&RedisSet]) -> Vec<Bytes> {
         let mut out = HashSet::new();
@@ -207,6 +234,8 @@ mod tests {
         assert_eq!(uni.len(), 4);
         let diff = RedisSet::sdiff(&[&a, &b]);
         assert_eq!(diff, vec![Bytes::from("1")]);
+        assert_eq!(RedisSet::sinter_count(&[&a, &b], None), 2);
+        assert_eq!(RedisSet::sinter_count(&[&a, &b], Some(1)), 1);
     }
 
     #[test]

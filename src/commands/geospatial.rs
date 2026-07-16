@@ -280,7 +280,7 @@ impl CommandHandler {
     /// Handle GEOSEARCH command
     /// GEOSEARCH key FROMMEMBER member | FROMLONLAT longitude latitude
     ///   BYRADIUS radius M|KM|FT|MI | BYBOX width height M|KM|FT|MI
-    ///   [ASC|DESC] [COUNT count [ANY]] [WITHDIST] [WITHCOORD]
+    ///   [ASC|DESC] [COUNT count [ANY]] [WITHDIST] [WITHHASH] [WITHCOORD]
     pub(super) fn handle_geosearch(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.len() < 5 {
             return Ok(RespValue::error(
@@ -416,6 +416,7 @@ impl CommandHandler {
 
         // Parse optional flags
         let mut with_dist = false;
+        let mut with_hash = false;
         let mut with_coord = false;
         let mut count: Option<usize> = None;
         let mut sort = SortOrder::Asc;
@@ -428,6 +429,7 @@ impl CommandHandler {
             };
             match opt.as_str() {
                 "WITHDIST" => { with_dist = true; idx += 1; }
+                "WITHHASH" => { with_hash = true; idx += 1; }
                 "WITHCOORD" => { with_coord = true; idx += 1; }
                 "ASC" => { sort = SortOrder::Asc; idx += 1; }
                 "DESC" => { sort = SortOrder::Desc; idx += 1; }
@@ -474,7 +476,7 @@ impl CommandHandler {
 
         let resp_results: Vec<RespValue> = results
             .iter()
-            .map(|r| self.format_geosearch_result(r, with_dist, with_coord, &shape_unit))
+            .map(|r| self.format_geosearch_result(r, with_dist, with_hash, with_coord, &shape_unit))
             .collect();
 
         Ok(RespValue::Array(resp_results))
@@ -511,36 +513,18 @@ impl CommandHandler {
         }
 
         if storedist {
-            // Add WITHDIST so handle_geosearch returns distances in the response
             search_args.push(RespValue::BulkString(Some(Bytes::from_static(b"WITHDIST"))));
             let search_result = self.handle_geosearch(&search_args)?;
 
-            // Store results in a sorted set with distance as score
-            let source_key = match args[1].as_bulk_string() {
-                Some(k) => k.clone(),
-                None => return Ok(RespValue::error("ERR invalid source key")),
-            };
-            let dest_key_for_store = dest_key.clone();
-            // Ensure we don't hold the source geoset lock while writing to dest
-            // (source and dest may be the same key)
-            let dest_sorted = match self.cache.get_or_create_sorted_set(&dest_key_for_store) {
-                Ok(z) => z,
-                Err(Error::WrongType) => {
-                    return Ok(RespValue::error(Error::WrongType.to_resp_string()));
-                }
-                Err(e) => return Ok(RespValue::error(e.to_resp_string())),
-            };
-            let mut zset = dest_sorted.write();
-            let _ = source_key; // consumed above
+            // Redis: overwrite destination regardless of prior type.
+            let _ = self.cache.delete(&dest_key);
 
-            let mut count = 0i64;
+            let mut members: Vec<(Bytes, f64)> = Vec::new();
             if let RespValue::Array(arr) = &search_result {
                 for item in arr {
                     if let RespValue::Array(sub) = item {
                         // WITHDIST format: [member, dist_string, ...]
-                        if let (Some(name_val), Some(dist_val)) =
-                            (sub.get(0), sub.get(1))
-                        {
+                        if let (Some(name_val), Some(dist_val)) = (sub.get(0), sub.get(1)) {
                             if let (Some(name), Some(dist_bytes)) = (
                                 name_val.as_bulk_string(),
                                 dist_val.as_bulk_string(),
@@ -549,8 +533,7 @@ impl CommandHandler {
                                     .ok()
                                     .and_then(|s| s.parse::<f64>().ok())
                                 {
-                                    zset.add(name.clone(), dist);
-                                    count += 1;
+                                    members.push((name.clone(), dist));
                                 }
                             }
                         }
@@ -558,6 +541,26 @@ impl CommandHandler {
                 }
             }
 
+            if members.is_empty() {
+                return Ok(RespValue::Integer(0));
+            }
+
+            let dest_sorted = match self.cache.get_or_create_sorted_set(&dest_key) {
+                Ok(z) => z,
+                Err(Error::WrongType) => {
+                    return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+                }
+                Err(e) => return Ok(RespValue::error(e.to_resp_string())),
+            };
+            let mut zset = dest_sorted.write();
+            let before = crate::memory::estimate_keyed_object(dest_key.len(), zset.memory_size());
+            let count = members.len() as i64;
+            for (name, dist) in members {
+                zset.add(name, dist);
+            }
+            let after = crate::memory::estimate_keyed_object(dest_key.len(), zset.memory_size());
+            drop(zset);
+            self.cache.account_sorted_set_delta(before, after);
             return Ok(RespValue::Integer(count));
         }
 
@@ -571,7 +574,10 @@ impl CommandHandler {
 
         let source_geoset = match self.cache.get_geo_set(source_key) {
             Some(g) => g,
-            None => return Ok(RespValue::Integer(0)),
+            None => {
+                let _ = self.cache.delete(&dest_key);
+                return Ok(RespValue::Integer(0));
+            }
         };
 
         // Collect member names from GEOSEARCH result
@@ -590,12 +596,25 @@ impl CommandHandler {
             }
         }
 
-        let count = member_names.len();
+        // Snapshot positions under source lock, then release before dest write.
+        let points: Vec<(Bytes, f64, f64)> = {
+            let src = source_geoset.read();
+            member_names
+                .iter()
+                .filter_map(|name| {
+                    src.get_position(name)
+                        .map(|(lon, lat)| (name.clone(), lon, lat))
+                })
+                .collect()
+        };
+        let count = points.len() as i64;
+
+        // Overwrite destination (any prior type).
+        let _ = self.cache.delete(&dest_key);
         if count == 0 {
             return Ok(RespValue::Integer(0));
         }
 
-        // Write results to destination geoset
         let dest_geoset = match self.cache.get_or_create_geo_set(&dest_key) {
             Ok(g) => g,
             Err(Error::WrongType) => {
@@ -604,71 +623,169 @@ impl CommandHandler {
             Err(e) => return Ok(RespValue::error(e.to_resp_string())),
         };
         let mut dest = dest_geoset.write();
-        let src = source_geoset.read();
-
-        for name in &member_names {
-            if let Some((lon, lat)) = src.get_position(name) {
-                dest.add(name.clone(), lon, lat);
-            }
+        let before = crate::memory::estimate_keyed_object(dest_key.len(), dest.memory_usage());
+        for (name, lon, lat) in points {
+            dest.add(name, lon, lat);
         }
+        let after = crate::memory::estimate_keyed_object(dest_key.len(), dest.memory_usage());
+        drop(dest);
+        self.cache.account_geo_set_delta(before, after);
 
-        Ok(RespValue::Integer(count as i64))
+        Ok(RespValue::Integer(count))
     }
 
     /// Handle GEORADIUS command (legacy / deprecated)
-    /// GEORADIUS key longitude latitude radius M|KM|FT|MI [WITHCOORD] [WITHDIST] [COUNT count] [ASC|DESC]
+    /// GEORADIUS key longitude latitude radius M|KM|FT|MI
+    ///   [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT count] [ASC|DESC]
+    ///   [STORE key] [STOREDIST key]
     pub(super) fn handle_georadius(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.len() < 5 {
             return Ok(RespValue::error(
                 "ERR wrong number of arguments for 'georadius' command",
             ));
         }
-
-        // Rewrite as GEOSEARCH key FROMLONLAT lon lat BYRADIUS radius unit [opts...]
-        let mut rewritten = vec![
-            args[0].clone(),                      // key
-            RespValue::BulkString(Some(Bytes::from_static(b"FROMLONLAT"))),
-            args[1].clone(),                      // longitude
-            args[2].clone(),                      // latitude
-            RespValue::BulkString(Some(Bytes::from_static(b"BYRADIUS"))),
-            args[3].clone(),                      // radius
-            args[4].clone(),                      // unit
-        ];
-        rewritten.extend_from_slice(&args[5..]);
-        self.handle_geosearch(&rewritten)
+        self.handle_georadius_impl(
+            &args[0],
+            true,
+            &args[1],
+            &args[2],
+            &args[3],
+            &args[4],
+            &args[5..],
+            "georadius",
+        )
     }
 
     /// Handle GEORADIUSBYMEMBER command (legacy / deprecated)
-    /// GEORADIUSBYMEMBER key member radius M|KM|FT|MI [WITHCOORD] [WITHDIST] [COUNT count] [ASC|DESC]
+    /// GEORADIUSBYMEMBER key member radius M|KM|FT|MI
+    ///   [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT count] [ASC|DESC]
+    ///   [STORE key] [STOREDIST key]
     pub(super) fn handle_georadiusbymember(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.len() < 4 {
             return Ok(RespValue::error(
                 "ERR wrong number of arguments for 'georadiusbymember' command",
             ));
         }
-
-        // Rewrite as GEOSEARCH key FROMMEMBER member BYRADIUS radius unit [opts...]
-        let mut rewritten = vec![
-            args[0].clone(),                      // key
-            RespValue::BulkString(Some(Bytes::from_static(b"FROMMEMBER"))),
-            args[1].clone(),                      // member
-            RespValue::BulkString(Some(Bytes::from_static(b"BYRADIUS"))),
-            args[2].clone(),                      // radius
-            args[3].clone(),                      // unit
-        ];
-        rewritten.extend_from_slice(&args[4..]);
-        self.handle_geosearch(&rewritten)
+        // Dummy lon/lat slots unused when from_lonlat=false.
+        let dummy = RespValue::BulkString(Some(Bytes::from_static(b"0")));
+        self.handle_georadius_impl(
+            &args[0],
+            false,
+            &args[1],
+            &dummy,
+            &args[2],
+            &args[3],
+            &args[4..],
+            "georadiusbymember",
+        )
     }
 
-    /// Format a single geosearch result based on options
+    /// Shared GEORADIUS / GEORADIUSBYMEMBER path with optional STORE/STOREDIST.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_georadius_impl(
+        &self,
+        key: &RespValue,
+        from_lonlat: bool,
+        arg_a: &RespValue, // lon or member
+        arg_b: &RespValue, // lat or unused
+        radius: &RespValue,
+        unit: &RespValue,
+        opts: &[RespValue],
+        _name: &str,
+    ) -> Result<RespValue> {
+        // Split STORE / STOREDIST from read-options.
+        let mut store_key: Option<Bytes> = None;
+        let mut storedist_key: Option<Bytes> = None;
+        let mut search_opts: Vec<RespValue> = Vec::new();
+        let mut i = 0;
+        while i < opts.len() {
+            let opt = match opts[i].as_bulk_string() {
+                Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+                None => {
+                    search_opts.push(opts[i].clone());
+                    i += 1;
+                    continue;
+                }
+            };
+            match opt.as_str() {
+                "STORE" => {
+                    if i + 1 >= opts.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    match opts[i + 1].as_bulk_string() {
+                        Some(k) => store_key = Some(k.clone()),
+                        None => return Ok(RespValue::error("ERR invalid store key")),
+                    }
+                    i += 2;
+                }
+                "STOREDIST" => {
+                    if i + 1 >= opts.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    match opts[i + 1].as_bulk_string() {
+                        Some(k) => storedist_key = Some(k.clone()),
+                        None => return Ok(RespValue::error("ERR invalid store key")),
+                    }
+                    i += 2;
+                }
+                _ => {
+                    search_opts.push(opts[i].clone());
+                    i += 1;
+                }
+            }
+        }
+
+        // Build GEOSEARCH / GEOSEARCHSTORE argument list.
+        let mut search_core = if from_lonlat {
+            vec![
+                key.clone(),
+                RespValue::BulkString(Some(Bytes::from_static(b"FROMLONLAT"))),
+                arg_a.clone(),
+                arg_b.clone(),
+                RespValue::BulkString(Some(Bytes::from_static(b"BYRADIUS"))),
+                radius.clone(),
+                unit.clone(),
+            ]
+        } else {
+            vec![
+                key.clone(),
+                RespValue::BulkString(Some(Bytes::from_static(b"FROMMEMBER"))),
+                arg_a.clone(),
+                RespValue::BulkString(Some(Bytes::from_static(b"BYRADIUS"))),
+                radius.clone(),
+                unit.clone(),
+            ]
+        };
+        search_core.extend(search_opts);
+
+        // Redis: when STORE/STOREDIST present, return stored count (not member list).
+        // STOREDIST takes precedence if both are given (matches Redis).
+        if let Some(dest) = storedist_key {
+            let mut store_args = vec![RespValue::BulkString(Some(dest))];
+            store_args.extend(search_core);
+            store_args.push(RespValue::BulkString(Some(Bytes::from_static(b"STOREDIST"))));
+            return self.handle_geosearchstore(&store_args);
+        }
+        if let Some(dest) = store_key {
+            let mut store_args = vec![RespValue::BulkString(Some(dest))];
+            store_args.extend(search_core);
+            return self.handle_geosearchstore(&store_args);
+        }
+
+        self.handle_geosearch(&search_core)
+    }
+
+    /// Format a single geosearch result based on options.
+    /// Redis order: member, WITHDIST, WITHHASH, WITHCOORD.
     fn format_geosearch_result(
         &self,
         result: &GeoSearchResult,
         with_dist: bool,
+        with_hash: bool,
         with_coord: bool,
         unit: &DistanceUnit,
     ) -> RespValue {
-        if !with_dist && !with_coord {
+        if !with_dist && !with_hash && !with_coord {
             RespValue::BulkString(Some(result.member.clone()))
         } else {
             let mut items = vec![RespValue::BulkString(Some(result.member.clone()))];
@@ -676,6 +793,12 @@ impl CommandHandler {
             if with_dist {
                 let distance = unit.from_meters(result.distance);
                 items.push(RespValue::BulkString(Some(Bytes::from(format!("{:.4}", distance)))));
+            }
+
+            if with_hash {
+                // Redis WITHHASH: raw 52-bit geohash score as a bulk decimal string.
+                let hash = geohash_encode(result.longitude, result.latitude);
+                items.push(RespValue::BulkString(Some(Bytes::from(hash.to_string()))));
             }
 
             if with_coord {

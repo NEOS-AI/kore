@@ -586,6 +586,7 @@ impl CommandHandler {
             "HINCRBYFLOAT" => self.handle_hincrbyfloat(&args[1..]),
             "HSTRLEN" => self.handle_hstrlen(&args[1..]),
             "HMSET" => self.handle_hmset(&args[1..]),
+            "HRANDFIELD" => self.handle_hrandfield(&args[1..]),
             "HSCAN" => self.handle_hscan(&args[1..]),
 
             // List commands
@@ -611,8 +612,10 @@ impl CommandHandler {
             "SREM" => self.handle_srem(&args[1..]),
             "SMEMBERS" => self.handle_smembers(&args[1..]),
             "SISMEMBER" => self.handle_sismember(&args[1..]),
+            "SMISMEMBER" => self.handle_smismember(&args[1..]),
             "SCARD" => self.handle_scard(&args[1..]),
             "SINTER" => self.handle_sinter(&args[1..]),
+            "SINTERCARD" => self.handle_sintercard(&args[1..]),
             "SUNION" => self.handle_sunion(&args[1..]),
             "SDIFF" => self.handle_sdiff(&args[1..]),
             "SINTERSTORE" => self.handle_sinterstore(&args[1..]),
@@ -1050,6 +1053,8 @@ fn is_write_command(cmd: &str) -> bool {
             | "BZMPOP"
             | "GEOADD"
             | "GEOSEARCHSTORE"
+            | "GEORADIUS"
+            | "GEORADIUSBYMEMBER"
             | "HSET"
             | "HMSET"
             | "HDEL"

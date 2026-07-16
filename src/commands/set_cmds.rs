@@ -143,6 +143,120 @@ impl CommandHandler {
         Ok(RespValue::Integer(if exists { 1 } else { 0 }))
     }
 
+    /// SMISMEMBER key member [member ...]
+    pub(super) fn handle_smismember(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() < 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'smismember' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_set_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+        let members: Vec<&Bytes> = args[1..]
+            .iter()
+            .filter_map(|a| a.as_bulk_string())
+            .collect();
+        if members.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'smismember' command",
+            ));
+        }
+        let flags: Vec<RespValue> = match self.cache.get_set(key) {
+            Some(s) => {
+                let set = s.read();
+                members
+                    .iter()
+                    .map(|m| RespValue::Integer(if set.sismember(m) { 1 } else { 0 }))
+                    .collect()
+            }
+            None => members.iter().map(|_| RespValue::Integer(0)).collect(),
+        };
+        Ok(RespValue::Array(flags))
+    }
+
+    /// SINTERCARD numkeys key [key ...] [LIMIT limit]
+    pub(super) fn handle_sintercard(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() < 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'sintercard' command",
+            ));
+        }
+        let numkeys = match self.parse_integer(&args[0]) {
+            Ok(n) if n > 0 => n as usize,
+            _ => {
+                return Ok(RespValue::error(
+                    "ERR at least 1 input key is needed for SINTERCARD",
+                ))
+            }
+        };
+        if args.len() < 1 + numkeys {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'sintercard' command",
+            ));
+        }
+
+        let mut keys = Vec::with_capacity(numkeys);
+        for a in &args[1..1 + numkeys] {
+            match a.as_bulk_string() {
+                Some(k) => keys.push(k.clone()),
+                None => return Ok(RespValue::error("ERR invalid key")),
+            }
+        }
+
+        // Optional LIMIT limit (0 = unlimited).
+        let mut limit: Option<usize> = None;
+        let mut i = 1 + numkeys;
+        while i < args.len() {
+            let opt = match args[i].as_bulk_string() {
+                Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+                None => return Ok(RespValue::error("ERR syntax error")),
+            };
+            match opt.as_str() {
+                "LIMIT" => {
+                    if i + 1 >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    let lim = match self.parse_integer(&args[i + 1]) {
+                        Ok(n) if n >= 0 => n as usize,
+                        _ => {
+                            return Ok(RespValue::error("ERR LIMIT can't be negative"));
+                        }
+                    };
+                    limit = if lim == 0 { None } else { Some(lim) };
+                    i += 2;
+                }
+                _ => return Ok(RespValue::error("ERR syntax error")),
+            }
+        }
+
+        for k in &keys {
+            match self.cache.key_type(k) {
+                KeyType::None | KeyType::Set => {}
+                _ => return Ok(RespValue::error(Error::WrongType.to_resp_string())),
+            }
+        }
+
+        // Any missing key → empty intersection.
+        let shared: Vec<_> = match keys
+            .iter()
+            .map(|k| self.cache.get_set(k))
+            .collect::<Option<Vec<_>>>()
+        {
+            Some(v) => v,
+            None => return Ok(RespValue::Integer(0)),
+        };
+        let locks: Vec<_> = shared.iter().map(|s| s.read()).collect();
+        let set_refs: Vec<&RedisSet> = locks.iter().map(|g| &**g).collect();
+        Ok(RespValue::Integer(
+            RedisSet::sinter_count(&set_refs, limit) as i64,
+        ))
+    }
+
     /// SCARD key
     pub(super) fn handle_scard(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.len() != 1 {

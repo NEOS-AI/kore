@@ -18,10 +18,10 @@ const SCRIPT_CALL_ALLOWLIST: &[&str] = &[
     "INCR", "DECR", "INCRBY", "DECRBY", //
     "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST", "TTL", "PTTL", "EXPIRETIME", "PEXPIRETIME", //
     "HSET", "HMSET", "HGET", "HMGET", "HDEL", "HGETALL", "HLEN", "HEXISTS", "HKEYS", "HVALS", //
-    "HINCRBY", "HINCRBYFLOAT", "HSTRLEN", "HSCAN", //
+    "HINCRBY", "HINCRBYFLOAT", "HSTRLEN", "HRANDFIELD", "HSCAN", //
     "LPUSH", "RPUSH", "LPOP", "RPOP", "LRANGE", "LLEN", "LINDEX", "LSET", "LREM", "LTRIM", "LINSERT", //
     "LPOS", "LMOVE", //
-    "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD", "SINTER", "SUNION", "SDIFF", //
+    "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SMISMEMBER", "SCARD", "SINTER", "SINTERCARD", "SUNION", "SDIFF", //
     "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE", "SMOVE", "SPOP", "SRANDMEMBER", "SSCAN", //
     "ZADD", "ZRANGE", "ZREVRANGE", "ZCARD", "ZSCORE", "ZMSCORE", "ZREM", "ZRANK", "ZREVRANK", //
     "ZINCRBY", "ZRANGEBYSCORE", "ZREVRANGEBYSCORE", "ZCOUNT", "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", "ZSCAN", //
@@ -382,6 +382,7 @@ impl CommandHandler {
             "HINCRBY" => self.handle_hincrby(args),
             "HINCRBYFLOAT" => self.handle_hincrbyfloat(args),
             "HSTRLEN" => self.handle_hstrlen(args),
+            "HRANDFIELD" => self.handle_hrandfield(args),
             "HSCAN" => self.handle_hscan(args),
             "LPUSH" => self.handle_lpush(args),
             "RPUSH" => self.handle_rpush(args),
@@ -400,8 +401,10 @@ impl CommandHandler {
             "SREM" => self.handle_srem(args),
             "SMEMBERS" => self.handle_smembers(args),
             "SISMEMBER" => self.handle_sismember(args),
+            "SMISMEMBER" => self.handle_smismember(args),
             "SCARD" => self.handle_scard(args),
             "SINTER" => self.handle_sinter(args),
+            "SINTERCARD" => self.handle_sintercard(args),
             "SUNION" => self.handle_sunion(args),
             "SDIFF" => self.handle_sdiff(args),
             "SINTERSTORE" => self.handle_sinterstore(args),

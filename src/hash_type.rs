@@ -110,6 +110,47 @@ impl RedisHash {
         self.fields.get(field).map(|v| v.len()).unwrap_or(0)
     }
 
+    /// Random fields without removal (Redis HRANDFIELD count semantics).
+    ///
+    /// * `count > 0`: up to `count` distinct fields
+    /// * `count < 0`: `|count|` fields with replacement
+    /// * `count == 0`: empty
+    pub fn hrandfield(&self, count: i64) -> Vec<(Bytes, Bytes)> {
+        use rand::seq::{IteratorRandom, SliceRandom};
+        if self.fields.is_empty() || count == 0 {
+            return Vec::new();
+        }
+        let mut rng = rand::thread_rng();
+        if count > 0 {
+            let n = (count as usize).min(self.fields.len());
+            self.fields
+                .iter()
+                .choose_multiple(&mut rng, n)
+                .into_iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        } else {
+            let n = (-count) as usize;
+            let pool: Vec<(&Bytes, &Bytes)> = self.fields.iter().map(|(k, v)| (k, v)).collect();
+            (0..n)
+                .map(|_| {
+                    let (k, v) = *pool.choose(&mut rng).unwrap();
+                    (k.clone(), v.clone())
+                })
+                .collect()
+        }
+    }
+
+    /// Single random field/value pair, if any.
+    pub fn hrandfield_one(&self) -> Option<(Bytes, Bytes)> {
+        use rand::seq::IteratorRandom;
+        let mut rng = rand::thread_rng();
+        self.fields
+            .iter()
+            .choose(&mut rng)
+            .map(|(k, v)| (k.clone(), v.clone()))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.fields.is_empty()
     }
@@ -189,5 +230,20 @@ mod tests {
         h.hset(Bytes::from("s"), Bytes::from("hello"));
         assert_eq!(h.hstrlen(&Bytes::from("s")), 5);
         assert!(h.hincrbyfloat(Bytes::from("s"), 1.0).is_err());
+    }
+
+    #[test]
+    fn test_hrandfield() {
+        let mut h = RedisHash::new();
+        h.hset(Bytes::from("a"), Bytes::from("1"));
+        h.hset(Bytes::from("b"), Bytes::from("2"));
+        h.hset(Bytes::from("c"), Bytes::from("3"));
+        assert!(h.hrandfield_one().is_some());
+        let two = h.hrandfield(2);
+        assert_eq!(two.len(), 2);
+        let with_dup = h.hrandfield(-5);
+        assert_eq!(with_dup.len(), 5);
+        assert!(h.hrandfield(0).is_empty());
+        assert!(h.hrandfield(10).len() <= 3);
     }
 }

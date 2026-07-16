@@ -546,6 +546,75 @@ impl CommandHandler {
         }
     }
 
+    /// HRANDFIELD key [count [WITHVALUES]]
+    pub(super) fn handle_hrandfield(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() || args.len() > 3 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'hrandfield' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_hash_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+
+        let with_count = args.len() >= 2;
+        let mut with_values = false;
+        if args.len() == 3 {
+            let opt = match args[2].as_bulk_string() {
+                Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+                None => return Ok(RespValue::error("ERR syntax error")),
+            };
+            if opt != "WITHVALUES" {
+                return Ok(RespValue::error("ERR syntax error"));
+            }
+            with_values = true;
+        }
+
+        let hash = match self.cache.get_hash(key) {
+            Some(h) => h,
+            None => {
+                return Ok(if with_count {
+                    RespValue::Array(vec![])
+                } else {
+                    RespValue::null()
+                });
+            }
+        };
+        let h = hash.read();
+
+        if !with_count {
+            return Ok(match h.hrandfield_one() {
+                Some((field, _)) => RespValue::BulkString(Some(field)),
+                None => RespValue::null(),
+            });
+        }
+
+        let count = match self.parse_integer(&args[1]) {
+            Ok(n) => n,
+            Err(e) => return Ok(RespValue::error(e.to_resp_string())),
+        };
+        let pairs = h.hrandfield(count);
+        if with_values {
+            let mut out = Vec::with_capacity(pairs.len() * 2);
+            for (f, v) in pairs {
+                out.push(RespValue::BulkString(Some(f)));
+                out.push(RespValue::BulkString(Some(v)));
+            }
+            Ok(RespValue::Array(out))
+        } else {
+            Ok(RespValue::Array(
+                pairs
+                    .into_iter()
+                    .map(|(f, _)| RespValue::BulkString(Some(f)))
+                    .collect(),
+            ))
+        }
+    }
+
     /// HSCAN key cursor [MATCH pattern] [COUNT count]
     pub(super) fn handle_hscan(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.len() < 2 {
