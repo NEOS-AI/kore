@@ -1,5 +1,5 @@
 //! Redis Streams commands: XADD, XRANGE, XREVRANGE, XLEN, XDEL, XTRIM,
-//! XREAD, XGROUP, XREADGROUP, XACK, XPENDING, XCLAIM, XAUTOCLAIM, XSETID.
+//! XREAD, XGROUP, XREADGROUP, XACK, XPENDING, XCLAIM, XAUTOCLAIM, XSETID, XINFO.
 
 use crate::cache::KeyType;
 use crate::error::{Error, Result};
@@ -733,6 +733,110 @@ impl CommandHandler {
                         let mut s = stream.write();
                         match s.group_setid(&group, id) {
                             Ok(()) => Ok(RespValue::ok()),
+                            Err(e) => {
+                                if e.starts_with("NOGROUP") {
+                                    Ok(RespValue::error(format!(
+                                        "NOGROUP No such key '{}' or consumer group",
+                                        String::from_utf8_lossy(&key)
+                                    )))
+                                } else {
+                                    Ok(RespValue::error(e))
+                                }
+                            }
+                        }
+                    }
+                    _ => Ok(RespValue::error(Error::WrongType.to_resp_string())),
+                }
+            }
+            "CREATECONSUMER" => {
+                // XGROUP CREATECONSUMER key groupname consumername
+                if args.len() != 4 {
+                    return Ok(RespValue::error(
+                        "ERR wrong number of arguments for 'xgroup|createconsumer' command",
+                    ));
+                }
+                let key = match args[1].as_bulk_string() {
+                    Some(k) => k.clone(),
+                    None => return Ok(RespValue::error("ERR invalid key")),
+                };
+                let group = match args[2].as_bulk_string() {
+                    Some(g) => g.clone(),
+                    None => return Ok(RespValue::error("ERR invalid group name")),
+                };
+                let consumer = match args[3].as_bulk_string() {
+                    Some(c) => c.clone(),
+                    None => return Ok(RespValue::error("ERR invalid consumer name")),
+                };
+                match self.cache.key_type(&key) {
+                    KeyType::None => Ok(RespValue::error(format!(
+                        "NOGROUP No such key '{}' or consumer group",
+                        String::from_utf8_lossy(&key)
+                    ))),
+                    KeyType::Stream => {
+                        let stream = match self.cache.get_stream(&key) {
+                            Some(s) => s,
+                            None => {
+                                return Ok(RespValue::error(format!(
+                                    "NOGROUP No such key '{}' or consumer group",
+                                    String::from_utf8_lossy(&key)
+                                )));
+                            }
+                        };
+                        let mut s = stream.write();
+                        match s.group_create_consumer(&group, &consumer) {
+                            Ok(created) => Ok(RespValue::Integer(if created { 1 } else { 0 })),
+                            Err(e) => {
+                                if e.starts_with("NOGROUP") {
+                                    Ok(RespValue::error(format!(
+                                        "NOGROUP No such key '{}' or consumer group",
+                                        String::from_utf8_lossy(&key)
+                                    )))
+                                } else {
+                                    Ok(RespValue::error(e))
+                                }
+                            }
+                        }
+                    }
+                    _ => Ok(RespValue::error(Error::WrongType.to_resp_string())),
+                }
+            }
+            "DELCONSUMER" => {
+                // XGROUP DELCONSUMER key groupname consumername
+                if args.len() != 4 {
+                    return Ok(RespValue::error(
+                        "ERR wrong number of arguments for 'xgroup|delconsumer' command",
+                    ));
+                }
+                let key = match args[1].as_bulk_string() {
+                    Some(k) => k.clone(),
+                    None => return Ok(RespValue::error("ERR invalid key")),
+                };
+                let group = match args[2].as_bulk_string() {
+                    Some(g) => g.clone(),
+                    None => return Ok(RespValue::error("ERR invalid group name")),
+                };
+                let consumer = match args[3].as_bulk_string() {
+                    Some(c) => c.clone(),
+                    None => return Ok(RespValue::error("ERR invalid consumer name")),
+                };
+                match self.cache.key_type(&key) {
+                    KeyType::None => Ok(RespValue::error(format!(
+                        "NOGROUP No such key '{}' or consumer group",
+                        String::from_utf8_lossy(&key)
+                    ))),
+                    KeyType::Stream => {
+                        let stream = match self.cache.get_stream(&key) {
+                            Some(s) => s,
+                            None => {
+                                return Ok(RespValue::error(format!(
+                                    "NOGROUP No such key '{}' or consumer group",
+                                    String::from_utf8_lossy(&key)
+                                )));
+                            }
+                        };
+                        let mut s = stream.write();
+                        match s.group_del_consumer(&group, &consumer) {
+                            Ok(n) => Ok(RespValue::Integer(n as i64)),
                             Err(e) => {
                                 if e.starts_with("NOGROUP") {
                                     Ok(RespValue::error(format!(
@@ -1628,6 +1732,194 @@ impl CommandHandler {
             _ => Ok(RespValue::error(Error::WrongType.to_resp_string())),
         }
     }
+
+    /// XINFO STREAM key
+    /// XINFO GROUPS key
+    /// XINFO CONSUMERS key groupname
+    pub(super) fn handle_xinfo(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'xinfo' command",
+            ));
+        }
+        let sub = match args[0].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+            None => return Ok(RespValue::error("ERR syntax error")),
+        };
+        match sub.as_str() {
+            "STREAM" => {
+                if args.len() < 2 {
+                    return Ok(RespValue::error(
+                        "ERR wrong number of arguments for 'xinfo|stream' command",
+                    ));
+                }
+                // FULL is accepted but not expanded beyond summary for now.
+                let key = match args[1].as_bulk_string() {
+                    Some(k) => k.clone(),
+                    None => return Ok(RespValue::error("ERR invalid key")),
+                };
+                match self.cache.key_type(&key) {
+                    KeyType::None => Ok(RespValue::error("ERR no such key")),
+                    KeyType::Stream => {
+                        let stream = match self.cache.get_stream(&key) {
+                            Some(s) => s,
+                            None => return Ok(RespValue::error("ERR no such key")),
+                        };
+                        let info = stream.read().xinfo_stream();
+                        let first = match info.first_entry {
+                            Some(ref e) => Self::stream_entry_to_resp(e),
+                            None => RespValue::null(),
+                        };
+                        let last = match info.last_entry {
+                            Some(ref e) => Self::stream_entry_to_resp(e),
+                            None => RespValue::null(),
+                        };
+                        Ok(RespValue::Array(vec![
+                            bulk_static(b"length"),
+                            RespValue::Integer(info.length as i64),
+                            bulk_static(b"radix-tree-keys"),
+                            RespValue::Integer(info.length as i64),
+                            bulk_static(b"radix-tree-nodes"),
+                            RespValue::Integer(info.length.saturating_add(1) as i64),
+                            bulk_static(b"last-generated-id"),
+                            RespValue::BulkString(Some(info.last_generated_id.to_bytes())),
+                            bulk_static(b"max-deleted-entry-id"),
+                            RespValue::BulkString(Some(Bytes::from_static(b"0-0"))),
+                            bulk_static(b"entries-added"),
+                            RespValue::Integer(info.length as i64),
+                            bulk_static(b"groups"),
+                            RespValue::Integer(info.groups as i64),
+                            bulk_static(b"first-entry"),
+                            first,
+                            bulk_static(b"last-entry"),
+                            last,
+                        ]))
+                    }
+                    _ => Ok(RespValue::error(Error::WrongType.to_resp_string())),
+                }
+            }
+            "GROUPS" => {
+                if args.len() != 2 {
+                    return Ok(RespValue::error(
+                        "ERR wrong number of arguments for 'xinfo|groups' command",
+                    ));
+                }
+                let key = match args[1].as_bulk_string() {
+                    Some(k) => k.clone(),
+                    None => return Ok(RespValue::error("ERR invalid key")),
+                };
+                match self.cache.key_type(&key) {
+                    KeyType::None => Ok(RespValue::error("ERR no such key")),
+                    KeyType::Stream => {
+                        let stream = match self.cache.get_stream(&key) {
+                            Some(s) => s,
+                            None => return Ok(RespValue::error("ERR no such key")),
+                        };
+                        let groups = stream.read().xinfo_groups();
+                        let rows: Vec<RespValue> = groups
+                            .into_iter()
+                            .map(|g| {
+                                RespValue::Array(vec![
+                                    bulk_static(b"name"),
+                                    RespValue::BulkString(Some(g.name)),
+                                    bulk_static(b"consumers"),
+                                    RespValue::Integer(g.consumers as i64),
+                                    bulk_static(b"pending"),
+                                    RespValue::Integer(g.pending as i64),
+                                    bulk_static(b"last-delivered-id"),
+                                    RespValue::BulkString(Some(g.last_delivered_id.to_bytes())),
+                                    bulk_static(b"entries-read"),
+                                    RespValue::null(),
+                                    bulk_static(b"lag"),
+                                    RespValue::Integer(g.lag as i64),
+                                ])
+                            })
+                            .collect();
+                        Ok(RespValue::Array(rows))
+                    }
+                    _ => Ok(RespValue::error(Error::WrongType.to_resp_string())),
+                }
+            }
+            "CONSUMERS" => {
+                if args.len() != 3 {
+                    return Ok(RespValue::error(
+                        "ERR wrong number of arguments for 'xinfo|consumers' command",
+                    ));
+                }
+                let key = match args[1].as_bulk_string() {
+                    Some(k) => k.clone(),
+                    None => return Ok(RespValue::error("ERR invalid key")),
+                };
+                let group = match args[2].as_bulk_string() {
+                    Some(g) => g.clone(),
+                    None => return Ok(RespValue::error("ERR invalid group name")),
+                };
+                match self.cache.key_type(&key) {
+                    KeyType::None => Ok(RespValue::error(format!(
+                        "NOGROUP No such key '{}' or consumer group",
+                        String::from_utf8_lossy(&key)
+                    ))),
+                    KeyType::Stream => {
+                        let stream = match self.cache.get_stream(&key) {
+                            Some(s) => s,
+                            None => {
+                                return Ok(RespValue::error(format!(
+                                    "NOGROUP No such key '{}' or consumer group",
+                                    String::from_utf8_lossy(&key)
+                                )));
+                            }
+                        };
+                        let s = stream.read();
+                        match s.xinfo_consumers(&group) {
+                            Ok(consumers) => {
+                                let rows: Vec<RespValue> = consumers
+                                    .into_iter()
+                                    .map(|c| {
+                                        RespValue::Array(vec![
+                                            bulk_static(b"name"),
+                                            RespValue::BulkString(Some(c.name)),
+                                            bulk_static(b"pending"),
+                                            RespValue::Integer(c.pending as i64),
+                                            bulk_static(b"idle"),
+                                            RespValue::Integer(c.idle_ms as i64),
+                                            bulk_static(b"inactive"),
+                                            RespValue::Integer(c.inactive_ms as i64),
+                                        ])
+                                    })
+                                    .collect();
+                                Ok(RespValue::Array(rows))
+                            }
+                            Err(e) => {
+                                if e.starts_with("NOGROUP") {
+                                    Ok(RespValue::error(format!(
+                                        "NOGROUP No such key '{}' or consumer group",
+                                        String::from_utf8_lossy(&key)
+                                    )))
+                                } else {
+                                    Ok(RespValue::error(e))
+                                }
+                            }
+                        }
+                    }
+                    _ => Ok(RespValue::error(Error::WrongType.to_resp_string())),
+                }
+            }
+            "HELP" => Ok(RespValue::Array(vec![
+                bulk_static(b"STREAM <key> [FULL [COUNT <count>]]"),
+                bulk_static(b"GROUPS <key>"),
+                bulk_static(b"CONSUMERS <key> <groupname>"),
+                bulk_static(b"HELP"),
+            ])),
+            _ => Ok(RespValue::error(format!(
+                "ERR unknown subcommand '{}'. Try XINFO HELP.",
+                sub
+            ))),
+        }
+    }
+}
+
+fn bulk_static(s: &'static [u8]) -> RespValue {
+    RespValue::BulkString(Some(Bytes::from_static(s)))
 }
 
 /// Outcome of one non-blocking XREADGROUP attempt.

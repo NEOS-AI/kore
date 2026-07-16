@@ -638,6 +638,7 @@ impl CommandHandler {
             "XCLAIM" => self.handle_xclaim(&args[1..]),
             "XAUTOCLAIM" => self.handle_xautoclaim(&args[1..]),
             "XSETID" => self.handle_xsetid(&args[1..]),
+            "XINFO" => self.handle_xinfo(&args[1..]),
 
             // Pub/Sub commands (async — no block_in_place)
             "PUBLISH" => self.handle_publish(&args[1..]).await,

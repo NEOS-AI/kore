@@ -727,7 +727,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "zrangebylex", "zrevrangebylex", "zlexcount", "zrandmember", "zscan",
             "zunion", "zinter", "zdiff", "zintercard",
             "hscan",
-            "xlen", "xrange", "xrevrange", "xread", "xpending",
+            "xlen", "xrange", "xrevrange", "xread", "xpending", "xinfo",
             "geopos", "geodist", "geohash", "geosearch", "info", "role", "lastsave", "object",
             "memory", "dump", "strlen", "getbit", "bitcount", "bitpos", "pfcount",
         ],
@@ -795,7 +795,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
         ],
         "stream" => &[
             "xadd", "xlen", "xrange", "xrevrange", "xdel", "xtrim", "xread", "xgroup", "xreadgroup",
-            "xack", "xpending", "xclaim", "xautoclaim", "xsetid",
+            "xack", "xpending", "xclaim", "xautoclaim", "xsetid", "xinfo",
         ],
         "geo" => &[
             "geoadd", "geosearch", "geosearchstore", "geodist", "geopos", "geohash", "georadius",

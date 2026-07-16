@@ -101,6 +101,36 @@ impl StreamEntry {
     }
 }
 
+/// XINFO STREAM summary fields.
+#[derive(Debug, Clone)]
+pub struct XInfoStream {
+    pub length: usize,
+    pub last_generated_id: StreamId,
+    pub groups: usize,
+    pub first_entry: Option<StreamEntry>,
+    pub last_entry: Option<StreamEntry>,
+}
+
+/// One group row for XINFO GROUPS.
+#[derive(Debug, Clone)]
+pub struct XInfoGroup {
+    pub name: Bytes,
+    pub consumers: usize,
+    pub pending: usize,
+    pub last_delivered_id: StreamId,
+    /// Entries with ID greater than last-delivered-id (approximate lag).
+    pub lag: usize,
+}
+
+/// One consumer row for XINFO CONSUMERS.
+#[derive(Debug, Clone)]
+pub struct XInfoConsumer {
+    pub name: Bytes,
+    pub pending: usize,
+    pub idle_ms: u64,
+    pub inactive_ms: u64,
+}
+
 /// Pending entry in a consumer group's PEL.
 #[derive(Debug, Clone)]
 pub struct PendingEntry {
@@ -420,6 +450,60 @@ impl RedisStream {
         self.groups.remove(name).is_some()
     }
 
+    /// XGROUP CREATECONSUMER — create consumer if missing.
+    /// Returns `true` if created, `false` if already present.
+    pub fn group_create_consumer(
+        &mut self,
+        group_name: &Bytes,
+        consumer_name: &Bytes,
+    ) -> Result<bool, String> {
+        let group = self
+            .groups
+            .get_mut(group_name)
+            .ok_or_else(|| "NOGROUP No such key '' or consumer group".to_string())?;
+        if group.consumers.contains_key(consumer_name) {
+            return Ok(false);
+        }
+        let now = Self::now_ms();
+        group.consumers.insert(
+            consumer_name.clone(),
+            Consumer {
+                name: consumer_name.clone(),
+                seen_time_ms: now,
+                pending: 0,
+            },
+        );
+        Ok(true)
+    }
+
+    /// XGROUP DELCONSUMER — remove consumer and drop their PEL entries.
+    /// Returns number of pending messages that belonged to the consumer.
+    pub fn group_del_consumer(
+        &mut self,
+        group_name: &Bytes,
+        consumer_name: &Bytes,
+    ) -> Result<usize, String> {
+        let group = self
+            .groups
+            .get_mut(group_name)
+            .ok_or_else(|| "NOGROUP No such key '' or consumer group".to_string())?;
+        if !group.consumers.contains_key(consumer_name) {
+            return Ok(0);
+        }
+        let pending_ids: Vec<StreamId> = group
+            .pending
+            .iter()
+            .filter(|(_, pe)| &pe.consumer == consumer_name)
+            .map(|(id, _)| *id)
+            .collect();
+        let n = pending_ids.len();
+        for id in pending_ids {
+            group.pending.remove(&id);
+        }
+        group.consumers.remove(consumer_name);
+        Ok(n)
+    }
+
     /// XGROUP SETID — set the group's last_delivered_id cursor.
     pub fn group_setid(&mut self, name: &Bytes, id: StreamId) -> Result<(), String> {
         let group = self
@@ -685,6 +769,71 @@ impl RedisStream {
             }
         }
         Ok(out)
+    }
+
+    /// Snapshot for XINFO STREAM (summary form).
+    pub fn xinfo_stream(&self) -> XInfoStream {
+        let first = self.entries.values().next().cloned();
+        let last = self.entries.values().next_back().cloned();
+        XInfoStream {
+            length: self.entries.len(),
+            last_generated_id: self.last_generated_id,
+            groups: self.groups.len(),
+            first_entry: first,
+            last_entry: last,
+        }
+    }
+
+    /// Snapshot for XINFO GROUPS.
+    pub fn xinfo_groups(&self) -> Vec<XInfoGroup> {
+        let mut groups: Vec<XInfoGroup> = self
+            .groups
+            .values()
+            .map(|g| {
+                let lag = self
+                    .entries
+                    .range(next_id(g.last_delivered_id)..)
+                    .count();
+                XInfoGroup {
+                    name: g.name.clone(),
+                    consumers: g.consumers.len(),
+                    pending: g.pending.len(),
+                    last_delivered_id: g.last_delivered_id,
+                    lag,
+                }
+            })
+            .collect();
+        groups.sort_by(|a, b| a.name.cmp(&b.name));
+        groups
+    }
+
+    /// Snapshot for XINFO CONSUMERS key group.
+    pub fn xinfo_consumers(&self, group_name: &Bytes) -> Result<Vec<XInfoConsumer>, String> {
+        let group = self
+            .groups
+            .get(group_name)
+            .ok_or_else(|| "NOGROUP No such key '' or consumer group".to_string())?;
+        let now = Self::now_ms();
+        let mut consumers: Vec<XInfoConsumer> = group
+            .consumers
+            .values()
+            .map(|c| {
+                let pending = group
+                    .pending
+                    .values()
+                    .filter(|pe| &pe.consumer == &c.name)
+                    .count();
+                let idle = now.saturating_sub(c.seen_time_ms);
+                XInfoConsumer {
+                    name: c.name.clone(),
+                    pending,
+                    idle_ms: idle,
+                    inactive_ms: idle,
+                }
+            })
+            .collect();
+        consumers.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(consumers)
     }
 
     pub fn group_exists(&self, name: &Bytes) -> bool {

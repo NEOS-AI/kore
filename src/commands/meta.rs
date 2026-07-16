@@ -143,6 +143,7 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     CmdSpec { name: "xclaim", arity: -6, flags: &["write", "random"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "xautoclaim", arity: -6, flags: &["write", "random"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "xsetid", arity: 3, flags: &["write", "denyoom", "fast"], first_key: 1, last_key: 1, step: 1 },
+    CmdSpec { name: "xinfo", arity: -2, flags: &["readonly", "random"], first_key: 2, last_key: 2, step: 1 },
     CmdSpec { name: "zadd", arity: -4, flags: &["write", "denyoom", "fast"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "zrange", arity: -4, flags: &["readonly"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "zrevrange", arity: -4, flags: &["readonly"], first_key: 1, last_key: 1, step: 1 },
