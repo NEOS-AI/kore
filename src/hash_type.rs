@@ -38,6 +38,11 @@ impl RedisHash {
             .count()
     }
 
+    /// Get-and-delete fields in order (HGETDEL). Missing fields yield `None`.
+    pub fn hgetdel(&mut self, fields: &[Bytes]) -> Vec<Option<Bytes>> {
+        fields.iter().map(|f| self.fields.remove(f)).collect()
+    }
+
     pub fn hgetall(&self) -> Vec<(Bytes, Bytes)> {
         self.fields
             .iter()

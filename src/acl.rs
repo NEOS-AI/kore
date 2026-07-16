@@ -719,8 +719,8 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             return Ok(all_known_commands());
         }
         "read" => &[
-            "get", "mget", "exists", "type", "strlen", "getrange", "ttl", "pttl", "keys", "scan", "dbsize",
-            "hget", "hmget", "hgetall", "hlen", "hexists", "hkeys", "hvals", "hstrlen", "lrange", "llen",
+            "get", "mget", "exists", "type", "strlen", "lcs", "getrange", "ttl", "pttl", "keys", "scan", "dbsize",
+            "hget", "hmget", "hgetall", "hlen", "hexists", "hkeys", "hvals", "hstrlen", "hrandfield", "lrange", "llen",
             "lindex", "lpos", "smembers", "sismember", "scard", "sinter", "sunion", "sdiff", "srandmember", "sscan",
             "zrange", "zrevrange", "zcard",
             "zscore", "zmscore", "zrank", "zrevrank", "zrangebyscore", "zrevrangebyscore", "zcount",
@@ -734,8 +734,8 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
         "write" => &[
             "set", "del", "mset", "msetnx", "append", "setrange", "setex", "getset", "unlink", "rename", "renamenx",
             "setnx", "getdel", "getex", "incr", "decr", "incrby", "decrby", "expire", "pexpire", "expireat", "pexpireat", "persist", "expiretime", "pexpiretime",
-            "hset", "hmset", "hdel", "hincrby", "hincrbyfloat", "lpush", "rpush", "lpop", "rpop", "blpop", "brpop", "lset",
-            "lrem", "ltrim", "linsert", "lmove", "blmove",
+            "hset", "hsetnx", "hmset", "hdel", "hgetdel", "hincrby", "hincrbyfloat", "lpush", "rpush", "lpop", "rpop", "blpop", "brpop", "lset",
+            "lrem", "ltrim", "linsert", "lmove", "blmove", "rpoplpush", "brpoplpush", "lmpop", "blmpop",
             "sadd", "srem", "sinterstore", "sunionstore", "sdiffstore", "smove", "spop",
             "zadd", "zrem", "zincrby", "zremrangebyrank", "zremrangebyscore", "zremrangebylex",
             "zunionstore", "zinterstore", "zdiffstore", "zpopmin", "zpopmax", "zmpop",
@@ -765,7 +765,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "type", "unlink", "ttl", "pttl", "dbsize", "flushdb", "flushall",
         ],
         "string" => &[
-            "get", "set", "mget", "mset", "msetnx", "append", "strlen", "getrange", "setrange",
+            "get", "set", "mget", "mset", "msetnx", "append", "strlen", "lcs", "getrange", "setrange",
             "setex", "setnx", "getset", "getdel",
             "getex", "incr", "decr", "incrby", "decrby",
         ],
@@ -774,15 +774,15 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
         ],
         "hyperloglog" => &["pfadd", "pfcount", "pfmerge"],
         "hash" => &[
-            "hset", "hmset", "hget", "hmget", "hdel", "hgetall", "hlen", "hexists", "hkeys", "hvals",
-            "hincrby", "hincrbyfloat", "hstrlen", "hscan",
+            "hset", "hsetnx", "hmset", "hget", "hmget", "hdel", "hgetdel", "hgetall", "hlen", "hexists", "hkeys", "hvals",
+            "hincrby", "hincrbyfloat", "hstrlen", "hrandfield", "hscan",
         ],
         "list" => &[
             "lpush", "rpush", "lpop", "rpop", "blpop", "brpop", "lrange", "llen", "lindex", "lset",
-            "lrem", "ltrim", "linsert", "lpos", "lmove", "blmove",
+            "lrem", "ltrim", "linsert", "lpos", "lmove", "blmove", "rpoplpush", "brpoplpush", "lmpop", "blmpop",
         ],
         "set" => &[
-            "sadd", "srem", "smembers", "sismember", "scard", "sinter", "sunion", "sdiff",
+            "sadd", "srem", "smembers", "sismember", "smismember", "scard", "sinter", "sintercard", "sunion", "sdiff",
             "sinterstore", "sunionstore", "sdiffstore", "smove", "spop", "srandmember", "sscan",
         ],
         "sortedset" => &[

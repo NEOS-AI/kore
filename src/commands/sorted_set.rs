@@ -339,42 +339,23 @@ impl CommandHandler {
 
     pub(super) fn handle_zrank(&self, args: &[RespValue]) -> Result<RespValue> {
         self.cache.stats.incr(&self.cache.stats.cmd_zrank);
-        
-        if args.len() != 2 {
-            return Ok(RespValue::error("ERR wrong number of arguments for 'zrank'"));
-        }
-
-        let key = match args[0].as_bulk_string() {
-            Some(k) => k,
-            None => return Ok(RespValue::error("ERR invalid key")),
-        };
-
-        if let Err(Error::WrongType) = self.ensure_zset_key(key) {
-            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
-        }
-
-        let member = match args[1].as_bulk_string() {
-            Some(m) => m,
-            None => return Ok(RespValue::error("ERR invalid member")),
-        };
-
-        let zset = match self.cache.get_sorted_set(key) {
-            Some(z) => z,
-            None => return Ok(RespValue::null()),
-        };
-
-        let set = zset.read();
-        match set.rank(member) {
-            Some(rank) => Ok(RespValue::Integer(rank as i64)),
-            None => Ok(RespValue::null()),
-        }
+        self.zrank_impl(args, false)
     }
 
     pub(super) fn handle_zrevrank(&self, args: &[RespValue]) -> Result<RespValue> {
         self.cache.stats.incr(&self.cache.stats.cmd_zrevrank);
-        
-        if args.len() != 2 {
-            return Ok(RespValue::error("ERR wrong number of arguments for 'zrevrank'"));
+        self.zrank_impl(args, true)
+    }
+
+    /// ZRANK / ZREVRANK key member [WITHSCORE]
+    /// WITHSCORE → array `[rank, score-bulk]` (Redis 7.2+); else integer rank / null.
+    fn zrank_impl(&self, args: &[RespValue], reverse: bool) -> Result<RespValue> {
+        let cmd = if reverse { "zrevrank" } else { "zrank" };
+        if args.len() < 2 || args.len() > 3 {
+            return Ok(RespValue::error(format!(
+                "ERR wrong number of arguments for '{}' command",
+                cmd
+            )));
         }
 
         let key = match args[0].as_bulk_string() {
@@ -391,14 +372,42 @@ impl CommandHandler {
             None => return Ok(RespValue::error("ERR invalid member")),
         };
 
+        let with_score = if args.len() == 3 {
+            let opt = match args[2].as_bulk_string() {
+                Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+                None => return Ok(RespValue::error("ERR syntax error")),
+            };
+            if opt != "WITHSCORE" {
+                return Ok(RespValue::error("ERR syntax error"));
+            }
+            true
+        } else {
+            false
+        };
+
         let zset = match self.cache.get_sorted_set(key) {
             Some(z) => z,
             None => return Ok(RespValue::null()),
         };
 
         let set = zset.read();
-        match set.rev_rank(member) {
-            Some(rank) => Ok(RespValue::Integer(rank as i64)),
+        let rank = if reverse {
+            set.rev_rank(member)
+        } else {
+            set.rank(member)
+        };
+        match rank {
+            Some(rank) => {
+                if with_score {
+                    let score = set.score(member).unwrap_or(0.0);
+                    Ok(RespValue::Array(vec![
+                        RespValue::Integer(rank as i64),
+                        RespValue::BulkString(Some(Bytes::from(format_score(score)))),
+                    ]))
+                } else {
+                    Ok(RespValue::Integer(rank as i64))
+                }
+            }
             None => Ok(RespValue::null()),
         }
     }

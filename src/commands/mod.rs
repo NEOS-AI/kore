@@ -470,6 +470,7 @@ impl CommandHandler {
             "SETNX" => self.handle_setnx(&args[1..]),
             "GETDEL" => self.handle_getdel(&args[1..]),
             "GETEX" => self.handle_getex(&args[1..]),
+            "LCS" => self.handle_lcs(&args[1..]),
 
             // Counter commands
             "INCR" => self.handle_incr(&args[1..]),
@@ -512,6 +513,8 @@ impl CommandHandler {
             "HEALTH" => self.handle_health(&args[1..]),
             "SWEEP" => self.handle_sweep(&args[1..]),
             "CONFIG" => self.handle_config(&args[1..]),
+            "MEMORY" => self.handle_memory(&args[1..]),
+            "OBJECT" => self.handle_object(&args[1..]),
 
             // Persistence
             "SAVE" => self.handle_save(&args[1..]),
@@ -578,6 +581,7 @@ impl CommandHandler {
             "HGET" => self.handle_hget(&args[1..]),
             "HMGET" => self.handle_hmget(&args[1..]),
             "HDEL" => self.handle_hdel(&args[1..]),
+            "HGETDEL" => self.handle_hgetdel(&args[1..]),
             "HGETALL" => self.handle_hgetall(&args[1..]),
             "HLEN" => self.handle_hlen(&args[1..]),
             "HEXISTS" => self.handle_hexists(&args[1..]),
@@ -1021,6 +1025,7 @@ fn is_write_command(cmd: &str) -> bool {
             | "SETNX"
             | "GETDEL"
             | "GETEX"
+            | "HGETDEL"
             | "APPEND"
             | "SETEX"
             | "GETSET"

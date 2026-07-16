@@ -148,6 +148,177 @@ impl CommandHandler {
         Ok(RespValue::ok())
     }
 
+    /// MEMORY USAGE key [SAMPLES count]
+    /// Returns estimated bytes for `key`, or null if missing. SAMPLES is accepted and ignored.
+    pub(super) fn handle_memory(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'memory' command",
+            ));
+        }
+        let sub = match args[0].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+            None => return Ok(RespValue::error("ERR syntax error")),
+        };
+        match sub.as_str() {
+            "USAGE" => self.handle_memory_usage(&args[1..]),
+            "HELP" => Ok(RespValue::Array(vec![
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"MEMORY <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"USAGE <key> [SAMPLES <count>] -- estimate memory use of a key",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"HELP -- print this help",
+                ))),
+            ])),
+            _ => Ok(RespValue::error(format!(
+                "ERR unknown subcommand '{}'. Try MEMORY HELP.",
+                sub
+            ))),
+        }
+    }
+
+    fn handle_memory_usage(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'memory|usage' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        // Optional SAMPLES count (Redis samples nested structures; we ignore).
+        let mut i = 1;
+        while i < args.len() {
+            let opt = match args[i].as_bulk_string() {
+                Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+                None => return Ok(RespValue::error("ERR syntax error")),
+            };
+            if opt != "SAMPLES" {
+                return Ok(RespValue::error("ERR syntax error"));
+            }
+            i += 1;
+            if i >= args.len() {
+                return Ok(RespValue::error("ERR syntax error"));
+            }
+            if self.parse_integer(&args[i]).is_err() {
+                return Ok(RespValue::error(
+                    "ERR value is not an integer or out of range",
+                ));
+            }
+            i += 1;
+        }
+
+        match self.key_memory_bytes(key) {
+            Some(n) => Ok(RespValue::Integer(n as i64)),
+            None => Ok(RespValue::null()),
+        }
+    }
+
+    /// Estimated accounted size of a key (same helpers as maxmemory tracking).
+    fn key_memory_bytes(&self, key: &Bytes) -> Option<usize> {
+        use crate::cache::KeyType;
+        use crate::entry::LoadOptions;
+        match self.cache.key_type(key) {
+            KeyType::None => None,
+            KeyType::String => {
+                let entry = self.cache.load(key, LoadOptions::default()).ok()??;
+                Some(entry.size())
+            }
+            KeyType::Hash => {
+                let h = self.cache.get_hash(key)?;
+                let content = h.read().memory_size();
+                Some(crate::memory::estimate_keyed_object(key.len(), content))
+            }
+            KeyType::List => {
+                let l = self.cache.get_list(key)?;
+                let content = l.read().memory_size();
+                Some(crate::memory::estimate_keyed_object(key.len(), content))
+            }
+            KeyType::Set => {
+                let s = self.cache.get_set(key)?;
+                let content = s.read().memory_size();
+                Some(crate::memory::estimate_keyed_object(key.len(), content))
+            }
+            KeyType::ZSet => {
+                let z = self.cache.get_sorted_set(key)?;
+                let content = z.read().memory_size();
+                Some(crate::memory::estimate_keyed_object(key.len(), content))
+            }
+            KeyType::Geo => {
+                let g = self.cache.get_geo_set(key)?;
+                let content = g.read().memory_usage();
+                Some(crate::memory::estimate_keyed_object(key.len(), content))
+            }
+            KeyType::Stream => {
+                let s = self.cache.get_stream(key)?;
+                let content = s.read().memory_size();
+                Some(crate::memory::estimate_keyed_object(key.len(), content))
+            }
+        }
+    }
+
+    /// OBJECT ENCODING key — report internal encoding name (Redis-compatible labels).
+    pub(super) fn handle_object(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'object' command",
+            ));
+        }
+        let sub = match args[0].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+            None => return Ok(RespValue::error("ERR syntax error")),
+        };
+        match sub.as_str() {
+            "ENCODING" => self.handle_object_encoding(&args[1..]),
+            "HELP" => Ok(RespValue::Array(vec![
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"OBJECT <subcommand> key. Subcommands are:",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"ENCODING <key> -- report the encoding used to store the key",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"HELP -- print this help",
+                ))),
+            ])),
+            _ => Ok(RespValue::error(format!(
+                "ERR unknown subcommand '{}'. Try OBJECT HELP.",
+                sub
+            ))),
+        }
+    }
+
+    fn handle_object_encoding(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 1 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'object|encoding' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        use crate::cache::KeyType;
+        let enc: Option<&'static str> = match self.cache.key_type(key) {
+            KeyType::None => None,
+            // Kore stores all strings as raw byte blobs (no int/embstr specializations).
+            KeyType::String => Some("raw"),
+            KeyType::Hash => Some("hashtable"),
+            KeyType::List => Some("quicklist"),
+            KeyType::Set => Some("hashtable"),
+            KeyType::ZSet | KeyType::Geo => Some("skiplist"),
+            KeyType::Stream => Some("stream"),
+        };
+        match enc {
+            Some(s) => Ok(RespValue::BulkString(Some(Bytes::from_static(s.as_bytes())))),
+            None => Ok(RespValue::null()),
+        }
+    }
+
     pub(super) fn handle_info(&self, _args: &[RespValue]) -> Result<RespValue> {
         let stats = &self.cache.stats;
         let total_cmds = stats.total_commands_processed();

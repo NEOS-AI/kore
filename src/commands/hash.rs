@@ -293,6 +293,60 @@ impl CommandHandler {
         Ok(RespValue::Integer(removed))
     }
 
+    /// HGETDEL key field [field ...] — get and delete fields atomically.
+    /// Reply: array of values (null bulk for missing fields), matching field order.
+    pub(super) fn handle_hgetdel(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() < 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'hgetdel' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_hash_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+        let fields: Vec<Bytes> = args[1..]
+            .iter()
+            .filter_map(|a| a.as_bulk_string().cloned())
+            .collect();
+        if fields.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'hgetdel' command",
+            ));
+        }
+
+        let hash = match self.cache.get_hash(key) {
+            Some(h) => h,
+            None => {
+                return Ok(RespValue::Array(
+                    fields.iter().map(|_| RespValue::null()).collect(),
+                ));
+            }
+        };
+        let mut h = hash.write();
+        let before = crate::memory::estimate_keyed_object(key.len(), h.memory_size());
+        let values = h.hgetdel(&fields);
+        let empty = h.is_empty();
+        let after = crate::memory::estimate_keyed_object(key.len(), h.memory_size());
+        drop(h);
+        let _ = self.cache.account_hash_delta(before, after);
+        if empty {
+            self.cache.remove_hash(key);
+        }
+        Ok(RespValue::Array(
+            values
+                .into_iter()
+                .map(|v| match v {
+                    Some(b) => RespValue::BulkString(Some(b)),
+                    None => RespValue::null(),
+                })
+                .collect(),
+        ))
+    }
+
     /// HGETALL key
     /// RESP2: flat array of field/value pairs. RESP3: map.
     pub(super) fn handle_hgetall(&self, args: &[RespValue]) -> Result<RespValue> {

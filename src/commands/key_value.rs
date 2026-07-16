@@ -546,6 +546,70 @@ impl CommandHandler {
         Ok(RespValue::Integer(1))
     }
 
+    /// LCS key1 key2 [LEN]
+    /// Longest common subsequence of two string keys (missing key = empty string).
+    /// Without options: bulk LCS string. With `LEN`: integer length.
+    pub(super) fn handle_lcs(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() < 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'lcs' command",
+            ));
+        }
+        let key1 = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        let key2 = match args[1].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+
+        let mut len_only = false;
+        let mut i = 2;
+        while i < args.len() {
+            let opt = match args[i].as_bulk_string() {
+                Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+                None => return Ok(RespValue::error("ERR syntax error")),
+            };
+            match opt.as_str() {
+                "LEN" => {
+                    len_only = true;
+                    i += 1;
+                }
+                // IDX / MINMATCHLEN / WITHMATCHLEN not implemented in this batch.
+                "IDX" | "MINMATCHLEN" | "WITHMATCHLEN" => {
+                    return Ok(RespValue::error(
+                        "ERR LCS IDX/MINMATCHLEN/WITHMATCHLEN not supported",
+                    ));
+                }
+                _ => return Ok(RespValue::error("ERR syntax error")),
+            }
+        }
+
+        for key in [key1, key2] {
+            match self.cache.key_type(key) {
+                KeyType::None | KeyType::String => {}
+                _ => return Ok(RespValue::error(Error::WrongType.to_resp_string())),
+            }
+        }
+
+        let a = match self.cache.load(key1, LoadOptions::default())? {
+            Some(e) => e.value.clone(),
+            None => Bytes::new(),
+        };
+        let b = match self.cache.load(key2, LoadOptions::default())? {
+            Some(e) => e.value.clone(),
+            None => Bytes::new(),
+        };
+
+        let lcs = compute_lcs(a.as_ref(), b.as_ref());
+        if len_only {
+            Ok(RespValue::Integer(lcs.len() as i64))
+        } else {
+            Ok(RespValue::BulkString(Some(Bytes::from(lcs))))
+        }
+    }
+
     /// STRLEN key — length of string value (0 if missing).
     pub(super) fn handle_strlen(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.len() != 1 {
@@ -843,4 +907,41 @@ fn substr_range(value: &Bytes, start: isize, end: isize) -> Bytes {
     }
     let end_idx = end_idx.min(len - 1);
     value.slice(start_idx as usize..=end_idx as usize)
+}
+
+/// Classic DP longest common subsequence (bytes). O(mn) time/space.
+fn compute_lcs(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let m = a.len();
+    let n = b.len();
+    if m == 0 || n == 0 {
+        return Vec::new();
+    }
+    // dp[i][j] = LCS length of a[..i], b[..j]
+    let mut dp = vec![vec![0u32; n + 1]; m + 1];
+    for i in 1..=m {
+        for j in 1..=n {
+            if a[i - 1] == b[j - 1] {
+                dp[i][j] = dp[i - 1][j - 1] + 1;
+            } else {
+                dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
+            }
+        }
+    }
+    // Backtrack to reconstruct one LCS
+    let mut out = Vec::with_capacity(dp[m][n] as usize);
+    let mut i = m;
+    let mut j = n;
+    while i > 0 && j > 0 {
+        if a[i - 1] == b[j - 1] {
+            out.push(a[i - 1]);
+            i -= 1;
+            j -= 1;
+        } else if dp[i - 1][j] >= dp[i][j - 1] {
+            i -= 1;
+        } else {
+            j -= 1;
+        }
+    }
+    out.reverse();
+    out
 }

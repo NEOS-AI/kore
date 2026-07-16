@@ -157,6 +157,7 @@ Also tracked in `docs/roadmap.md`.
   - *Batch AO*: `HINCRBYFLOAT` (bulk float reply), `HSTRLEN`, `HMSET` (OK alias of HSET)
   - *Batch AV*: `HRANDFIELD` (count / WITHVALUES)
   - *Batch AW*: `HSETNX`
+  - *Batch AX*: `HGETDEL` (get-and-delete fields; array reply)
 - [x] **`[P0]`** **Lists** (`LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, …)
   - *Done*: LPUSH/RPUSH/LPOP/RPOP/LRANGE/LLEN/LINDEX/LSET; **BLPOP/BRPOP** (blocking via `ListBlockers` + `Notify`; timeout 0 = forever; multi-key left-to-right; null array on timeout)
   - *Batch AK*: `LREM` (count signed), `LTRIM`, `LINSERT` BEFORE|AFTER; empty list key deleted
@@ -181,6 +182,7 @@ Also tracked in `docs/roadmap.md`.
   - *Done*: atomic APPEND; UNLINK = sync DEL; RENAME/RENAMENX across all key types
   - *Batch AG*: `MOVE` (cross-DB), `COPY` (`DB` / `REPLACE`), `RANDOMKEY`, `TOUCH` — multi-type dump/restore; TTL preserved
   - *Batch AL*: `GETRANGE` / `SETRANGE` (zero-pad) / `MSETNX`
+  - *Batch AX*: `LCS` (+ `LEN`; IDX not yet); `MEMORY USAGE`; `OBJECT ENCODING`
 - [x] **`[P1]`** `CLIENT`, `COMMAND`, `HELLO`
   - *Done*: HELLO (RESP2 + RESP3; AUTH/SETNAME); CLIENT ID/SETNAME/GETNAME/SETINFO/LIST/INFO; COMMAND / COUNT / LIST / INFO catalog
 - [x] **`[P1]`** Multi-DB: `SELECT` (or explicitly document single-DB only)
@@ -206,6 +208,7 @@ Also tracked in `docs/roadmap.md`.
   - *Done*: `ShardedKeyMap<V>` (parking_lot per-shard locks, ahash); zset + geo use same `num_shards` as string map
 - [x] **`[P1]`** O(log n) rank (`ZRANK` / `ZREVRANK`) — skiplist or ranked tree instead of BTreeMap scan
   - *Done*: Redis-style span skiplist (`sorted_set.rs`); `rank`/`rev_rank`/`get_by_rank` O(log n); member HashMap for O(1) score
+  - *Batch AX*: `ZRANK` / `ZREVRANK` `WITHSCORE` → `[rank, score-bulk]`
   - *Batch AI*: `ZINCRBY`, `ZRANGEBYSCORE` / `ZREVRANGEBYSCORE` (`WITHSCORES`, `LIMIT`, exclusive `(` bounds, `±inf`), `ZCOUNT`, `ZREMRANGEBYRANK`, `ZREMRANGEBYSCORE`
   - *Batch AM*: `ZUNIONSTORE` / `ZINTERSTORE` (`numkeys`, `WEIGHTS`, `AGGREGATE` SUM|MIN|MAX); dest overwrite any type; missing source = empty; return cardinality
   - *Batch AP*: `ZPOPMIN` / `ZPOPMAX` (optional count); `BZPOPMIN` / `BZPOPMAX` (multi-key, timeout 0 = forever; null array on timeout; woken by ZADD/ZINCRBY/*STORE)

@@ -12,13 +12,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Blocking / multi / admin / nested-script commands are excluded.
 const SCRIPT_CALL_ALLOWLIST: &[&str] = &[
     "PING", "ECHO", //
-    "GET", "SET", "DEL", "EXISTS", "TYPE", "MGET", "MSET", "MSETNX", "APPEND", "STRLEN",
+    "GET", "SET", "DEL", "EXISTS", "TYPE", "MGET", "MSET", "MSETNX", "APPEND", "STRLEN", "LCS",
     "GETRANGE", "SETRANGE", "SETEX",
     "GETSET", "UNLINK", "RENAME", "RENAMENX", "SETNX", "GETDEL", "GETEX", //
     "INCR", "DECR", "INCRBY", "DECRBY", //
     "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST", "TTL", "PTTL", "EXPIRETIME", "PEXPIRETIME", //
-    "HSET", "HSETNX", "HMSET", "HGET", "HMGET", "HDEL", "HGETALL", "HLEN", "HEXISTS", "HKEYS", "HVALS", //
+    "HSET", "HSETNX", "HMSET", "HGET", "HMGET", "HDEL", "HGETDEL", "HGETALL", "HLEN", "HEXISTS", "HKEYS", "HVALS", //
     "HINCRBY", "HINCRBYFLOAT", "HSTRLEN", "HRANDFIELD", "HSCAN", //
+    "OBJECT", "MEMORY", //
     "LPUSH", "RPUSH", "LPOP", "RPOP", "LRANGE", "LLEN", "LINDEX", "LSET", "LREM", "LTRIM", "LINSERT", //
     "LPOS", "LMOVE", "RPOPLPUSH", "LMPOP", //
     "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SMISMEMBER", "SCARD", "SINTER", "SINTERCARD", "SUNION", "SDIFF", //
@@ -356,6 +357,9 @@ impl CommandHandler {
             "SETNX" => self.handle_setnx(args),
             "GETDEL" => self.handle_getdel(args),
             "GETEX" => self.handle_getex(args),
+            "LCS" => self.handle_lcs(args),
+            "OBJECT" => self.handle_object(args),
+            "MEMORY" => self.handle_memory(args),
             "INCR" => self.handle_incr(args),
             "DECR" => self.handle_decr(args),
             "INCRBY" => self.handle_incrby(args),
@@ -375,6 +379,7 @@ impl CommandHandler {
             "HGET" => self.handle_hget(args),
             "HMGET" => self.handle_hmget(args),
             "HDEL" => self.handle_hdel(args),
+            "HGETDEL" => self.handle_hgetdel(args),
             "HGETALL" => self.handle_hgetall(args),
             "HLEN" => self.handle_hlen(args),
             "HEXISTS" => self.handle_hexists(args),
