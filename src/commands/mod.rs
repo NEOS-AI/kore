@@ -489,6 +489,7 @@ impl CommandHandler {
             "BITPOS" => self.handle_bitpos(&args[1..]),
             "BITOP" => self.handle_bitop(&args[1..]),
             "BITFIELD" => self.handle_bitfield(&args[1..]),
+            "BITFIELD_RO" => self.handle_bitfield_ro(&args[1..]),
 
             // HyperLogLog
             "PFADD" => self.handle_pfadd(&args[1..]),
@@ -508,6 +509,7 @@ impl CommandHandler {
 
             // Admin commands
             "SELECT" => self.handle_select(&args[1..]),
+            "SWAPDB" => self.handle_swapdb(&args[1..]),
             "DBSIZE" => self.handle_dbsize(&args[1..]),
             "KEYS" => self.handle_keys(&args[1..]),
             "SCAN" => self.handle_scan(&args[1..]),
@@ -578,7 +580,9 @@ impl CommandHandler {
             "GEOPOS" => self.handle_geopos(&args[1..]),
             "GEOHASH" => self.handle_geohash(&args[1..]),
             "GEORADIUS" => self.handle_georadius(&args[1..]),
+            "GEORADIUS_RO" => self.handle_georadius_ro(&args[1..]),
             "GEORADIUSBYMEMBER" => self.handle_georadiusbymember(&args[1..]),
+            "GEORADIUSBYMEMBER_RO" => self.handle_georadiusbymember_ro(&args[1..]),
 
             // Hash commands
             "HSET" => self.handle_hset(&args[1..]),
@@ -1077,6 +1081,7 @@ fn is_write_command(cmd: &str) -> bool {
             | "GEOSEARCHSTORE"
             | "GEORADIUS"
             | "GEORADIUSBYMEMBER"
+            | "SWAPDB"
             | "HSET"
             | "HSETNX"
             | "HMSET"

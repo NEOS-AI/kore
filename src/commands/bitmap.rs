@@ -201,10 +201,20 @@ impl CommandHandler {
     }
 
     pub(super) fn handle_bitfield(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.bitfield_impl(args, false, "bitfield")
+    }
+
+    /// BITFIELD_RO — read-only BITFIELD (GET only; SET/INCRBY rejected).
+    pub(super) fn handle_bitfield_ro(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.bitfield_impl(args, true, "bitfield_ro")
+    }
+
+    fn bitfield_impl(&self, args: &[RespValue], readonly: bool, cmd: &str) -> Result<RespValue> {
         if args.is_empty() {
-            return Ok(RespValue::error(
-                "ERR wrong number of arguments for 'bitfield'",
-            ));
+            return Ok(RespValue::error(format!(
+                "ERR wrong number of arguments for '{}' command",
+                cmd
+            )));
         }
         let key = match args[0].as_bulk_string() {
             Some(k) => k.clone(),
@@ -264,7 +274,12 @@ impl CommandHandler {
                     });
                     i += 3;
                 }
-                "SET" => {
+                "SET" | "INCRBY" => {
+                    if readonly {
+                        return Ok(RespValue::error(
+                            "ERR BITFIELD_RO only supports the GET subcommand",
+                        ));
+                    }
                     if i + 3 >= args.len() {
                         return Ok(RespValue::error("ERR syntax error"));
                     }
@@ -284,40 +299,21 @@ impl CommandHandler {
                             ))
                         }
                     };
-                    segment.push(BitfieldOp::Set {
-                        signed,
-                        bits,
-                        offset,
-                        value,
-                    });
-                    i += 4;
-                }
-                "INCRBY" => {
-                    if i + 3 >= args.len() {
-                        return Ok(RespValue::error("ERR syntax error"));
+                    if tok == "SET" {
+                        segment.push(BitfieldOp::Set {
+                            signed,
+                            bits,
+                            offset,
+                            value,
+                        });
+                    } else {
+                        segment.push(BitfieldOp::IncrBy {
+                            signed,
+                            bits,
+                            offset,
+                            increment: value,
+                        });
                     }
-                    let (signed, bits) = match parse_bf_type(&args[i + 1]) {
-                        Ok(t) => t,
-                        Err(e) => return Ok(RespValue::error(e)),
-                    };
-                    let offset = match parse_bf_offset(&args[i + 2], bits) {
-                        Ok(o) => o,
-                        Err(e) => return Ok(RespValue::error(e)),
-                    };
-                    let increment = match self.parse_integer(&args[i + 3]) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            return Ok(RespValue::error(
-                                "ERR value is not an integer or out of range",
-                            ))
-                        }
-                    };
-                    segment.push(BitfieldOp::IncrBy {
-                        signed,
-                        bits,
-                        offset,
-                        increment,
-                    });
                     i += 4;
                 }
                 _ => return Ok(RespValue::error("ERR syntax error")),

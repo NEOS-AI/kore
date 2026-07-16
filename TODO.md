@@ -176,6 +176,7 @@ Also tracked in `docs/roadmap.md`.
   - *Batch AU*: `XINFO STREAM|GROUPS|CONSUMERS`; `XGROUP CREATECONSUMER` / `DELCONSUMER`
 - [x] **`[P2]`** Bitmaps / bitfields, HyperLogLog
   - *Done (MVP)*: `SETBIT`/`GETBIT`/`BITCOUNT`/`BITPOS`/`BITOP` (AND/OR/XOR/NOT)/`BITFIELD` (GET/SET/INCRBY + OVERFLOW WRAP|SAT|FAIL); `PFADD`/`PFCOUNT`/`PFMERGE` dense HLL (p=14, Kore `KHLL` format). String-key backed; ACL `@bitmap`/`@hyperloglog`.
+  - *Batch AZ*: `BITFIELD_RO` (GET only)
 
 ### Command coverage
 
@@ -183,12 +184,14 @@ Also tracked in `docs/roadmap.md`.
   - *Done*: atomic APPEND; UNLINK = sync DEL; RENAME/RENAMENX across all key types
   - *Batch AG*: `MOVE` (cross-DB), `COPY` (`DB` / `REPLACE`), `RANDOMKEY`, `TOUCH` — multi-type dump/restore; TTL preserved
   - *Batch AL*: `GETRANGE` / `SETRANGE` (zero-pad) / `MSETNX`
-  - *Batch AX*: `LCS` (+ `LEN`; IDX not yet); `MEMORY USAGE`; `OBJECT ENCODING`
+  - *Batch AX*: `LCS` (+ `LEN`); `MEMORY USAGE`; `OBJECT ENCODING`
   - *Batch AY*: `PSETEX`; `INCRBYFLOAT`; `SUBSTR` (GETRANGE alias); `TIME`; `ZRANGESTORE` (BYSCORE/BYLEX/REV/LIMIT)
+  - *Batch AZ*: `LCS` `IDX` / `MINMATCHLEN` / `WITHMATCHLEN`; `OBJECT IDLETIME|REFCOUNT|FREQ`; `BITFIELD_RO`; `GEORADIUS_RO` / `GEORADIUSBYMEMBER_RO`; `SWAPDB`
 - [x] **`[P1]`** `CLIENT`, `COMMAND`, `HELLO`
   - *Done*: HELLO (RESP2 + RESP3; AUTH/SETNAME); CLIENT ID/SETNAME/GETNAME/SETINFO/LIST/INFO; COMMAND / COUNT / LIST / INFO catalog
 - [x] **`[P1]`** Multi-DB: `SELECT` (or explicitly document single-DB only)
   - *Done*: `--databases` (default 16); per-connection `SELECT`; key isolation; `FLUSHDB` vs `FLUSHALL`; shared pub/sub+stats; **RDB v3 multi-DB + AOF SELECT** on save/rewrite/load/startup
+  - *Batch AZ*: `SWAPDB` (content swap all types + TTL via dump/restore)
 - [x] **`[P2]`** Lua scripting / functions
   - *Done (MVP)*: `EVAL` / `EVALSHA` / `SCRIPT LOAD|EXISTS|FLUSH|KILL` via mlua Lua 5.4 (vendored); shared `ScriptCache`; `redis.call` / `redis.pcall` whitelist for core string/hash/list/set/zset/bitmap/HLL ops; KEYS/ARGV; RESP↔Lua mapping (nil bulk→false, status→`{ok=…}`); ACL `@scripting`; cluster key extract from numkeys. Not yet: FUNCTIONS library, `redis.setresp`, full movablekeys COMMAND, nested scripts, script time limits.
 
@@ -219,6 +222,7 @@ Also tracked in `docs/roadmap.md`.
   - *Batch AS*: `ZINTERCARD` (`LIMIT`); `ZMPOP` / `BZMPOP` (`MIN|MAX`, `COUNT`; multi-key left-to-right; nested `[key, [[m,s]…]]` reply)
   - *Batch AY*: `ZRANGESTORE` destination source min max [BYSCORE|BYLEX] [REV] [LIMIT offset count]
   - *Batch AV geo polish*: `GEOSEARCH` `WITHHASH`; `GEORADIUS`/`GEORADIUSBYMEMBER` `STORE`/`STOREDIST`; `GEOSEARCHSTORE` dest overwrite + memory accounting; geo commands in `COMMAND` catalog
+  - *Batch AZ*: `GEORADIUS_RO` / `GEORADIUSBYMEMBER_RO` (reject STORE/STOREDIST)
 
 ---
 

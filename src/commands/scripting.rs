@@ -30,9 +30,10 @@ const SCRIPT_CALL_ALLOWLIST: &[&str] = &[
     "ZRANGEBYLEX", "ZREVRANGEBYLEX", "ZLEXCOUNT", "ZREMRANGEBYLEX", "ZRANDMEMBER", //
     "ZUNION", "ZINTER", "ZDIFF", "ZINTERCARD", "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE", //
     "ZPOPMIN", "ZPOPMAX", "ZMPOP", //
-    "SETBIT", "GETBIT", "BITCOUNT", "BITPOS", "BITOP", //
+    "SETBIT", "GETBIT", "BITCOUNT", "BITPOS", "BITOP", "BITFIELD", "BITFIELD_RO", //
     "PFADD", "PFCOUNT", "PFMERGE", //
-    "DBSIZE", "KEYS", //
+    "DBSIZE", "KEYS", "SWAPDB", //
+    "GEORADIUS_RO", "GEORADIUSBYMEMBER_RO", //
 ];
 
 impl CommandHandler {
@@ -466,6 +467,11 @@ impl CommandHandler {
             "BITCOUNT" => self.handle_bitcount(args),
             "BITPOS" => self.handle_bitpos(args),
             "BITOP" => self.handle_bitop(args),
+            "BITFIELD" => self.handle_bitfield(args),
+            "BITFIELD_RO" => self.handle_bitfield_ro(args),
+            "GEORADIUS_RO" => self.handle_georadius_ro(args),
+            "GEORADIUSBYMEMBER_RO" => self.handle_georadiusbymember_ro(args),
+            "SWAPDB" => self.handle_swapdb(args),
             "PFADD" => self.handle_pfadd(args),
             "PFCOUNT" => self.handle_pfcount(args),
             "PFMERGE" => self.handle_pfmerge(args),

@@ -546,9 +546,8 @@ impl CommandHandler {
         Ok(RespValue::Integer(1))
     }
 
-    /// LCS key1 key2 [LEN]
+    /// LCS key1 key2 [LEN] [IDX] [MINMATCHLEN len] [WITHMATCHLEN]
     /// Longest common subsequence of two string keys (missing key = empty string).
-    /// Without options: bulk LCS string. With `LEN`: integer length.
     pub(super) fn handle_lcs(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.len() < 2 {
             return Ok(RespValue::error(
@@ -565,6 +564,9 @@ impl CommandHandler {
         };
 
         let mut len_only = false;
+        let mut with_idx = false;
+        let mut with_match_len = false;
+        let mut min_match_len: usize = 0;
         let mut i = 2;
         while i < args.len() {
             let opt = match args[i].as_bulk_string() {
@@ -576,14 +578,35 @@ impl CommandHandler {
                     len_only = true;
                     i += 1;
                 }
-                // IDX / MINMATCHLEN / WITHMATCHLEN not implemented in this batch.
-                "IDX" | "MINMATCHLEN" | "WITHMATCHLEN" => {
-                    return Ok(RespValue::error(
-                        "ERR LCS IDX/MINMATCHLEN/WITHMATCHLEN not supported",
-                    ));
+                "IDX" => {
+                    with_idx = true;
+                    i += 1;
+                }
+                "WITHMATCHLEN" => {
+                    with_match_len = true;
+                    i += 1;
+                }
+                "MINMATCHLEN" => {
+                    if i + 1 >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    min_match_len = match self.parse_integer(&args[i + 1]) {
+                        Ok(n) if n >= 0 => n as usize,
+                        _ => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ));
+                        }
+                    };
+                    i += 2;
                 }
                 _ => return Ok(RespValue::error("ERR syntax error")),
             }
+        }
+        if len_only && with_idx {
+            return Ok(RespValue::error(
+                "ERR If you want both the length and indexes, please just use IDX.",
+            ));
         }
 
         for key in [key1, key2] {
@@ -602,12 +625,39 @@ impl CommandHandler {
             None => Bytes::new(),
         };
 
-        let lcs = compute_lcs(a.as_ref(), b.as_ref());
+        let result = compute_lcs_detail(a.as_ref(), b.as_ref());
         if len_only {
-            Ok(RespValue::Integer(lcs.len() as i64))
-        } else {
-            Ok(RespValue::BulkString(Some(Bytes::from(lcs))))
+            return Ok(RespValue::Integer(result.lcs.len() as i64));
         }
+        if with_idx {
+            let mut matches_arr = Vec::new();
+            for m in result.matches {
+                if m.len < min_match_len {
+                    continue;
+                }
+                let mut pair = vec![
+                    RespValue::Array(vec![
+                        RespValue::Integer(m.a_start as i64),
+                        RespValue::Integer(m.a_end as i64),
+                    ]),
+                    RespValue::Array(vec![
+                        RespValue::Integer(m.b_start as i64),
+                        RespValue::Integer(m.b_end as i64),
+                    ]),
+                ];
+                if with_match_len {
+                    pair.push(RespValue::Integer(m.len as i64));
+                }
+                matches_arr.push(RespValue::Array(pair));
+            }
+            return Ok(RespValue::Array(vec![
+                RespValue::BulkString(Some(Bytes::from_static(b"matches"))),
+                RespValue::Array(matches_arr),
+                RespValue::BulkString(Some(Bytes::from_static(b"len"))),
+                RespValue::Integer(result.lcs.len() as i64),
+            ]));
+        }
+        Ok(RespValue::BulkString(Some(Bytes::from(result.lcs))))
     }
 
     /// STRLEN key — length of string value (0 if missing).
@@ -941,14 +991,30 @@ fn substr_range(value: &Bytes, start: isize, end: isize) -> Bytes {
     value.slice(start_idx as usize..=end_idx as usize)
 }
 
-/// Classic DP longest common subsequence (bytes). O(mn) time/space.
-fn compute_lcs(a: &[u8], b: &[u8]) -> Vec<u8> {
+/// One contiguous matching range of the LCS (inclusive indices).
+struct LcsMatch {
+    a_start: usize,
+    a_end: usize,
+    b_start: usize,
+    b_end: usize,
+    len: usize,
+}
+
+struct LcsDetail {
+    lcs: Vec<u8>,
+    matches: Vec<LcsMatch>,
+}
+
+/// Classic DP LCS with match ranges for IDX. O(mn) time/space.
+fn compute_lcs_detail(a: &[u8], b: &[u8]) -> LcsDetail {
     let m = a.len();
     let n = b.len();
     if m == 0 || n == 0 {
-        return Vec::new();
+        return LcsDetail {
+            lcs: Vec::new(),
+            matches: Vec::new(),
+        };
     }
-    // dp[i][j] = LCS length of a[..i], b[..j]
     let mut dp = vec![vec![0u32; n + 1]; m + 1];
     for i in 1..=m {
         for j in 1..=n {
@@ -959,12 +1025,14 @@ fn compute_lcs(a: &[u8], b: &[u8]) -> Vec<u8> {
             }
         }
     }
-    // Backtrack to reconstruct one LCS
+    // Backtrack: collect matched (i,j) index pairs in reverse order.
+    let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(dp[m][n] as usize);
     let mut out = Vec::with_capacity(dp[m][n] as usize);
     let mut i = m;
     let mut j = n;
     while i > 0 && j > 0 {
         if a[i - 1] == b[j - 1] {
+            pairs.push((i - 1, j - 1));
             out.push(a[i - 1]);
             i -= 1;
             j -= 1;
@@ -975,5 +1043,40 @@ fn compute_lcs(a: &[u8], b: &[u8]) -> Vec<u8> {
         }
     }
     out.reverse();
-    out
+    pairs.reverse();
+
+    // Compress consecutive index pairs into inclusive ranges (Redis LCS matches).
+    let mut matches = Vec::new();
+    if !pairs.is_empty() {
+        let (mut a0, mut b0) = pairs[0];
+        let mut a1 = a0;
+        let mut b1 = b0;
+        for &(ai, bi) in pairs.iter().skip(1) {
+            if ai == a1 + 1 && bi == b1 + 1 {
+                a1 = ai;
+                b1 = bi;
+            } else {
+                matches.push(LcsMatch {
+                    a_start: a0,
+                    a_end: a1,
+                    b_start: b0,
+                    b_end: b1,
+                    len: a1 - a0 + 1,
+                });
+                a0 = ai;
+                b0 = bi;
+                a1 = ai;
+                b1 = bi;
+            }
+        }
+        matches.push(LcsMatch {
+            a_start: a0,
+            a_end: a1,
+            b_start: b0,
+            b_end: b1,
+            len: a1 - a0 + 1,
+        });
+    }
+
+    LcsDetail { lcs: out, matches }
 }

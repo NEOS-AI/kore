@@ -728,8 +728,8 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "zunion", "zinter", "zdiff", "zintercard",
             "hscan",
             "xlen", "xrange", "xrevrange", "xread", "xpending", "xinfo",
-            "geopos", "geodist", "geohash", "geosearch", "info", "role", "lastsave", "object",
-            "memory", "dump", "strlen", "getbit", "bitcount", "bitpos", "pfcount", "time",
+            "geopos", "geodist", "geohash", "geosearch", "georadius_ro", "georadiusbymember_ro", "info", "role", "lastsave", "object",
+            "memory", "dump", "strlen", "getbit", "bitcount", "bitpos", "bitfield_ro", "pfcount", "time",
         ],
         "write" => &[
             "set", "del", "mset", "msetnx", "append", "setrange", "setex", "psetex", "getset", "unlink", "rename", "renamenx",
@@ -741,7 +741,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "zunionstore", "zinterstore", "zdiffstore", "zrangestore", "zpopmin", "zpopmax", "zmpop",
             "bzpopmin", "bzpopmax", "bzmpop",
             "xadd", "xdel", "xtrim", "xgroup", "xack", "xreadgroup", "xclaim", "xautoclaim", "xsetid",
-            "geoadd", "geosearchstore", "georadius", "georadiusbymember", "flushdb", "flushall",
+            "geoadd", "geosearchstore", "georadius", "georadiusbymember", "flushdb", "flushall", "swapdb",
             "setbit", "bitop", "bitfield", "pfadd", "pfmerge",
         ],
         "admin" => &[
@@ -762,7 +762,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
         ],
         "keyspace" => &[
             "del", "exists", "expire", "pexpire", "expireat", "pexpireat", "persist", "expiretime", "pexpiretime", "keys", "scan", "move", "copy", "randomkey", "touch", "rename", "renamenx",
-            "type", "unlink", "ttl", "pttl", "dbsize", "flushdb", "flushall",
+            "type", "unlink", "ttl", "pttl", "dbsize", "flushdb", "flushall", "swapdb", "select",
         ],
         "string" => &[
             "get", "set", "mget", "mset", "msetnx", "append", "strlen", "lcs", "getrange", "substr", "setrange",
@@ -770,7 +770,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "getex", "incr", "decr", "incrby", "decrby", "incrbyfloat",
         ],
         "bitmap" => &[
-            "setbit", "getbit", "bitcount", "bitpos", "bitop", "bitfield",
+            "setbit", "getbit", "bitcount", "bitpos", "bitop", "bitfield", "bitfield_ro",
         ],
         "hyperloglog" => &["pfadd", "pfcount", "pfmerge"],
         "hash" => &[
@@ -799,7 +799,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
         ],
         "geo" => &[
             "geoadd", "geosearch", "geosearchstore", "geodist", "geopos", "geohash", "georadius",
-            "georadiusbymember",
+            "georadius_ro", "georadiusbymember", "georadiusbymember_ro",
         ],
         "transaction" => &["multi", "exec", "discard", "watch", "unwatch"],
         "scripting" => &["eval", "evalsha", "script"],

@@ -653,6 +653,27 @@ impl CommandHandler {
             &args[4],
             &args[5..],
             "georadius",
+            true,
+        )
+    }
+
+    /// GEORADIUS_RO — read-only GEORADIUS (STORE/STOREDIST rejected).
+    pub(super) fn handle_georadius_ro(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() < 5 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'georadius_ro' command",
+            ));
+        }
+        self.handle_georadius_impl(
+            &args[0],
+            true,
+            &args[1],
+            &args[2],
+            &args[3],
+            &args[4],
+            &args[5..],
+            "georadius_ro",
+            false,
         )
     }
 
@@ -677,6 +698,28 @@ impl CommandHandler {
             &args[3],
             &args[4..],
             "georadiusbymember",
+            true,
+        )
+    }
+
+    /// GEORADIUSBYMEMBER_RO — read-only variant (no STORE/STOREDIST).
+    pub(super) fn handle_georadiusbymember_ro(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() < 4 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'georadiusbymember_ro' command",
+            ));
+        }
+        let dummy = RespValue::BulkString(Some(Bytes::from_static(b"0")));
+        self.handle_georadius_impl(
+            &args[0],
+            false,
+            &args[1],
+            &dummy,
+            &args[2],
+            &args[3],
+            &args[4..],
+            "georadiusbymember_ro",
+            false,
         )
     }
 
@@ -692,6 +735,7 @@ impl CommandHandler {
         unit: &RespValue,
         opts: &[RespValue],
         _name: &str,
+        allow_store: bool,
     ) -> Result<RespValue> {
         // Split STORE / STOREDIST from read-options.
         let mut store_key: Option<Bytes> = None;
@@ -709,6 +753,11 @@ impl CommandHandler {
             };
             match opt.as_str() {
                 "STORE" => {
+                    if !allow_store {
+                        return Ok(RespValue::error(
+                            "ERR syntax error, STORE option is not valid for this command",
+                        ));
+                    }
                     if i + 1 >= opts.len() {
                         return Ok(RespValue::error("ERR syntax error"));
                     }
@@ -719,6 +768,11 @@ impl CommandHandler {
                     i += 2;
                 }
                 "STOREDIST" => {
+                    if !allow_store {
+                        return Ok(RespValue::error(
+                            "ERR syntax error, STOREDIST option is not valid for this command",
+                        ));
+                    }
                     if i + 1 >= opts.len() {
                         return Ok(RespValue::error("ERR syntax error"));
                     }

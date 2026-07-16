@@ -274,12 +274,24 @@ impl CommandHandler {
         };
         match sub.as_str() {
             "ENCODING" => self.handle_object_encoding(&args[1..]),
+            "IDLETIME" => self.handle_object_idletime(&args[1..]),
+            "REFCOUNT" => self.handle_object_refcount(&args[1..]),
+            "FREQ" => self.handle_object_freq(&args[1..]),
             "HELP" => Ok(RespValue::Array(vec![
                 RespValue::BulkString(Some(Bytes::from_static(
                     b"OBJECT <subcommand> key. Subcommands are:",
                 ))),
                 RespValue::BulkString(Some(Bytes::from_static(
                     b"ENCODING <key> -- report the encoding used to store the key",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"IDLETIME <key> -- idle time in seconds (string keys)",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"REFCOUNT <key> -- approximate object refcount (1 when present)",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"FREQ <key> -- logarithmic LFU counter (string keys)",
                 ))),
                 RespValue::BulkString(Some(Bytes::from_static(
                     b"HELP -- print this help",
@@ -316,6 +328,131 @@ impl CommandHandler {
         match enc {
             Some(s) => Ok(RespValue::BulkString(Some(Bytes::from_static(s.as_bytes())))),
             None => Ok(RespValue::null()),
+        }
+    }
+
+    /// OBJECT IDLETIME key — seconds since last access (string keys; typed → 0).
+    fn handle_object_idletime(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 1 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'object|idletime' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        use crate::cache::KeyType;
+        use crate::entry::LoadOptions;
+        use std::time::Instant;
+        match self.cache.key_type(key) {
+            KeyType::None => Ok(RespValue::null()),
+            KeyType::String => {
+                let entry = match self.cache.load(
+                    key,
+                    LoadOptions {
+                        touch: false,
+                        with_cas: false,
+                    },
+                )? {
+                    Some(e) => e,
+                    None => return Ok(RespValue::null()),
+                };
+                let idle = Instant::now()
+                    .saturating_duration_since(entry.last_access_time())
+                    .as_secs() as i64;
+                Ok(RespValue::Integer(idle))
+            }
+            // Typed keys do not track LRU idle yet — report 0 (recently used).
+            _ => Ok(RespValue::Integer(0)),
+        }
+    }
+
+    /// OBJECT REFCOUNT key — Redis returns allocator refcount; we report 1 if present.
+    fn handle_object_refcount(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 1 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'object|refcount' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        use crate::cache::KeyType;
+        if matches!(self.cache.key_type(key), KeyType::None) {
+            Ok(RespValue::null())
+        } else {
+            Ok(RespValue::Integer(1))
+        }
+    }
+
+    /// OBJECT FREQ key — logarithmic LFU counter for string keys (0 for typed).
+    fn handle_object_freq(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 1 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'object|freq' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        use crate::cache::KeyType;
+        use crate::entry::LoadOptions;
+        match self.cache.key_type(key) {
+            KeyType::None => Ok(RespValue::null()),
+            KeyType::String => {
+                let entry = match self.cache.load(
+                    key,
+                    LoadOptions {
+                        touch: false,
+                        with_cas: false,
+                    },
+                )? {
+                    Some(e) => e,
+                    None => return Ok(RespValue::null()),
+                };
+                let freq = entry.lfu_freq(self.cache.lfu_decay_time()) as i64;
+                Ok(RespValue::Integer(freq))
+            }
+            _ => Ok(RespValue::Integer(0)),
+        }
+    }
+
+    /// SWAPDB index1 index2 — atomically swap two logical database keyspaces.
+    pub(super) fn handle_swapdb(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        if self.cluster.is_some() {
+            return Ok(RespValue::error(
+                "ERR SWAPDB is not allowed in cluster mode",
+            ));
+        }
+        if args.len() != 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'swapdb' command",
+            ));
+        }
+        let a = match self.parse_integer(&args[0]) {
+            Ok(i) if i >= 0 => i as usize,
+            _ => return Ok(RespValue::error("ERR DB index is out of range")),
+        };
+        let b = match self.parse_integer(&args[1]) {
+            Ok(i) if i >= 0 => i as usize,
+            _ => return Ok(RespValue::error("ERR DB index is out of range")),
+        };
+        match self.databases.swap_db(a, b) {
+            Ok(()) => {
+                // Watches are DB-scoped; invalidate if either side is selected.
+                if self.selected_db == a || self.selected_db == b {
+                    self.clear_watches();
+                    // Rebind Arc in case of future map-based swap; content swap is fine either way.
+                    if let Some(db) = self.databases.get(self.selected_db) {
+                        self.cache = db;
+                    }
+                }
+                Ok(RespValue::ok())
+            }
+            Err(msg) => Ok(RespValue::error(msg)),
         }
     }
 

@@ -80,6 +80,47 @@ impl Databases {
         }
     }
 
+    /// SWAPDB: exchange all keys (all types + TTLs) between two logical DBs.
+    /// Content swap so existing `Arc<Cache>` holders observe the new data.
+    pub fn swap_db(&self, a: usize, b: usize) -> Result<(), String> {
+        if a >= self.dbs.len() || b >= self.dbs.len() {
+            return Err("ERR DB index is out of range".into());
+        }
+        if a == b {
+            return Ok(());
+        }
+        let da = &self.dbs[a];
+        let db = &self.dbs[b];
+
+        let keys_a = da.keys(None);
+        let keys_b = db.keys(None);
+        let mut payloads_a = Vec::with_capacity(keys_a.len());
+        for k in &keys_a {
+            if let Some(p) = da.dump_key(k) {
+                payloads_a.push((k.clone(), p));
+            }
+        }
+        let mut payloads_b = Vec::with_capacity(keys_b.len());
+        for k in &keys_b {
+            if let Some(p) = db.dump_key(k) {
+                payloads_b.push((k.clone(), p));
+            }
+        }
+
+        da.flush();
+        db.flush();
+
+        for (k, p) in payloads_b {
+            da.restore_key(&k, &p, true)
+                .map_err(|e| e.to_resp_string())?;
+        }
+        for (k, p) in payloads_a {
+            db.restore_key(&k, &p, true)
+                .map_err(|e| e.to_resp_string())?;
+        }
+        Ok(())
+    }
+
     /// Apply eviction policy to every DB (CONFIG SET maxmemory-policy).
     pub fn set_eviction_policy_all(&self, policy: crate::cache::EvictionPolicy) {
         for db in &self.dbs {
