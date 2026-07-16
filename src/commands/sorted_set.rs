@@ -1044,6 +1044,73 @@ impl CommandHandler {
         self.handle_zset_algebra(args, ZAlgebra::Diff, true, "zdiffstore")
     }
 
+    /// ZINTERCARD numkeys key [key ...] [LIMIT limit]
+    pub(super) fn handle_zintercard(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() < 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'zintercard' command",
+            ));
+        }
+        let numkeys = match self.parse_integer(&args[0]) {
+            Ok(n) if n > 0 => n as usize,
+            _ => {
+                return Ok(RespValue::error(
+                    "ERR at least 1 input key is needed for ZINTERCARD",
+                ))
+            }
+        };
+        if args.len() < 1 + numkeys {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'zintercard' command",
+            ));
+        }
+
+        let mut keys = Vec::with_capacity(numkeys);
+        for a in &args[1..1 + numkeys] {
+            match a.as_bulk_string() {
+                Some(k) => keys.push(k.clone()),
+                None => return Ok(RespValue::error("ERR invalid key")),
+            }
+        }
+
+        // Optional LIMIT limit (single integer; 0 = no limit).
+        let mut limit: Option<usize> = None;
+        let mut i = 1 + numkeys;
+        while i < args.len() {
+            let opt = match args[i].as_bulk_string() {
+                Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+                None => return Ok(RespValue::error("ERR syntax error")),
+            };
+            match opt.as_str() {
+                "LIMIT" => {
+                    if i + 1 >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    let lim = match self.parse_integer(&args[i + 1]) {
+                        Ok(n) if n >= 0 => n as usize,
+                        _ => {
+                            return Ok(RespValue::error(
+                                "ERR LIMIT can't be negative",
+                            ))
+                        }
+                    };
+                    // Redis: LIMIT 0 means unlimited.
+                    limit = if lim == 0 { None } else { Some(lim) };
+                    i += 2;
+                }
+                _ => return Ok(RespValue::error("ERR syntax error")),
+            }
+        }
+
+        let snapshots = match self.snapshot_zsets(&keys, true) {
+            Ok(Some(s)) => s,
+            Ok(None) => return Ok(RespValue::Integer(0)),
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+
+        Ok(RespValue::Integer(count_zinter(&snapshots, limit) as i64))
+    }
+
     /// Shared path for ZUNION/ZINTER/ZDIFF and *STORE variants.
     /// Store forms take `destination` as the first argument.
     fn handle_zset_algebra(
@@ -1280,6 +1347,88 @@ impl CommandHandler {
         Ok(scored_members_to_resp(popped, true))
     }
 
+    /// ZMPOP numkeys key [key ...] <MIN|MAX> [COUNT count]
+    pub(super) fn handle_zmpop(&self, args: &[RespValue]) -> Result<RespValue> {
+        match parse_zmpop_args(self, args, "zmpop") {
+            Ok((keys, min, count)) => {
+                for key in &keys {
+                    if let Err(Error::WrongType) = self.ensure_zset_key(key) {
+                        return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+                    }
+                }
+                match self.try_zmpop(&keys, min, count) {
+                    Some((key, members)) => Ok(zmpop_reply(key, members)),
+                    None => Ok(RespValue::null()),
+                }
+            }
+            Err(e) => Ok(RespValue::error(e)),
+        }
+    }
+
+    /// BZMPOP timeout numkeys key [key ...] <MIN|MAX> [COUNT count]
+    pub(super) async fn handle_bzmpop(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() < 4 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'bzmpop' command",
+            ));
+        }
+        let timeout_secs = match Self::parse_timeout_seconds(&args[0]) {
+            Ok(t) => t,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+        let (keys, min, count) = match parse_zmpop_args(self, &args[1..], "bzmpop") {
+            Ok(v) => v,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+
+        for key in &keys {
+            if let Err(Error::WrongType) = self.ensure_zset_key(key) {
+                return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+            }
+        }
+
+        if let Some((key, members)) = self.try_zmpop(&keys, min, count) {
+            return Ok(zmpop_reply(key, members));
+        }
+
+        // Inside MULTI: never block (Redis).
+        if self.executing_multi {
+            return Ok(RespValue::null());
+        }
+
+        let block_forever = timeout_secs == 0.0;
+        let deadline = if block_forever {
+            None
+        } else {
+            Some(std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_secs))
+        };
+
+        let (waiter_id, notify) = self.cache.list_blockers.register(&keys);
+
+        let result = loop {
+            if let Some((key, members)) = self.try_zmpop(&keys, min, count) {
+                break Ok(zmpop_reply(key, members));
+            }
+
+            if let Some(dl) = deadline {
+                let now = std::time::Instant::now();
+                if now >= dl {
+                    break Ok(RespValue::null());
+                }
+                let remaining = dl - now;
+                match tokio::time::timeout(remaining, notify.notified()).await {
+                    Ok(()) => continue,
+                    Err(_) => break Ok(RespValue::null()),
+                }
+            } else {
+                notify.notified().await;
+            }
+        };
+
+        self.cache.list_blockers.unregister(waiter_id, &keys);
+        result
+    }
+
     /// BZPOPMIN key [key ...] timeout
     pub(super) async fn handle_bzpopmin(&self, args: &[RespValue]) -> Result<RespValue> {
         self.handle_blocking_zpop(args, true).await
@@ -1323,8 +1472,10 @@ impl CommandHandler {
             }
         }
 
-        if let Some((key, member, score)) = self.try_blocking_zpop(&keys, min) {
-            return Ok(bzpop_reply(key, member, score));
+        if let Some((key, members)) = self.try_zmpop(&keys, min, 1) {
+            if let Some(sm) = members.into_iter().next() {
+                return Ok(bzpop_reply(key, sm.member, sm.score));
+            }
         }
 
         if self.executing_multi {
@@ -1341,8 +1492,10 @@ impl CommandHandler {
         let (waiter_id, notify) = self.cache.list_blockers.register(&keys);
 
         let result = loop {
-            if let Some((key, member, score)) = self.try_blocking_zpop(&keys, min) {
-                break Ok(bzpop_reply(key, member, score));
+            if let Some((key, members)) = self.try_zmpop(&keys, min, 1) {
+                if let Some(sm) = members.into_iter().next() {
+                    break Ok(bzpop_reply(key, sm.member, sm.score));
+                }
             }
 
             if let Some(dl) = deadline {
@@ -1364,12 +1517,16 @@ impl CommandHandler {
         result
     }
 
-    /// Pop one member from the first non-empty zset among `keys` (left-to-right).
-    fn try_blocking_zpop(
+    /// Pop up to `count` members from the first non-empty zset among `keys` (left-to-right).
+    fn try_zmpop(
         &self,
         keys: &[Bytes],
         min: bool,
-    ) -> Option<(Bytes, Bytes, f64)> {
+        count: usize,
+    ) -> Option<(Bytes, Vec<ScoredMember>)> {
+        if count == 0 {
+            return None;
+        }
         for key in keys {
             if !matches!(self.cache.key_type(key), KeyType::ZSet) {
                 continue;
@@ -1382,10 +1539,10 @@ impl CommandHandler {
                 continue;
             }
             let before = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
-            let mut popped = if min {
-                set.pop_min(1)
+            let popped = if min {
+                set.pop_min(count)
             } else {
-                set.pop_max(1)
+                set.pop_max(count)
             };
             let empty = set.is_empty();
             let after = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
@@ -1394,8 +1551,8 @@ impl CommandHandler {
             if empty {
                 self.cache.remove_sorted_set(key);
             }
-            if let Some(sm) = popped.pop() {
-                return Some((key.clone(), sm.member, sm.score));
+            if !popped.is_empty() {
+                return Some((key.clone(), popped));
             }
         }
         None
@@ -1408,6 +1565,100 @@ fn bzpop_reply(key: Bytes, member: Bytes, score: f64) -> RespValue {
         RespValue::BulkString(Some(member)),
         RespValue::BulkString(Some(Bytes::from(format_score(score)))),
     ])
+}
+
+/// ZMPOP / BZMPOP reply: `[key, [[member, score], ...]]`.
+fn zmpop_reply(key: Bytes, members: Vec<ScoredMember>) -> RespValue {
+    let pairs: Vec<RespValue> = members
+        .into_iter()
+        .map(|sm| {
+            RespValue::Array(vec![
+                RespValue::BulkString(Some(sm.member)),
+                RespValue::BulkString(Some(Bytes::from(format_score(sm.score)))),
+            ])
+        })
+        .collect();
+    RespValue::Array(vec![
+        RespValue::BulkString(Some(key)),
+        RespValue::Array(pairs),
+    ])
+}
+
+/// Parse `numkeys key [key ...] <MIN|MAX> [COUNT count]` for ZMPOP/BZMPOP.
+fn parse_zmpop_args(
+    handler: &CommandHandler,
+    args: &[RespValue],
+    name: &str,
+) -> std::result::Result<(Vec<Bytes>, bool, usize), String> {
+    if args.len() < 3 {
+        return Err(format!(
+            "ERR wrong number of arguments for '{}' command",
+            name
+        ));
+    }
+    let numkeys = match handler.parse_integer(&args[0]) {
+        Ok(n) if n > 0 => n as usize,
+        _ => {
+            return Err(
+                "ERR numkeys should be greater than 0".into(),
+            )
+        }
+    };
+    if args.len() < 1 + numkeys + 1 {
+        return Err(format!(
+            "ERR wrong number of arguments for '{}' command",
+            name
+        ));
+    }
+
+    let mut keys = Vec::with_capacity(numkeys);
+    for a in &args[1..1 + numkeys] {
+        match a.as_bulk_string() {
+            Some(k) => keys.push(k.clone()),
+            None => return Err("ERR invalid key".into()),
+        }
+    }
+
+    let where_token = match args[1 + numkeys].as_bulk_string() {
+        Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+        None => return Err("ERR syntax error".into()),
+    };
+    let min = match where_token.as_str() {
+        "MIN" => true,
+        "MAX" => false,
+        _ => return Err("ERR syntax error".into()),
+    };
+
+    let mut count: usize = 1;
+    let mut i = 2 + numkeys;
+    while i < args.len() {
+        let opt = match args[i].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+            None => return Err("ERR syntax error".into()),
+        };
+        match opt.as_str() {
+            "COUNT" => {
+                if i + 1 >= args.len() {
+                    return Err("ERR syntax error".into());
+                }
+                count = match handler.parse_integer(&args[i + 1]) {
+                    Ok(n) if n > 0 => n as usize,
+                    Ok(_) => {
+                        return Err("ERR count should be greater than 0".into())
+                    }
+                    Err(_) => {
+                        return Err(
+                            "ERR value is not an integer or out of range".into(),
+                        )
+                    }
+                };
+                i += 2;
+            }
+            _ => return Err("ERR syntax error".into()),
+        }
+    }
+
+    Ok((keys, min, count))
 }
 
 /// Parse trailing WEIGHTS / AGGREGATE / WITHSCORES options for zset multi-key ops.
@@ -1557,4 +1808,29 @@ fn compute_zinter(
         out.push((member.clone(), score));
     }
     out
+}
+
+/// Count intersection cardinality; stop early when `limit` is reached.
+fn count_zinter(snapshots: &[HashMap<Bytes, f64>], limit: Option<usize>) -> usize {
+    if snapshots.is_empty() {
+        return 0;
+    }
+    let mut order: Vec<usize> = (0..snapshots.len()).collect();
+    order.sort_by_key(|&i| snapshots[i].len());
+    let first = order[0];
+    let mut n = 0usize;
+    'member: for member in snapshots[first].keys() {
+        for &idx in &order[1..] {
+            if !snapshots[idx].contains_key(member) {
+                continue 'member;
+            }
+        }
+        n += 1;
+        if let Some(lim) = limit {
+            if n >= lim {
+                return n;
+            }
+        }
+    }
+    n
 }

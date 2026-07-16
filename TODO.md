@@ -205,6 +205,7 @@ Also tracked in `docs/roadmap.md`.
   - *Batch AP*: `ZPOPMIN` / `ZPOPMAX` (optional count); `BZPOPMIN` / `BZPOPMAX` (multi-key, timeout 0 = forever; null array on timeout; woken by ZADD/ZINCRBY/*STORE)
   - *Batch AQ*: `ZUNION` / `ZINTER` / `ZDIFF` (+ `WITHSCORES`; WEIGHTS/AGGREGATE for union/inter); `ZDIFFSTORE`
   - *Batch AR*: `ZMSCORE`; `ZRANDMEMBER` (count / WITHSCORES); `ZRANGEBYLEX` / `ZREVRANGEBYLEX` / `ZLEXCOUNT` / `ZREMRANGEBYLEX` (`-`/`+`/`[`/`(` bounds, LIMIT)
+  - *Batch AS*: `ZINTERCARD` (`LIMIT`); `ZMPOP` / `BZMPOP` (`MIN|MAX`, `COUNT`; multi-key left-to-right; nested `[key, [[m,s]…]]` reply)
 
 ---
 

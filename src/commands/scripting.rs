@@ -26,8 +26,8 @@ const SCRIPT_CALL_ALLOWLIST: &[&str] = &[
     "ZADD", "ZRANGE", "ZREVRANGE", "ZCARD", "ZSCORE", "ZMSCORE", "ZREM", "ZRANK", "ZREVRANK", //
     "ZINCRBY", "ZRANGEBYSCORE", "ZREVRANGEBYSCORE", "ZCOUNT", "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", "ZSCAN", //
     "ZRANGEBYLEX", "ZREVRANGEBYLEX", "ZLEXCOUNT", "ZREMRANGEBYLEX", "ZRANDMEMBER", //
-    "ZUNION", "ZINTER", "ZDIFF", "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE", //
-    "ZPOPMIN", "ZPOPMAX", //
+    "ZUNION", "ZINTER", "ZDIFF", "ZINTERCARD", "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE", //
+    "ZPOPMIN", "ZPOPMAX", "ZMPOP", //
     "SETBIT", "GETBIT", "BITCOUNT", "BITPOS", "BITOP", //
     "PFADD", "PFCOUNT", "PFMERGE", //
     "DBSIZE", "KEYS", //
@@ -435,11 +435,13 @@ impl CommandHandler {
             "ZUNION" => self.handle_zunion(args),
             "ZINTER" => self.handle_zinter(args),
             "ZDIFF" => self.handle_zdiff(args),
+            "ZINTERCARD" => self.handle_zintercard(args),
             "ZUNIONSTORE" => self.handle_zunionstore(args),
             "ZINTERSTORE" => self.handle_zinterstore(args),
             "ZDIFFSTORE" => self.handle_zdiffstore(args),
             "ZPOPMIN" => self.handle_zpopmin(args),
             "ZPOPMAX" => self.handle_zpopmax(args),
+            "ZMPOP" => self.handle_zmpop(args),
             "SETBIT" => self.handle_setbit(args),
             "GETBIT" => self.handle_getbit(args),
             "BITCOUNT" => self.handle_bitcount(args),

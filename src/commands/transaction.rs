@@ -203,6 +203,10 @@ fn write_keys(cmd: &str, args: &[RespValue]) -> Vec<Bytes> {
                     .collect()
             }
         }
+        // ZMPOP numkeys key [key ...] MIN|MAX [COUNT n]
+        "ZMPOP" => numkeys_keys(args, 0),
+        // BZMPOP timeout numkeys key [key ...] MIN|MAX [COUNT n]
+        "BZMPOP" => numkeys_keys(args, 1),
         // XGROUP CREATE/DESTROY key …
         "XGROUP" => args
             .get(1)
@@ -235,4 +239,27 @@ fn write_keys(cmd: &str, args: &[RespValue]) -> Vec<Bytes> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Keys after a `numkeys` integer at `args[numkeys_idx]` (e.g. ZMPOP / BZMPOP).
+fn numkeys_keys(args: &[RespValue], numkeys_idx: usize) -> Vec<Bytes> {
+    let Some(nk_arg) = args.get(numkeys_idx) else {
+        return Vec::new();
+    };
+    let n = match nk_arg {
+        RespValue::Integer(i) if *i > 0 => *i as usize,
+        RespValue::BulkString(Some(b)) => {
+            match std::str::from_utf8(b).ok().and_then(|s| s.parse::<i64>().ok()) {
+                Some(i) if i > 0 => i as usize,
+                _ => return Vec::new(),
+            }
+        }
+        _ => return Vec::new(),
+    };
+    let start = numkeys_idx + 1;
+    let end = (start + n).min(args.len());
+    args[start..end]
+        .iter()
+        .filter_map(|a| a.as_bulk_string().cloned())
+        .collect()
 }

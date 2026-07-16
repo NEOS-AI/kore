@@ -551,13 +551,16 @@ impl CommandHandler {
             "ZUNION" => self.handle_zunion(&args[1..]),
             "ZINTER" => self.handle_zinter(&args[1..]),
             "ZDIFF" => self.handle_zdiff(&args[1..]),
+            "ZINTERCARD" => self.handle_zintercard(&args[1..]),
             "ZUNIONSTORE" => self.handle_zunionstore(&args[1..]),
             "ZINTERSTORE" => self.handle_zinterstore(&args[1..]),
             "ZDIFFSTORE" => self.handle_zdiffstore(&args[1..]),
             "ZPOPMIN" => self.handle_zpopmin(&args[1..]),
             "ZPOPMAX" => self.handle_zpopmax(&args[1..]),
+            "ZMPOP" => self.handle_zmpop(&args[1..]),
             "BZPOPMIN" => self.handle_bzpopmin(&args[1..]).await,
             "BZPOPMAX" => self.handle_bzpopmax(&args[1..]).await,
+            "BZMPOP" => self.handle_bzmpop(&args[1..]).await,
 
             // Geospatial commands
             "GEOADD" => self.handle_geoadd(&args[1..]),
@@ -1037,8 +1040,10 @@ fn is_write_command(cmd: &str) -> bool {
             | "ZDIFFSTORE"
             | "ZPOPMIN"
             | "ZPOPMAX"
+            | "ZMPOP"
             | "BZPOPMIN"
             | "BZPOPMAX"
+            | "BZMPOP"
             | "GEOADD"
             | "GEOSEARCHSTORE"
             | "HSET"
