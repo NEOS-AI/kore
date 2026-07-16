@@ -618,6 +618,11 @@ where
                 }
             };
 
+            // CLIENT REPLY OFF/SKIP: execute command but omit response on the wire.
+            if handler.take_suppress_reply() {
+                continue;
+            }
+
             // SYNC / PSYNC: flush any prior pipeline bytes, then handshake + feed.
             if let Some(raw) = handler.take_raw_response() {
                 if !pipeline_buf.is_empty() {

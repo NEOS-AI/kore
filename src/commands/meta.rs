@@ -87,6 +87,7 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     // MEMORY USAGE key [SAMPLES n] — first_key points at USAGE's key (arg index 2 in full command).
     CmdSpec { name: "memory", arity: -2, flags: &["readonly", "random"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "object", arity: -2, flags: &["readonly", "random"], first_key: 2, last_key: 2, step: 1 },
+    CmdSpec { name: "slowlog", arity: -2, flags: &["admin", "random", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "save", arity: 1, flags: &["admin", "noscript"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "bgsave", arity: -1, flags: &["admin", "noscript"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "lastsave", arity: 1, flags: &["loading", "stale", "fast", "admin"], first_key: 0, last_key: 0, step: 0 },
@@ -524,7 +525,8 @@ impl CommandHandler {
                 );
                 Ok(bulk(info))
             }
-            "KILL" | "PAUSE" | "UNPAUSE" | "REPLY" | "NO-EVICT" | "NO-TOUCH" | "TRACKING"
+            "REPLY" => self.client_reply(&args[1..]),
+            "KILL" | "PAUSE" | "UNPAUSE" | "NO-EVICT" | "NO-TOUCH" | "TRACKING"
             | "CACHING" | "GETREDIR" | "TRACKINGINFO" => Ok(RespValue::error(format!(
                 "ERR CLIENT {} is not supported yet",
                 sub
@@ -533,6 +535,38 @@ impl CommandHandler {
                 "ERR unknown subcommand '{}'. Try CLIENT HELP.",
                 sub
             ))),
+        }
+    }
+
+    /// CLIENT REPLY ON|OFF|SKIP
+    fn client_reply(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 1 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'client|reply' command",
+            ));
+        }
+        let mode = match args[0].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+            None => return Ok(RespValue::error("ERR syntax error")),
+        };
+        match mode.as_str() {
+            "ON" => {
+                self.client_reply_off = false;
+                self.client_reply_skip = false;
+                Ok(RespValue::ok())
+            }
+            "OFF" => {
+                self.client_reply_off = true;
+                Ok(RespValue::ok())
+            }
+            "SKIP" => {
+                // Next command (not this one) will suppress its reply.
+                self.client_reply_skip = true;
+                Ok(RespValue::ok())
+            }
+            _ => Ok(RespValue::error(
+                "ERR syntax error, try CLIENT (LIST | KILL | GETNAME | SETNAME | REPLY | ...)",
+            )),
         }
     }
 

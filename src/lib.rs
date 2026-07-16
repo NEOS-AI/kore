@@ -29,6 +29,7 @@ pub mod vector_search;
 pub mod persistence;
 pub mod metrics;
 pub mod scripting;
+pub mod slowlog;
 
 pub use acl::{AclStore, AclUser};
 pub use cache::{Cache, EvictionPolicy};
@@ -73,4 +74,5 @@ pub use search_index::{SearchIndexManager, IndexDefinition, FieldDefinition, Fie
 pub use query_engine::{Query, QueryFilter, QueryExecutor};
 pub use vector_search::{VectorIndex, VectorSearchResult};
 pub use scripting::{script_sha1, ScriptCache};
+pub use slowlog::{SlowLog, SlowLogEntry, DEFAULT_MAX_LEN as SLOWLOG_DEFAULT_MAX_LEN, DEFAULT_SLOWER_THAN_US};
 

@@ -86,6 +86,12 @@ pub struct CommandHandler {
     redlock: Option<Arc<Redlock>>,
     /// Shared SCRIPT LOAD / EVALSHA cache (server-wide).
     script_cache: Arc<ScriptCache>,
+    /// CLIENT REPLY OFF — suppress all replies until ON.
+    client_reply_off: bool,
+    /// CLIENT REPLY SKIP — suppress the next command's reply once.
+    client_reply_skip: bool,
+    /// After `handle`, network checks this to omit writing a response.
+    suppress_reply: bool,
 }
 
 impl CommandHandler {
@@ -157,7 +163,17 @@ impl CommandHandler {
             protocol_version: 2,
             redlock: None,
             script_cache: ScriptCache::shared(),
+            client_reply_off: false,
+            client_reply_skip: false,
+            suppress_reply: false,
         }
+    }
+
+    /// Whether the last `handle` result should be omitted from the wire (CLIENT REPLY).
+    pub fn take_suppress_reply(&mut self) -> bool {
+        let s = self.suppress_reply;
+        self.suppress_reply = false;
+        s
     }
 
     /// Attach Redlock for INFO metrics (fair queue stats).
@@ -298,6 +314,9 @@ impl CommandHandler {
     }
 
     pub async fn handle(&mut self, value: RespValue) -> Result<RespValue> {
+        self.suppress_reply = false;
+        let handle_start = std::time::Instant::now();
+
         let args = match value.as_array() {
             Some(arr) => arr,
             None => return Ok(RespValue::error("ERR invalid command format")),
@@ -316,6 +335,22 @@ impl CommandHandler {
         let mut cmd_buf = [0u8; 64];
         let cmd_upper_cow = ascii_uppercase_cmd(cmd, &mut cmd_buf);
         let cmd_upper = cmd_upper_cow.as_ref();
+
+        // CLIENT REPLY: decide suppress before any early return (except CLIENT REPLY itself).
+        let is_client_reply = cmd_upper == "CLIENT"
+            && args
+                .get(1)
+                .and_then(|a| a.as_bulk_string())
+                .map(|s| s.eq_ignore_ascii_case(b"REPLY"))
+                .unwrap_or(false);
+        if !is_client_reply {
+            if self.client_reply_off {
+                self.suppress_reply = true;
+            } else if self.client_reply_skip {
+                self.client_reply_skip = false;
+                self.suppress_reply = true;
+            }
+        }
 
         // AUTH / HELLO don't require prior authentication (HELLO may AUTH inline)
         if cmd_upper == "AUTH" {
@@ -523,6 +558,7 @@ impl CommandHandler {
             "CONFIG" => self.handle_config(&args[1..]),
             "MEMORY" => self.handle_memory(&args[1..]),
             "OBJECT" => self.handle_object(&args[1..]),
+            "SLOWLOG" => self.handle_slowlog(&args[1..]),
 
             // Persistence
             "SAVE" => self.handle_save(&args[1..]),
@@ -702,6 +738,20 @@ impl CommandHandler {
                 self.notify_watch_after_write(cmd_upper, &args[1..]);
             }
         }
+
+        // Slow log (skip SLOWLOG itself and transaction control).
+        if !matches!(
+            cmd_upper,
+            "SLOWLOG" | "EXEC" | "MULTI" | "DISCARD" | "WATCH" | "UNWATCH"
+        ) {
+            let duration_us = handle_start.elapsed().as_micros() as i64;
+            let argv: Vec<Bytes> = args
+                .iter()
+                .filter_map(|a| a.as_bulk_string().cloned())
+                .collect();
+            self.cache.slowlog.maybe_push(duration_us, argv);
+        }
+
         result
     }
 

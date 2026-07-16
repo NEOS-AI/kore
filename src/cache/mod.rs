@@ -28,6 +28,7 @@ use crate::stats::Stats;
 use crate::pubsub::PubSub;
 use crate::memory::MemoryTracker;
 use crate::search_index::SearchIndexManager;
+use crate::slowlog::SlowLog;
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -69,6 +70,8 @@ pub struct Cache {
     pub(super) memory_tracker: Arc<MemoryTracker>,
     /// Statistics
     pub stats: Arc<Stats>,
+    /// Server-wide slow log (shared across logical DBs).
+    pub slowlog: Arc<SlowLog>,
     /// Maximum memory in bytes (live-updatable via CONFIG SET maxmemory)
     pub(super) max_memory: AtomicUsize,
     /// Current memory usage
@@ -139,6 +142,7 @@ impl Cache {
             search_index_manager: Arc::new(SearchIndexManager::new()),
             memory_tracker,
             stats: Arc::new(Stats::new()),
+            slowlog: Arc::new(SlowLog::new()),
             max_memory: AtomicUsize::new(max_memory),
             memory_usage: AtomicUsize::new(0),
             max_entry_size: AtomicUsize::new(max_entry_size),
@@ -192,6 +196,7 @@ impl Cache {
             search_index_manager: Arc::new(SearchIndexManager::new()),
             memory_tracker,
             stats: Arc::clone(&shared.stats),
+            slowlog: Arc::clone(&shared.slowlog),
             max_memory: AtomicUsize::new(max_memory),
             memory_usage: AtomicUsize::new(0),
             max_entry_size: AtomicUsize::new(max_entry_size),

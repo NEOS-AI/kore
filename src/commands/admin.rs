@@ -162,6 +162,9 @@ impl CommandHandler {
         };
         match sub.as_str() {
             "USAGE" => self.handle_memory_usage(&args[1..]),
+            "STATS" => self.handle_memory_stats(&args[1..]),
+            "DOCTOR" => self.handle_memory_doctor(&args[1..]),
+            "PURGE" => self.handle_memory_purge(&args[1..]),
             "HELP" => Ok(RespValue::Array(vec![
                 RespValue::BulkString(Some(Bytes::from_static(
                     b"MEMORY <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
@@ -170,11 +173,239 @@ impl CommandHandler {
                     b"USAGE <key> [SAMPLES <count>] -- estimate memory use of a key",
                 ))),
                 RespValue::BulkString(Some(Bytes::from_static(
+                    b"STATS -- overview of tracked memory by category",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"DOCTOR -- human-readable memory health notes",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"PURGE -- best-effort allocator trim (no-op if unsupported)",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
                     b"HELP -- print this help",
                 ))),
             ])),
             _ => Ok(RespValue::error(format!(
                 "ERR unknown subcommand '{}'. Try MEMORY HELP.",
+                sub
+            ))),
+        }
+    }
+
+    /// MEMORY STATS — flat array of field/value pairs (Redis-compatible shape).
+    fn handle_memory_stats(&self, args: &[RespValue]) -> Result<RespValue> {
+        if !args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'memory|stats' command",
+            ));
+        }
+        use crate::memory::MemoryCategory;
+        let used = self.cache.memory_usage();
+        let max = self.cache.max_memory();
+        let pairs: Vec<(&str, i64)> = vec![
+            ("peak.allocated", used as i64),
+            ("total.allocated", used as i64),
+            ("startup.allocated", 0),
+            ("keys.bytes-per-key", 0),
+            ("dataset.bytes", used as i64),
+            (
+                "dataset.percentage",
+                if max == 0 {
+                    0
+                } else {
+                    ((used as f64 / max as f64) * 100.0) as i64
+                },
+            ),
+            ("allocator.allocated", used as i64),
+            ("allocator.active", used as i64),
+            ("allocator.resident", used as i64),
+            (
+                "memory.cache",
+                self.cache.category_memory(MemoryCategory::Cache) as i64,
+            ),
+            (
+                "memory.hashes",
+                self.cache.category_memory(MemoryCategory::Hashes) as i64,
+            ),
+            (
+                "memory.lists",
+                self.cache.category_memory(MemoryCategory::Lists) as i64,
+            ),
+            (
+                "memory.sets",
+                self.cache.category_memory(MemoryCategory::Sets) as i64,
+            ),
+            (
+                "memory.sorted_sets",
+                self.cache.category_memory(MemoryCategory::SortedSets) as i64,
+            ),
+            (
+                "memory.geo_sets",
+                self.cache.category_memory(MemoryCategory::GeoSets) as i64,
+            ),
+            (
+                "memory.streams",
+                self.cache.category_memory(MemoryCategory::Streams) as i64,
+            ),
+            (
+                "memory.pubsub",
+                self.cache.category_memory(MemoryCategory::PubSub) as i64,
+            ),
+            (
+                "memory.search",
+                self.cache.category_memory(MemoryCategory::Search) as i64,
+            ),
+            ("maxmemory", max as i64),
+            ("db.size", self.cache.dbsize() as i64),
+        ];
+        let mut out = Vec::with_capacity(pairs.len() * 2);
+        for (k, v) in pairs {
+            out.push(RespValue::BulkString(Some(Bytes::from(k))));
+            out.push(RespValue::Integer(v));
+        }
+        Ok(RespValue::Array(out))
+    }
+
+    /// MEMORY DOCTOR — short advisory text.
+    fn handle_memory_doctor(&self, args: &[RespValue]) -> Result<RespValue> {
+        if !args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'memory|doctor' command",
+            ));
+        }
+        let used = self.cache.memory_usage();
+        let max = self.cache.max_memory();
+        let mut notes = Vec::new();
+        if max == 0 {
+            notes.push(
+                "Maxmemory is not configured; Kore will not evict under pressure.".to_string(),
+            );
+        } else {
+            let pct = (used as f64 / max as f64) * 100.0;
+            if pct > 90.0 {
+                notes.push(format!(
+                    "High memory utilization: {:.1}% of maxmemory used.",
+                    pct
+                ));
+            } else if pct > 70.0 {
+                notes.push(format!(
+                    "Moderate memory utilization: {:.1}% of maxmemory used.",
+                    pct
+                ));
+            } else {
+                notes.push(format!(
+                    "Memory utilization is healthy: {:.1}% of maxmemory used.",
+                    pct
+                ));
+            }
+        }
+        notes.push(format!(
+            "Tracked dataset ≈ {} bytes across {} keys (DB {}).",
+            used,
+            self.cache.dbsize(),
+            self.selected_db
+        ));
+        notes.push(
+            "Kore uses structural size estimates (not jemalloc RSS); MEMORY STATS reflects those counters."
+                .into(),
+        );
+        Ok(RespValue::BulkString(Some(Bytes::from(notes.join("\n")))))
+    }
+
+    /// MEMORY PURGE — Redis frees jemalloc dirty pages; we return OK (best-effort no-op).
+    fn handle_memory_purge(&self, args: &[RespValue]) -> Result<RespValue> {
+        if !args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'memory|purge' command",
+            ));
+        }
+        // No jemalloc control in Kore; acknowledge for client compatibility.
+        Ok(RespValue::ok())
+    }
+
+    /// SLOWLOG GET [count] | LEN | RESET | HELP
+    pub(super) fn handle_slowlog(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'slowlog' command",
+            ));
+        }
+        let sub = match args[0].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+            None => return Ok(RespValue::error("ERR syntax error")),
+        };
+        match sub.as_str() {
+            "GET" => {
+                let count = if args.len() == 1 {
+                    10usize
+                } else if args.len() == 2 {
+                    match self.parse_integer(&args[1]) {
+                        Ok(n) if n >= 0 => n as usize,
+                        Ok(_) => usize::MAX, // negative → all (Redis)
+                        Err(_) => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ))
+                        }
+                    }
+                } else {
+                    return Ok(RespValue::error(
+                        "ERR wrong number of arguments for 'slowlog|get' command",
+                    ));
+                };
+                let entries = self.cache.slowlog.get(count);
+                let arr: Vec<RespValue> = entries
+                    .into_iter()
+                    .map(|e| {
+                        let argv: Vec<RespValue> = e
+                            .argv
+                            .into_iter()
+                            .map(|a| RespValue::BulkString(Some(a)))
+                            .collect();
+                        RespValue::Array(vec![
+                            RespValue::Integer(e.id as i64),
+                            RespValue::Integer(e.timestamp),
+                            RespValue::Integer(e.duration_us),
+                            RespValue::Array(argv),
+                        ])
+                    })
+                    .collect();
+                Ok(RespValue::Array(arr))
+            }
+            "LEN" => {
+                if args.len() != 1 {
+                    return Ok(RespValue::error(
+                        "ERR wrong number of arguments for 'slowlog|len' command",
+                    ));
+                }
+                Ok(RespValue::Integer(self.cache.slowlog.len() as i64))
+            }
+            "RESET" => {
+                if args.len() != 1 {
+                    return Ok(RespValue::error(
+                        "ERR wrong number of arguments for 'slowlog|reset' command",
+                    ));
+                }
+                self.cache.slowlog.reset();
+                Ok(RespValue::ok())
+            }
+            "HELP" => Ok(RespValue::Array(vec![
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"SLOWLOG <subcommand> [<arg> ...]. Subcommands are:",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"GET [<count>] -- return newest slow log entries",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"LEN -- number of entries in the slow log",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"RESET -- clear the slow log",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(b"HELP -- print this help"))),
+            ])),
+            _ => Ok(RespValue::error(format!(
+                "ERR unknown subcommand '{}'. Try SLOWLOG HELP.",
                 sub
             ))),
         }
@@ -722,6 +953,15 @@ impl CommandHandler {
                         "lfu-decay-time",
                         &self.cache.lfu_decay_time().to_string(),
                     )),
+                    "slowlog-log-slower-than" | "slowlog_log_slower_than" => Ok(self
+                        .config_kv_reply(
+                            "slowlog-log-slower-than",
+                            &self.cache.slowlog.slower_than_us().to_string(),
+                        )),
+                    "slowlog-max-len" | "slowlog_max_len" => Ok(self.config_kv_reply(
+                        "slowlog-max-len",
+                        &self.cache.slowlog.max_len().to_string(),
+                    )),
                     "databases" => Ok(self.config_kv_reply(
                         "databases",
                         &self.databases.len().to_string(),
@@ -840,6 +1080,36 @@ impl CommandHandler {
                                 let _ = db.set_lfu_log_factor(n as u8);
                             }
                         }
+                        Ok(RespValue::ok())
+                    }
+                    "slowlog-log-slower-than" | "slowlog_log_slower_than" => {
+                        let n: i64 = match value_str.parse() {
+                            Ok(n) => n,
+                            Err(_) => {
+                                return Ok(RespValue::error(
+                                    "ERR invalid slowlog-log-slower-than value",
+                                ))
+                            }
+                        };
+                        self.cache.slowlog.set_slower_than_us(n);
+                        // Shared across multi-DB keyspaces via Arc.
+                        Ok(RespValue::ok())
+                    }
+                    "slowlog-max-len" | "slowlog_max_len" => {
+                        let n: i64 = match value_str.parse() {
+                            Ok(n) if n >= 0 => n,
+                            Ok(_) => {
+                                return Ok(RespValue::error(
+                                    "ERR slowlog-max-len must be >= 0",
+                                ))
+                            }
+                            Err(_) => {
+                                return Ok(RespValue::error(
+                                    "ERR invalid slowlog-max-len value",
+                                ))
+                            }
+                        };
+                        self.cache.slowlog.set_max_len(n as usize);
                         Ok(RespValue::ok())
                     }
                     "lfu-decay-time" | "lfu_decay_time" => {
