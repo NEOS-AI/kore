@@ -6,7 +6,7 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use super::CommandHandler;
 
-/// How ZUNIONSTORE / ZINTERSTORE combine scores for the same member.
+/// How ZUNION/ZINTER (and *STORE) combine scores for the same member.
 #[derive(Clone, Copy)]
 enum ZAggregate {
     Sum,
@@ -23,6 +23,14 @@ impl ZAggregate {
             (ZAggregate::Max, Some(a)) => a.max(weighted),
         }
     }
+}
+
+/// Sorted-set multi-key algebra.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ZAlgebra {
+    Union,
+    Inter,
+    Diff,
 }
 
 impl CommandHandler {
@@ -745,71 +753,153 @@ impl CommandHandler {
         Ok(super::admin::scan_reply(next, elements))
     }
 
-    /// ZUNIONSTORE destination numkeys key [key ...] [WEIGHTS w ...] [AGGREGATE SUM|MIN|MAX]
+    /// ZUNION numkeys key [key ...] [WEIGHTS …] [AGGREGATE …] [WITHSCORES]
+    pub(super) fn handle_zunion(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.handle_zset_algebra(args, ZAlgebra::Union, false, "zunion")
+    }
+
+    /// ZINTER numkeys key [key ...] [WEIGHTS …] [AGGREGATE …] [WITHSCORES]
+    pub(super) fn handle_zinter(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.handle_zset_algebra(args, ZAlgebra::Inter, false, "zinter")
+    }
+
+    /// ZDIFF numkeys key [key ...] [WITHSCORES]
+    pub(super) fn handle_zdiff(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.handle_zset_algebra(args, ZAlgebra::Diff, false, "zdiff")
+    }
+
+    /// ZUNIONSTORE destination numkeys key [key ...] [WEIGHTS …] [AGGREGATE …]
     pub(super) fn handle_zunionstore(&self, args: &[RespValue]) -> Result<RespValue> {
-        self.handle_zstore(args, false, "zunionstore")
+        self.handle_zset_algebra(args, ZAlgebra::Union, true, "zunionstore")
     }
 
-    /// ZINTERSTORE destination numkeys key [key ...] [WEIGHTS w ...] [AGGREGATE SUM|MIN|MAX]
+    /// ZINTERSTORE destination numkeys key [key ...] [WEIGHTS …] [AGGREGATE …]
     pub(super) fn handle_zinterstore(&self, args: &[RespValue]) -> Result<RespValue> {
-        self.handle_zstore(args, true, "zinterstore")
+        self.handle_zset_algebra(args, ZAlgebra::Inter, true, "zinterstore")
     }
 
-    fn handle_zstore(
+    /// ZDIFFSTORE destination numkeys key [key ...]
+    pub(super) fn handle_zdiffstore(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.handle_zset_algebra(args, ZAlgebra::Diff, true, "zdiffstore")
+    }
+
+    /// Shared path for ZUNION/ZINTER/ZDIFF and *STORE variants.
+    /// Store forms take `destination` as the first argument.
+    fn handle_zset_algebra(
         &self,
         args: &[RespValue],
-        inter: bool,
+        op: ZAlgebra,
+        store: bool,
         name: &str,
     ) -> Result<RespValue> {
-        // destination + numkeys + at least one key
-        if args.len() < 3 {
+        // store: dest + numkeys + ≥1 key; read: numkeys + ≥1 key
+        let min_args = if store { 3 } else { 2 };
+        if args.len() < min_args {
             return Ok(RespValue::error(format!(
                 "ERR wrong number of arguments for '{}' command",
                 name
             )));
         }
-        let dest = match args[0].as_bulk_string() {
-            Some(k) => k.clone(),
-            None => return Ok(RespValue::error("ERR invalid destination key")),
+
+        let (dest, rest) = if store {
+            let d = match args[0].as_bulk_string() {
+                Some(k) => k.clone(),
+                None => return Ok(RespValue::error("ERR invalid destination key")),
+            };
+            (Some(d), &args[1..])
+        } else {
+            (None, args)
         };
-        let numkeys = match self.parse_integer(&args[1]) {
+
+        let numkeys = match self.parse_integer(&rest[0]) {
             Ok(n) if n > 0 => n as usize,
             _ => {
                 return Ok(RespValue::error(
-                    "ERR at least 1 input key is needed for ZUNIONSTORE/ZINTERSTORE",
+                    "ERR at least 1 input key is needed for ZUNIONSTORE/ZINTERSTORE/ZDIFFSTORE",
                 ))
             }
         };
-        if args.len() < 2 + numkeys {
+        if rest.len() < 1 + numkeys {
             return Ok(RespValue::error(format!(
                 "ERR wrong number of arguments for '{}' command",
                 name
             )));
         }
 
-        let key_args = &args[2..2 + numkeys];
         let mut keys = Vec::with_capacity(numkeys);
-        for a in key_args {
+        for a in &rest[1..1 + numkeys] {
             match a.as_bulk_string() {
                 Some(k) => keys.push(k.clone()),
                 None => return Ok(RespValue::error("ERR invalid key")),
             }
         }
 
-        let (weights, aggregate) = match parse_zstore_options(&args[2 + numkeys..], numkeys) {
+        let allow_weights = op != ZAlgebra::Diff;
+        let allow_withscores = !store;
+        let (weights, aggregate, with_scores) = match parse_zset_op_options(
+            &rest[1 + numkeys..],
+            numkeys,
+            allow_weights,
+            allow_withscores,
+        ) {
             Ok(v) => v,
             Err(e) => return Ok(RespValue::error(e)),
         };
 
-        // Type-check sources; snapshot member→score under read locks.
-        // Missing keys act as empty zsets (inter → empty result if any missing).
-        let mut snapshots: Vec<HashMap<Bytes, f64>> = Vec::with_capacity(numkeys);
-        for k in &keys {
+        let snapshots = match self.snapshot_zsets(&keys, op == ZAlgebra::Inter) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                // Early empty (inter with missing/empty source).
+                if store {
+                    return self.store_zset_result(dest.as_ref().unwrap(), Vec::new());
+                }
+                return Ok(RespValue::Array(vec![]));
+            }
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+
+        let mut result = match op {
+            ZAlgebra::Union => compute_zunion(&snapshots, &weights, aggregate),
+            ZAlgebra::Inter => compute_zinter(&snapshots, &weights, aggregate),
+            ZAlgebra::Diff => compute_zdiff(&snapshots),
+        };
+
+        if result.iter().any(|(_, s)| s.is_nan()) {
+            return Ok(RespValue::error(
+                "ERR resulting score is not a number (NaN)",
+            ));
+        }
+
+        if store {
+            return self.store_zset_result(dest.as_ref().unwrap(), result);
+        }
+
+        // Read path: sort by score ascending, then member (Redis-compatible).
+        result.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let members: Vec<ScoredMember> = result
+            .into_iter()
+            .map(|(m, s)| ScoredMember::new(m, s))
+            .collect();
+        Ok(scored_members_to_resp(members, with_scores))
+    }
+
+    /// Snapshot source zsets. Returns `Ok(None)` for early-empty intersection.
+    /// Missing keys are empty; wrong type → error string.
+    fn snapshot_zsets(
+        &self,
+        keys: &[Bytes],
+        inter: bool,
+    ) -> std::result::Result<Option<Vec<HashMap<Bytes, f64>>>, String> {
+        let mut snapshots: Vec<HashMap<Bytes, f64>> = Vec::with_capacity(keys.len());
+        for k in keys {
             match self.cache.key_type(k) {
                 KeyType::None => {
                     if inter {
-                        // Intersection with empty → empty; still overwrite dest below.
-                        return self.store_zset_result(&dest, Vec::new());
+                        return Ok(None);
                     }
                     snapshots.push(HashMap::new());
                 }
@@ -819,28 +909,14 @@ impl CommandHandler {
                         None => HashMap::new(),
                     };
                     if inter && map.is_empty() {
-                        return self.store_zset_result(&dest, Vec::new());
+                        return Ok(None);
                     }
                     snapshots.push(map);
                 }
-                _ => return Ok(RespValue::error(Error::WrongType.to_resp_string())),
+                _ => return Err(Error::WrongType.to_resp_string()),
             }
         }
-
-        let result = if inter {
-            compute_zinter(&snapshots, &weights, aggregate)
-        } else {
-            compute_zunion(&snapshots, &weights, aggregate)
-        };
-
-        // Reject NaN scores (Redis).
-        if result.iter().any(|(_, s)| s.is_nan()) {
-            return Ok(RespValue::error(
-                "ERR resulting score is not a number (NaN)",
-            ));
-        }
-
-        self.store_zset_result(&dest, result)
+        Ok(Some(snapshots))
     }
 
     /// Overwrite `dest` with a zset of `members` (score pairs). Empty → delete key, return 0.
@@ -1073,13 +1149,16 @@ fn bzpop_reply(key: Bytes, member: Bytes, score: f64) -> RespValue {
     ])
 }
 
-/// Parse trailing WEIGHTS / AGGREGATE options for Z*STORE.
-fn parse_zstore_options(
+/// Parse trailing WEIGHTS / AGGREGATE / WITHSCORES options for zset multi-key ops.
+fn parse_zset_op_options(
     rest: &[RespValue],
     numkeys: usize,
-) -> std::result::Result<(Vec<f64>, ZAggregate), String> {
+    allow_weights_agg: bool,
+    allow_withscores: bool,
+) -> std::result::Result<(Vec<f64>, ZAggregate, bool), String> {
     let mut weights = vec![1.0_f64; numkeys];
     let mut aggregate = ZAggregate::Sum;
+    let mut with_scores = false;
     let mut i = 0;
     while i < rest.len() {
         let token = match rest[i].as_bulk_string() {
@@ -1088,6 +1167,9 @@ fn parse_zstore_options(
         };
         match token.as_str() {
             "WEIGHTS" => {
+                if !allow_weights_agg {
+                    return Err("ERR syntax error".into());
+                }
                 i += 1;
                 if rest.len() < i + numkeys {
                     return Err("ERR syntax error".into());
@@ -1108,6 +1190,9 @@ fn parse_zstore_options(
                 i += numkeys;
             }
             "AGGREGATE" => {
+                if !allow_weights_agg {
+                    return Err("ERR syntax error".into());
+                }
                 i += 1;
                 if i >= rest.len() {
                     return Err("ERR syntax error".into());
@@ -1128,10 +1213,36 @@ fn parse_zstore_options(
                 };
                 i += 1;
             }
+            "WITHSCORES" => {
+                if !allow_withscores {
+                    return Err("ERR syntax error".into());
+                }
+                with_scores = true;
+                i += 1;
+            }
             _ => return Err("ERR syntax error".into()),
         }
     }
-    Ok((weights, aggregate))
+    Ok((weights, aggregate, with_scores))
+}
+
+/// Members in the first set that are absent from every subsequent set.
+/// Scores are taken from the first set only.
+fn compute_zdiff(snapshots: &[HashMap<Bytes, f64>]) -> Vec<(Bytes, f64)> {
+    if snapshots.is_empty() {
+        return Vec::new();
+    }
+    let first = &snapshots[0];
+    let mut out = Vec::new();
+    'member: for (member, score) in first {
+        for other in &snapshots[1..] {
+            if other.contains_key(member) {
+                continue 'member;
+            }
+        }
+        out.push((member.clone(), *score));
+    }
+    out
 }
 
 fn compute_zunion(

@@ -542,8 +542,12 @@ impl CommandHandler {
             "ZREMRANGEBYRANK" => self.handle_zremrangebyrank(&args[1..]),
             "ZREMRANGEBYSCORE" => self.handle_zremrangebyscore(&args[1..]),
             "ZSCAN" => self.handle_zscan(&args[1..]),
+            "ZUNION" => self.handle_zunion(&args[1..]),
+            "ZINTER" => self.handle_zinter(&args[1..]),
+            "ZDIFF" => self.handle_zdiff(&args[1..]),
             "ZUNIONSTORE" => self.handle_zunionstore(&args[1..]),
             "ZINTERSTORE" => self.handle_zinterstore(&args[1..]),
+            "ZDIFFSTORE" => self.handle_zdiffstore(&args[1..]),
             "ZPOPMIN" => self.handle_zpopmin(&args[1..]),
             "ZPOPMAX" => self.handle_zpopmax(&args[1..]),
             "BZPOPMIN" => self.handle_bzpopmin(&args[1..]).await,
@@ -1023,6 +1027,7 @@ fn is_write_command(cmd: &str) -> bool {
             | "ZREMRANGEBYSCORE"
             | "ZUNIONSTORE"
             | "ZINTERSTORE"
+            | "ZDIFFSTORE"
             | "ZPOPMIN"
             | "ZPOPMAX"
             | "BZPOPMIN"

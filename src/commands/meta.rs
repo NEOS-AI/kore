@@ -155,9 +155,14 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     CmdSpec { name: "zremrangebyrank", arity: 4, flags: &["write"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "zremrangebyscore", arity: 4, flags: &["write"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "zscan", arity: -3, flags: &["readonly", "random"], first_key: 1, last_key: 1, step: 1 },
-    // numkeys + optional WEIGHTS/AGGREGATE make full key ranges movable; expose dest only.
+    // numkeys + optional WEIGHTS/AGGREGATE/WITHSCORES make full key ranges movable.
+    CmdSpec { name: "zunion", arity: -3, flags: &["readonly", "movablekeys"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "zinter", arity: -3, flags: &["readonly", "movablekeys"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "zdiff", arity: -3, flags: &["readonly", "movablekeys"], first_key: 0, last_key: 0, step: 0 },
+    // Store forms: expose dest only (numkeys complicates static key ranges).
     CmdSpec { name: "zunionstore", arity: -4, flags: &["write", "denyoom", "movablekeys"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "zinterstore", arity: -4, flags: &["write", "denyoom", "movablekeys"], first_key: 1, last_key: 1, step: 1 },
+    CmdSpec { name: "zdiffstore", arity: -4, flags: &["write", "denyoom", "movablekeys"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "zpopmin", arity: -2, flags: &["write", "fast"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "zpopmax", arity: -2, flags: &["write", "fast"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "bzpopmin", arity: -3, flags: &["write", "blocking", "fast"], first_key: 1, last_key: -2, step: 1 },
