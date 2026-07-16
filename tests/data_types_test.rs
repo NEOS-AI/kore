@@ -298,6 +298,203 @@ fn test_sinter_basic() {
     assert_eq!(members, vec!["2", "3"]);
 }
 
+// ── Batch AH: set algebra + random set ops ──────────────────────────────────
+
+#[test]
+fn test_sunion_sdiff() {
+    let cache = make_cache();
+    let mut h = make_handler(cache);
+
+    handle(&mut h, cmd(&["SADD", "a", "1", "2", "3"]));
+    handle(&mut h, cmd(&["SADD", "b", "2", "3", "4"]));
+
+    let resp = handle(&mut h, cmd(&["SUNION", "a", "b"]));
+    let mut members = array_bulk_strs(&resp);
+    members.sort();
+    assert_eq!(members, vec!["1", "2", "3", "4"]);
+
+    let resp = handle(&mut h, cmd(&["SDIFF", "a", "b"]));
+    let mut members = array_bulk_strs(&resp);
+    members.sort();
+    assert_eq!(members, vec!["1"]);
+
+    let resp = handle(&mut h, cmd(&["SDIFF", "b", "a"]));
+    let mut members = array_bulk_strs(&resp);
+    members.sort();
+    assert_eq!(members, vec!["4"]);
+
+    // Missing keys act as empty for union/diff.
+    let resp = handle(&mut h, cmd(&["SUNION", "a", "missing"]));
+    let mut members = array_bulk_strs(&resp);
+    members.sort();
+    assert_eq!(members, vec!["1", "2", "3"]);
+
+    let resp = handle(&mut h, cmd(&["SDIFF", "missing", "a"]));
+    assert_eq!(array_bulk_strs(&resp), Vec::<String>::new());
+}
+
+#[test]
+fn test_set_store_variants() {
+    let cache = make_cache();
+    let mut h = make_handler(cache);
+
+    handle(&mut h, cmd(&["SADD", "a", "1", "2", "3"]));
+    handle(&mut h, cmd(&["SADD", "b", "2", "3", "4"]));
+
+    let resp = handle(&mut h, cmd(&["SINTERSTORE", "out", "a", "b"]));
+    assert_eq!(resp, RespValue::Integer(2));
+    let mut members = array_bulk_strs(&handle(&mut h, cmd(&["SMEMBERS", "out"])));
+    members.sort();
+    assert_eq!(members, vec!["2", "3"]);
+
+    let resp = handle(&mut h, cmd(&["SUNIONSTORE", "out", "a", "b"]));
+    assert_eq!(resp, RespValue::Integer(4));
+    let mut members = array_bulk_strs(&handle(&mut h, cmd(&["SMEMBERS", "out"])));
+    members.sort();
+    assert_eq!(members, vec!["1", "2", "3", "4"]);
+
+    let resp = handle(&mut h, cmd(&["SDIFFSTORE", "out", "a", "b"]));
+    assert_eq!(resp, RespValue::Integer(1));
+    let members = array_bulk_strs(&handle(&mut h, cmd(&["SMEMBERS", "out"])));
+    assert_eq!(members, vec!["1"]);
+
+    // Empty result deletes destination.
+    handle(&mut h, cmd(&["SADD", "c", "9"]));
+    handle(&mut h, cmd(&["SADD", "d", "9"]));
+    let resp = handle(&mut h, cmd(&["SDIFFSTORE", "out", "c", "d"]));
+    assert_eq!(resp, RespValue::Integer(0));
+    let resp = handle(&mut h, cmd(&["EXISTS", "out"]));
+    assert_eq!(resp, RespValue::Integer(0));
+
+    // Overwrite non-set destination.
+    handle(&mut h, cmd(&["SET", "strdest", "hello"]));
+    handle(&mut h, cmd(&["SADD", "only1", "1"]));
+    let resp = handle(&mut h, cmd(&["SUNIONSTORE", "strdest", "only1"]));
+    assert_eq!(resp, RespValue::Integer(1));
+    let resp = handle(&mut h, cmd(&["TYPE", "strdest"]));
+    assert_eq!(resp, RespValue::SimpleString(Bytes::from_static(b"set")));
+}
+
+#[test]
+fn test_smove() {
+    let cache = make_cache();
+    let mut h = make_handler(cache);
+
+    handle(&mut h, cmd(&["SADD", "src", "x", "y"]));
+    handle(&mut h, cmd(&["SADD", "dst", "z"]));
+
+    let resp = handle(&mut h, cmd(&["SMOVE", "src", "dst", "x"]));
+    assert_eq!(resp, RespValue::Integer(1));
+    assert_eq!(
+        handle(&mut h, cmd(&["SISMEMBER", "src", "x"])),
+        RespValue::Integer(0)
+    );
+    assert_eq!(
+        handle(&mut h, cmd(&["SISMEMBER", "dst", "x"])),
+        RespValue::Integer(1)
+    );
+
+    // Missing member.
+    let resp = handle(&mut h, cmd(&["SMOVE", "src", "dst", "nope"]));
+    assert_eq!(resp, RespValue::Integer(0));
+
+    // Same-key no-op when present.
+    let resp = handle(&mut h, cmd(&["SMOVE", "src", "src", "y"]));
+    assert_eq!(resp, RespValue::Integer(1));
+
+    // Creates dest if absent.
+    let resp = handle(&mut h, cmd(&["SMOVE", "src", "newdst", "y"]));
+    assert_eq!(resp, RespValue::Integer(1));
+    assert_eq!(
+        handle(&mut h, cmd(&["SCARD", "src"])),
+        RespValue::Integer(0)
+    );
+    assert_eq!(
+        handle(&mut h, cmd(&["SISMEMBER", "newdst", "y"])),
+        RespValue::Integer(1)
+    );
+
+    // WRONGTYPE on dest.
+    handle(&mut h, cmd(&["SET", "str", "v"]));
+    handle(&mut h, cmd(&["SADD", "s2", "m"]));
+    let resp = handle(&mut h, cmd(&["SMOVE", "s2", "str", "m"]));
+    assert!(is_wrongtype(&resp), "expected WRONGTYPE, got {:?}", resp);
+}
+
+#[test]
+fn test_spop_srandmember() {
+    let cache = make_cache();
+    let mut h = make_handler(cache);
+
+    handle(&mut h, cmd(&["SADD", "s", "a", "b", "c", "d"]));
+
+    // SRANDMEMBER single: bulk string, set unchanged.
+    let resp = handle(&mut h, cmd(&["SRANDMEMBER", "s"]));
+    match resp {
+        RespValue::BulkString(Some(m)) => {
+            let s = String::from_utf8_lossy(&m).into_owned();
+            assert!(["a", "b", "c", "d"].contains(&s.as_str()));
+        }
+        other => panic!("expected bulk member, got {:?}", other),
+    }
+    assert_eq!(
+        handle(&mut h, cmd(&["SCARD", "s"])),
+        RespValue::Integer(4)
+    );
+
+    let resp = handle(&mut h, cmd(&["SRANDMEMBER", "s", "2"]));
+    assert_eq!(array_bulk_strs(&resp).len(), 2);
+
+    let resp = handle(&mut h, cmd(&["SRANDMEMBER", "s", "-3"]));
+    assert_eq!(array_bulk_strs(&resp).len(), 3);
+
+    // SPOP single.
+    let resp = handle(&mut h, cmd(&["SPOP", "s"]));
+    match resp {
+        RespValue::BulkString(Some(_)) => {}
+        other => panic!("expected popped member, got {:?}", other),
+    }
+    assert_eq!(
+        handle(&mut h, cmd(&["SCARD", "s"])),
+        RespValue::Integer(3)
+    );
+
+    // SPOP count.
+    let resp = handle(&mut h, cmd(&["SPOP", "s", "2"]));
+    assert_eq!(array_bulk_strs(&resp).len(), 2);
+    assert_eq!(
+        handle(&mut h, cmd(&["SCARD", "s"])),
+        RespValue::Integer(1)
+    );
+
+    // Empty key.
+    let resp = handle(&mut h, cmd(&["SPOP", "missing"]));
+    assert_eq!(resp, RespValue::BulkString(None));
+    let resp = handle(&mut h, cmd(&["SRANDMEMBER", "missing", "5"]));
+    assert_eq!(array_bulk_strs(&resp), Vec::<String>::new());
+}
+
+#[test]
+fn test_set_algebra_wrongtype() {
+    let cache = make_cache();
+    let mut h = make_handler(cache);
+
+    handle(&mut h, cmd(&["SET", "str", "v"]));
+    handle(&mut h, cmd(&["SADD", "s", "m"]));
+
+    for cmd_name in ["SINTER", "SUNION", "SDIFF"] {
+        let resp = handle(&mut h, cmd(&[cmd_name, "s", "str"]));
+        assert!(
+            is_wrongtype(&resp),
+            "{} expected WRONGTYPE, got {:?}",
+            cmd_name,
+            resp
+        );
+    }
+    let resp = handle(&mut h, cmd(&["SINTERSTORE", "out", "s", "str"]));
+    assert!(is_wrongtype(&resp));
+}
+
 #[test]
 fn test_flush_clears_new_types() {
     let cache = make_cache();

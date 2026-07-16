@@ -157,6 +157,7 @@ Also tracked in `docs/roadmap.md`.
   - *Done*: LPUSH/RPUSH/LPOP/RPOP/LRANGE/LLEN/LINDEX/LSET; **BLPOP/BRPOP** (blocking via `ListBlockers` + `Notify`; timeout 0 = forever; multi-key left-to-right; null array on timeout)
 - [x] **`[P0]`** **Sets** (`SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SINTER`, …)
   - *Done*: SADD/SREM/SMEMBERS/SISMEMBER/SCARD/SINTER
+  - *Batch AH*: SUNION/SDIFF + *STORE (SINTERSTORE/SUNIONSTORE/SDIFFSTORE); SMOVE; SPOP/SRANDMEMBER (optional count)
 - [x] **`[P0]`** Transactions: `MULTI` / `EXEC` / `DISCARD` / `WATCH`
   - *Done*: per-connection queue; WATCH via key generation counters; UNWATCH; EXECABORT on queue errors
 - [x] **`[P1]`** Streams + consumer groups

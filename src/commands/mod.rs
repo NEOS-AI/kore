@@ -574,6 +574,14 @@ impl CommandHandler {
             "SISMEMBER" => self.handle_sismember(&args[1..]),
             "SCARD" => self.handle_scard(&args[1..]),
             "SINTER" => self.handle_sinter(&args[1..]),
+            "SUNION" => self.handle_sunion(&args[1..]),
+            "SDIFF" => self.handle_sdiff(&args[1..]),
+            "SINTERSTORE" => self.handle_sinterstore(&args[1..]),
+            "SUNIONSTORE" => self.handle_sunionstore(&args[1..]),
+            "SDIFFSTORE" => self.handle_sdiffstore(&args[1..]),
+            "SMOVE" => self.handle_smove(&args[1..]),
+            "SPOP" => self.handle_spop(&args[1..]),
+            "SRANDMEMBER" => self.handle_srandmember(&args[1..]),
 
             // Stream commands
             "XADD" => self.handle_xadd(&args[1..]),
@@ -995,6 +1003,11 @@ fn is_write_command(cmd: &str) -> bool {
             | "LSET"
             | "SADD"
             | "SREM"
+            | "SINTERSTORE"
+            | "SUNIONSTORE"
+            | "SDIFFSTORE"
+            | "SMOVE"
+            | "SPOP"
             | "XADD"
             | "XDEL"
             | "XTRIM"
@@ -1029,6 +1042,7 @@ fn is_noop_write(cmd: &str, response: &RespValue) -> bool {
         ("MOVE", RespValue::Integer(0)) => true,
         ("COPY", RespValue::Integer(0)) => true,
         ("SETNX", RespValue::Integer(0)) => true,
+        ("SMOVE", RespValue::Integer(0)) => true,
         _ => false,
     }
 }

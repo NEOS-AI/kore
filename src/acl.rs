@@ -721,7 +721,8 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
         "read" => &[
             "get", "mget", "exists", "type", "strlen", "ttl", "pttl", "keys", "scan", "dbsize",
             "hget", "hmget", "hgetall", "hlen", "hexists", "hkeys", "hvals", "lrange", "llen",
-            "lindex", "smembers", "sismember", "scard", "sinter", "zrange", "zrevrange", "zcard",
+            "lindex", "smembers", "sismember", "scard", "sinter", "sunion", "sdiff", "srandmember",
+            "zrange", "zrevrange", "zcard",
             "zscore", "zrank", "zrevrank", "xlen", "xrange", "xrevrange", "xread", "xpending",
             "geopos", "geodist", "geohash", "geosearch", "info", "role", "lastsave", "object",
             "memory", "dump", "strlen", "getbit", "bitcount", "bitpos", "pfcount",
@@ -730,7 +731,8 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "set", "del", "mset", "append", "setex", "getset", "unlink", "rename", "renamenx",
             "setnx", "getdel", "getex", "incr", "decr", "incrby", "decrby", "expire", "pexpire", "expireat", "pexpireat", "persist", "expiretime", "pexpiretime",
             "hset", "hdel", "hincrby", "lpush", "rpush", "lpop", "rpop", "blpop", "brpop", "lset",
-            "sadd", "srem", "zadd", "zrem", "xadd", "xdel", "xtrim", "xgroup", "xack", "xreadgroup",
+            "sadd", "srem", "sinterstore", "sunionstore", "sdiffstore", "smove", "spop",
+            "zadd", "zrem", "xadd", "xdel", "xtrim", "xgroup", "xack", "xreadgroup",
             "geoadd", "geosearchstore", "georadius", "georadiusbymember", "flushdb", "flushall",
             "setbit", "bitop", "bitfield", "pfadd", "pfmerge",
         ],
@@ -769,7 +771,10 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
         "list" => &[
             "lpush", "rpush", "lpop", "rpop", "blpop", "brpop", "lrange", "llen", "lindex", "lset",
         ],
-        "set" => &["sadd", "srem", "smembers", "sismember", "scard", "sinter"],
+        "set" => &[
+            "sadd", "srem", "smembers", "sismember", "scard", "sinter", "sunion", "sdiff",
+            "sinterstore", "sunionstore", "sdiffstore", "smove", "spop", "srandmember",
+        ],
         "sortedset" => &[
             "zadd", "zrange", "zrevrange", "zcard", "zscore", "zrem", "zrank", "zrevrank",
         ],

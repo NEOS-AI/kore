@@ -100,6 +100,61 @@ impl RedisSet {
             .collect()
     }
 
+    /// Remove and return up to `count` random members.
+    pub fn spop(&mut self, count: usize) -> Vec<Bytes> {
+        use rand::seq::IteratorRandom;
+        if count == 0 || self.members.is_empty() {
+            return Vec::new();
+        }
+        let n = count.min(self.members.len());
+        let mut rng = rand::thread_rng();
+        let chosen: Vec<Bytes> = self
+            .members
+            .iter()
+            .choose_multiple(&mut rng, n)
+            .into_iter()
+            .cloned()
+            .collect();
+        for m in &chosen {
+            self.members.remove(m);
+        }
+        chosen
+    }
+
+    /// Random members without removal.
+    ///
+    /// * `count >= 0`: up to `count` distinct members (or empty if set empty).
+    /// * `count < 0`: `|count|` members with replacement (duplicates allowed).
+    pub fn srandmember(&self, count: i64) -> Vec<Bytes> {
+        use rand::seq::{IteratorRandom, SliceRandom};
+        if self.members.is_empty() || count == 0 {
+            return Vec::new();
+        }
+        let mut rng = rand::thread_rng();
+        if count > 0 {
+            let n = (count as usize).min(self.members.len());
+            self.members
+                .iter()
+                .choose_multiple(&mut rng, n)
+                .into_iter()
+                .cloned()
+                .collect()
+        } else {
+            let n = (-count) as usize;
+            let pool: Vec<&Bytes> = self.members.iter().collect();
+            (0..n)
+                .map(|_| (*pool.choose(&mut rng).unwrap()).clone())
+                .collect()
+        }
+    }
+
+    /// Single random member, if any.
+    pub fn srandmember_one(&self) -> Option<Bytes> {
+        use rand::seq::IteratorRandom;
+        let mut rng = rand::thread_rng();
+        self.members.iter().choose(&mut rng).cloned()
+    }
+
     pub fn iter_members(&self) -> impl Iterator<Item = Bytes> + '_ {
         self.members.iter().cloned()
     }
@@ -152,5 +207,21 @@ mod tests {
         assert_eq!(uni.len(), 4);
         let diff = RedisSet::sdiff(&[&a, &b]);
         assert_eq!(diff, vec![Bytes::from("1")]);
+    }
+
+    #[test]
+    fn test_spop_and_srandmember() {
+        let mut s = RedisSet::new();
+        s.sadd([Bytes::from("a"), Bytes::from("b"), Bytes::from("c")]);
+        let one = s.srandmember_one();
+        assert!(one.is_some());
+        assert!(s.sismember(one.as_ref().unwrap()));
+        let multi = s.srandmember(2);
+        assert_eq!(multi.len(), 2);
+        let with_dup = s.srandmember(-5);
+        assert_eq!(with_dup.len(), 5);
+        let popped = s.spop(2);
+        assert_eq!(popped.len(), 2);
+        assert_eq!(s.scard(), 1);
     }
 }

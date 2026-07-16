@@ -172,40 +172,376 @@ impl CommandHandler {
                 "ERR wrong number of arguments for 'sinter' command",
             ));
         }
-        let keys: Vec<&Bytes> = args
-            .iter()
-            .filter_map(|a| a.as_bulk_string())
-            .collect();
-        if keys.is_empty() {
-            return Ok(RespValue::Array(vec![]));
+        match self.compute_set_algebra(args, SetAlgebra::Inter) {
+            Ok(members) => Ok(members_to_array(members)),
+            Err(e) => Ok(RespValue::error(e.to_resp_string())),
+        }
+    }
+
+    /// SUNION key [key ...]
+    pub(super) fn handle_sunion(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'sunion' command",
+            ));
+        }
+        match self.compute_set_algebra(args, SetAlgebra::Union) {
+            Ok(members) => Ok(members_to_array(members)),
+            Err(e) => Ok(RespValue::error(e.to_resp_string())),
+        }
+    }
+
+    /// SDIFF key [key ...]
+    pub(super) fn handle_sdiff(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'sdiff' command",
+            ));
+        }
+        match self.compute_set_algebra(args, SetAlgebra::Diff) {
+            Ok(members) => Ok(members_to_array(members)),
+            Err(e) => Ok(RespValue::error(e.to_resp_string())),
+        }
+    }
+
+    /// SINTERSTORE destination key [key ...]
+    pub(super) fn handle_sinterstore(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.handle_set_store(args, SetAlgebra::Inter, "sinterstore")
+    }
+
+    /// SUNIONSTORE destination key [key ...]
+    pub(super) fn handle_sunionstore(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.handle_set_store(args, SetAlgebra::Union, "sunionstore")
+    }
+
+    /// SDIFFSTORE destination key [key ...]
+    pub(super) fn handle_sdiffstore(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.handle_set_store(args, SetAlgebra::Diff, "sdiffstore")
+    }
+
+    /// SMOVE source destination member
+    pub(super) fn handle_smove(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 3 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'smove' command",
+            ));
+        }
+        let source = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid source key")),
+        };
+        let dest = match args[1].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid destination key")),
+        };
+        let member = match args[2].as_bulk_string() {
+            Some(m) => m.clone(),
+            None => return Ok(RespValue::error("ERR invalid member")),
+        };
+
+        match self.cache.key_type(source) {
+            KeyType::None => return Ok(RespValue::Integer(0)),
+            KeyType::Set => {}
+            _ => return Ok(RespValue::error(Error::WrongType.to_resp_string())),
+        }
+        match self.cache.key_type(dest) {
+            KeyType::None | KeyType::Set => {}
+            _ => return Ok(RespValue::error(Error::WrongType.to_resp_string())),
         }
 
-        // Type-check all keys; missing keys act as empty sets.
-        for k in &keys {
-            match self.cache.key_type(k) {
-                KeyType::None | KeyType::Set => {}
-                _ => return Ok(RespValue::error(Error::WrongType.to_resp_string())),
+        // Same key: no-op move; return 1 if member present.
+        if source == dest {
+            let present = self
+                .cache
+                .get_set(source)
+                .map(|s| s.read().sismember(&member))
+                .unwrap_or(false);
+            return Ok(RespValue::Integer(if present { 1 } else { 0 }));
+        }
+
+        let src_set = match self.cache.get_set(source) {
+            Some(s) => s,
+            None => return Ok(RespValue::Integer(0)),
+        };
+
+        // Bail early if member is absent (no dest mutation).
+        if !src_set.read().sismember(&member) {
+            return Ok(RespValue::Integer(0));
+        }
+
+        // Reserve room for dest insert before mutating source.
+        let est = member.len() + 16;
+        if let Err(e) = self.cache.ensure_non_string_capacity(est) {
+            return Ok(RespValue::error(e.to_resp_string()));
+        }
+
+        // Remove from source.
+        {
+            let mut s = src_set.write();
+            if !s.sismember(&member) {
+                return Ok(RespValue::Integer(0));
+            }
+            let before = crate::memory::estimate_keyed_object(source.len(), s.memory_size());
+            let _ = s.srem([member.clone()]);
+            let empty = s.is_empty();
+            let after = crate::memory::estimate_keyed_object(source.len(), s.memory_size());
+            drop(s);
+            self.cache.account_set_delta(before, after);
+            if empty {
+                self.cache.remove_set(source);
             }
         }
 
-        // If any key is missing, intersection is empty.
-        let shared: Vec<_> = match keys
-            .iter()
-            .map(|k| self.cache.get_set(k))
-            .collect::<Option<Vec<_>>>()
-        {
-            Some(v) => v,
-            None => return Ok(RespValue::Array(vec![])),
+        // Insert into destination.
+        let dest_set = match self.cache.get_or_create_set(dest) {
+            Ok(s) => s,
+            Err(Error::WrongType) => {
+                return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+            }
+            Err(e) => return Ok(RespValue::error(e.to_resp_string())),
+        };
+        let mut d = dest_set.write();
+        let before = crate::memory::estimate_keyed_object(dest.len(), d.memory_size());
+        let _ = d.sadd([member]);
+        let after = crate::memory::estimate_keyed_object(dest.len(), d.memory_size());
+        drop(d);
+        self.cache.account_set_delta(before, after);
+        Ok(RespValue::Integer(1))
+    }
+
+    /// SPOP key [count]
+    pub(super) fn handle_spop(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() || args.len() > 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'spop' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_set_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+
+        let with_count = args.len() == 2;
+        let count = if with_count {
+            match self.parse_integer(&args[1]) {
+                Ok(n) if n >= 0 => n as usize,
+                Ok(_) => {
+                    return Ok(RespValue::error(
+                        "ERR value is out of range, must be positive",
+                    ));
+                }
+                Err(e) => return Ok(RespValue::error(e.to_resp_string())),
+            }
+        } else {
+            1
         };
 
-        let locks: Vec<_> = shared.iter().map(|s| s.read()).collect();
-        let set_refs: Vec<&RedisSet> = locks.iter().map(|g| &**g).collect();
-        let members = RedisSet::sinter(&set_refs);
-        Ok(RespValue::Array(
-            members
-                .into_iter()
-                .map(|m| RespValue::BulkString(Some(m)))
-                .collect(),
-        ))
+        let set = match self.cache.get_set(key) {
+            Some(s) => s,
+            None => {
+                return Ok(if with_count {
+                    RespValue::Array(vec![])
+                } else {
+                    RespValue::BulkString(None)
+                });
+            }
+        };
+
+        let mut s = set.write();
+        if s.is_empty() {
+            return Ok(if with_count {
+                RespValue::Array(vec![])
+            } else {
+                RespValue::BulkString(None)
+            });
+        }
+        let before = crate::memory::estimate_keyed_object(key.len(), s.memory_size());
+        let popped = s.spop(count);
+        let empty = s.is_empty();
+        let after = crate::memory::estimate_keyed_object(key.len(), s.memory_size());
+        drop(s);
+        self.cache.account_set_delta(before, after);
+        if empty {
+            self.cache.remove_set(key);
+        }
+
+        if with_count {
+            Ok(members_to_array(popped))
+        } else {
+            Ok(RespValue::BulkString(popped.into_iter().next()))
+        }
     }
+
+    /// SRANDMEMBER key [count]
+    pub(super) fn handle_srandmember(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() || args.len() > 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'srandmember' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_set_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+
+        let with_count = args.len() == 2;
+        let set = match self.cache.get_set(key) {
+            Some(s) => s,
+            None => {
+                return Ok(if with_count {
+                    RespValue::Array(vec![])
+                } else {
+                    RespValue::BulkString(None)
+                });
+            }
+        };
+        let s = set.read();
+        if !with_count {
+            return Ok(RespValue::BulkString(s.srandmember_one()));
+        }
+        let count = match self.parse_integer(&args[1]) {
+            Ok(n) => n,
+            Err(e) => return Ok(RespValue::error(e.to_resp_string())),
+        };
+        Ok(members_to_array(s.srandmember(count)))
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    fn handle_set_store(
+        &self,
+        args: &[RespValue],
+        op: SetAlgebra,
+        name: &str,
+    ) -> Result<RespValue> {
+        if args.len() < 2 {
+            return Ok(RespValue::error(format!(
+                "ERR wrong number of arguments for '{}' command",
+                name
+            )));
+        }
+        let dest = match args[0].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid destination key")),
+        };
+        let members = match self.compute_set_algebra(&args[1..], op) {
+            Ok(m) => m,
+            Err(e) => return Ok(RespValue::error(e.to_resp_string())),
+        };
+        let card = members.len() as i64;
+
+        // Overwrite destination regardless of prior type (Redis semantics).
+        let _ = self.cache.delete(&dest);
+
+        if members.is_empty() {
+            return Ok(RespValue::Integer(0));
+        }
+
+        let est: usize = members.iter().map(|m| m.len() + 16).sum();
+        if let Err(e) = self.cache.ensure_non_string_capacity(est) {
+            return Ok(RespValue::error(e.to_resp_string()));
+        }
+        let set = match self.cache.get_or_create_set(&dest) {
+            Ok(s) => s,
+            Err(e) => return Ok(RespValue::error(e.to_resp_string())),
+        };
+        let mut s = set.write();
+        let before = crate::memory::estimate_keyed_object(dest.len(), s.memory_size());
+        let _ = s.sadd(members);
+        let after = crate::memory::estimate_keyed_object(dest.len(), s.memory_size());
+        drop(s);
+        self.cache.account_set_delta(before, after);
+        Ok(RespValue::Integer(card))
+    }
+
+    /// Compute set algebra over keys in `args`. Missing keys act as empty sets
+    /// (except SINTER: any missing key → empty result).
+    fn compute_set_algebra(
+        &self,
+        args: &[RespValue],
+        op: SetAlgebra,
+    ) -> std::result::Result<Vec<Bytes>, Error> {
+        let keys: Vec<&Bytes> = args.iter().filter_map(|a| a.as_bulk_string()).collect();
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        for k in &keys {
+            match self.cache.key_type(k) {
+                KeyType::None | KeyType::Set => {}
+                _ => return Err(Error::WrongType),
+            }
+        }
+
+        match op {
+            SetAlgebra::Inter => {
+                // Any missing key → empty intersection.
+                let shared: Vec<_> = match keys
+                    .iter()
+                    .map(|k| self.cache.get_set(k))
+                    .collect::<Option<Vec<_>>>()
+                {
+                    Some(v) => v,
+                    None => return Ok(Vec::new()),
+                };
+                let locks: Vec<_> = shared.iter().map(|s| s.read()).collect();
+                let set_refs: Vec<&RedisSet> = locks.iter().map(|g| &**g).collect();
+                Ok(RedisSet::sinter(&set_refs))
+            }
+            SetAlgebra::Union => {
+                // Snapshot members under per-set read locks, then union.
+                let mut out = std::collections::HashSet::new();
+                for k in &keys {
+                    if let Some(s) = self.cache.get_set(k) {
+                        let g = s.read();
+                        for m in g.iter_members() {
+                            out.insert(m);
+                        }
+                    }
+                }
+                Ok(out.into_iter().collect())
+            }
+            SetAlgebra::Diff => {
+                // First key missing → empty.
+                let first = match self.cache.get_set(keys[0]) {
+                    Some(s) => s,
+                    None => return Ok(Vec::new()),
+                };
+                let first_lock = first.read();
+                let others: Vec<_> = keys[1..]
+                    .iter()
+                    .filter_map(|k| self.cache.get_set(k))
+                    .collect();
+                let other_locks: Vec<_> = others.iter().map(|s| s.read()).collect();
+                let mut set_refs: Vec<&RedisSet> = Vec::with_capacity(1 + other_locks.len());
+                set_refs.push(&*first_lock);
+                for g in &other_locks {
+                    set_refs.push(&**g);
+                }
+                Ok(RedisSet::sdiff(&set_refs))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SetAlgebra {
+    Inter,
+    Union,
+    Diff,
+}
+
+fn members_to_array(members: Vec<Bytes>) -> RespValue {
+    RespValue::Array(
+        members
+            .into_iter()
+            .map(|m| RespValue::BulkString(Some(m)))
+            .collect(),
+    )
 }

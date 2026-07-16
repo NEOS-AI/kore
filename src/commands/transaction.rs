@@ -154,12 +154,25 @@ fn write_keys(cmd: &str, args: &[RespValue]) -> Vec<Bytes> {
         "SET" | "SETNX" | "GETDEL" | "GETEX" | "APPEND" | "SETEX" | "GETSET" | "INCR"
         | "DECR" | "INCRBY" | "DECRBY" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "PERSIST" | "ZADD" | "ZREM" | "GEOADD"
         | "GEOSEARCHSTORE" | "HSET" | "HDEL" | "HINCRBY" | "LPUSH" | "RPUSH" | "LPOP"
-        | "RPOP" | "LSET" | "SADD" | "SREM" | "XADD" | "XDEL" | "XTRIM" | "XACK"
+        | "RPOP" | "LSET" | "SADD" | "SREM" | "SPOP" | "XADD" | "XDEL" | "XTRIM" | "XACK"
         | "SETBIT" | "BITFIELD" | "PFADD" | "TOUCH" | "MOVE" => args
             .first()
             .and_then(|a| a.as_bulk_string())
             .cloned()
             .into_iter()
+            .collect(),
+        // SINTERSTORE/SUNIONSTORE/SDIFFSTORE destination key [key ...] — dest is first arg
+        "SINTERSTORE" | "SUNIONSTORE" | "SDIFFSTORE" => args
+            .first()
+            .and_then(|a| a.as_bulk_string())
+            .cloned()
+            .into_iter()
+            .collect(),
+        // SMOVE source destination member
+        "SMOVE" => args
+            .iter()
+            .take(2)
+            .filter_map(|a| a.as_bulk_string().cloned())
             .collect(),
         // BITOP dest key [key ...] — dest is first arg after command
         "BITOP" => args

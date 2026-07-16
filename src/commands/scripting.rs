@@ -18,7 +18,8 @@ const SCRIPT_CALL_ALLOWLIST: &[&str] = &[
     "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST", "TTL", "PTTL", "EXPIRETIME", "PEXPIRETIME", //
     "HSET", "HGET", "HMGET", "HDEL", "HGETALL", "HLEN", "HEXISTS", "HKEYS", "HVALS", "HINCRBY", //
     "LPUSH", "RPUSH", "LPOP", "RPOP", "LRANGE", "LLEN", "LINDEX", "LSET", //
-    "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD", "SINTER", //
+    "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD", "SINTER", "SUNION", "SDIFF", //
+    "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE", "SMOVE", "SPOP", "SRANDMEMBER", //
     "ZADD", "ZRANGE", "ZREVRANGE", "ZCARD", "ZSCORE", "ZREM", "ZRANK", "ZREVRANK", //
     "SETBIT", "GETBIT", "BITCOUNT", "BITPOS", "BITOP", //
     "PFADD", "PFCOUNT", "PFMERGE", //
@@ -382,6 +383,14 @@ impl CommandHandler {
             "SISMEMBER" => self.handle_sismember(args),
             "SCARD" => self.handle_scard(args),
             "SINTER" => self.handle_sinter(args),
+            "SUNION" => self.handle_sunion(args),
+            "SDIFF" => self.handle_sdiff(args),
+            "SINTERSTORE" => self.handle_sinterstore(args),
+            "SUNIONSTORE" => self.handle_sunionstore(args),
+            "SDIFFSTORE" => self.handle_sdiffstore(args),
+            "SMOVE" => self.handle_smove(args),
+            "SPOP" => self.handle_spop(args),
+            "SRANDMEMBER" => self.handle_srandmember(args),
             "ZADD" => self.handle_zadd(args),
             "ZRANGE" => self.handle_zrange(args),
             "ZREVRANGE" => self.handle_zrevrange(args),
