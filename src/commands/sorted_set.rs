@@ -1,7 +1,7 @@
 use crate::cache::KeyType;
 use crate::error::{Error, Result};
 use crate::protocol::RespValue;
-use crate::sorted_set::{ScoreBound, ScoredMember};
+use crate::sorted_set::{LexBound, ScoreBound, ScoredMember};
 use bytes::Bytes;
 use std::collections::HashMap;
 use super::CommandHandler;
@@ -577,6 +577,259 @@ impl CommandHandler {
         Ok(RespValue::Integer(removed as i64))
     }
 
+    /// ZMSCORE key member [member ...]
+    pub(super) fn handle_zmscore(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() < 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'zmscore' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_zset_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+
+        let members: Vec<&Bytes> = args[1..]
+            .iter()
+            .filter_map(|a| a.as_bulk_string())
+            .collect();
+        if members.len() != args.len() - 1 {
+            return Ok(RespValue::error("ERR invalid member"));
+        }
+
+        let scores: Vec<Option<f64>> = match self.cache.get_sorted_set(key) {
+            Some(z) => {
+                let set = z.read();
+                members.iter().map(|m| set.score(m)).collect()
+            }
+            None => members.iter().map(|_| None).collect(),
+        };
+
+        let result: Vec<RespValue> = scores
+            .into_iter()
+            .map(|opt| match opt {
+                Some(s) => RespValue::BulkString(Some(Bytes::from(format_score(s)))),
+                None => RespValue::null(),
+            })
+            .collect();
+        Ok(RespValue::Array(result))
+    }
+
+    /// ZRANDMEMBER key [count [WITHSCORES]]
+    pub(super) fn handle_zrandmember(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() || args.len() > 3 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'zrandmember' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_zset_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+
+        let with_count = args.len() >= 2;
+        let mut with_scores = false;
+        if args.len() == 3 {
+            let opt = match args[2].as_bulk_string() {
+                Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+                None => return Ok(RespValue::error("ERR syntax error")),
+            };
+            if opt != "WITHSCORES" {
+                return Ok(RespValue::error("ERR syntax error"));
+            }
+            with_scores = true;
+        }
+
+        let zset = match self.cache.get_sorted_set(key) {
+            Some(z) => z,
+            None => {
+                return Ok(if with_count {
+                    RespValue::Array(vec![])
+                } else {
+                    RespValue::null()
+                });
+            }
+        };
+        let set = zset.read();
+
+        if !with_count {
+            return Ok(match set.randmember_one() {
+                Some(sm) => RespValue::BulkString(Some(sm.member)),
+                None => RespValue::null(),
+            });
+        }
+
+        let count = match self.parse_integer(&args[1]) {
+            Ok(n) => n,
+            Err(e) => return Ok(RespValue::error(e.to_resp_string())),
+        };
+        Ok(scored_members_to_resp(set.randmember(count), with_scores))
+    }
+
+    /// ZRANGEBYLEX key min max [LIMIT offset count]
+    pub(super) fn handle_zrangebylex(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.handle_zrangebylex_impl(args, false, "zrangebylex")
+    }
+
+    /// ZREVRANGEBYLEX key max min [LIMIT offset count]
+    pub(super) fn handle_zrevrangebylex(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.handle_zrangebylex_impl(args, true, "zrevrangebylex")
+    }
+
+    /// ZLEXCOUNT key min max
+    pub(super) fn handle_zlexcount(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 3 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'zlexcount' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_zset_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+        let min = match parse_lex_bound(&args[1]) {
+            Ok(b) => b,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+        let max = match parse_lex_bound(&args[2]) {
+            Ok(b) => b,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+        let n = match self.cache.get_sorted_set(key) {
+            Some(z) => z.read().count_by_lex(&min, &max),
+            None => 0,
+        };
+        Ok(RespValue::Integer(n as i64))
+    }
+
+    /// ZREMRANGEBYLEX key min max
+    pub(super) fn handle_zremrangebylex(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 3 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'zremrangebylex' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_zset_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+        let min = match parse_lex_bound(&args[1]) {
+            Ok(b) => b,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+        let max = match parse_lex_bound(&args[2]) {
+            Ok(b) => b,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+        let zset = match self.cache.get_sorted_set(key) {
+            Some(z) => z,
+            None => return Ok(RespValue::Integer(0)),
+        };
+        let mut set = zset.write();
+        let before = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
+        let removed = set.remove_range_by_lex(&min, &max);
+        let empty = set.is_empty();
+        let after = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
+        drop(set);
+        self.cache.account_sorted_set_delta(before, after);
+        if empty {
+            self.cache.remove_sorted_set(key);
+        }
+        Ok(RespValue::Integer(removed as i64))
+    }
+
+    fn handle_zrangebylex_impl(
+        &self,
+        args: &[RespValue],
+        reverse: bool,
+        name: &str,
+    ) -> Result<RespValue> {
+        if args.len() < 3 {
+            return Ok(RespValue::error(format!(
+                "ERR wrong number of arguments for '{}' command",
+                name
+            )));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_zset_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+
+        // ZRANGEBYLEX: min max; ZREVRANGEBYLEX: max min — normalize to min/max.
+        let bound_a = match parse_lex_bound(&args[1]) {
+            Ok(b) => b,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+        let bound_b = match parse_lex_bound(&args[2]) {
+            Ok(b) => b,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+        let (min, max) = if reverse {
+            (bound_b, bound_a)
+        } else {
+            (bound_a, bound_b)
+        };
+
+        let mut offset: usize = 0;
+        let mut count: Option<usize> = None;
+        let mut i = 3;
+        while i < args.len() {
+            let opt = match args[i].as_bulk_string() {
+                Some(s) => String::from_utf8_lossy(s).to_uppercase(),
+                None => return Ok(RespValue::error("ERR syntax error")),
+            };
+            match opt.as_str() {
+                "LIMIT" => {
+                    if i + 2 >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    offset = match self.parse_integer(&args[i + 1]) {
+                        Ok(n) if n >= 0 => n as usize,
+                        _ => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ));
+                        }
+                    };
+                    let c = match self.parse_integer(&args[i + 2]) {
+                        Ok(n) => n,
+                        _ => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ));
+                        }
+                    };
+                    count = if c < 0 { None } else { Some(c as usize) };
+                    i += 3;
+                }
+                _ => return Ok(RespValue::error("ERR syntax error")),
+            }
+        }
+
+        let members = match self.cache.get_sorted_set(key) {
+            Some(z) => z
+                .read()
+                .range_by_lex(&min, &max, reverse, offset, count),
+            None => Vec::new(),
+        };
+        Ok(scored_members_to_resp(members, false))
+    }
+
     fn handle_zrangebyscore_impl(
         &self,
         args: &[RespValue],
@@ -684,6 +937,14 @@ fn parse_score_bound(value: &RespValue) -> std::result::Result<ScoreBound, Strin
             ScoreBound::parse(&s).map_err(|_| "ERR min or max is not a float".to_string())
         }
         None => Err("ERR min or max is not a float".to_string()),
+    }
+}
+
+fn parse_lex_bound(value: &RespValue) -> std::result::Result<LexBound, String> {
+    match value.as_bulk_string() {
+        Some(bytes) => LexBound::parse(bytes)
+            .map_err(|_| "ERR min or max not valid string range item".to_string()),
+        None => Err("ERR min or max not valid string range item".to_string()),
     }
 }
 

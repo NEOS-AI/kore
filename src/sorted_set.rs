@@ -20,6 +20,59 @@ pub struct ScoreBound {
     pub exclusive: bool,
 }
 
+/// Lexicographical bound for ZRANGEBYLEX / ZLEXCOUNT / ZREMRANGEBYLEX.
+///
+/// Redis specs: `-` / `+` (open ends), `[member` (inclusive), `(member` (exclusive).
+#[derive(Debug, Clone, PartialEq)]
+pub enum LexBound {
+    NegInf,
+    PosInf,
+    Inclusive(Bytes),
+    Exclusive(Bytes),
+}
+
+impl LexBound {
+    /// Parse a Redis lex range item (`-`, `+`, `[…`, `(…`).
+    pub fn parse(s: &[u8]) -> Result<Self, ()> {
+        if s == b"-" {
+            return Ok(LexBound::NegInf);
+        }
+        if s == b"+" {
+            return Ok(LexBound::PosInf);
+        }
+        if s.is_empty() {
+            return Err(());
+        }
+        match s[0] {
+            b'[' => Ok(LexBound::Inclusive(Bytes::copy_from_slice(&s[1..]))),
+            b'(' => Ok(LexBound::Exclusive(Bytes::copy_from_slice(&s[1..]))),
+            _ => Err(()),
+        }
+    }
+
+    fn accepts_as_min(&self, member: &[u8]) -> bool {
+        match self {
+            LexBound::NegInf => true,
+            LexBound::PosInf => false,
+            LexBound::Inclusive(b) => member >= b.as_ref(),
+            LexBound::Exclusive(b) => member > b.as_ref(),
+        }
+    }
+
+    fn accepts_as_max(&self, member: &[u8]) -> bool {
+        match self {
+            LexBound::PosInf => true,
+            LexBound::NegInf => false,
+            LexBound::Inclusive(b) => member <= b.as_ref(),
+            LexBound::Exclusive(b) => member < b.as_ref(),
+        }
+    }
+}
+
+fn member_in_lex_range(member: &[u8], min: &LexBound, max: &LexBound) -> bool {
+    min.accepts_as_min(member) && max.accepts_as_max(member)
+}
+
 impl ScoreBound {
     pub fn inclusive(value: f64) -> Self {
         Self {
@@ -664,6 +717,110 @@ impl SortedSet {
             }
         }
         count
+    }
+
+    /// Members whose names fall in the lex range `[min, max]` (Redis ZRANGEBYLEX).
+    ///
+    /// Intended for sets where all scores are equal; with mixed scores the walk
+    /// order follows the skiplist `(score, member)` order.
+    pub fn range_by_lex(
+        &self,
+        min: &LexBound,
+        max: &LexBound,
+        reverse: bool,
+        offset: usize,
+        count: Option<usize>,
+    ) -> Vec<ScoredMember> {
+        let mut matched: Vec<ScoredMember> = self
+            .list
+            .iter_keys()
+            .filter(|k| member_in_lex_range(k.member.as_ref(), min, max))
+            .map(|k| ScoredMember::new(k.member.clone(), k.score.0))
+            .collect();
+        // Lex order is member order; with equal scores skiplist order is already
+        // member-sorted. Sort by member for stable pure-lex results.
+        matched.sort_by(|a, b| a.member.cmp(&b.member));
+        if reverse {
+            matched.reverse();
+        }
+        if offset >= matched.len() {
+            return Vec::new();
+        }
+        let end = match count {
+            Some(c) => (offset + c).min(matched.len()),
+            None => matched.len(),
+        };
+        matched[offset..end].to_vec()
+    }
+
+    /// Count members in a lex range.
+    pub fn count_by_lex(&self, min: &LexBound, max: &LexBound) -> usize {
+        self.member_map
+            .keys()
+            .filter(|m| member_in_lex_range(m.as_ref(), min, max))
+            .count()
+    }
+
+    /// Remove members in a lex range. Returns number removed.
+    pub fn remove_range_by_lex(&mut self, min: &LexBound, max: &LexBound) -> usize {
+        let members: Vec<Bytes> = self
+            .member_map
+            .keys()
+            .filter(|m| member_in_lex_range(m.as_ref(), min, max))
+            .cloned()
+            .collect();
+        let mut count = 0;
+        for m in members {
+            if self.remove(&m) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Random members without removal (Redis ZRANDMEMBER count semantics).
+    ///
+    /// * `count > 0`: up to `count` distinct members
+    /// * `count < 0`: `|count|` members with replacement
+    /// * `count == 0`: empty
+    pub fn randmember(&self, count: i64) -> Vec<ScoredMember> {
+        use rand::seq::{IteratorRandom, SliceRandom};
+        if self.is_empty() || count == 0 {
+            return Vec::new();
+        }
+        let mut rng = rand::thread_rng();
+        if count > 0 {
+            let n = (count as usize).min(self.len());
+            self.member_map
+                .iter()
+                .choose_multiple(&mut rng, n)
+                .into_iter()
+                .map(|(m, s)| ScoredMember::new(m.clone(), *s))
+                .collect()
+        } else {
+            let n = (-count) as usize;
+            let pool: Vec<(&Bytes, f64)> = self
+                .member_map
+                .iter()
+                .map(|(m, s)| (m, *s))
+                .collect();
+            (0..n)
+                .map(|_| {
+                    let (m, s) = *pool.choose(&mut rng).unwrap();
+                    ScoredMember::new(m.clone(), s)
+                })
+                .collect()
+        }
+    }
+
+    /// Single random member, if any.
+    pub fn randmember_one(&self) -> Option<ScoredMember> {
+        use rand::seq::IteratorRandom;
+        let mut rng = rand::thread_rng();
+        self.member_map
+            .iter()
+            .choose(&mut rng)
+            .map(|(m, s)| ScoredMember::new(m.clone(), *s))
     }
 
     /// Approximate heap size of zset contents (members only; key charged separately).

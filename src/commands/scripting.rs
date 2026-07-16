@@ -23,8 +23,9 @@ const SCRIPT_CALL_ALLOWLIST: &[&str] = &[
     "LPOS", "LMOVE", //
     "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD", "SINTER", "SUNION", "SDIFF", //
     "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE", "SMOVE", "SPOP", "SRANDMEMBER", "SSCAN", //
-    "ZADD", "ZRANGE", "ZREVRANGE", "ZCARD", "ZSCORE", "ZREM", "ZRANK", "ZREVRANK", //
+    "ZADD", "ZRANGE", "ZREVRANGE", "ZCARD", "ZSCORE", "ZMSCORE", "ZREM", "ZRANK", "ZREVRANK", //
     "ZINCRBY", "ZRANGEBYSCORE", "ZREVRANGEBYSCORE", "ZCOUNT", "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", "ZSCAN", //
+    "ZRANGEBYLEX", "ZREVRANGEBYLEX", "ZLEXCOUNT", "ZREMRANGEBYLEX", "ZRANDMEMBER", //
     "ZUNION", "ZINTER", "ZDIFF", "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE", //
     "ZPOPMIN", "ZPOPMAX", //
     "SETBIT", "GETBIT", "BITCOUNT", "BITPOS", "BITOP", //
@@ -415,6 +416,7 @@ impl CommandHandler {
             "ZREVRANGE" => self.handle_zrevrange(args),
             "ZCARD" => self.handle_zcard(args),
             "ZSCORE" => self.handle_zscore(args),
+            "ZMSCORE" => self.handle_zmscore(args),
             "ZREM" => self.handle_zrem(args),
             "ZRANK" => self.handle_zrank(args),
             "ZREVRANK" => self.handle_zrevrank(args),
@@ -424,6 +426,11 @@ impl CommandHandler {
             "ZCOUNT" => self.handle_zcount(args),
             "ZREMRANGEBYRANK" => self.handle_zremrangebyrank(args),
             "ZREMRANGEBYSCORE" => self.handle_zremrangebyscore(args),
+            "ZRANGEBYLEX" => self.handle_zrangebylex(args),
+            "ZREVRANGEBYLEX" => self.handle_zrevrangebylex(args),
+            "ZLEXCOUNT" => self.handle_zlexcount(args),
+            "ZREMRANGEBYLEX" => self.handle_zremrangebylex(args),
+            "ZRANDMEMBER" => self.handle_zrandmember(args),
             "ZSCAN" => self.handle_zscan(args),
             "ZUNION" => self.handle_zunion(args),
             "ZINTER" => self.handle_zinter(args),

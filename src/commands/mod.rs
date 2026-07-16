@@ -532,6 +532,7 @@ impl CommandHandler {
             "ZREVRANGE" => self.handle_zrevrange(&args[1..]),
             "ZCARD" => self.handle_zcard(&args[1..]),
             "ZSCORE" => self.handle_zscore(&args[1..]),
+            "ZMSCORE" => self.handle_zmscore(&args[1..]),
             "ZREM" => self.handle_zrem(&args[1..]),
             "ZRANK" => self.handle_zrank(&args[1..]),
             "ZREVRANK" => self.handle_zrevrank(&args[1..]),
@@ -541,6 +542,11 @@ impl CommandHandler {
             "ZCOUNT" => self.handle_zcount(&args[1..]),
             "ZREMRANGEBYRANK" => self.handle_zremrangebyrank(&args[1..]),
             "ZREMRANGEBYSCORE" => self.handle_zremrangebyscore(&args[1..]),
+            "ZRANGEBYLEX" => self.handle_zrangebylex(&args[1..]),
+            "ZREVRANGEBYLEX" => self.handle_zrevrangebylex(&args[1..]),
+            "ZLEXCOUNT" => self.handle_zlexcount(&args[1..]),
+            "ZREMRANGEBYLEX" => self.handle_zremrangebylex(&args[1..]),
+            "ZRANDMEMBER" => self.handle_zrandmember(&args[1..]),
             "ZSCAN" => self.handle_zscan(&args[1..]),
             "ZUNION" => self.handle_zunion(&args[1..]),
             "ZINTER" => self.handle_zinter(&args[1..]),
@@ -1025,6 +1031,7 @@ fn is_write_command(cmd: &str) -> bool {
             | "ZINCRBY"
             | "ZREMRANGEBYRANK"
             | "ZREMRANGEBYSCORE"
+            | "ZREMRANGEBYLEX"
             | "ZUNIONSTORE"
             | "ZINTERSTORE"
             | "ZDIFFSTORE"
