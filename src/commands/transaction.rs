@@ -163,7 +163,8 @@ fn write_keys(cmd: &str, args: &[RespValue]) -> Vec<Bytes> {
             .into_iter()
             .collect(),
         // SINTERSTORE/SUNIONSTORE/SDIFFSTORE destination key [key ...] — dest is first arg
-        "SINTERSTORE" | "SUNIONSTORE" | "SDIFFSTORE" => args
+        // ZUNIONSTORE/ZINTERSTORE destination numkeys key … — dest is first arg
+        "SINTERSTORE" | "SUNIONSTORE" | "SDIFFSTORE" | "ZUNIONSTORE" | "ZINTERSTORE" => args
             .first()
             .and_then(|a| a.as_bulk_string())
             .cloned()

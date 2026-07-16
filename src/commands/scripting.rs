@@ -23,6 +23,7 @@ const SCRIPT_CALL_ALLOWLIST: &[&str] = &[
     "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE", "SMOVE", "SPOP", "SRANDMEMBER", "SSCAN", //
     "ZADD", "ZRANGE", "ZREVRANGE", "ZCARD", "ZSCORE", "ZREM", "ZRANK", "ZREVRANK", //
     "ZINCRBY", "ZRANGEBYSCORE", "ZREVRANGEBYSCORE", "ZCOUNT", "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE", "ZSCAN", //
+    "ZUNIONSTORE", "ZINTERSTORE", //
     "SETBIT", "GETBIT", "BITCOUNT", "BITPOS", "BITOP", //
     "PFADD", "PFCOUNT", "PFMERGE", //
     "DBSIZE", "KEYS", //
@@ -416,6 +417,8 @@ impl CommandHandler {
             "ZREMRANGEBYRANK" => self.handle_zremrangebyrank(args),
             "ZREMRANGEBYSCORE" => self.handle_zremrangebyscore(args),
             "ZSCAN" => self.handle_zscan(args),
+            "ZUNIONSTORE" => self.handle_zunionstore(args),
+            "ZINTERSTORE" => self.handle_zinterstore(args),
             "SETBIT" => self.handle_setbit(args),
             "GETBIT" => self.handle_getbit(args),
             "BITCOUNT" => self.handle_bitcount(args),

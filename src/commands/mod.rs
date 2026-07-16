@@ -542,6 +542,8 @@ impl CommandHandler {
             "ZREMRANGEBYRANK" => self.handle_zremrangebyrank(&args[1..]),
             "ZREMRANGEBYSCORE" => self.handle_zremrangebyscore(&args[1..]),
             "ZSCAN" => self.handle_zscan(&args[1..]),
+            "ZUNIONSTORE" => self.handle_zunionstore(&args[1..]),
+            "ZINTERSTORE" => self.handle_zinterstore(&args[1..]),
 
             // Geospatial commands
             "GEOADD" => self.handle_geoadd(&args[1..]),
@@ -1009,6 +1011,8 @@ fn is_write_command(cmd: &str) -> bool {
             | "ZINCRBY"
             | "ZREMRANGEBYRANK"
             | "ZREMRANGEBYSCORE"
+            | "ZUNIONSTORE"
+            | "ZINTERSTORE"
             | "GEOADD"
             | "GEOSEARCHSTORE"
             | "HSET"

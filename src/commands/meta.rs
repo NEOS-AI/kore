@@ -149,6 +149,9 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     CmdSpec { name: "zremrangebyrank", arity: 4, flags: &["write"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "zremrangebyscore", arity: 4, flags: &["write"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "zscan", arity: -3, flags: &["readonly", "random"], first_key: 1, last_key: 1, step: 1 },
+    // numkeys + optional WEIGHTS/AGGREGATE make full key ranges movable; expose dest only.
+    CmdSpec { name: "zunionstore", arity: -4, flags: &["write", "denyoom", "movablekeys"], first_key: 1, last_key: 1, step: 1 },
+    CmdSpec { name: "zinterstore", arity: -4, flags: &["write", "denyoom", "movablekeys"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "publish", arity: 3, flags: &["pubsub", "loading", "stale", "fast"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "subscribe", arity: -2, flags: &["pubsub", "noscript", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "unsubscribe", arity: -1, flags: &["pubsub", "noscript", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },

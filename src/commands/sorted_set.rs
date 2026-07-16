@@ -3,7 +3,27 @@ use crate::error::{Error, Result};
 use crate::protocol::RespValue;
 use crate::sorted_set::{ScoreBound, ScoredMember};
 use bytes::Bytes;
+use std::collections::HashMap;
 use super::CommandHandler;
+
+/// How ZUNIONSTORE / ZINTERSTORE combine scores for the same member.
+#[derive(Clone, Copy)]
+enum ZAggregate {
+    Sum,
+    Min,
+    Max,
+}
+
+impl ZAggregate {
+    fn apply(self, acc: Option<f64>, weighted: f64) -> f64 {
+        match (self, acc) {
+            (_, None) => weighted,
+            (ZAggregate::Sum, Some(a)) => a + weighted,
+            (ZAggregate::Min, Some(a)) => a.min(weighted),
+            (ZAggregate::Max, Some(a)) => a.max(weighted),
+        }
+    }
+}
 
 impl CommandHandler {
     /// Return WRONGTYPE if key exists but is not a sorted set.
@@ -721,4 +741,247 @@ impl CommandHandler {
         }
         Ok(super::admin::scan_reply(next, elements))
     }
+
+    /// ZUNIONSTORE destination numkeys key [key ...] [WEIGHTS w ...] [AGGREGATE SUM|MIN|MAX]
+    pub(super) fn handle_zunionstore(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.handle_zstore(args, false, "zunionstore")
+    }
+
+    /// ZINTERSTORE destination numkeys key [key ...] [WEIGHTS w ...] [AGGREGATE SUM|MIN|MAX]
+    pub(super) fn handle_zinterstore(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.handle_zstore(args, true, "zinterstore")
+    }
+
+    fn handle_zstore(
+        &self,
+        args: &[RespValue],
+        inter: bool,
+        name: &str,
+    ) -> Result<RespValue> {
+        // destination + numkeys + at least one key
+        if args.len() < 3 {
+            return Ok(RespValue::error(format!(
+                "ERR wrong number of arguments for '{}' command",
+                name
+            )));
+        }
+        let dest = match args[0].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid destination key")),
+        };
+        let numkeys = match self.parse_integer(&args[1]) {
+            Ok(n) if n > 0 => n as usize,
+            _ => {
+                return Ok(RespValue::error(
+                    "ERR at least 1 input key is needed for ZUNIONSTORE/ZINTERSTORE",
+                ))
+            }
+        };
+        if args.len() < 2 + numkeys {
+            return Ok(RespValue::error(format!(
+                "ERR wrong number of arguments for '{}' command",
+                name
+            )));
+        }
+
+        let key_args = &args[2..2 + numkeys];
+        let mut keys = Vec::with_capacity(numkeys);
+        for a in key_args {
+            match a.as_bulk_string() {
+                Some(k) => keys.push(k.clone()),
+                None => return Ok(RespValue::error("ERR invalid key")),
+            }
+        }
+
+        let (weights, aggregate) = match parse_zstore_options(&args[2 + numkeys..], numkeys) {
+            Ok(v) => v,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+
+        // Type-check sources; snapshot member→score under read locks.
+        // Missing keys act as empty zsets (inter → empty result if any missing).
+        let mut snapshots: Vec<HashMap<Bytes, f64>> = Vec::with_capacity(numkeys);
+        for k in &keys {
+            match self.cache.key_type(k) {
+                KeyType::None => {
+                    if inter {
+                        // Intersection with empty → empty; still overwrite dest below.
+                        return self.store_zset_result(&dest, Vec::new());
+                    }
+                    snapshots.push(HashMap::new());
+                }
+                KeyType::ZSet => {
+                    let map = match self.cache.get_sorted_set(k) {
+                        Some(z) => z.read().iter_members().collect(),
+                        None => HashMap::new(),
+                    };
+                    if inter && map.is_empty() {
+                        return self.store_zset_result(&dest, Vec::new());
+                    }
+                    snapshots.push(map);
+                }
+                _ => return Ok(RespValue::error(Error::WrongType.to_resp_string())),
+            }
+        }
+
+        let result = if inter {
+            compute_zinter(&snapshots, &weights, aggregate)
+        } else {
+            compute_zunion(&snapshots, &weights, aggregate)
+        };
+
+        // Reject NaN scores (Redis).
+        if result.iter().any(|(_, s)| s.is_nan()) {
+            return Ok(RespValue::error(
+                "ERR resulting score is not a number (NaN)",
+            ));
+        }
+
+        self.store_zset_result(&dest, result)
+    }
+
+    /// Overwrite `dest` with a zset of `members` (score pairs). Empty → delete key, return 0.
+    fn store_zset_result(
+        &self,
+        dest: &Bytes,
+        members: Vec<(Bytes, f64)>,
+    ) -> Result<RespValue> {
+        let card = members.len() as i64;
+        let _ = self.cache.delete(dest);
+        if members.is_empty() {
+            return Ok(RespValue::Integer(0));
+        }
+
+        let est: usize = members.iter().map(|(m, _)| m.len() + 64).sum();
+        if let Err(e) = self.cache.ensure_non_string_capacity(est) {
+            return Ok(RespValue::error(e.to_resp_string()));
+        }
+        let zset = match self.cache.get_or_create_sorted_set(dest) {
+            Ok(z) => z,
+            Err(e) => return Ok(RespValue::error(e.to_resp_string())),
+        };
+        let mut set = zset.write();
+        let before = crate::memory::estimate_keyed_object(dest.len(), set.memory_size());
+        for (member, score) in members {
+            let _ = set.add(member, score);
+        }
+        let after = crate::memory::estimate_keyed_object(dest.len(), set.memory_size());
+        drop(set);
+        self.cache.account_sorted_set_delta(before, after);
+        Ok(RespValue::Integer(card))
+    }
+}
+
+/// Parse trailing WEIGHTS / AGGREGATE options for Z*STORE.
+fn parse_zstore_options(
+    rest: &[RespValue],
+    numkeys: usize,
+) -> std::result::Result<(Vec<f64>, ZAggregate), String> {
+    let mut weights = vec![1.0_f64; numkeys];
+    let mut aggregate = ZAggregate::Sum;
+    let mut i = 0;
+    while i < rest.len() {
+        let token = match rest[i].as_bulk_string() {
+            Some(b) => String::from_utf8_lossy(b).to_ascii_uppercase(),
+            None => return Err("ERR syntax error".into()),
+        };
+        match token.as_str() {
+            "WEIGHTS" => {
+                i += 1;
+                if rest.len() < i + numkeys {
+                    return Err("ERR syntax error".into());
+                }
+                for w in 0..numkeys {
+                    let s = match rest[i + w].as_bulk_string() {
+                        Some(b) => String::from_utf8_lossy(b),
+                        None => return Err("ERR weight value is not a float".into()),
+                    };
+                    let v: f64 = s
+                        .parse()
+                        .map_err(|_| "ERR weight value is not a float".to_string())?;
+                    if v.is_nan() {
+                        return Err("ERR weight value is not a float".into());
+                    }
+                    weights[w] = v;
+                }
+                i += numkeys;
+            }
+            "AGGREGATE" => {
+                i += 1;
+                if i >= rest.len() {
+                    return Err("ERR syntax error".into());
+                }
+                let agg = match rest[i].as_bulk_string() {
+                    Some(b) => String::from_utf8_lossy(b).to_ascii_uppercase(),
+                    None => return Err("ERR syntax error".into()),
+                };
+                aggregate = match agg.as_str() {
+                    "SUM" => ZAggregate::Sum,
+                    "MIN" => ZAggregate::Min,
+                    "MAX" => ZAggregate::Max,
+                    _ => {
+                        return Err(
+                            "ERR AGGREGATE supports SUM, MIN, or MAX only".into(),
+                        )
+                    }
+                };
+                i += 1;
+            }
+            _ => return Err("ERR syntax error".into()),
+        }
+    }
+    Ok((weights, aggregate))
+}
+
+fn compute_zunion(
+    snapshots: &[HashMap<Bytes, f64>],
+    weights: &[f64],
+    aggregate: ZAggregate,
+) -> Vec<(Bytes, f64)> {
+    let mut acc: HashMap<Bytes, f64> = HashMap::new();
+    for (idx, snap) in snapshots.iter().enumerate() {
+        let w = weights[idx];
+        for (member, score) in snap {
+            let weighted = score * w;
+            let entry = acc.entry(member.clone());
+            match entry {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let new_score = aggregate.apply(Some(*e.get()), weighted);
+                    e.insert(new_score);
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(aggregate.apply(None, weighted));
+                }
+            }
+        }
+    }
+    acc.into_iter().collect()
+}
+
+fn compute_zinter(
+    snapshots: &[HashMap<Bytes, f64>],
+    weights: &[f64],
+    aggregate: ZAggregate,
+) -> Vec<(Bytes, f64)> {
+    if snapshots.is_empty() {
+        return Vec::new();
+    }
+    // Start from the smallest set for fewer candidates.
+    let mut order: Vec<usize> = (0..snapshots.len()).collect();
+    order.sort_by_key(|&i| snapshots[i].len());
+    let first = order[0];
+    let mut out = Vec::new();
+    'member: for (member, first_score) in &snapshots[first] {
+        let mut score = aggregate.apply(None, first_score * weights[first]);
+        for &idx in &order[1..] {
+            match snapshots[idx].get(member) {
+                Some(s) => {
+                    score = aggregate.apply(Some(score), s * weights[idx]);
+                }
+                None => continue 'member,
+            }
+        }
+        out.push((member.clone(), score));
+    }
+    out
 }
