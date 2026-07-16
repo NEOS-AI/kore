@@ -544,6 +544,10 @@ impl CommandHandler {
             "ZSCAN" => self.handle_zscan(&args[1..]),
             "ZUNIONSTORE" => self.handle_zunionstore(&args[1..]),
             "ZINTERSTORE" => self.handle_zinterstore(&args[1..]),
+            "ZPOPMIN" => self.handle_zpopmin(&args[1..]),
+            "ZPOPMAX" => self.handle_zpopmax(&args[1..]),
+            "BZPOPMIN" => self.handle_bzpopmin(&args[1..]).await,
+            "BZPOPMAX" => self.handle_bzpopmax(&args[1..]).await,
 
             // Geospatial commands
             "GEOADD" => self.handle_geoadd(&args[1..]),
@@ -1019,6 +1023,10 @@ fn is_write_command(cmd: &str) -> bool {
             | "ZREMRANGEBYSCORE"
             | "ZUNIONSTORE"
             | "ZINTERSTORE"
+            | "ZPOPMIN"
+            | "ZPOPMAX"
+            | "BZPOPMIN"
+            | "BZPOPMAX"
             | "GEOADD"
             | "GEOSEARCHSTORE"
             | "HSET"

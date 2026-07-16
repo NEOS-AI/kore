@@ -153,7 +153,7 @@ fn write_keys(cmd: &str, args: &[RespValue]) -> Vec<Bytes> {
     match cmd {
         "SET" | "SETNX" | "GETDEL" | "GETEX" | "APPEND" | "SETRANGE" | "SETEX" | "GETSET" | "INCR"
         | "DECR" | "INCRBY" | "DECRBY" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "PERSIST" | "ZADD" | "ZREM" | "ZINCRBY"
-        | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "GEOADD"
+        | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "ZPOPMIN" | "ZPOPMAX" | "GEOADD"
         | "GEOSEARCHSTORE" | "HSET" | "HMSET" | "HDEL" | "HINCRBY" | "HINCRBYFLOAT" | "LPUSH" | "RPUSH" | "LPOP"
         | "RPOP" | "LSET" | "LREM" | "LTRIM" | "LINSERT" | "SADD" | "SREM" | "SPOP" | "XADD" | "XDEL" | "XTRIM" | "XACK"
         | "SETBIT" | "BITFIELD" | "PFADD" | "TOUCH" | "MOVE" => args
@@ -190,8 +190,8 @@ fn write_keys(cmd: &str, args: &[RespValue]) -> Vec<Bytes> {
             .cloned()
             .into_iter()
             .collect(),
-        // BLPOP/BRPOP: all args except the trailing timeout are keys
-        "BLPOP" | "BRPOP" => {
+        // BLPOP/BRPOP/BZPOP*: all args except the trailing timeout are keys
+        "BLPOP" | "BRPOP" | "BZPOPMIN" | "BZPOPMAX" => {
             if args.len() < 2 {
                 Vec::new()
             } else {

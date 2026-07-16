@@ -536,6 +536,42 @@ impl SortedSet {
         out
     }
 
+    /// Pop up to `count` members with the lowest scores (ascending order).
+    pub fn pop_min(&mut self, count: usize) -> Vec<ScoredMember> {
+        let n = count.min(self.len());
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let Some(key) = self.list.get_by_rank(0) else {
+                break;
+            };
+            let member = key.member.clone();
+            let score = key.score.0;
+            let _ = self.remove(&member);
+            out.push(ScoredMember::new(member, score));
+        }
+        out
+    }
+
+    /// Pop up to `count` members with the highest scores (descending order).
+    pub fn pop_max(&mut self, count: usize) -> Vec<ScoredMember> {
+        let n = count.min(self.len());
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            if self.is_empty() {
+                break;
+            }
+            let last = self.len() - 1;
+            let Some(key) = self.list.get_by_rank(last) else {
+                break;
+            };
+            let member = key.member.clone();
+            let score = key.score.0;
+            let _ = self.remove(&member);
+            out.push(ScoredMember::new(member, score));
+        }
+        out
+    }
+
     /// 0-based rank in ascending score order. O(log n).
     pub fn rank(&self, member: &Bytes) -> Option<usize> {
         let score = *self.member_map.get(member)?;

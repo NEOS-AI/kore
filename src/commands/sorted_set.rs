@@ -96,6 +96,8 @@ impl CommandHandler {
         let after = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
         drop(set);
         self.cache.account_sorted_set_delta(before, after);
+        // Wake BZPOPMIN/BZPOPMAX waiters.
+        self.cache.list_blockers.notify_key(&key);
 
         Ok(RespValue::Integer(added as i64))
     }
@@ -438,6 +440,7 @@ impl CommandHandler {
         let after = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
         drop(set);
         self.cache.account_sorted_set_delta(before, after);
+        self.cache.list_blockers.notify_key(&key);
         Ok(RespValue::BulkString(Some(Bytes::from(format_score(new_score)))))
     }
 
@@ -868,8 +871,206 @@ impl CommandHandler {
         let after = crate::memory::estimate_keyed_object(dest.len(), set.memory_size());
         drop(set);
         self.cache.account_sorted_set_delta(before, after);
+        self.cache.list_blockers.notify_key(dest);
         Ok(RespValue::Integer(card))
     }
+
+    /// ZPOPMIN key [count]
+    pub(super) fn handle_zpopmin(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.handle_zpop(args, true, "zpopmin")
+    }
+
+    /// ZPOPMAX key [count]
+    pub(super) fn handle_zpopmax(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.handle_zpop(args, false, "zpopmax")
+    }
+
+    fn handle_zpop(
+        &self,
+        args: &[RespValue],
+        min: bool,
+        name: &str,
+    ) -> Result<RespValue> {
+        if args.is_empty() || args.len() > 2 {
+            return Ok(RespValue::error(format!(
+                "ERR wrong number of arguments for '{}' command",
+                name
+            )));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_zset_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+        let count = if args.len() == 2 {
+            match self.parse_integer(&args[1]) {
+                Ok(c) if c >= 0 => c as usize,
+                Ok(_) => {
+                    return Ok(RespValue::error(
+                        "ERR value is out of range, must be positive",
+                    ))
+                }
+                Err(_) => {
+                    return Ok(RespValue::error(
+                        "ERR value is not an integer or out of range",
+                    ))
+                }
+            }
+        } else {
+            1
+        };
+
+        let zset = match self.cache.get_sorted_set(key) {
+            Some(z) => z,
+            None => return Ok(RespValue::Array(vec![])),
+        };
+        let mut set = zset.write();
+        let before = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
+        let popped = if min {
+            set.pop_min(count)
+        } else {
+            set.pop_max(count)
+        };
+        let empty = set.is_empty();
+        let after = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
+        drop(set);
+        self.cache.account_sorted_set_delta(before, after);
+        if empty {
+            self.cache.remove_sorted_set(key);
+        }
+        Ok(scored_members_to_resp(popped, true))
+    }
+
+    /// BZPOPMIN key [key ...] timeout
+    pub(super) async fn handle_bzpopmin(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.handle_blocking_zpop(args, true).await
+    }
+
+    /// BZPOPMAX key [key ...] timeout
+    pub(super) async fn handle_bzpopmax(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.handle_blocking_zpop(args, false).await
+    }
+
+    async fn handle_blocking_zpop(
+        &self,
+        args: &[RespValue],
+        min: bool,
+    ) -> Result<RespValue> {
+        let cmd = if min { "bzpopmin" } else { "bzpopmax" };
+        if args.len() < 2 {
+            return Ok(RespValue::error(format!(
+                "ERR wrong number of arguments for '{}' command",
+                cmd
+            )));
+        }
+
+        let timeout_arg = &args[args.len() - 1];
+        let timeout_secs = match Self::parse_timeout_seconds(timeout_arg) {
+            Ok(t) => t,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+
+        let mut keys = Vec::with_capacity(args.len() - 1);
+        for a in &args[..args.len() - 1] {
+            match a.as_bulk_string() {
+                Some(k) => keys.push(k.clone()),
+                None => return Ok(RespValue::error("ERR invalid key")),
+            }
+        }
+
+        for key in &keys {
+            if let Err(Error::WrongType) = self.ensure_zset_key(key) {
+                return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+            }
+        }
+
+        if let Some((key, member, score)) = self.try_blocking_zpop(&keys, min) {
+            return Ok(bzpop_reply(key, member, score));
+        }
+
+        if self.executing_multi {
+            return Ok(RespValue::null_array());
+        }
+
+        let block_forever = timeout_secs == 0.0;
+        let deadline = if block_forever {
+            None
+        } else {
+            Some(std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout_secs))
+        };
+
+        let (waiter_id, notify) = self.cache.list_blockers.register(&keys);
+
+        let result = loop {
+            if let Some((key, member, score)) = self.try_blocking_zpop(&keys, min) {
+                break Ok(bzpop_reply(key, member, score));
+            }
+
+            if let Some(dl) = deadline {
+                let now = std::time::Instant::now();
+                if now >= dl {
+                    break Ok(RespValue::null_array());
+                }
+                let remaining = dl - now;
+                match tokio::time::timeout(remaining, notify.notified()).await {
+                    Ok(()) => continue,
+                    Err(_) => break Ok(RespValue::null_array()),
+                }
+            } else {
+                notify.notified().await;
+            }
+        };
+
+        self.cache.list_blockers.unregister(waiter_id, &keys);
+        result
+    }
+
+    /// Pop one member from the first non-empty zset among `keys` (left-to-right).
+    fn try_blocking_zpop(
+        &self,
+        keys: &[Bytes],
+        min: bool,
+    ) -> Option<(Bytes, Bytes, f64)> {
+        for key in keys {
+            if !matches!(self.cache.key_type(key), KeyType::ZSet) {
+                continue;
+            }
+            let Some(zset) = self.cache.get_sorted_set(key) else {
+                continue;
+            };
+            let mut set = zset.write();
+            if set.is_empty() {
+                continue;
+            }
+            let before = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
+            let mut popped = if min {
+                set.pop_min(1)
+            } else {
+                set.pop_max(1)
+            };
+            let empty = set.is_empty();
+            let after = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
+            drop(set);
+            self.cache.account_sorted_set_delta(before, after);
+            if empty {
+                self.cache.remove_sorted_set(key);
+            }
+            if let Some(sm) = popped.pop() {
+                return Some((key.clone(), sm.member, sm.score));
+            }
+        }
+        None
+    }
+}
+
+fn bzpop_reply(key: Bytes, member: Bytes, score: f64) -> RespValue {
+    RespValue::Array(vec![
+        RespValue::BulkString(Some(key)),
+        RespValue::BulkString(Some(member)),
+        RespValue::BulkString(Some(Bytes::from(format_score(score)))),
+    ])
 }
 
 /// Parse trailing WEIGHTS / AGGREGATE options for Z*STORE.

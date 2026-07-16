@@ -226,8 +226,8 @@ impl CommandHandler {
         result
     }
 
-    /// Parse BLPOP/BRPOP timeout in seconds (integer or float string; 0 = forever).
-    fn parse_timeout_seconds(value: &RespValue) -> std::result::Result<f64, String> {
+    /// Parse BLPOP/BRPOP/BZPOP* timeout in seconds (integer or float string; 0 = forever).
+    pub(crate) fn parse_timeout_seconds(value: &RespValue) -> std::result::Result<f64, String> {
         if let Some(i) = value.as_integer() {
             if i < 0 {
                 return Err("ERR timeout is negative".into());

@@ -158,6 +158,10 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     // numkeys + optional WEIGHTS/AGGREGATE make full key ranges movable; expose dest only.
     CmdSpec { name: "zunionstore", arity: -4, flags: &["write", "denyoom", "movablekeys"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "zinterstore", arity: -4, flags: &["write", "denyoom", "movablekeys"], first_key: 1, last_key: 1, step: 1 },
+    CmdSpec { name: "zpopmin", arity: -2, flags: &["write", "fast"], first_key: 1, last_key: 1, step: 1 },
+    CmdSpec { name: "zpopmax", arity: -2, flags: &["write", "fast"], first_key: 1, last_key: 1, step: 1 },
+    CmdSpec { name: "bzpopmin", arity: -3, flags: &["write", "blocking", "fast"], first_key: 1, last_key: -2, step: 1 },
+    CmdSpec { name: "bzpopmax", arity: -3, flags: &["write", "blocking", "fast"], first_key: 1, last_key: -2, step: 1 },
     CmdSpec { name: "publish", arity: 3, flags: &["pubsub", "loading", "stale", "fast"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "subscribe", arity: -2, flags: &["pubsub", "noscript", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "unsubscribe", arity: -1, flags: &["pubsub", "noscript", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },
