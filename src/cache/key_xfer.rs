@@ -310,3 +310,393 @@ impl Cache {
         n
     }
 }
+
+// ─── Kore DUMP/RESTORE wire format (KDF1) ───────────────────────────────────
+// Not Redis RDB — Kore-native multi-type snapshot for DUMP/RESTORE round-trips.
+// Layout: magic "KDF1" | type u8 | body…  (no embedded TTL; RESTORE supplies it)
+
+const KDF_MAGIC: &[u8; 4] = b"KDF1";
+const KDF_STRING: u8 = 1;
+const KDF_HASH: u8 = 2;
+const KDF_LIST: u8 = 3;
+const KDF_SET: u8 = 4;
+const KDF_ZSET: u8 = 5;
+const KDF_GEO: u8 = 6;
+const KDF_STREAM: u8 = 7;
+
+impl KeyPayload {
+    /// Encode for DUMP (TTL is not embedded — RESTORE applies expiry).
+    pub fn encode_dump(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64);
+        out.extend_from_slice(KDF_MAGIC);
+        match self {
+            KeyPayload::String { value, flags, .. } => {
+                out.push(KDF_STRING);
+                out.extend_from_slice(&flags.to_le_bytes());
+                write_bytes(&mut out, value);
+            }
+            KeyPayload::Hash { fields, .. } => {
+                out.push(KDF_HASH);
+                write_u32(&mut out, fields.len() as u32);
+                for (k, v) in fields {
+                    write_bytes(&mut out, k);
+                    write_bytes(&mut out, v);
+                }
+            }
+            KeyPayload::List { elements, .. } => {
+                out.push(KDF_LIST);
+                write_u32(&mut out, elements.len() as u32);
+                for e in elements {
+                    write_bytes(&mut out, e);
+                }
+            }
+            KeyPayload::Set { members, .. } => {
+                out.push(KDF_SET);
+                write_u32(&mut out, members.len() as u32);
+                for m in members {
+                    write_bytes(&mut out, m);
+                }
+            }
+            KeyPayload::ZSet { members, .. } => {
+                out.push(KDF_ZSET);
+                write_u32(&mut out, members.len() as u32);
+                for (m, score) in members {
+                    write_bytes(&mut out, m);
+                    out.extend_from_slice(&score.to_le_bytes());
+                }
+            }
+            KeyPayload::Geo { members, .. } => {
+                out.push(KDF_GEO);
+                write_u32(&mut out, members.len() as u32);
+                for (m, lon, lat) in members {
+                    write_bytes(&mut out, m);
+                    out.extend_from_slice(&lon.to_le_bytes());
+                    out.extend_from_slice(&lat.to_le_bytes());
+                }
+            }
+            KeyPayload::Stream { state, .. } => {
+                out.push(KDF_STREAM);
+                encode_stream(&mut out, state);
+            }
+        }
+        out
+    }
+
+    /// Decode DUMP payload into a KeyPayload with `pttl = -1` (caller sets TTL).
+    pub fn decode_dump(data: &[u8]) -> std::result::Result<KeyPayload, String> {
+        if data.len() < 5 || &data[0..4] != KDF_MAGIC {
+            return Err("DUMP payload version or checksum are wrong".into());
+        }
+        let mut r = Reader { data, pos: 4 };
+        let ty = r.u8()?;
+        let payload = match ty {
+            KDF_STRING => {
+                let flags = r.u32()?;
+                let value = r.bytes()?;
+                KeyPayload::String {
+                    value,
+                    flags,
+                    pttl: -1,
+                }
+            }
+            KDF_HASH => {
+                let n = r.u32()? as usize;
+                let mut fields = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let k = r.bytes()?;
+                    let v = r.bytes()?;
+                    fields.push((k, v));
+                }
+                KeyPayload::Hash { fields, pttl: -1 }
+            }
+            KDF_LIST => {
+                let n = r.u32()? as usize;
+                let mut elements = Vec::with_capacity(n);
+                for _ in 0..n {
+                    elements.push(r.bytes()?);
+                }
+                KeyPayload::List {
+                    elements,
+                    pttl: -1,
+                }
+            }
+            KDF_SET => {
+                let n = r.u32()? as usize;
+                let mut members = Vec::with_capacity(n);
+                for _ in 0..n {
+                    members.push(r.bytes()?);
+                }
+                KeyPayload::Set {
+                    members,
+                    pttl: -1,
+                }
+            }
+            KDF_ZSET => {
+                let n = r.u32()? as usize;
+                let mut members = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let m = r.bytes()?;
+                    let score = r.f64()?;
+                    members.push((m, score));
+                }
+                KeyPayload::ZSet {
+                    members,
+                    pttl: -1,
+                }
+            }
+            KDF_GEO => {
+                let n = r.u32()? as usize;
+                let mut members = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let m = r.bytes()?;
+                    let lon = r.f64()?;
+                    let lat = r.f64()?;
+                    members.push((m, lon, lat));
+                }
+                KeyPayload::Geo {
+                    members,
+                    pttl: -1,
+                }
+            }
+            KDF_STREAM => {
+                let state = decode_stream(&mut r)?;
+                KeyPayload::Stream { state, pttl: -1 }
+            }
+            _ => return Err("DUMP payload version or checksum are wrong".into()),
+        };
+        if r.pos != r.data.len() {
+            return Err("DUMP payload version or checksum are wrong".into());
+        }
+        Ok(payload)
+    }
+
+    /// Apply external TTL for RESTORE: `pttl_ms` remaining (or absolute when `absttl`).
+    /// `0` means no expiration. Negative remaining is treated as immediate delete by caller.
+    pub fn with_restore_ttl(mut self, ttl_arg: i64, absttl: bool) -> KeyPayload {
+        let pttl = if ttl_arg <= 0 {
+            -1
+        } else if absttl {
+            // Convert absolute unix ms → remaining; past times → 0 (caller deletes).
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            if ttl_arg <= now {
+                0
+            } else {
+                ttl_arg - now
+            }
+        } else {
+            ttl_arg
+        };
+        match &mut self {
+            KeyPayload::String { pttl: p, .. }
+            | KeyPayload::Hash { pttl: p, .. }
+            | KeyPayload::List { pttl: p, .. }
+            | KeyPayload::Set { pttl: p, .. }
+            | KeyPayload::ZSet { pttl: p, .. }
+            | KeyPayload::Geo { pttl: p, .. }
+            | KeyPayload::Stream { pttl: p, .. } => *p = pttl,
+        }
+        self
+    }
+}
+
+impl Cache {
+    /// DUMP key — Kore KDF1 blob, or None if missing.
+    pub fn dump_serialized(&self, key: &Bytes) -> Option<Bytes> {
+        let payload = self.dump_key(key)?;
+        Some(Bytes::from(payload.encode_dump()))
+    }
+
+    /// RESTORE key from DUMP blob. Returns Ok(true) on success.
+    /// Err string is Redis-style message (BUSYKEY / bad payload).
+    pub fn restore_serialized(
+        &self,
+        key: &Bytes,
+        data: &[u8],
+        ttl_arg: i64,
+        replace: bool,
+        absttl: bool,
+    ) -> std::result::Result<bool, String> {
+        if self.exists(key) && !replace {
+            return Err("BUSYKEY Target key name already exists.".into());
+        }
+        let payload = KeyPayload::decode_dump(data)
+            .map_err(|_| "ERR DUMP payload version or checksum are wrong".to_string())?;
+        let mut payload = payload.with_restore_ttl(ttl_arg, absttl);
+        // pttl==0 after ABSTTL past → restore then immediately delete.
+        let expire_now = payload.pttl() == 0;
+        if expire_now {
+            payload.set_pttl(-1);
+        }
+        self.restore_key(key, &payload, true)
+            .map_err(|e| e.to_resp_string())?;
+        if expire_now {
+            let _ = self.delete(key);
+        }
+        Ok(true)
+    }
+}
+
+impl KeyPayload {
+    fn set_pttl(&mut self, pttl: i64) {
+        match self {
+            KeyPayload::String { pttl: p, .. }
+            | KeyPayload::Hash { pttl: p, .. }
+            | KeyPayload::List { pttl: p, .. }
+            | KeyPayload::Set { pttl: p, .. }
+            | KeyPayload::ZSet { pttl: p, .. }
+            | KeyPayload::Geo { pttl: p, .. }
+            | KeyPayload::Stream { pttl: p, .. } => *p = pttl,
+        }
+    }
+}
+
+fn write_u32(out: &mut Vec<u8>, n: u32) {
+    out.extend_from_slice(&n.to_le_bytes());
+}
+
+fn write_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    write_u32(out, b.len() as u32);
+    out.extend_from_slice(b);
+}
+
+fn encode_stream(out: &mut Vec<u8>, state: &StreamStateSnapshot) {
+    write_u64(out, state.last_generated_id.ms);
+    write_u64(out, state.last_generated_id.seq);
+    write_u32(out, state.entries.len() as u32);
+    for (id, fields) in &state.entries {
+        write_u64(out, id.ms);
+        write_u64(out, id.seq);
+        write_u32(out, fields.len() as u32);
+        for (k, v) in fields {
+            write_bytes(out, k);
+            write_bytes(out, v);
+        }
+    }
+    write_u32(out, state.groups.len() as u32);
+    for g in &state.groups {
+        write_bytes(out, &g.name);
+        write_u64(out, g.last_delivered_id.ms);
+        write_u64(out, g.last_delivered_id.seq);
+        write_u32(out, g.pending.len() as u32);
+        for p in &g.pending {
+            write_u64(out, p.id.ms);
+            write_u64(out, p.id.seq);
+            write_bytes(out, &p.consumer);
+            write_u64(out, p.delivery_time_ms);
+            write_u64(out, p.delivery_count);
+        }
+        write_u32(out, g.consumers.len() as u32);
+        for c in &g.consumers {
+            write_bytes(out, &c.name);
+            write_u64(out, c.seen_time_ms);
+            write_u32(out, c.pending as u32);
+        }
+    }
+}
+
+fn decode_stream(r: &mut Reader<'_>) -> std::result::Result<StreamStateSnapshot, String> {
+    use crate::stream_type::{
+        ConsumerSnapshot, GroupSnapshot, PendingEntrySnapshot, StreamId,
+    };
+    let last_generated_id = StreamId::new(r.u64()?, r.u64()?);
+    let n_entries = r.u32()? as usize;
+    let mut entries = Vec::with_capacity(n_entries);
+    for _ in 0..n_entries {
+        let id = StreamId::new(r.u64()?, r.u64()?);
+        let nf = r.u32()? as usize;
+        let mut fields = Vec::with_capacity(nf);
+        for _ in 0..nf {
+            fields.push((r.bytes()?, r.bytes()?));
+        }
+        entries.push((id, fields));
+    }
+    let n_groups = r.u32()? as usize;
+    let mut groups = Vec::with_capacity(n_groups);
+    for _ in 0..n_groups {
+        let name = r.bytes()?;
+        let last_delivered_id = StreamId::new(r.u64()?, r.u64()?);
+        let np = r.u32()? as usize;
+        let mut pending = Vec::with_capacity(np);
+        for _ in 0..np {
+            pending.push(PendingEntrySnapshot {
+                id: StreamId::new(r.u64()?, r.u64()?),
+                consumer: r.bytes()?,
+                delivery_time_ms: r.u64()?,
+                delivery_count: r.u64()?,
+            });
+        }
+        let nc = r.u32()? as usize;
+        let mut consumers = Vec::with_capacity(nc);
+        for _ in 0..nc {
+            consumers.push(ConsumerSnapshot {
+                name: r.bytes()?,
+                seen_time_ms: r.u64()?,
+                pending: r.u32()? as usize,
+            });
+        }
+        groups.push(GroupSnapshot {
+            name,
+            last_delivered_id,
+            pending,
+            consumers,
+        });
+    }
+    Ok(StreamStateSnapshot {
+        last_generated_id,
+        entries,
+        groups,
+    })
+}
+
+fn write_u64(out: &mut Vec<u8>, n: u64) {
+    out.extend_from_slice(&n.to_le_bytes());
+}
+
+struct Reader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn need(&self, n: usize) -> std::result::Result<(), String> {
+        if self.pos + n > self.data.len() {
+            Err("DUMP payload version or checksum are wrong".into())
+        } else {
+            Ok(())
+        }
+    }
+    fn u8(&mut self) -> std::result::Result<u8, String> {
+        self.need(1)?;
+        let v = self.data[self.pos];
+        self.pos += 1;
+        Ok(v)
+    }
+    fn u32(&mut self) -> std::result::Result<u32, String> {
+        self.need(4)?;
+        let v = u32::from_le_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap());
+        self.pos += 4;
+        Ok(v)
+    }
+    fn u64(&mut self) -> std::result::Result<u64, String> {
+        self.need(8)?;
+        let v = u64::from_le_bytes(self.data[self.pos..self.pos + 8].try_into().unwrap());
+        self.pos += 8;
+        Ok(v)
+    }
+    fn f64(&mut self) -> std::result::Result<f64, String> {
+        self.need(8)?;
+        let v = f64::from_le_bytes(self.data[self.pos..self.pos + 8].try_into().unwrap());
+        self.pos += 8;
+        Ok(v)
+    }
+    fn bytes(&mut self) -> std::result::Result<Bytes, String> {
+        let n = self.u32()? as usize;
+        self.need(n)?;
+        let b = Bytes::copy_from_slice(&self.data[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(b)
+    }
+}

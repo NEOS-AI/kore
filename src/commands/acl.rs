@@ -32,12 +32,54 @@ impl CommandHandler {
             "DELUSER" => self.acl_deluser(&args[1..]),
             "LOAD" => self.acl_load(&args[1..]),
             "SAVE" => self.acl_save(&args[1..]),
+            "GENPASS" => self.acl_genpass(&args[1..]),
             "HELP" => Ok(acl_help()),
             _ => Ok(RespValue::error(format!(
                 "ERR Unknown subcommand or wrong number of arguments for '{}'. Try ACL HELP.",
                 sub
             ))),
         }
+    }
+
+    /// ACL GENPASS [bits] — random hex password (default 256 bits; bits rounded up to multiple of 4).
+    fn acl_genpass(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() > 1 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'acl|genpass' command",
+            ));
+        }
+        let mut bits: u64 = 256;
+        if args.len() == 1 {
+            bits = match self.parse_integer(&args[0]) {
+                Ok(n) if n > 0 && n <= 4096 => n as u64,
+                Ok(_) => {
+                    return Ok(RespValue::error(
+                        "ERR ACL GENPASS argument must be the number of bits for the output password, a positive integer up to 4096",
+                    ))
+                }
+                Err(_) => {
+                    return Ok(RespValue::error(
+                        "ERR ACL GENPASS argument must be the number of bits for the output password, a positive integer up to 4096",
+                    ))
+                }
+            };
+        }
+        // Round up to multiple of 4 bits (one hex nibble).
+        let bits = ((bits + 3) / 4) * 4;
+        let nbytes = (bits / 8) as usize;
+        // When bits is not multiple of 8 after nibble round (e.g. 4 → half byte),
+        // emit ceil(bits/8) bytes and trim hex to bits/4 chars.
+        let nbytes = nbytes.max(1);
+        use rand::RngCore;
+        let mut buf = vec![0u8; nbytes];
+        rand::thread_rng().fill_bytes(&mut buf);
+        let hex_len = (bits / 4) as usize;
+        let mut hex = String::with_capacity(hex_len);
+        for b in &buf {
+            hex.push_str(&format!("{:02x}", b));
+        }
+        hex.truncate(hex_len);
+        Ok(RespValue::BulkString(Some(Bytes::from(hex))))
     }
 
     fn acl_setuser(&self, args: &[RespValue]) -> Result<RespValue> {
@@ -272,6 +314,8 @@ fn acl_help() -> RespValue {
             "    Save the current ACL rules to the configured ACL file.",
             "SETUSER <username> [rules...]",
             "    Create or modify a user.",
+            "GENPASS [<bits>]",
+            "    Generate a secure random password (default 256 bits).",
             "USERS",
             "    List all usernames.",
             "WHOAMI",

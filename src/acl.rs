@@ -1,7 +1,7 @@
 //! ACL (Access Control List) — users, passwords, command, key & channel permissions.
 //!
 //! Subset of Redis ACL including LOAD/SAVE, DELUSER, and channel patterns.
-//! GENPASS is not implemented.
+//! GENPASS is implemented on the ACL command path.
 
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};

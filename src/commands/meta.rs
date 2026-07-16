@@ -41,6 +41,8 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     CmdSpec { name: "append", arity: 3, flags: &["write", "denyoom", "fast"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "strlen", arity: 2, flags: &["readonly", "fast"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "lcs", arity: -3, flags: &["readonly"], first_key: 1, last_key: 2, step: 1 },
+    CmdSpec { name: "dump", arity: 2, flags: &["readonly", "random"], first_key: 1, last_key: 1, step: 1 },
+    CmdSpec { name: "restore", arity: -4, flags: &["write", "denyoom"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "getrange", arity: 4, flags: &["readonly"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "substr", arity: 4, flags: &["readonly"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "setrange", arity: 4, flags: &["write", "denyoom"], first_key: 1, last_key: 1, step: 1 },
@@ -62,6 +64,7 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     CmdSpec { name: "decr", arity: 2, flags: &["write", "denyoom", "fast"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "incrby", arity: 3, flags: &["write", "denyoom", "fast"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "decrby", arity: 3, flags: &["write", "denyoom", "fast"], first_key: 1, last_key: 1, step: 1 },
+    // EXPIRE family accepts optional NX|XX|GT|LT (arity still -3 minimum).
     CmdSpec { name: "expire", arity: -3, flags: &["write", "fast"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "pexpire", arity: -3, flags: &["write", "fast"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "expireat", arity: -3, flags: &["write", "fast"], first_key: 1, last_key: 1, step: 1 },
@@ -573,7 +576,8 @@ impl CommandHandler {
                 let names: Vec<RespValue> = COMMAND_SPECS.iter().map(|s| bulk(s.name)).collect();
                 Ok(RespValue::Array(names))
             }
-            "DOCS" | "GETKEYS" | "GETKEYSANDFLAGS" => Ok(RespValue::error(format!(
+            "GETKEYS" => self.command_getkeys(&args[1..]),
+            "DOCS" | "GETKEYSANDFLAGS" => Ok(RespValue::error(format!(
                 "ERR COMMAND {} is not supported yet",
                 sub
             ))),
@@ -587,6 +591,114 @@ impl CommandHandler {
             }
         }
     }
+
+    /// COMMAND GETKEYS <command> [arg ...] — extract key arguments via catalog specs.
+    fn command_getkeys(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'command|getkeys' command",
+            ));
+        }
+        let cmd_name = match args[0].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_ascii_lowercase(),
+            None => {
+                return Ok(RespValue::error(
+                    "ERR Invalid command specified",
+                ))
+            }
+        };
+        let cmd_args = &args[1..];
+
+        // EVAL / EVALSHA: keys follow numkeys.
+        if cmd_name == "eval" || cmd_name == "evalsha" {
+            return Ok(RespValue::Array(
+                extract_eval_keys_for_getkeys(cmd_args)
+                    .into_iter()
+                    .map(|b| RespValue::BulkString(Some(b)))
+                    .collect(),
+            ));
+        }
+
+        let Some(spec) = find_spec(&cmd_name) else {
+            return Ok(RespValue::error("ERR Invalid command specified"));
+        };
+        if spec.first_key <= 0 {
+            return Ok(RespValue::Array(vec![]));
+        }
+        let keys = extract_keys_from_spec(cmd_args, spec.first_key, spec.last_key, spec.step);
+        Ok(RespValue::Array(
+            keys.into_iter()
+                .map(|b| RespValue::BulkString(Some(b)))
+                .collect(),
+        ))
+    }
+}
+
+/// Extract keys for COMMAND GETKEYS using Redis first/last/step on args after command name.
+fn extract_keys_from_spec(
+    args: &[RespValue],
+    first_key: i64,
+    last_key: i64,
+    step: i64,
+) -> Vec<Bytes> {
+    if first_key <= 0 || args.is_empty() {
+        return Vec::new();
+    }
+    let step = if step <= 0 { 1 } else { step as usize };
+    let first = (first_key as usize).saturating_sub(1);
+    if first >= args.len() {
+        return Vec::new();
+    }
+    let last = if last_key >= 0 {
+        (last_key as usize).saturating_sub(1).min(args.len() - 1)
+    } else {
+        let from_end = (-last_key) as usize;
+        if from_end > args.len() {
+            return Vec::new();
+        }
+        args.len() - from_end
+    };
+    if first > last {
+        return Vec::new();
+    }
+    let mut keys = Vec::new();
+    let mut i = first;
+    while i <= last {
+        if let Some(b) = args[i].as_bulk_string() {
+            keys.push(b.clone());
+        }
+        i += step;
+    }
+    keys
+}
+
+/// EVAL/EVALSHA args for GETKEYS: [script|sha, numkeys, key…, arg…]
+fn extract_eval_keys_for_getkeys(args: &[RespValue]) -> Vec<Bytes> {
+    if args.len() < 2 {
+        return Vec::new();
+    }
+    let numkeys = match args[1].as_integer() {
+        Some(n) if n >= 0 => n as usize,
+        Some(_) => return Vec::new(),
+        None => match args[1].as_bulk_string() {
+            Some(s) => match std::str::from_utf8(s)
+                .ok()
+                .and_then(|t| t.parse::<i64>().ok())
+            {
+                Some(n) if n >= 0 => n as usize,
+                _ => return Vec::new(),
+            },
+            None => return Vec::new(),
+        },
+    };
+    let key_slice = &args[2..];
+    if key_slice.len() < numkeys {
+        return Vec::new();
+    }
+    key_slice[..numkeys]
+        .iter()
+        .filter_map(|k| k.as_bulk_string().cloned())
+        .collect()
 }
 
 fn is_hello_keyword(b: &Bytes) -> bool {

@@ -474,6 +474,8 @@ impl CommandHandler {
             "GETDEL" => self.handle_getdel(&args[1..]),
             "GETEX" => self.handle_getex(&args[1..]),
             "LCS" => self.handle_lcs(&args[1..]),
+            "DUMP" => self.handle_dump(&args[1..]),
+            "RESTORE" => self.handle_restore(&args[1..]),
 
             // Counter commands
             "INCR" => self.handle_incr(&args[1..]),
@@ -1082,6 +1084,7 @@ fn is_write_command(cmd: &str) -> bool {
             | "GEORADIUS"
             | "GEORADIUSBYMEMBER"
             | "SWAPDB"
+            | "RESTORE"
             | "HSET"
             | "HSETNX"
             | "HMSET"

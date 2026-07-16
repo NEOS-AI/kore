@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const SCRIPT_CALL_ALLOWLIST: &[&str] = &[
     "PING", "ECHO", //
     "GET", "SET", "DEL", "EXISTS", "TYPE", "MGET", "MSET", "MSETNX", "APPEND", "STRLEN", "LCS",
-    "GETRANGE", "SUBSTR", "SETRANGE", "SETEX", "PSETEX",
+    "GETRANGE", "SUBSTR", "SETRANGE", "SETEX", "PSETEX", "DUMP", "RESTORE",
     "GETSET", "UNLINK", "RENAME", "RENAMENX", "SETNX", "GETDEL", "GETEX", //
     "INCR", "DECR", "INCRBY", "DECRBY", "INCRBYFLOAT", //
     "TIME", //
@@ -472,6 +472,8 @@ impl CommandHandler {
             "GEORADIUS_RO" => self.handle_georadius_ro(args),
             "GEORADIUSBYMEMBER_RO" => self.handle_georadiusbymember_ro(args),
             "SWAPDB" => self.handle_swapdb(args),
+            "DUMP" => self.handle_dump(args),
+            "RESTORE" => self.handle_restore(args),
             "PFADD" => self.handle_pfadd(args),
             "PFCOUNT" => self.handle_pfcount(args),
             "PFMERGE" => self.handle_pfmerge(args),

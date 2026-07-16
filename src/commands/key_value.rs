@@ -966,6 +966,104 @@ impl CommandHandler {
         }
         Ok(RespValue::Integer(self.cache.touch_keys(&keys) as i64))
     }
+
+    /// DUMP key — Kore KDF1 serialized value (null if missing).
+    pub(super) fn handle_dump(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 1 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'dump' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        match self.cache.dump_serialized(key) {
+            Some(b) => Ok(RespValue::BulkString(Some(b))),
+            None => Ok(RespValue::null()),
+        }
+    }
+
+    /// RESTORE key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME seconds] [FREQ frequency]
+    /// IDLETIME/FREQ accepted and ignored (Redis compatibility).
+    pub(super) fn handle_restore(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() < 3 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'restore' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        let ttl_arg = match self.parse_integer(&args[1]) {
+            Ok(n) => n,
+            Err(_) => {
+                return Ok(RespValue::error(
+                    "ERR value is not an integer or out of range",
+                ))
+            }
+        };
+        if ttl_arg < 0 {
+            return Ok(RespValue::error("ERR Invalid TTL value, must be >= 0"));
+        }
+        let data = match args[2].as_bulk_string() {
+            Some(b) => b.clone(),
+            None => {
+                return Ok(RespValue::error(
+                    "ERR DUMP payload version or checksum are wrong",
+                ))
+            }
+        };
+
+        let mut replace = false;
+        let mut absttl = false;
+        let mut i = 3;
+        while i < args.len() {
+            let opt = match args[i].as_bulk_string() {
+                Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+                None => return Ok(RespValue::error("ERR syntax error")),
+            };
+            match opt.as_str() {
+                "REPLACE" => {
+                    replace = true;
+                    i += 1;
+                }
+                "ABSTTL" => {
+                    absttl = true;
+                    i += 1;
+                }
+                "IDLETIME" | "FREQ" => {
+                    if i + 1 >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    if self.parse_integer(&args[i + 1]).is_err() {
+                        return Ok(RespValue::error(
+                            "ERR value is not an integer or out of range",
+                        ));
+                    }
+                    i += 2;
+                }
+                _ => return Ok(RespValue::error("ERR syntax error")),
+            }
+        }
+
+        match self
+            .cache
+            .restore_serialized(&key, data.as_ref(), ttl_arg, replace, absttl)
+        {
+            Ok(_) => Ok(RespValue::ok()),
+            Err(msg) => {
+                if msg.starts_with("BUSYKEY") {
+                    Ok(RespValue::error(msg))
+                } else if msg.starts_with("ERR ") {
+                    Ok(RespValue::error(msg))
+                } else {
+                    Ok(RespValue::error(format!("ERR {msg}")))
+                }
+            }
+        }
+    }
 }
 
 /// Inclusive Redis-style substring of `value` using `start`/`end` indices.
