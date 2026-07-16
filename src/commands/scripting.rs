@@ -15,7 +15,7 @@ const SCRIPT_CALL_ALLOWLIST: &[&str] = &[
     "GET", "SET", "DEL", "EXISTS", "TYPE", "MGET", "MSET", "APPEND", "STRLEN", "SETEX",
     "GETSET", "UNLINK", "RENAME", "RENAMENX", "SETNX", "GETDEL", "GETEX", //
     "INCR", "DECR", "INCRBY", "DECRBY", //
-    "EXPIRE", "PEXPIRE", "TTL", "PTTL", //
+    "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST", "TTL", "PTTL", "EXPIRETIME", "PEXPIRETIME", //
     "HSET", "HGET", "HMGET", "HDEL", "HGETALL", "HLEN", "HEXISTS", "HKEYS", "HVALS", "HINCRBY", //
     "LPUSH", "RPUSH", "LPOP", "RPOP", "LRANGE", "LLEN", "LINDEX", "LSET", //
     "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD", "SINTER", //
@@ -351,8 +351,13 @@ impl CommandHandler {
             "DECRBY" => self.handle_decrby(args),
             "EXPIRE" => self.handle_expire(args),
             "PEXPIRE" => self.handle_pexpire(args),
+            "EXPIREAT" => self.handle_expireat(args),
+            "PEXPIREAT" => self.handle_pexpireat(args),
+            "PERSIST" => self.handle_persist(args),
             "TTL" => self.handle_ttl(args),
             "PTTL" => self.handle_pttl(args),
+            "EXPIRETIME" => self.handle_expiretime(args),
+            "PEXPIRETIME" => self.handle_pexpiretime(args),
             "HSET" => self.handle_hset(args),
             "HGET" => self.handle_hget(args),
             "HMGET" => self.handle_hmget(args),

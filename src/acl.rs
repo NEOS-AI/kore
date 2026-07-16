@@ -728,7 +728,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
         ],
         "write" => &[
             "set", "del", "mset", "append", "setex", "getset", "unlink", "rename", "renamenx",
-            "setnx", "getdel", "getex", "incr", "decr", "incrby", "decrby", "expire", "pexpire",
+            "setnx", "getdel", "getex", "incr", "decr", "incrby", "decrby", "expire", "pexpire", "expireat", "pexpireat", "persist", "expiretime", "pexpiretime",
             "hset", "hdel", "hincrby", "lpush", "rpush", "lpop", "rpop", "blpop", "brpop", "lset",
             "sadd", "srem", "zadd", "zrem", "xadd", "xdel", "xtrim", "xgroup", "xack", "xreadgroup",
             "geoadd", "geosearchstore", "georadius", "georadiusbymember", "flushdb", "flushall",
@@ -751,7 +751,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "ssubscribe", "sunsubscribe", "spublish",
         ],
         "keyspace" => &[
-            "del", "exists", "expire", "pexpire", "keys", "scan", "move", "rename", "renamenx",
+            "del", "exists", "expire", "pexpire", "expireat", "pexpireat", "persist", "expiretime", "pexpiretime", "keys", "scan", "move", "rename", "renamenx",
             "type", "unlink", "ttl", "pttl", "dbsize", "flushdb", "flushall",
         ],
         "string" => &[

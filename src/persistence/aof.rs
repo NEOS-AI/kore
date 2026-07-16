@@ -400,7 +400,13 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             }
             Ok(())
         }
-        "EXPIRE" | "PEXPIRE" | "PEXPIREAT" => {
+        "PERSIST" => {
+            if argv.len() >= 2 {
+                let _ = cache.persist(&argv[1]);
+            }
+            Ok(())
+        }
+        "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" => {
             if argv.len() >= 3 {
                 let n: i64 = std::str::from_utf8(&argv[2])
                     .ok()
@@ -412,6 +418,9 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
                     }
                     "PEXPIRE" => {
                         let _ = cache.expire(&argv[1], n.max(0) as u64);
+                    }
+                    "EXPIREAT" => {
+                        let _ = cache.expire_at_unix_ms(&argv[1], n.saturating_mul(1000));
                     }
                     "PEXPIREAT" => {
                         use crate::cache::KeyType;

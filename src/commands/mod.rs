@@ -486,8 +486,13 @@ impl CommandHandler {
             // Expiration commands
             "EXPIRE" => self.handle_expire(&args[1..]),
             "PEXPIRE" => self.handle_pexpire(&args[1..]),
+            "EXPIREAT" => self.handle_expireat(&args[1..]),
+            "PEXPIREAT" => self.handle_pexpireat(&args[1..]),
+            "PERSIST" => self.handle_persist(&args[1..]),
             "TTL" => self.handle_ttl(&args[1..]),
             "PTTL" => self.handle_pttl(&args[1..]),
+            "EXPIRETIME" => self.handle_expiretime(&args[1..]),
+            "PEXPIRETIME" => self.handle_pexpiretime(&args[1..]),
 
             // Admin commands
             "SELECT" => self.handle_select(&args[1..]),
@@ -957,6 +962,9 @@ fn is_write_command(cmd: &str) -> bool {
             | "DECRBY"
             | "EXPIRE"
             | "PEXPIRE"
+            | "EXPIREAT"
+            | "PEXPIREAT"
+            | "PERSIST"
             | "FLUSHDB"
             | "FLUSHALL"
             | "ZADD"

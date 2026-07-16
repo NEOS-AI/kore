@@ -10,10 +10,19 @@ use super::Cache;
 
 impl Cache {
     /// Set expiration on a key (milliseconds from now). Works for all key types.
-    /// Returns true if the timeout was set (key exists).
+    /// Returns true if the timeout was set (or key deleted for `ttl_ms == 0`).
+    ///
+    /// Redis: `EXPIRE key 0` / zero ms deletes the key immediately.
     pub fn expire(&self, key: &Bytes, ttl_ms: u64) -> Result<bool> {
         // Lazy-delete if already past expiry so we don't revive a ghost key.
         let kt = self.key_type(key);
+        if kt == KeyType::None {
+            return Ok(false);
+        }
+        if ttl_ms == 0 {
+            let _ = self.delete(key);
+            return Ok(true);
+        }
         match kt {
             KeyType::None => Ok(false),
             KeyType::String => match self.map.get(key) {
@@ -32,6 +41,32 @@ impl Cache {
                 Ok(true)
             }
         }
+    }
+
+    /// Set absolute Unix-epoch-millisecond expiration (all key types).
+    /// Past or equal timestamps delete the key (Redis EXPIREAT/PEXPIREAT).
+    pub fn expire_at_unix_ms(&self, key: &Bytes, expire_unix_ms: i64) -> Result<bool> {
+        let kt = self.key_type(key);
+        if kt == KeyType::None {
+            return Ok(false);
+        }
+        let now = now_unix_ms();
+        if expire_unix_ms <= now {
+            let _ = self.delete(key);
+            return Ok(true);
+        }
+        let remaining = (expire_unix_ms - now) as u64;
+        self.expire(key, remaining)
+    }
+
+    /// Absolute expire time as Unix epoch milliseconds.
+    /// `-2` missing, `-1` no expire, else absolute ms.
+    pub fn expire_time_unix_ms(&self, key: &Bytes) -> i64 {
+        let ttl = self.ttl(key);
+        if ttl < 0 {
+            return ttl; // -1 or -2
+        }
+        now_unix_ms() + ttl
     }
 
     /// Remove any expiration from a key. Returns true if a timeout was removed.
@@ -256,4 +291,11 @@ impl Cache {
         }
         count
     }
+}
+
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }

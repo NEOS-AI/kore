@@ -286,3 +286,160 @@ fn expire_missing_typed_returns_zero() {
         RespValue::Integer(-2)
     );
 }
+
+#[test]
+fn persist_removes_ttl_string_and_hash() {
+    let cache = make_cache(16 * 1024 * 1024);
+    let mut h = make_handler(cache.clone());
+
+    handle(&mut h, cmd(&["SET", "s", "v"]));
+    handle(&mut h, cmd(&["EXPIRE", "s", "100"]));
+    assert!(matches!(
+        handle(&mut h, cmd(&["TTL", "s"])),
+        RespValue::Integer(n) if n > 0
+    ));
+    assert_eq!(
+        handle(&mut h, cmd(&["PERSIST", "s"])),
+        RespValue::Integer(1)
+    );
+    assert_eq!(handle(&mut h, cmd(&["TTL", "s"])), RespValue::Integer(-1));
+    // Second persist: no timeout
+    assert_eq!(
+        handle(&mut h, cmd(&["PERSIST", "s"])),
+        RespValue::Integer(0)
+    );
+
+    handle(&mut h, cmd(&["HSET", "h", "f", "v"]));
+    handle(&mut h, cmd(&["EXPIRE", "h", "50"]));
+    assert_eq!(
+        handle(&mut h, cmd(&["PERSIST", "h"])),
+        RespValue::Integer(1)
+    );
+    assert_eq!(handle(&mut h, cmd(&["TTL", "h"])), RespValue::Integer(-1));
+    assert_eq!(
+        handle(&mut h, cmd(&["PERSIST", "missing"])),
+        RespValue::Integer(0)
+    );
+}
+
+#[test]
+fn expireat_and_pexpireat_absolute() {
+    let cache = make_cache(16 * 1024 * 1024);
+    let mut h = make_handler(cache.clone());
+
+    handle(&mut h, cmd(&["SET", "a", "1"]));
+    handle(&mut h, cmd(&["HSET", "b", "f", "v"]));
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let future_ms = now_ms + 30_000;
+    let future_sec = future_ms / 1000;
+
+    assert_eq!(
+        handle(
+            &mut h,
+            cmd(&["PEXPIREAT", "a", &future_ms.to_string()])
+        ),
+        RespValue::Integer(1)
+    );
+    assert_eq!(
+        handle(
+            &mut h,
+            cmd(&["EXPIREAT", "b", &future_sec.to_string()])
+        ),
+        RespValue::Integer(1)
+    );
+
+    let pttl = match handle(&mut h, cmd(&["PTTL", "a"])) {
+        RespValue::Integer(n) => n,
+        o => panic!("{:?}", o),
+    };
+    assert!(pttl > 20_000 && pttl <= 30_000, "pttl={pttl}");
+
+    let et = match handle(&mut h, cmd(&["EXPIRETIME", "b"])) {
+        RespValue::Integer(n) => n,
+        o => panic!("{:?}", o),
+    };
+    assert!(
+        (et - future_sec).abs() <= 1,
+        "expiretime={et} expected ~{future_sec}"
+    );
+
+    let pet = match handle(&mut h, cmd(&["PEXPIRETIME", "a"])) {
+        RespValue::Integer(n) => n,
+        o => panic!("{:?}", o),
+    };
+    assert!((pet - future_ms).abs() < 2000, "pexpiretime={pet}");
+
+    // No expire
+    handle(&mut h, cmd(&["SET", "c", "1"]));
+    assert_eq!(
+        handle(&mut h, cmd(&["EXPIRETIME", "c"])),
+        RespValue::Integer(-1)
+    );
+    assert_eq!(
+        handle(&mut h, cmd(&["EXPIRETIME", "missing"])),
+        RespValue::Integer(-2)
+    );
+}
+
+#[test]
+fn expireat_past_deletes_key() {
+    let cache = make_cache(16 * 1024 * 1024);
+    let mut h = make_handler(cache.clone());
+
+    handle(&mut h, cmd(&["SET", "gone", "v"]));
+    handle(&mut h, cmd(&["HSET", "hgone", "f", "v"]));
+
+    // Past absolute times
+    assert_eq!(
+        handle(&mut h, cmd(&["EXPIREAT", "gone", "1"])),
+        RespValue::Integer(1)
+    );
+    assert!(!cache.exists(&Bytes::from_static(b"gone")));
+
+    assert_eq!(
+        handle(&mut h, cmd(&["PEXPIREAT", "hgone", "1"])),
+        RespValue::Integer(1)
+    );
+    assert!(!cache.exists(&Bytes::from_static(b"hgone")));
+}
+
+#[test]
+fn expire_zero_deletes_key() {
+    let cache = make_cache(16 * 1024 * 1024);
+    let mut h = make_handler(cache.clone());
+
+    handle(&mut h, cmd(&["SET", "z", "v"]));
+    handle(&mut h, cmd(&["SADD", "sz", "m"]));
+    assert_eq!(
+        handle(&mut h, cmd(&["EXPIRE", "z", "0"])),
+        RespValue::Integer(1)
+    );
+    assert!(!cache.exists(&Bytes::from_static(b"z")));
+    assert_eq!(
+        handle(&mut h, cmd(&["PEXPIRE", "sz", "0"])),
+        RespValue::Integer(1)
+    );
+    assert!(!cache.exists(&Bytes::from_static(b"sz")));
+}
+
+#[test]
+fn expire_negative_is_error() {
+    let cache = make_cache(16 * 1024 * 1024);
+    let mut h = make_handler(cache.clone());
+    handle(&mut h, cmd(&["SET", "k", "v"]));
+    let resp = handle(&mut h, cmd(&["EXPIRE", "k", "-5"]));
+    match resp {
+        RespValue::Error(e) => {
+            assert!(
+                String::from_utf8_lossy(&e).contains("invalid expire"),
+                "{:?}",
+                e
+            );
+        }
+        other => panic!("expected error, got {:?}", other),
+    }
+}
