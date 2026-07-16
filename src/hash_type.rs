@@ -80,6 +80,36 @@ impl RedisHash {
         Ok(new_val)
     }
 
+    /// Increment field by float `delta`. Creates field at 0.0 if missing.
+    /// Returns the new value, or an error if the stored value is not a float / NaN.
+    pub fn hincrbyfloat(&mut self, field: Bytes, delta: f64) -> Result<f64, String> {
+        let current = match self.fields.get(&field) {
+            Some(v) => {
+                let s = std::str::from_utf8(v)
+                    .map_err(|_| "hash value is not a valid float".to_string())?;
+                s.trim()
+                    .parse::<f64>()
+                    .map_err(|_| "hash value is not a valid float".to_string())?
+            }
+            None => 0.0,
+        };
+        if current.is_nan() {
+            return Err("hash value is not a valid float".into());
+        }
+        let new_val = current + delta;
+        if new_val.is_nan() {
+            return Err("increment would produce NaN".into());
+        }
+        self.fields
+            .insert(field, Bytes::from(format_hash_float(new_val)));
+        Ok(new_val)
+    }
+
+    /// Byte length of the string value at `field`, or 0 if missing.
+    pub fn hstrlen(&self, field: &Bytes) -> usize {
+        self.fields.get(field).map(|v| v.len()).unwrap_or(0)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.fields.is_empty()
     }
@@ -116,6 +146,15 @@ impl Default for RedisHash {
 
 pub type SharedHash = Arc<RwLock<RedisHash>>;
 
+/// Redis-ish float rendering for HINCRBYFLOAT stored values / replies.
+fn format_hash_float(v: f64) -> String {
+    if v.fract() == 0.0 && v.is_finite() && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        format!("{}", v)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +176,18 @@ mod tests {
         let mut h = RedisHash::new();
         assert_eq!(h.hincrby(Bytes::from("n"), 5).unwrap(), 5);
         assert_eq!(h.hincrby(Bytes::from("n"), -2).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_hincrbyfloat_and_hstrlen() {
+        let mut h = RedisHash::new();
+        assert_eq!(h.hincrbyfloat(Bytes::from("f"), 1.5).unwrap(), 1.5);
+        assert_eq!(h.hincrbyfloat(Bytes::from("f"), 0.5).unwrap(), 2.0);
+        assert_eq!(h.hget(&Bytes::from("f")), Some(Bytes::from("2")));
+        assert_eq!(h.hstrlen(&Bytes::from("f")), 1);
+        assert_eq!(h.hstrlen(&Bytes::from("missing")), 0);
+        h.hset(Bytes::from("s"), Bytes::from("hello"));
+        assert_eq!(h.hstrlen(&Bytes::from("s")), 5);
+        assert!(h.hincrbyfloat(Bytes::from("s"), 1.0).is_err());
     }
 }

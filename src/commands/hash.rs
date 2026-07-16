@@ -433,6 +433,119 @@ impl CommandHandler {
         }
     }
 
+    /// HINCRBYFLOAT key field increment
+    pub(super) fn handle_hincrbyfloat(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 3 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'hincrbyfloat' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        let field = match args[1].as_bulk_string() {
+            Some(f) => f.clone(),
+            None => return Ok(RespValue::error("ERR invalid field")),
+        };
+        let delta = match self.parse_float(&args[2]) {
+            Ok(d) => d,
+            Err(_) => return Ok(RespValue::error("ERR value is not a valid float")),
+        };
+        if delta.is_nan() {
+            return Ok(RespValue::error(
+                "ERR would produce NaN: value is not a valid float",
+            ));
+        }
+
+        let hash = match self.cache.get_or_create_hash(&key) {
+            Ok(h) => h,
+            Err(Error::WrongType) => {
+                return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+            }
+            Err(e) => return Ok(RespValue::error(e.to_resp_string())),
+        };
+        let (before, after, prior, incr_result) = {
+            let mut h = hash.write();
+            let before = crate::memory::estimate_keyed_object(key.len(), h.memory_size());
+            let prior = h.hget(&field);
+            match h.hincrbyfloat(field.clone(), delta) {
+                Ok(v) => {
+                    let after = crate::memory::estimate_keyed_object(key.len(), h.memory_size());
+                    (before, after, prior, Ok(v))
+                }
+                Err(msg) => (before, before, prior, Err(msg)),
+            }
+        };
+
+        match incr_result {
+            Ok(v) => {
+                if let Err(e) = self.cache.account_hash_delta(before, after) {
+                    let mut h = hash.write();
+                    match prior {
+                        Some(old) => {
+                            h.hset(field, old);
+                        }
+                        None => {
+                            let _ = h.hdel(&[field]);
+                        }
+                    }
+                    if h.is_empty() {
+                        drop(h);
+                        self.cache.remove_hash(&key);
+                    }
+                    return Ok(RespValue::error(e.to_resp_string()));
+                }
+                // Redis returns bulk string of the new float value.
+                let s = if v.fract() == 0.0 && v.is_finite() && v.abs() < 1e15 {
+                    format!("{}", v as i64)
+                } else {
+                    format!("{}", v)
+                };
+                Ok(RespValue::BulkString(Some(Bytes::from(s))))
+            }
+            Err(msg) => Ok(RespValue::error(format!("ERR {}", msg))),
+        }
+    }
+
+    /// HSTRLEN key field
+    pub(super) fn handle_hstrlen(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'hstrlen' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_hash_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+        let field = match args[1].as_bulk_string() {
+            Some(f) => f,
+            None => return Ok(RespValue::error("ERR invalid field")),
+        };
+        let len = match self.cache.get_hash(key) {
+            Some(h) => h.read().hstrlen(field) as i64,
+            None => 0,
+        };
+        Ok(RespValue::Integer(len))
+    }
+
+    /// HMSET key field value [field value ...] — deprecated alias of HSET; always OK.
+    pub(super) fn handle_hmset(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() < 3 || args.len() % 2 == 0 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'hmset' command",
+            ));
+        }
+        match self.handle_hset(args)? {
+            RespValue::Integer(_) => Ok(RespValue::ok()),
+            other => Ok(other),
+        }
+    }
+
     /// HSCAN key cursor [MATCH pattern] [COUNT count]
     pub(super) fn handle_hscan(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.len() < 2 {

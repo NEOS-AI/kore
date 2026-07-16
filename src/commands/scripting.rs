@@ -17,7 +17,8 @@ const SCRIPT_CALL_ALLOWLIST: &[&str] = &[
     "GETSET", "UNLINK", "RENAME", "RENAMENX", "SETNX", "GETDEL", "GETEX", //
     "INCR", "DECR", "INCRBY", "DECRBY", //
     "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST", "TTL", "PTTL", "EXPIRETIME", "PEXPIRETIME", //
-    "HSET", "HGET", "HMGET", "HDEL", "HGETALL", "HLEN", "HEXISTS", "HKEYS", "HVALS", "HINCRBY", "HSCAN", //
+    "HSET", "HMSET", "HGET", "HMGET", "HDEL", "HGETALL", "HLEN", "HEXISTS", "HKEYS", "HVALS", //
+    "HINCRBY", "HINCRBYFLOAT", "HSTRLEN", "HSCAN", //
     "LPUSH", "RPUSH", "LPOP", "RPOP", "LRANGE", "LLEN", "LINDEX", "LSET", "LREM", "LTRIM", "LINSERT", //
     "LPOS", "LMOVE", //
     "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD", "SINTER", "SUNION", "SDIFF", //
@@ -367,6 +368,7 @@ impl CommandHandler {
             "EXPIRETIME" => self.handle_expiretime(args),
             "PEXPIRETIME" => self.handle_pexpiretime(args),
             "HSET" => self.handle_hset(args),
+            "HMSET" => self.handle_hmset(args),
             "HGET" => self.handle_hget(args),
             "HMGET" => self.handle_hmget(args),
             "HDEL" => self.handle_hdel(args),
@@ -376,6 +378,8 @@ impl CommandHandler {
             "HKEYS" => self.handle_hkeys(args),
             "HVALS" => self.handle_hvals(args),
             "HINCRBY" => self.handle_hincrby(args),
+            "HINCRBYFLOAT" => self.handle_hincrbyfloat(args),
+            "HSTRLEN" => self.handle_hstrlen(args),
             "HSCAN" => self.handle_hscan(args),
             "LPUSH" => self.handle_lpush(args),
             "RPUSH" => self.handle_rpush(args),

@@ -720,7 +720,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
         }
         "read" => &[
             "get", "mget", "exists", "type", "strlen", "getrange", "ttl", "pttl", "keys", "scan", "dbsize",
-            "hget", "hmget", "hgetall", "hlen", "hexists", "hkeys", "hvals", "lrange", "llen",
+            "hget", "hmget", "hgetall", "hlen", "hexists", "hkeys", "hvals", "hstrlen", "lrange", "llen",
             "lindex", "lpos", "smembers", "sismember", "scard", "sinter", "sunion", "sdiff", "srandmember", "sscan",
             "zrange", "zrevrange", "zcard",
             "zscore", "zrank", "zrevrank", "zrangebyscore", "zrevrangebyscore", "zcount", "zscan",
@@ -732,7 +732,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
         "write" => &[
             "set", "del", "mset", "msetnx", "append", "setrange", "setex", "getset", "unlink", "rename", "renamenx",
             "setnx", "getdel", "getex", "incr", "decr", "incrby", "decrby", "expire", "pexpire", "expireat", "pexpireat", "persist", "expiretime", "pexpiretime",
-            "hset", "hdel", "hincrby", "lpush", "rpush", "lpop", "rpop", "blpop", "brpop", "lset",
+            "hset", "hmset", "hdel", "hincrby", "hincrbyfloat", "lpush", "rpush", "lpop", "rpop", "blpop", "brpop", "lset",
             "lrem", "ltrim", "linsert", "lmove", "blmove",
             "sadd", "srem", "sinterstore", "sunionstore", "sdiffstore", "smove", "spop",
             "zadd", "zrem", "zincrby", "zremrangebyrank", "zremrangebyscore",
@@ -771,8 +771,8 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
         ],
         "hyperloglog" => &["pfadd", "pfcount", "pfmerge"],
         "hash" => &[
-            "hset", "hget", "hmget", "hdel", "hgetall", "hlen", "hexists", "hkeys", "hvals",
-            "hincrby", "hscan",
+            "hset", "hmset", "hget", "hmget", "hdel", "hgetall", "hlen", "hexists", "hkeys", "hvals",
+            "hincrby", "hincrbyfloat", "hstrlen", "hscan",
         ],
         "list" => &[
             "lpush", "rpush", "lpop", "rpop", "blpop", "brpop", "lrange", "llen", "lindex", "lset",

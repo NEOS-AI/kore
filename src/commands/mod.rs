@@ -566,6 +566,9 @@ impl CommandHandler {
             "HKEYS" => self.handle_hkeys(&args[1..]),
             "HVALS" => self.handle_hvals(&args[1..]),
             "HINCRBY" => self.handle_hincrby(&args[1..]),
+            "HINCRBYFLOAT" => self.handle_hincrbyfloat(&args[1..]),
+            "HSTRLEN" => self.handle_hstrlen(&args[1..]),
+            "HMSET" => self.handle_hmset(&args[1..]),
             "HSCAN" => self.handle_hscan(&args[1..]),
 
             // List commands
@@ -1019,8 +1022,10 @@ fn is_write_command(cmd: &str) -> bool {
             | "GEOADD"
             | "GEOSEARCHSTORE"
             | "HSET"
+            | "HMSET"
             | "HDEL"
             | "HINCRBY"
+            | "HINCRBYFLOAT"
             | "LPUSH"
             | "RPUSH"
             | "LPOP"
