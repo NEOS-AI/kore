@@ -505,4 +505,158 @@ impl CommandHandler {
             Err(msg) => Ok(RespValue::error(format!("ERR {}", msg))),
         }
     }
+
+    /// LREM key count element
+    pub(super) fn handle_lrem(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 3 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'lrem' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_list_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+        let count = match self.parse_integer(&args[1]) {
+            Ok(c) => c,
+            Err(_) => {
+                return Ok(RespValue::error(
+                    "ERR value is not an integer or out of range",
+                ));
+            }
+        };
+        let element = match args[2].as_bulk_string() {
+            Some(e) => e,
+            None => return Ok(RespValue::error("ERR invalid value")),
+        };
+        let list = match self.cache.get_list(key) {
+            Some(l) => l,
+            None => return Ok(RespValue::Integer(0)),
+        };
+        let mut l = list.write();
+        let before = crate::memory::estimate_keyed_object(key.len(), l.memory_size());
+        let removed = l.lrem(count, element);
+        let empty = l.is_empty();
+        let after = crate::memory::estimate_keyed_object(key.len(), l.memory_size());
+        drop(l);
+        self.cache.account_list_delta(before, after);
+        if empty {
+            self.cache.remove_list(key);
+        }
+        Ok(RespValue::Integer(removed as i64))
+    }
+
+    /// LTRIM key start stop
+    pub(super) fn handle_ltrim(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 3 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'ltrim' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_list_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+        let start = match self.parse_integer(&args[1]) {
+            Ok(i) => i as isize,
+            Err(_) => {
+                return Ok(RespValue::error(
+                    "ERR value is not an integer or out of range",
+                ));
+            }
+        };
+        let stop = match self.parse_integer(&args[2]) {
+            Ok(i) => i as isize,
+            Err(_) => {
+                return Ok(RespValue::error(
+                    "ERR value is not an integer or out of range",
+                ));
+            }
+        };
+        let list = match self.cache.get_list(key) {
+            Some(l) => l,
+            None => return Ok(RespValue::ok()),
+        };
+        let mut l = list.write();
+        let before = crate::memory::estimate_keyed_object(key.len(), l.memory_size());
+        l.ltrim(start, stop);
+        let empty = l.is_empty();
+        let after = crate::memory::estimate_keyed_object(key.len(), l.memory_size());
+        drop(l);
+        self.cache.account_list_delta(before, after);
+        if empty {
+            self.cache.remove_list(key);
+        }
+        Ok(RespValue::ok())
+    }
+
+    /// LINSERT key BEFORE|AFTER pivot element
+    pub(super) fn handle_linsert(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 4 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'linsert' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_list_key(&key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+        let where_ = match args[1].as_bulk_string() {
+            Some(w) => String::from_utf8_lossy(w).to_uppercase(),
+            None => return Ok(RespValue::error("ERR syntax error")),
+        };
+        let before = match where_.as_str() {
+            "BEFORE" => true,
+            "AFTER" => false,
+            _ => return Ok(RespValue::error("ERR syntax error")),
+        };
+        let pivot = match args[2].as_bulk_string() {
+            Some(p) => p,
+            None => return Ok(RespValue::error("ERR invalid pivot")),
+        };
+        let element = match args[3].as_bulk_string() {
+            Some(e) => e.clone(),
+            None => return Ok(RespValue::error("ERR invalid value")),
+        };
+
+        let list = match self.cache.get_list(&key) {
+            Some(l) => l,
+            // Redis: missing key → 0 (not created).
+            None => return Ok(RespValue::Integer(0)),
+        };
+
+        // Capacity check only if pivot exists (cheap pre-check).
+        {
+            let l = list.read();
+            if l.iter_items().any(|v| &v == pivot) {
+                let est = element.len() + 16;
+                drop(l);
+                if let Err(e) = self.cache.ensure_non_string_capacity(est) {
+                    return Ok(RespValue::error(e.to_resp_string()));
+                }
+            }
+        }
+
+        let mut l = list.write();
+        let before_mem = crate::memory::estimate_keyed_object(key.len(), l.memory_size());
+        match l.linsert(before, pivot, element) {
+            Some(len) => {
+                let after = crate::memory::estimate_keyed_object(key.len(), l.memory_size());
+                drop(l);
+                self.cache.account_list_delta(before_mem, after);
+                self.cache.list_blockers.notify_key(&key);
+                Ok(RespValue::Integer(len as i64))
+            }
+            None => Ok(RespValue::Integer(-1)),
+        }
+    }
 }

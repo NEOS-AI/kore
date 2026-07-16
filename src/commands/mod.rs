@@ -574,6 +574,9 @@ impl CommandHandler {
             "LLEN" => self.handle_llen(&args[1..]),
             "LINDEX" => self.handle_lindex(&args[1..]),
             "LSET" => self.handle_lset(&args[1..]),
+            "LREM" => self.handle_lrem(&args[1..]),
+            "LTRIM" => self.handle_ltrim(&args[1..]),
+            "LINSERT" => self.handle_linsert(&args[1..]),
 
             // Set commands
             "SADD" => self.handle_sadd(&args[1..]),
@@ -1013,6 +1016,9 @@ fn is_write_command(cmd: &str) -> bool {
             | "BLPOP"
             | "BRPOP"
             | "LSET"
+            | "LREM"
+            | "LTRIM"
+            | "LINSERT"
             | "SADD"
             | "SREM"
             | "SINTERSTORE"

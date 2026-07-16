@@ -155,7 +155,7 @@ fn write_keys(cmd: &str, args: &[RespValue]) -> Vec<Bytes> {
         | "DECR" | "INCRBY" | "DECRBY" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "PERSIST" | "ZADD" | "ZREM" | "ZINCRBY"
         | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "GEOADD"
         | "GEOSEARCHSTORE" | "HSET" | "HDEL" | "HINCRBY" | "LPUSH" | "RPUSH" | "LPOP"
-        | "RPOP" | "LSET" | "SADD" | "SREM" | "SPOP" | "XADD" | "XDEL" | "XTRIM" | "XACK"
+        | "RPOP" | "LSET" | "LREM" | "LTRIM" | "LINSERT" | "SADD" | "SREM" | "SPOP" | "XADD" | "XDEL" | "XTRIM" | "XACK"
         | "SETBIT" | "BITFIELD" | "PFADD" | "TOUCH" | "MOVE" => args
             .first()
             .and_then(|a| a.as_bulk_string())

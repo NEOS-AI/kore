@@ -733,6 +733,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "set", "del", "mset", "append", "setex", "getset", "unlink", "rename", "renamenx",
             "setnx", "getdel", "getex", "incr", "decr", "incrby", "decrby", "expire", "pexpire", "expireat", "pexpireat", "persist", "expiretime", "pexpiretime",
             "hset", "hdel", "hincrby", "lpush", "rpush", "lpop", "rpop", "blpop", "brpop", "lset",
+            "lrem", "ltrim", "linsert",
             "sadd", "srem", "sinterstore", "sunionstore", "sdiffstore", "smove", "spop",
             "zadd", "zrem", "zincrby", "zremrangebyrank", "zremrangebyscore",
             "xadd", "xdel", "xtrim", "xgroup", "xack", "xreadgroup",
@@ -773,6 +774,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
         ],
         "list" => &[
             "lpush", "rpush", "lpop", "rpop", "blpop", "brpop", "lrange", "llen", "lindex", "lset",
+            "lrem", "ltrim", "linsert",
         ],
         "set" => &[
             "sadd", "srem", "smembers", "sismember", "scard", "sinter", "sunion", "sdiff",

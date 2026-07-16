@@ -123,6 +123,94 @@ impl RedisList {
         Ok(())
     }
 
+    /// Remove elements equal to `element`.
+    ///
+    /// * `count > 0`: remove up to `count` matches from head to tail
+    /// * `count < 0`: remove up to `|count|` matches from tail to head
+    /// * `count == 0`: remove all matches
+    ///
+    /// Returns number of removed elements.
+    pub fn lrem(&mut self, count: i64, element: &Bytes) -> usize {
+        if self.items.is_empty() {
+            return 0;
+        }
+        if count == 0 {
+            let before = self.items.len();
+            self.items.retain(|v| v != element);
+            return before - self.items.len();
+        }
+        if count > 0 {
+            let mut to_remove = count as usize;
+            let mut removed = 0usize;
+            let mut i = 0;
+            while i < self.items.len() && to_remove > 0 {
+                if &self.items[i] == element {
+                    self.items.remove(i);
+                    removed += 1;
+                    to_remove -= 1;
+                } else {
+                    i += 1;
+                }
+            }
+            removed
+        } else {
+            let mut to_remove = (-count) as usize;
+            let mut removed = 0usize;
+            // Walk tail → head.
+            let mut i = self.items.len();
+            while i > 0 && to_remove > 0 {
+                i -= 1;
+                if &self.items[i] == element {
+                    self.items.remove(i);
+                    removed += 1;
+                    to_remove -= 1;
+                }
+            }
+            removed
+        }
+    }
+
+    /// Keep only the inclusive index range `[start, stop]` (Redis negative indices).
+    /// Out-of-range / inverted ranges empty the list.
+    pub fn ltrim(&mut self, start: isize, stop: isize) {
+        let len = self.items.len() as isize;
+        if len == 0 {
+            return;
+        }
+        let start_idx = if start < 0 {
+            (len + start).max(0)
+        } else {
+            start
+        };
+        let stop_idx = if stop < 0 {
+            (len + stop).max(0)
+        } else {
+            stop
+        };
+        if start_idx > stop_idx || start_idx >= len {
+            self.items.clear();
+            return;
+        }
+        let stop_idx = stop_idx.min(len - 1) as usize;
+        let start_idx = start_idx as usize;
+        // Drop tail first so indices stay valid, then drop head.
+        if stop_idx + 1 < self.items.len() {
+            self.items.truncate(stop_idx + 1);
+        }
+        for _ in 0..start_idx {
+            self.items.pop_front();
+        }
+    }
+
+    /// Insert `element` before or after the first occurrence of `pivot`.
+    /// Returns `Some(new_len)` on success, `None` if pivot is missing.
+    pub fn linsert(&mut self, before: bool, pivot: &Bytes, element: Bytes) -> Option<usize> {
+        let idx = self.items.iter().position(|v| v == pivot)?;
+        let insert_at = if before { idx } else { idx + 1 };
+        self.items.insert(insert_at, element);
+        Some(self.items.len())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
@@ -182,5 +270,61 @@ mod tests {
         assert_eq!(list.lindex(-1), Some(Bytes::from("z")));
         list.lset(1, Bytes::from("Y")).unwrap();
         assert_eq!(list.lindex(1), Some(Bytes::from("Y")));
+    }
+
+    #[test]
+    fn test_lrem_ltrim_linsert() {
+        let mut list = RedisList::new();
+        list.rpush([
+            Bytes::from("a"),
+            Bytes::from("b"),
+            Bytes::from("a"),
+            Bytes::from("c"),
+            Bytes::from("a"),
+        ]);
+        assert_eq!(list.lrem(2, &Bytes::from("a")), 2);
+        assert_eq!(
+            list.lrange(0, -1),
+            vec![Bytes::from("b"), Bytes::from("c"), Bytes::from("a")]
+        );
+        assert_eq!(list.lrem(-1, &Bytes::from("a")), 1);
+        assert_eq!(
+            list.lrange(0, -1),
+            vec![Bytes::from("b"), Bytes::from("c")]
+        );
+
+        list.rpush([Bytes::from("d"), Bytes::from("e")]);
+        // b c d e
+        list.ltrim(1, 2);
+        assert_eq!(
+            list.lrange(0, -1),
+            vec![Bytes::from("c"), Bytes::from("d")]
+        );
+
+        assert_eq!(
+            list.linsert(true, &Bytes::from("d"), Bytes::from("x")),
+            Some(3)
+        );
+        assert_eq!(
+            list.lrange(0, -1),
+            vec![Bytes::from("c"), Bytes::from("x"), Bytes::from("d")]
+        );
+        assert_eq!(
+            list.linsert(false, &Bytes::from("c"), Bytes::from("y")),
+            Some(4)
+        );
+        assert_eq!(
+            list.lrange(0, -1),
+            vec![
+                Bytes::from("c"),
+                Bytes::from("y"),
+                Bytes::from("x"),
+                Bytes::from("d")
+            ]
+        );
+        assert_eq!(
+            list.linsert(true, &Bytes::from("missing"), Bytes::from("z")),
+            None
+        );
     }
 }
