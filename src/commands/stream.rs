@@ -1,12 +1,12 @@
 //! Redis Streams commands: XADD, XRANGE, XREVRANGE, XLEN, XDEL, XTRIM,
-//! XREAD, XGROUP, XREADGROUP, XACK, XPENDING.
+//! XREAD, XGROUP, XREADGROUP, XACK, XPENDING, XCLAIM, XAUTOCLAIM, XSETID.
 
 use crate::cache::KeyType;
 use crate::error::{Error, Result};
 use crate::protocol::RespValue;
-use crate::stream_type::{StreamEntry, StreamId};
+use crate::stream_type::{StreamEntry, StreamId, XClaimOpts};
 use bytes::Bytes;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use super::CommandHandler;
 
 impl CommandHandler {
@@ -681,6 +681,73 @@ impl CommandHandler {
                     _ => Ok(RespValue::error(Error::WrongType.to_resp_string())),
                 }
             }
+            "SETID" => {
+                // XGROUP SETID key groupname id|$
+                if args.len() != 4 {
+                    return Ok(RespValue::error(
+                        "ERR wrong number of arguments for 'xgroup|setid' command",
+                    ));
+                }
+                let key = match args[1].as_bulk_string() {
+                    Some(k) => k.clone(),
+                    None => return Ok(RespValue::error("ERR invalid key")),
+                };
+                let group = match args[2].as_bulk_string() {
+                    Some(g) => g.clone(),
+                    None => return Ok(RespValue::error("ERR invalid group name")),
+                };
+                let id_s = match args[3].as_bulk_string() {
+                    Some(b) => String::from_utf8_lossy(b).into_owned(),
+                    None => return Ok(RespValue::error("ERR invalid stream ID")),
+                };
+                match self.cache.key_type(&key) {
+                    KeyType::None => Ok(RespValue::error(format!(
+                        "NOGROUP No such key '{}' or consumer group",
+                        String::from_utf8_lossy(&key)
+                    ))),
+                    KeyType::Stream => {
+                        let stream = match self.cache.get_stream(&key) {
+                            Some(s) => s,
+                            None => {
+                                return Ok(RespValue::error(format!(
+                                    "NOGROUP No such key '{}' or consumer group",
+                                    String::from_utf8_lossy(&key)
+                                )));
+                            }
+                        };
+                        let id = if id_s == "$" {
+                            stream.read().last_id()
+                        } else if id_s == "0" || id_s == "0-0" {
+                            StreamId::ZERO
+                        } else {
+                            match StreamId::parse_explicit(&id_s).or_else(|| StreamId::parse(&id_s))
+                            {
+                                Some(id) => id,
+                                None => {
+                                    return Ok(RespValue::error(
+                                        "ERR Invalid stream ID specified as stream command argument",
+                                    ));
+                                }
+                            }
+                        };
+                        let mut s = stream.write();
+                        match s.group_setid(&group, id) {
+                            Ok(()) => Ok(RespValue::ok()),
+                            Err(e) => {
+                                if e.starts_with("NOGROUP") {
+                                    Ok(RespValue::error(format!(
+                                        "NOGROUP No such key '{}' or consumer group",
+                                        String::from_utf8_lossy(&key)
+                                    )))
+                                } else {
+                                    Ok(RespValue::error(e))
+                                }
+                            }
+                        }
+                    }
+                    _ => Ok(RespValue::error(Error::WrongType.to_resp_string())),
+                }
+            }
             _ => Ok(RespValue::error(format!(
                 "ERR unknown subcommand '{}'",
                 sub
@@ -961,7 +1028,8 @@ impl CommandHandler {
         }
     }
 
-    /// XPENDING key group  — summary form only
+    /// XPENDING key group
+    /// XPENDING key group [[IDLE min-idle-time] start end count [consumer]]
     pub(super) fn handle_xpending(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.len() < 2 {
             return Ok(RespValue::error(
@@ -976,12 +1044,7 @@ impl CommandHandler {
             Some(g) => g.clone(),
             None => return Ok(RespValue::error("ERR invalid group name")),
         };
-        // Extended form not implemented yet
-        if args.len() > 2 {
-            return Ok(RespValue::error(
-                "ERR XPENDING extended form not implemented",
-            ));
-        }
+
         match self.cache.key_type(&key) {
             KeyType::None => Ok(RespValue::error(format!(
                 "NOGROUP No such key '{}' or consumer group",
@@ -998,34 +1061,567 @@ impl CommandHandler {
                     }
                 };
                 let s = stream.read();
-                match s.xpending_summary(&group) {
-                    Ok((total, min_id, max_id, consumers)) => {
-                        let min = min_id
-                            .map(|id| RespValue::BulkString(Some(id.to_bytes())))
-                            .unwrap_or_else(RespValue::null);
-                        let max = max_id
-                            .map(|id| RespValue::BulkString(Some(id.to_bytes())))
-                            .unwrap_or_else(RespValue::null);
-                        let cons: Vec<RespValue> = consumers
+
+                // Summary form
+                if args.len() == 2 {
+                    return match s.xpending_summary(&group) {
+                        Ok((total, min_id, max_id, consumers)) => {
+                            let min = min_id
+                                .map(|id| RespValue::BulkString(Some(id.to_bytes())))
+                                .unwrap_or_else(RespValue::null);
+                            let max = max_id
+                                .map(|id| RespValue::BulkString(Some(id.to_bytes())))
+                                .unwrap_or_else(RespValue::null);
+                            let cons: Vec<RespValue> = consumers
+                                .into_iter()
+                                .map(|(name, cnt)| {
+                                    RespValue::Array(vec![
+                                        RespValue::BulkString(Some(name)),
+                                        RespValue::BulkString(Some(Bytes::from(cnt.to_string()))),
+                                    ])
+                                })
+                                .collect();
+                            Ok(RespValue::Array(vec![
+                                RespValue::Integer(total as i64),
+                                min,
+                                max,
+                                if cons.is_empty() {
+                                    RespValue::null()
+                                } else {
+                                    RespValue::Array(cons)
+                                },
+                            ]))
+                        }
+                        Err(e) => {
+                            if e.starts_with("NOGROUP") {
+                                Ok(RespValue::error(format!(
+                                    "NOGROUP No such key '{}' or consumer group",
+                                    String::from_utf8_lossy(&key)
+                                )))
+                            } else {
+                                Ok(RespValue::error(e))
+                            }
+                        }
+                    };
+                }
+
+                // Extended: [IDLE min-idle] start end count [consumer]
+                let mut i = 2;
+                let mut min_idle_ms: u64 = 0;
+                if let Some(tok) = args.get(i).and_then(|a| a.as_bulk_string()) {
+                    if tok.eq_ignore_ascii_case(b"IDLE") {
+                        i += 1;
+                        min_idle_ms = match args.get(i).and_then(|a| a.as_bulk_string()) {
+                            Some(b) => match std::str::from_utf8(b)
+                                .ok()
+                                .and_then(|s| s.parse::<i64>().ok())
+                            {
+                                Some(n) if n >= 0 => n as u64,
+                                _ => {
+                                    return Ok(RespValue::error(
+                                        "ERR value is not an integer or out of range",
+                                    ));
+                                }
+                            },
+                            None => return Ok(RespValue::error("ERR syntax error")),
+                        };
+                        i += 1;
+                    }
+                }
+                if args.len() < i + 3 {
+                    return Ok(RespValue::error(
+                        "ERR wrong number of arguments for 'xpending' command",
+                    ));
+                }
+                let start_s = match args[i].as_bulk_string() {
+                    Some(b) => String::from_utf8_lossy(b).into_owned(),
+                    None => return Ok(RespValue::error("ERR invalid stream ID")),
+                };
+                let end_s = match args[i + 1].as_bulk_string() {
+                    Some(b) => String::from_utf8_lossy(b).into_owned(),
+                    None => return Ok(RespValue::error("ERR invalid stream ID")),
+                };
+                let count = match args[i + 2].as_bulk_string() {
+                    Some(b) => match std::str::from_utf8(b)
+                        .ok()
+                        .and_then(|s| s.parse::<i64>().ok())
+                    {
+                        Some(n) if n >= 0 => n as usize,
+                        _ => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ));
+                        }
+                    },
+                    None => {
+                        return Ok(RespValue::error(
+                            "ERR value is not an integer or out of range",
+                        ));
+                    }
+                };
+                let consumer = if args.len() > i + 3 {
+                    match args[i + 3].as_bulk_string() {
+                        Some(c) => Some(c.clone()),
+                        None => return Ok(RespValue::error("ERR invalid consumer name")),
+                    }
+                } else {
+                    None
+                };
+                if args.len() > i + 4 {
+                    return Ok(RespValue::error("ERR syntax error"));
+                }
+
+                let start = match Self::parse_stream_id_bound(&start_s) {
+                    Ok(id) => id,
+                    Err(e) => return Ok(RespValue::error(e)),
+                };
+                let end = match Self::parse_stream_id_bound(&end_s) {
+                    Ok(id) => id,
+                    Err(e) => return Ok(RespValue::error(e)),
+                };
+
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+
+                match s.xpending_range(
+                    &group,
+                    start,
+                    end,
+                    count,
+                    consumer.as_ref(),
+                    min_idle_ms,
+                ) {
+                    Ok(entries) => {
+                        let rows: Vec<RespValue> = entries
                             .into_iter()
-                            .map(|(name, cnt)| {
+                            .map(|pe| {
+                                let idle = now.saturating_sub(pe.delivery_time_ms);
                                 RespValue::Array(vec![
-                                    RespValue::BulkString(Some(name)),
-                                    RespValue::BulkString(Some(Bytes::from(cnt.to_string()))),
+                                    RespValue::BulkString(Some(pe.id.to_bytes())),
+                                    RespValue::BulkString(Some(pe.consumer)),
+                                    RespValue::Integer(idle as i64),
+                                    RespValue::Integer(pe.delivery_count as i64),
                                 ])
                             })
                             .collect();
-                        Ok(RespValue::Array(vec![
-                            RespValue::Integer(total as i64),
-                            min,
-                            max,
-                            if cons.is_empty() {
-                                RespValue::null()
-                            } else {
-                                RespValue::Array(cons)
-                            },
-                        ]))
+                        Ok(RespValue::Array(rows))
                     }
+                    Err(e) => {
+                        if e.starts_with("NOGROUP") {
+                            Ok(RespValue::error(format!(
+                                "NOGROUP No such key '{}' or consumer group",
+                                String::from_utf8_lossy(&key)
+                            )))
+                        } else {
+                            Ok(RespValue::error(e))
+                        }
+                    }
+                }
+            }
+            _ => Ok(RespValue::error(Error::WrongType.to_resp_string())),
+        }
+    }
+
+    /// XCLAIM key group consumer min-idle-time id [id ...]
+    /// [IDLE ms] [TIME ms-unix-time] [RETRYCOUNT count] [FORCE] [JUSTID]
+    pub(super) fn handle_xclaim(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() < 5 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'xclaim' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        let group = match args[1].as_bulk_string() {
+            Some(g) => g.clone(),
+            None => return Ok(RespValue::error("ERR invalid group name")),
+        };
+        let consumer = match args[2].as_bulk_string() {
+            Some(c) => c.clone(),
+            None => return Ok(RespValue::error("ERR invalid consumer name")),
+        };
+        let min_idle = match args[3].as_bulk_string() {
+            Some(b) => match std::str::from_utf8(b).ok().and_then(|s| s.parse::<i64>().ok()) {
+                Some(n) if n >= 0 => n as u64,
+                _ => {
+                    return Ok(RespValue::error(
+                        "ERR value is not an integer or out of range",
+                    ));
+                }
+            },
+            None => {
+                return Ok(RespValue::error(
+                    "ERR value is not an integer or out of range",
+                ));
+            }
+        };
+
+        let mut force = false;
+        let mut just_id = false;
+        let mut time_ms: Option<u64> = None;
+        let mut idle_ms: Option<u64> = None;
+        let mut retrycount: Option<u64> = None;
+        let mut ids: Vec<StreamId> = Vec::new();
+        let mut i = 4;
+        while i < args.len() {
+            let tok = match args[i].as_bulk_string() {
+                Some(b) => b,
+                None => return Ok(RespValue::error("ERR syntax error")),
+            };
+            let upper = String::from_utf8_lossy(tok).to_ascii_uppercase();
+            match upper.as_str() {
+                "FORCE" => {
+                    force = true;
+                    i += 1;
+                }
+                "JUSTID" => {
+                    just_id = true;
+                    i += 1;
+                }
+                "IDLE" => {
+                    if i + 1 >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    idle_ms = match args[i + 1].as_bulk_string() {
+                        Some(b) => match std::str::from_utf8(b)
+                            .ok()
+                            .and_then(|s| s.parse::<i64>().ok())
+                        {
+                            Some(n) if n >= 0 => Some(n as u64),
+                            _ => {
+                                return Ok(RespValue::error(
+                                    "ERR value is not an integer or out of range",
+                                ));
+                            }
+                        },
+                        None => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ));
+                        }
+                    };
+                    i += 2;
+                }
+                "TIME" => {
+                    if i + 1 >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    time_ms = match args[i + 1].as_bulk_string() {
+                        Some(b) => match std::str::from_utf8(b)
+                            .ok()
+                            .and_then(|s| s.parse::<i64>().ok())
+                        {
+                            Some(n) if n >= 0 => Some(n as u64),
+                            _ => {
+                                return Ok(RespValue::error(
+                                    "ERR value is not an integer or out of range",
+                                ));
+                            }
+                        },
+                        None => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ));
+                        }
+                    };
+                    i += 2;
+                }
+                "RETRYCOUNT" => {
+                    if i + 1 >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    retrycount = match args[i + 1].as_bulk_string() {
+                        Some(b) => match std::str::from_utf8(b)
+                            .ok()
+                            .and_then(|s| s.parse::<i64>().ok())
+                        {
+                            Some(n) if n >= 0 => Some(n as u64),
+                            _ => {
+                                return Ok(RespValue::error(
+                                    "ERR value is not an integer or out of range",
+                                ));
+                            }
+                        },
+                        None => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ));
+                        }
+                    };
+                    i += 2;
+                }
+                "LASTID" => {
+                    // Accepted for Redis compatibility; no-op (no XCLAIM LASTID tracking yet).
+                    i += 2;
+                }
+                _ => {
+                    let s = String::from_utf8_lossy(tok);
+                    match StreamId::parse_explicit(&s).or_else(|| StreamId::parse(&s)) {
+                        Some(id) => ids.push(id),
+                        None => {
+                            return Ok(RespValue::error(
+                                "ERR Invalid stream ID specified as stream command argument",
+                            ));
+                        }
+                    }
+                    i += 1;
+                }
+            }
+        }
+        if ids.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'xclaim' command",
+            ));
+        }
+
+        match self.cache.key_type(&key) {
+            KeyType::None => Ok(RespValue::error(format!(
+                "NOGROUP No such key '{}' or consumer group",
+                String::from_utf8_lossy(&key)
+            ))),
+            KeyType::Stream => {
+                let stream = match self.cache.get_stream(&key) {
+                    Some(s) => s,
+                    None => {
+                        return Ok(RespValue::error(format!(
+                            "NOGROUP No such key '{}' or consumer group",
+                            String::from_utf8_lossy(&key)
+                        )));
+                    }
+                };
+                let mut s = stream.write();
+                let opts = XClaimOpts {
+                    min_idle_ms: min_idle,
+                    force,
+                    time_ms,
+                    idle_ms,
+                    retrycount,
+                    just_id,
+                };
+                let claimed = match s.xclaim(&group, &consumer, &ids, &opts) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        if e.starts_with("NOGROUP") {
+                            return Ok(RespValue::error(format!(
+                                "NOGROUP No such key '{}' or consumer group",
+                                String::from_utf8_lossy(&key)
+                            )));
+                        }
+                        return Ok(RespValue::error(e));
+                    }
+                };
+                if just_id {
+                    let arr: Vec<RespValue> = claimed
+                        .into_iter()
+                        .map(|id| RespValue::BulkString(Some(id.to_bytes())))
+                        .collect();
+                    Ok(RespValue::Array(arr))
+                } else {
+                    Ok(Self::claimed_entries_resp(&s, &claimed))
+                }
+            }
+            _ => Ok(RespValue::error(Error::WrongType.to_resp_string())),
+        }
+    }
+
+    fn claimed_entries_resp(
+        stream: &crate::stream_type::RedisStream,
+        ids: &[StreamId],
+    ) -> RespValue {
+        let mut arr = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(entry) = stream.get_entry(id) {
+                arr.push(Self::stream_entry_to_resp(entry));
+            }
+        }
+        RespValue::Array(arr)
+    }
+
+    /// XAUTOCLAIM key group consumer min-idle-time start [COUNT count] [JUSTID]
+    pub(super) fn handle_xautoclaim(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() < 5 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'xautoclaim' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        let group = match args[1].as_bulk_string() {
+            Some(g) => g.clone(),
+            None => return Ok(RespValue::error("ERR invalid group name")),
+        };
+        let consumer = match args[2].as_bulk_string() {
+            Some(c) => c.clone(),
+            None => return Ok(RespValue::error("ERR invalid consumer name")),
+        };
+        let min_idle = match args[3].as_bulk_string() {
+            Some(b) => match std::str::from_utf8(b).ok().and_then(|s| s.parse::<i64>().ok()) {
+                Some(n) if n >= 0 => n as u64,
+                _ => {
+                    return Ok(RespValue::error(
+                        "ERR value is not an integer or out of range",
+                    ));
+                }
+            },
+            None => {
+                return Ok(RespValue::error(
+                    "ERR value is not an integer or out of range",
+                ));
+            }
+        };
+        let start_s = match args[4].as_bulk_string() {
+            Some(b) => String::from_utf8_lossy(b).into_owned(),
+            None => return Ok(RespValue::error("ERR invalid stream ID")),
+        };
+        let start = if start_s == "-" {
+            StreamId::MIN
+        } else {
+            match StreamId::parse_explicit(&start_s).or_else(|| StreamId::parse(&start_s)) {
+                Some(id) => id,
+                None => {
+                    return Ok(RespValue::error(
+                        "ERR Invalid stream ID specified as stream command argument",
+                    ));
+                }
+            }
+        };
+
+        let mut count: usize = 100; // Redis default
+        let mut just_id = false;
+        let mut i = 5;
+        while i < args.len() {
+            let tok = match args[i].as_bulk_string() {
+                Some(b) => String::from_utf8_lossy(b).to_ascii_uppercase(),
+                None => return Ok(RespValue::error("ERR syntax error")),
+            };
+            match tok.as_str() {
+                "COUNT" => {
+                    if i + 1 >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    count = match args[i + 1].as_bulk_string() {
+                        Some(b) => match std::str::from_utf8(b)
+                            .ok()
+                            .and_then(|s| s.parse::<i64>().ok())
+                        {
+                            Some(n) if n > 0 => n as usize,
+                            _ => {
+                                return Ok(RespValue::error(
+                                    "ERR COUNT must be > 0",
+                                ));
+                            }
+                        },
+                        None => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ));
+                        }
+                    };
+                    i += 2;
+                }
+                "JUSTID" => {
+                    just_id = true;
+                    i += 1;
+                }
+                _ => return Ok(RespValue::error("ERR syntax error")),
+            }
+        }
+
+        match self.cache.key_type(&key) {
+            KeyType::None => Ok(RespValue::error(format!(
+                "NOGROUP No such key '{}' or consumer group",
+                String::from_utf8_lossy(&key)
+            ))),
+            KeyType::Stream => {
+                let stream = match self.cache.get_stream(&key) {
+                    Some(s) => s,
+                    None => {
+                        return Ok(RespValue::error(format!(
+                            "NOGROUP No such key '{}' or consumer group",
+                            String::from_utf8_lossy(&key)
+                        )));
+                    }
+                };
+                let mut s = stream.write();
+                let (next, claimed, deleted) =
+                    match s.xautoclaim(&group, &consumer, min_idle, start, count, just_id) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            if e.starts_with("NOGROUP") {
+                                return Ok(RespValue::error(format!(
+                                    "NOGROUP No such key '{}' or consumer group",
+                                    String::from_utf8_lossy(&key)
+                                )));
+                            }
+                            return Ok(RespValue::error(e));
+                        }
+                    };
+
+                let messages = if just_id {
+                    RespValue::Array(
+                        claimed
+                            .into_iter()
+                            .map(|id| RespValue::BulkString(Some(id.to_bytes())))
+                            .collect(),
+                    )
+                } else {
+                    Self::claimed_entries_resp(&s, &claimed)
+                };
+                let deleted_arr = RespValue::Array(
+                    deleted
+                        .into_iter()
+                        .map(|id| RespValue::BulkString(Some(id.to_bytes())))
+                        .collect(),
+                );
+                Ok(RespValue::Array(vec![
+                    RespValue::BulkString(Some(next.to_bytes())),
+                    messages,
+                    deleted_arr,
+                ]))
+            }
+            _ => Ok(RespValue::error(Error::WrongType.to_resp_string())),
+        }
+    }
+
+    /// XSETID key last-id
+    pub(super) fn handle_xsetid(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'xsetid' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        let id_s = match args[1].as_bulk_string() {
+            Some(b) => String::from_utf8_lossy(b).into_owned(),
+            None => return Ok(RespValue::error("ERR invalid stream ID")),
+        };
+        let id = match StreamId::parse_explicit(&id_s).or_else(|| StreamId::parse(&id_s)) {
+            Some(id) => id,
+            None => {
+                return Ok(RespValue::error(
+                    "ERR Invalid stream ID specified as stream command argument",
+                ));
+            }
+        };
+        match self.cache.key_type(&key) {
+            KeyType::None => Ok(RespValue::error("ERR no such key")),
+            KeyType::Stream => {
+                let stream = match self.cache.get_stream(&key) {
+                    Some(s) => s,
+                    None => return Ok(RespValue::error("ERR no such key")),
+                };
+                let mut s = stream.write();
+                match s.xsetid(id) {
+                    Ok(()) => Ok(RespValue::ok()),
                     Err(e) => Ok(RespValue::error(e)),
                 }
             }

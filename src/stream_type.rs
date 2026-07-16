@@ -110,6 +110,23 @@ pub struct PendingEntry {
     pub delivery_count: u64,
 }
 
+/// Options for XCLAIM / FORCE path.
+#[derive(Debug, Clone)]
+pub struct XClaimOpts {
+    /// Minimum idle time in ms required to claim (0 = always if pending/FORCE).
+    pub min_idle_ms: u64,
+    /// Create PEL entry even if not pending (message must exist).
+    pub force: bool,
+    /// Absolute delivery timestamp; else derived from IDLE or now.
+    pub time_ms: Option<u64>,
+    /// Relative idle ms → delivery_time = now - idle.
+    pub idle_ms: Option<u64>,
+    /// Override delivery count; if None and not just_id, increment by 1.
+    pub retrycount: Option<u64>,
+    /// JUSTID: do not increment delivery count; return IDs only at command layer.
+    pub just_id: bool,
+}
+
 /// Per-consumer state inside a group.
 #[derive(Debug, Clone)]
 pub struct Consumer {
@@ -178,6 +195,11 @@ impl RedisStream {
 
     pub fn last_generated_id(&self) -> StreamId {
         self.last_generated_id
+    }
+
+    /// Lookup a single entry by ID.
+    pub fn get_entry(&self, id: &StreamId) -> Option<&StreamEntry> {
+        self.entries.get(id)
     }
 
     pub fn memory_size(&self) -> usize {
@@ -421,26 +443,56 @@ impl RedisStream {
         Ok(())
     }
 
-    /// Force a message into the PEL for AOF rewrite / recovery (XCLAIM … FORCE).
-    /// Creates consumer if needed. No-op if entry id is not in the stream.
-    pub fn xclaim_force(
+    /// XCLAIM — transfer ownership of pending messages.
+    ///
+    /// Returns claimed entry IDs (in request order). Entries missing from the stream
+    /// are skipped (and removed from PEL if present — orphan cleanup).
+    pub fn xclaim(
         &mut self,
         group_name: &Bytes,
         consumer_name: &Bytes,
         ids: &[StreamId],
-        delivery_time_ms: Option<u64>,
-        delivery_count: Option<u64>,
+        opts: &XClaimOpts,
     ) -> Result<Vec<StreamId>, String> {
         if !self.groups.contains_key(group_name) {
             return Err("NOGROUP No such key '' or consumer group".into());
         }
-        let now = delivery_time_ms.unwrap_or_else(Self::now_ms);
+        let now = Self::now_ms();
+        let delivery_time = if let Some(t) = opts.time_ms {
+            t
+        } else if let Some(idle) = opts.idle_ms {
+            now.saturating_sub(idle)
+        } else {
+            now
+        };
+
         let mut claimed = Vec::new();
         for &id in ids {
+            // Orphan PEL entry (stream message deleted): drop from PEL, skip.
             if !self.entries.contains_key(&id) {
+                let group = self.groups.get_mut(group_name).unwrap();
+                if let Some(pe) = group.pending.remove(&id) {
+                    if let Some(c) = group.consumers.get_mut(&pe.consumer) {
+                        c.pending = c.pending.saturating_sub(1);
+                    }
+                }
                 continue;
             }
+
             let group = self.groups.get_mut(group_name).unwrap();
+            let in_pel = group.pending.contains_key(&id);
+            if !in_pel && !opts.force {
+                continue;
+            }
+            if in_pel {
+                let pe = group.pending.get(&id).unwrap();
+                let idle = now.saturating_sub(pe.delivery_time_ms);
+                if idle < opts.min_idle_ms {
+                    continue;
+                }
+            }
+
+            // Ensure consumer exists.
             group
                 .consumers
                 .entry(consumer_name.clone())
@@ -452,11 +504,12 @@ impl RedisStream {
             if let Some(c) = group.consumers.get_mut(consumer_name) {
                 c.seen_time_ms = now;
             }
+
             let is_new = !group.pending.contains_key(&id);
             let pe = group.pending.entry(id).or_insert_with(|| PendingEntry {
                 id,
                 consumer: consumer_name.clone(),
-                delivery_time_ms: now,
+                delivery_time_ms: delivery_time,
                 delivery_count: 0,
             });
             if pe.consumer != *consumer_name {
@@ -472,15 +525,166 @@ impl RedisStream {
                     c.pending += 1;
                 }
             }
-            pe.delivery_time_ms = now;
-            if let Some(dc) = delivery_count {
-                pe.delivery_count = dc.max(1);
-            } else {
-                pe.delivery_count = pe.delivery_count.max(1);
+            pe.delivery_time_ms = delivery_time;
+            if let Some(dc) = opts.retrycount {
+                pe.delivery_count = dc;
+            } else if !opts.just_id {
+                pe.delivery_count = pe.delivery_count.saturating_add(1).max(1);
+            } else if pe.delivery_count == 0 {
+                pe.delivery_count = 1;
             }
             claimed.push(id);
         }
         Ok(claimed)
+    }
+
+    /// Force a message into the PEL for AOF rewrite / recovery (XCLAIM … FORCE).
+    pub fn xclaim_force(
+        &mut self,
+        group_name: &Bytes,
+        consumer_name: &Bytes,
+        ids: &[StreamId],
+        delivery_time_ms: Option<u64>,
+        delivery_count: Option<u64>,
+    ) -> Result<Vec<StreamId>, String> {
+        self.xclaim(
+            group_name,
+            consumer_name,
+            ids,
+            &XClaimOpts {
+                min_idle_ms: 0,
+                force: true,
+                time_ms: delivery_time_ms,
+                idle_ms: None,
+                retrycount: delivery_count,
+                just_id: false,
+            },
+        )
+    }
+
+    /// XAUTOCLAIM — scan PEL from `start`, claim idle entries up to `count`.
+    ///
+    /// Returns `(next_start_id, claimed_ids, deleted_ids)` where `deleted_ids` are
+    /// PEL orphans removed because the stream entry no longer exists.
+    pub fn xautoclaim(
+        &mut self,
+        group_name: &Bytes,
+        consumer_name: &Bytes,
+        min_idle_ms: u64,
+        start: StreamId,
+        count: usize,
+        just_id: bool,
+    ) -> Result<(StreamId, Vec<StreamId>, Vec<StreamId>), String> {
+        if !self.groups.contains_key(group_name) {
+            return Err("NOGROUP No such key '' or consumer group".into());
+        }
+        let now = Self::now_ms();
+
+        // Collect candidates: IDs in PEL >= start that are idle enough (or orphans).
+        let candidates: Vec<StreamId> = {
+            let group = self.groups.get(group_name).unwrap();
+            group
+                .pending
+                .range(start..)
+                .map(|(id, pe)| (*id, pe.delivery_time_ms))
+                .filter(|(id, dt)| {
+                    !self.entries.contains_key(id) || now.saturating_sub(*dt) >= min_idle_ms
+                })
+                .map(|(id, _)| id)
+                .collect()
+        };
+
+        let mut claimed = Vec::new();
+        let mut deleted = Vec::new();
+        let mut last_examined: Option<StreamId> = None;
+
+        for id in candidates {
+            last_examined = Some(id);
+            if !self.entries.contains_key(&id) {
+                let group = self.groups.get_mut(group_name).unwrap();
+                if let Some(pe) = group.pending.remove(&id) {
+                    if let Some(c) = group.consumers.get_mut(&pe.consumer) {
+                        c.pending = c.pending.saturating_sub(1);
+                    }
+                    deleted.push(id);
+                }
+                continue;
+            }
+            if claimed.len() >= count {
+                // Still scan? Redis stops once COUNT claimed; next cursor is last examined.
+                // Continue only if we already hit count — break after setting cursor.
+                break;
+            }
+            let ids = [id];
+            let got = self.xclaim(
+                group_name,
+                consumer_name,
+                &ids,
+                &XClaimOpts {
+                    min_idle_ms,
+                    force: false,
+                    time_ms: None,
+                    idle_ms: None,
+                    retrycount: None,
+                    just_id,
+                },
+            )?;
+            claimed.extend(got);
+            if claimed.len() >= count {
+                break;
+            }
+        }
+
+        // Next cursor: exclusive next after last claimed/examined; "0-0" if end of PEL.
+        let next = if let Some(last) = last_examined {
+            let group = self.groups.get(group_name).unwrap();
+            group
+                .pending
+                .range(next_id(last)..)
+                .next()
+                .map(|(id, _)| *id)
+                .unwrap_or(StreamId::ZERO)
+        } else {
+            StreamId::ZERO
+        };
+
+        Ok((next, claimed, deleted))
+    }
+
+    /// XPENDING range form: list pending entries in [start, end], up to `count`.
+    /// Optional consumer filter and minimum idle time.
+    pub fn xpending_range(
+        &self,
+        group_name: &Bytes,
+        start: StreamId,
+        end: StreamId,
+        count: usize,
+        consumer: Option<&Bytes>,
+        min_idle_ms: u64,
+    ) -> Result<Vec<PendingEntry>, String> {
+        let group = self
+            .groups
+            .get(group_name)
+            .ok_or_else(|| "NOGROUP No such key '' or consumer group".to_string())?;
+        let now = Self::now_ms();
+        let mut out = Vec::new();
+        for (id, pe) in group.pending.range(start..=end) {
+            let _ = id;
+            if let Some(c) = consumer {
+                if &pe.consumer != c {
+                    continue;
+                }
+            }
+            let idle = now.saturating_sub(pe.delivery_time_ms);
+            if idle < min_idle_ms {
+                continue;
+            }
+            out.push(pe.clone());
+            if out.len() >= count {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     pub fn group_exists(&self, name: &Bytes) -> bool {

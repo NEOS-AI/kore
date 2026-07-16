@@ -166,6 +166,7 @@ Also tracked in `docs/roadmap.md`.
   - *Done*: per-connection queue; WATCH via key generation counters; UNWATCH; EXECABORT on queue errors
 - [x] **`[P1]`** Streams + consumer groups
   - *Done*: XADD (auto/`*` + explicit ID, MAXLEN), XLEN, XRANGE/XREVRANGE, XDEL, XTRIM, XREAD / XREADGROUP with **BLOCK** (ms; 0=forever; `$` fixed at wait start; stream_blockers + XADD notify), XGROUP CREATE/DESTROY (+MKSTREAM), XACK, XPENDING summary; TYPE/DEL/KEYS/DBSIZE/RENAME wired; RDB v3 + AOF stream persistence (entries, groups, PEL via XCLAIM FORCE on rewrite)
+  - *Batch AT*: `XCLAIM` (min-idle, FORCE/JUSTID/IDLE/TIME/RETRYCOUNT); `XAUTOCLAIM` (COUNT/JUSTID, deleted-ids); `XPENDING` range (`IDLE`, consumer); `XGROUP SETID`; `XSETID`
 - [x] **`[P2]`** Bitmaps / bitfields, HyperLogLog
   - *Done (MVP)*: `SETBIT`/`GETBIT`/`BITCOUNT`/`BITPOS`/`BITOP` (AND/OR/XOR/NOT)/`BITFIELD` (GET/SET/INCRBY + OVERFLOW WRAP|SAT|FAIL); `PFADD`/`PFCOUNT`/`PFMERGE` dense HLL (p=14, Kore `KHLL` format). String-key backed; ACL `@bitmap`/`@hyperloglog`.
 

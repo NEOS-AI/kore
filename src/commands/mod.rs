@@ -635,6 +635,9 @@ impl CommandHandler {
             "XREADGROUP" => self.handle_xreadgroup(&args[1..]).await,
             "XACK" => self.handle_xack(&args[1..]),
             "XPENDING" => self.handle_xpending(&args[1..]),
+            "XCLAIM" => self.handle_xclaim(&args[1..]),
+            "XAUTOCLAIM" => self.handle_xautoclaim(&args[1..]),
+            "XSETID" => self.handle_xsetid(&args[1..]),
 
             // Pub/Sub commands (async — no block_in_place)
             "PUBLISH" => self.handle_publish(&args[1..]).await,
@@ -1075,6 +1078,9 @@ fn is_write_command(cmd: &str) -> bool {
             | "XTRIM"
             | "XGROUP"
             | "XACK"
+            | "XCLAIM"
+            | "XAUTOCLAIM"
+            | "XSETID"
             // XREADGROUP mutates PEL / last_delivered
             | "XREADGROUP"
             | "SETBIT"
