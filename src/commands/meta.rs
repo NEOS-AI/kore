@@ -30,6 +30,11 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     CmdSpec { name: "acl", arity: -2, flags: &["admin", "noscript", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "cluster", arity: -2, flags: &["admin", "random", "stale"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "asking", arity: 1, flags: &["fast"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "lolwut", arity: -1, flags: &["readonly", "fast"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "readonly", arity: 1, flags: &["fast", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "readwrite", arity: 1, flags: &["fast", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },
+    // SORT: source key always; STORE dest is movable (handled in GETKEYS).
+    CmdSpec { name: "sort", arity: -2, flags: &["write", "denyoom", "movablekeys"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "set", arity: -3, flags: &["write", "denyoom"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "get", arity: 2, flags: &["readonly", "fast"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "del", arity: -2, flags: &["write"], first_key: 1, last_key: -1, step: 1 },
@@ -653,6 +658,16 @@ impl CommandHandler {
             ));
         }
 
+        // SORT key … [STORE dest] — source + optional destination.
+        if cmd_name == "sort" {
+            return Ok(RespValue::Array(
+                extract_sort_keys_for_getkeys(cmd_args)
+                    .into_iter()
+                    .map(|b| RespValue::BulkString(Some(b)))
+                    .collect(),
+            ));
+        }
+
         let Some(spec) = find_spec(&cmd_name) else {
             return Ok(RespValue::error("ERR Invalid command specified"));
         };
@@ -702,6 +717,42 @@ fn extract_keys_from_spec(
             keys.push(b.clone());
         }
         i += step;
+    }
+    keys
+}
+
+/// SORT args for GETKEYS: [key, …options…, STORE dest?]
+fn extract_sort_keys_for_getkeys(args: &[RespValue]) -> Vec<Bytes> {
+    if args.is_empty() {
+        return Vec::new();
+    }
+    let mut keys = Vec::new();
+    if let Some(k) = args[0].as_bulk_string() {
+        keys.push(k.clone());
+    }
+    let mut i = 1;
+    while i < args.len() {
+        let opt = match args[i].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        match opt.as_str() {
+            "STORE" => {
+                if i + 1 < args.len() {
+                    if let Some(d) = args[i + 1].as_bulk_string() {
+                        keys.push(d.clone());
+                    }
+                }
+                i += 2;
+            }
+            "BY" | "GET" => i += 2,
+            "LIMIT" => i += 3,
+            "ASC" | "DESC" | "ALPHA" => i += 1,
+            _ => i += 1,
+        }
     }
     keys
 }

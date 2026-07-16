@@ -92,6 +92,8 @@ pub struct CommandHandler {
     client_reply_skip: bool,
     /// After `handle`, network checks this to omit writing a response.
     suppress_reply: bool,
+    /// READONLY mode for cluster replica reads on this connection.
+    cluster_readonly: bool,
 }
 
 impl CommandHandler {
@@ -166,6 +168,7 @@ impl CommandHandler {
             client_reply_off: false,
             client_reply_skip: false,
             suppress_reply: false,
+            cluster_readonly: false,
         }
     }
 
@@ -393,8 +396,11 @@ impl CommandHandler {
             _ => {}
         }
 
-        // Reject writes on readonly replica (except SYNC is primary-only)
-        if is_write_command(cmd_upper) {
+        // Reject writes on readonly replica (except SYNC is primary-only).
+        // SORT is a write only when STORE is present (Redis replica semantics).
+        let is_write = is_write_command(cmd_upper)
+            || (cmd_upper == "SORT" && sort_has_store(&args[1..]));
+        if is_write {
             if let Some(p) = self.persistence.as_ref() {
                 if p.replication.readonly() {
                     return Ok(RespValue::error(
@@ -448,6 +454,9 @@ impl CommandHandler {
             "PING" => self.handle_ping(&args[1..]),
             "ECHO" => self.handle_echo(&args[1..]),
             "TIME" => self.handle_time(&args[1..]),
+            "LOLWUT" => self.handle_lolwut(&args[1..]),
+            "READONLY" => self.handle_readonly(&args[1..]),
+            "READWRITE" => self.handle_readwrite(&args[1..]),
             "QUIT" => Ok(RespValue::ok()),
 
             // Client handshake / introspection
@@ -473,6 +482,7 @@ impl CommandHandler {
                 self.cache = self.databases.db0();
                 self.protocol_version = 2;
                 self.asking = false;
+                self.cluster_readonly = false;
                 if let Some(id) = self.client_id {
                     self.cache.pubsub.set_client_protocol(id, 2).await;
                 }
@@ -664,6 +674,7 @@ impl CommandHandler {
             "BRPOPLPUSH" => self.handle_brpoplpush(&args[1..]).await,
             "LMPOP" => self.handle_lmpop(&args[1..]),
             "BLMPOP" => self.handle_blmpop(&args[1..]).await,
+            "SORT" => self.handle_sort(&args[1..]),
 
             // Set commands
             "SADD" => self.handle_sadd(&args[1..]),
@@ -730,12 +741,22 @@ impl CommandHandler {
         };
 
         if let Ok(ref resp) = result {
-            self.maybe_persist_write(cmd_upper, &args[1..], resp);
-            if is_write_command(cmd_upper)
-                && response_indicates_success(resp)
-                && !is_noop_write(cmd_upper, resp)
-            {
-                self.notify_watch_after_write(cmd_upper, &args[1..]);
+            // SORT only mutates (and must be AOF/repl propagated) when STORE is used.
+            if cmd_upper == "SORT" {
+                if sort_has_store(&args[1..]) {
+                    self.maybe_persist_write(cmd_upper, &args[1..], resp);
+                    if response_indicates_success(resp) {
+                        self.notify_watch_after_write(cmd_upper, &args[1..]);
+                    }
+                }
+            } else {
+                self.maybe_persist_write(cmd_upper, &args[1..], resp);
+                if is_write_command(cmd_upper)
+                    && response_indicates_success(resp)
+                    && !is_noop_write(cmd_upper, resp)
+                {
+                    self.notify_watch_after_write(cmd_upper, &args[1..]);
+                }
             }
         }
 
@@ -1075,6 +1096,34 @@ fn pubsub_count_from_frame(frame: Option<&RespValue>) -> Option<i64> {
         Some(RespValue::Integer(n)) => Some(*n),
         _ => None,
     }
+}
+
+/// True when SORT args include STORE (write path for replica/AOF/WATCH).
+fn sort_has_store(args: &[RespValue]) -> bool {
+    let mut i = 1; // skip key
+    while i < args.len() {
+        let opt = match args[i].as_bulk_string() {
+            Some(s) => s,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        let upper = String::from_utf8_lossy(opt).to_ascii_uppercase();
+        match upper.as_str() {
+            "STORE" | "BY" | "GET" => {
+                // STORE / BY / GET take one following argument
+                i += 2;
+                if upper == "STORE" {
+                    return true;
+                }
+            }
+            "LIMIT" => i += 3,
+            "ASC" | "DESC" | "ALPHA" => i += 1,
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 fn is_write_command(cmd: &str) -> bool {

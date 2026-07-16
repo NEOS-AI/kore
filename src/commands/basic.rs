@@ -87,4 +87,55 @@ impl CommandHandler {
             }
         }
     }
+
+    /// LOLWUT [version] — Redis easter-egg version art (Kore-flavored).
+    pub(super) fn handle_lolwut(&self, args: &[RespValue]) -> Result<RespValue> {
+        // Optional version arg accepted and ignored (Redis 6/7 art variants).
+        if args.len() > 1 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'lolwut' command",
+            ));
+        }
+        if args.len() == 1 {
+            if self.parse_integer(&args[0]).is_err() {
+                return Ok(RespValue::error(
+                    "ERR value is not an integer or out of range",
+                ));
+            }
+        }
+        let ver = env!("CARGO_PKG_VERSION");
+        let art = format!(
+            r#"
+    .--.  Kore Redis/Valkey-compatible server
+   /    \   version {ver}
+   | Kore|  https://github.com/NEOS-AI/kore
+   \    /
+    `--'
+   (ok, not much art — but it is LOLWUT)
+"#
+        );
+        Ok(RespValue::BulkString(Some(Bytes::from(art))))
+    }
+
+    /// READONLY — enable reading from cluster replicas on this connection.
+    pub(super) fn handle_readonly(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        if !args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'readonly' command",
+            ));
+        }
+        self.cluster_readonly = true;
+        Ok(RespValue::ok())
+    }
+
+    /// READWRITE — disable READONLY mode (default).
+    pub(super) fn handle_readwrite(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        if !args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'readwrite' command",
+            ));
+        }
+        self.cluster_readonly = false;
+        Ok(RespValue::ok())
+    }
 }

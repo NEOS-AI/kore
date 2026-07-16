@@ -190,6 +190,7 @@ Also tracked in `docs/roadmap.md`.
   - *Batch AZ*: `LCS` `IDX` / `MINMATCHLEN` / `WITHMATCHLEN`; `OBJECT IDLETIME|REFCOUNT|FREQ`; `BITFIELD_RO`; `GEORADIUS_RO` / `GEORADIUSBYMEMBER_RO`; `SWAPDB`
   - *Batch BA*: `DUMP` / `RESTORE` (Kore KDF1 multi-type; `REPLACE`/`ABSTTL`/`IDLETIME`/`FREQ`); `EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT` `NX|XX|GT|LT`; `COMMAND GETKEYS`; `ACL GENPASS`
   - *Batch BB*: `SLOWLOG` GET/LEN/RESET; `MEMORY STATS|DOCTOR|PURGE`; `CLIENT REPLY` ON|OFF|SKIP; `CONFIG` `slowlog-log-slower-than` / `slowlog-max-len`
+  - *Batch BC*: `SORT` (list/set/zset; `ALPHA`/`ASC`/`DESC`/`LIMIT`/`STORE`; `BY nosort` only); `LOLWUT`; `READONLY`/`READWRITE` (per-connection `cluster_readonly`)
 - [x] **`[P1]`** `CLIENT`, `COMMAND`, `HELLO`
   - *Done*: HELLO (RESP2 + RESP3; AUTH/SETNAME); CLIENT ID/SETNAME/GETNAME/SETINFO/LIST/INFO; COMMAND / COUNT / LIST / INFO catalog
 - [x] **`[P1]`** Multi-DB: `SELECT` (or explicitly document single-DB only)
@@ -261,6 +262,7 @@ Also tracked in `docs/roadmap.md`.
   - *Done (MVP)*: default user from `--auth`; `AUTH` password / username+password; `ACL SETUSER` (on/off, >pass/nopass, +@all/-@all, +cmd/-cmd, ~*/~prefix*, `&*`/`&pat`/allchannels/resetchannels), `GETUSER`/`LIST`/`WHOAMI`/`CAT`/`DELUSER`/`LOAD`/`SAVE`; `--aclfile` + boot load; per-connection username; command+key+channel checks; HELLO AUTH uses real user lookup.
   - *Batch BA*: `ACL GENPASS` [bits]; `COMMAND GETKEYS`; `DUMP`/`RESTORE`
   - *Batch BB*: `SLOWLOG`; `MEMORY STATS|DOCTOR|PURGE`; `CLIENT REPLY`; slowlog CONFIG params
+  - *Batch BC*: `SORT`; `LOLWUT`; `READONLY`/`READWRITE`
 - [x] **`[P1]`** TLS
   - *Done (MVP)*: `--tls` / `--tls-cert` / `--tls-key`; tokio-rustls server wrap on accept; fail-fast cert/key load; plaintext path unchanged; no mTLS / dual listener / replica link TLS
 - [x] **`[P2]`** Unix domain socket option

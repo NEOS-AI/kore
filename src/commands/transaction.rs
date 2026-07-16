@@ -180,6 +180,37 @@ fn write_keys(cmd: &str, args: &[RespValue]) -> Vec<Bytes> {
             .take(2)
             .filter_map(|a| a.as_bulk_string().cloned())
             .collect(),
+        // SORT key … [STORE dest] — touch source + dest when STORE present
+        "SORT" => {
+            let mut keys = Vec::new();
+            if let Some(k) = args.first().and_then(|a| a.as_bulk_string()) {
+                keys.push(k.clone());
+            }
+            let mut i = 1;
+            while i < args.len() {
+                let opt = match args[i].as_bulk_string() {
+                    Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+                    None => {
+                        i += 1;
+                        continue;
+                    }
+                };
+                match opt.as_str() {
+                    "STORE" => {
+                        if i + 1 < args.len() {
+                            if let Some(d) = args[i + 1].as_bulk_string() {
+                                keys.push(d.clone());
+                            }
+                        }
+                        break;
+                    }
+                    "BY" | "GET" => i += 2,
+                    "LIMIT" => i += 3,
+                    _ => i += 1,
+                }
+            }
+            keys
+        }
         // SMOVE / LMOVE / BLMOVE / RPOPLPUSH / BRPOPLPUSH: source + destination
         "SMOVE" | "LMOVE" | "BLMOVE" | "RPOPLPUSH" | "BRPOPLPUSH" => args
             .iter()

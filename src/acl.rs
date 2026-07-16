@@ -729,13 +729,13 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "hscan",
             "xlen", "xrange", "xrevrange", "xread", "xpending", "xinfo",
             "geopos", "geodist", "geohash", "geosearch", "georadius_ro", "georadiusbymember_ro", "info", "role", "lastsave", "object",
-            "memory", "dump", "strlen", "getbit", "bitcount", "bitpos", "bitfield_ro", "pfcount", "time",
+            "memory", "dump", "strlen", "getbit", "bitcount", "bitpos", "bitfield_ro", "pfcount", "time", "sort", "lolwut",
         ],
         "write" => &[
             "set", "del", "mset", "msetnx", "append", "setrange", "setex", "psetex", "getset", "unlink", "rename", "renamenx",
             "setnx", "getdel", "getex", "incr", "decr", "incrby", "decrby", "incrbyfloat", "expire", "pexpire", "expireat", "pexpireat", "persist", "expiretime", "pexpiretime",
             "hset", "hsetnx", "hmset", "hdel", "hgetdel", "hincrby", "hincrbyfloat", "lpush", "rpush", "lpushx", "rpushx", "lpop", "rpop", "blpop", "brpop", "lset",
-            "lrem", "ltrim", "linsert", "lmove", "blmove", "rpoplpush", "brpoplpush", "lmpop", "blmpop",
+            "lrem", "ltrim", "linsert", "lmove", "blmove", "rpoplpush", "brpoplpush", "lmpop", "blmpop", "sort",
             "sadd", "srem", "sinterstore", "sunionstore", "sdiffstore", "smove", "spop",
             "zadd", "zrem", "zincrby", "zremrangebyrank", "zremrangebyscore", "zremrangebylex",
             "zunionstore", "zinterstore", "zdiffstore", "zrangestore", "zpopmin", "zpopmax", "zmpop",
@@ -755,6 +755,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
         ],
         "connection" => &[
             "auth", "hello", "ping", "echo", "quit", "reset", "select", "client", "command",
+            "readonly", "readwrite",
         ],
         "pubsub" => &[
             "publish", "subscribe", "unsubscribe", "psubscribe", "punsubscribe", "pubsub",
@@ -779,7 +780,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
         ],
         "list" => &[
             "lpush", "rpush", "lpushx", "rpushx", "lpop", "rpop", "blpop", "brpop", "lrange", "llen", "lindex", "lset",
-            "lrem", "ltrim", "linsert", "lpos", "lmove", "blmove", "rpoplpush", "brpoplpush", "lmpop", "blmpop",
+            "lrem", "ltrim", "linsert", "lpos", "lmove", "blmove", "rpoplpush", "brpoplpush", "lmpop", "blmpop", "sort",
         ],
         "set" => &[
             "sadd", "srem", "smembers", "sismember", "smismember", "scard", "sinter", "sintercard", "sunion", "sdiff",

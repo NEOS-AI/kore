@@ -22,7 +22,8 @@ const SCRIPT_CALL_ALLOWLIST: &[&str] = &[
     "HINCRBY", "HINCRBYFLOAT", "HSTRLEN", "HRANDFIELD", "HSCAN", //
     "OBJECT", "MEMORY", //
     "LPUSH", "RPUSH", "LPUSHX", "RPUSHX", "LPOP", "RPOP", "LRANGE", "LLEN", "LINDEX", "LSET", "LREM", "LTRIM", "LINSERT", //
-    "LPOS", "LMOVE", "RPOPLPUSH", "LMPOP", //
+    "LPOS", "LMOVE", "RPOPLPUSH", "LMPOP", "SORT", //
+    "LOLWUT", //
     "SADD", "SREM", "SMEMBERS", "SISMEMBER", "SMISMEMBER", "SCARD", "SINTER", "SINTERCARD", "SUNION", "SDIFF", //
     "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE", "SMOVE", "SPOP", "SRANDMEMBER", "SSCAN", //
     "ZADD", "ZRANGE", "ZRANGESTORE", "ZREVRANGE", "ZCARD", "ZSCORE", "ZMSCORE", "ZREM", "ZRANK", "ZREVRANK", //
@@ -413,6 +414,8 @@ impl CommandHandler {
             "LMOVE" => self.handle_lmove(args),
             "RPOPLPUSH" => self.handle_rpoplpush(args),
             "LMPOP" => self.handle_lmpop(args),
+            "SORT" => self.handle_sort(args),
+            "LOLWUT" => self.handle_lolwut(args),
             "SADD" => self.handle_sadd(args),
             "SREM" => self.handle_srem(args),
             "SMEMBERS" => self.handle_smembers(args),

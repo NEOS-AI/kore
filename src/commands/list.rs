@@ -1209,6 +1209,214 @@ impl CommandHandler {
         self.cache.list_blockers.notify_key(dest);
         Ok(RespValue::BulkString(Some(val)))
     }
+
+    /// SORT key [BY nosort] [LIMIT offset count] [ASC|DESC] [ALPHA] [STORE destination]
+    ///
+    /// Sorts list/set/zset elements. Numeric by default (double parse); ALPHA for
+    /// lexicographic. BY only accepts `nosort` (skip sort). GET patterns not supported.
+    pub(super) fn handle_sort(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'sort' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+
+        let mut alpha = false;
+        let mut desc = false;
+        let mut nosort = false;
+        let mut limit_offset: usize = 0;
+        let mut limit_count: Option<i64> = None; // None = no LIMIT; negative count = all
+        let mut store_dest: Option<Bytes> = None;
+
+        let mut i = 1;
+        while i < args.len() {
+            let opt = match args[i].as_bulk_string() {
+                Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+                None => return Ok(RespValue::error("ERR syntax error")),
+            };
+            match opt.as_str() {
+                "ALPHA" => {
+                    alpha = true;
+                    i += 1;
+                }
+                "ASC" => {
+                    desc = false;
+                    i += 1;
+                }
+                "DESC" => {
+                    desc = true;
+                    i += 1;
+                }
+                "BY" => {
+                    if i + 1 >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    let pattern = match args[i + 1].as_bulk_string() {
+                        Some(p) => String::from_utf8_lossy(p).to_ascii_lowercase(),
+                        None => return Ok(RespValue::error("ERR syntax error")),
+                    };
+                    if pattern != "nosort" {
+                        return Ok(RespValue::error(
+                            "ERR BY pattern not supported (only BY nosort)",
+                        ));
+                    }
+                    nosort = true;
+                    i += 2;
+                }
+                "LIMIT" => {
+                    if i + 2 >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    let off = match self.parse_integer(&args[i + 1]) {
+                        Ok(n) if n >= 0 => n as usize,
+                        Ok(_) => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ));
+                        }
+                        Err(_) => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ));
+                        }
+                    };
+                    let cnt = match self.parse_integer(&args[i + 2]) {
+                        Ok(n) => n,
+                        Err(_) => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ));
+                        }
+                    };
+                    limit_offset = off;
+                    limit_count = Some(cnt);
+                    i += 3;
+                }
+                "STORE" => {
+                    if i + 1 >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    let dest = match args[i + 1].as_bulk_string() {
+                        Some(d) => d.clone(),
+                        None => return Ok(RespValue::error("ERR invalid destination key")),
+                    };
+                    store_dest = Some(dest);
+                    i += 2;
+                }
+                "GET" => {
+                    return Ok(RespValue::error(
+                        "ERR GET option not supported",
+                    ));
+                }
+                _ => return Ok(RespValue::error("ERR syntax error")),
+            }
+        }
+
+        // Collect source elements by type.
+        let mut elements: Vec<Bytes> = match self.cache.key_type(&key) {
+            KeyType::None => Vec::new(),
+            KeyType::List => match self.cache.get_list(&key) {
+                Some(l) => l.read().lrange(0, -1),
+                None => Vec::new(),
+            },
+            KeyType::Set => match self.cache.get_set(&key) {
+                Some(s) => s.read().smembers(),
+                None => Vec::new(),
+            },
+            KeyType::ZSet => match self.cache.get_sorted_set(&key) {
+                Some(z) => z
+                    .read()
+                    .range(0, -1, false)
+                    .into_iter()
+                    .map(|m| m.member)
+                    .collect(),
+                None => Vec::new(),
+            },
+            _ => {
+                return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+            }
+        };
+
+        if !nosort {
+            if alpha {
+                elements.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+            } else {
+                // Numeric sort: parse each as double; fail if any cannot convert.
+                let mut scored: Vec<(f64, Bytes)> = Vec::with_capacity(elements.len());
+                for el in elements {
+                    let s = String::from_utf8_lossy(&el);
+                    let n = match s.trim().parse::<f64>() {
+                        Ok(v) if v.is_finite() => v,
+                        _ => {
+                            return Ok(RespValue::error(
+                                "ERR One or more scores can't be converted into double",
+                            ));
+                        }
+                    };
+                    scored.push((n, el));
+                }
+                scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                elements = scored.into_iter().map(|(_, b)| b).collect();
+            }
+            if desc {
+                elements.reverse();
+            }
+        } else if desc {
+            // BY nosort + DESC: reverse the source order (Redis behavior).
+            elements.reverse();
+        }
+
+        // Apply LIMIT offset count.
+        if let Some(cnt) = limit_count {
+            if limit_offset >= elements.len() {
+                elements.clear();
+            } else {
+                let start = limit_offset;
+                let end = if cnt < 0 {
+                    elements.len()
+                } else {
+                    (start + cnt as usize).min(elements.len())
+                };
+                elements = elements[start..end].to_vec();
+            }
+        }
+
+        if let Some(dest) = store_dest {
+            // Overwrite destination as a list (any prior type).
+            let _ = self.cache.delete(&dest);
+            let len = elements.len() as i64;
+            if elements.is_empty() {
+                return Ok(RespValue::Integer(0));
+            }
+            let est: usize = elements.iter().map(|e| e.len() + 16).sum();
+            if let Err(e) = self.cache.ensure_non_string_capacity(est) {
+                return Ok(RespValue::error(e.to_resp_string()));
+            }
+            let list = match self.cache.get_or_create_list(&dest) {
+                Ok(l) => l,
+                Err(e) => return Ok(RespValue::error(e.to_resp_string())),
+            };
+            let mut l = list.write();
+            let before = crate::memory::estimate_keyed_object(dest.len(), l.memory_size());
+            let _ = l.rpush(elements);
+            let after = crate::memory::estimate_keyed_object(dest.len(), l.memory_size());
+            drop(l);
+            self.cache.account_list_delta(before, after);
+            self.cache.list_blockers.notify_key(&dest);
+            return Ok(RespValue::Integer(len));
+        }
+
+        Ok(RespValue::Array(
+            elements
+                .into_iter()
+                .map(|v| RespValue::BulkString(Some(v)))
+                .collect(),
+        ))
+    }
 }
 
 fn parse_list_side(value: &RespValue) -> std::result::Result<bool, String> {
