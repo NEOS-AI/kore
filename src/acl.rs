@@ -723,7 +723,8 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "hget", "hmget", "hgetall", "hlen", "hexists", "hkeys", "hvals", "lrange", "llen",
             "lindex", "smembers", "sismember", "scard", "sinter", "sunion", "sdiff", "srandmember",
             "zrange", "zrevrange", "zcard",
-            "zscore", "zrank", "zrevrank", "xlen", "xrange", "xrevrange", "xread", "xpending",
+            "zscore", "zrank", "zrevrank", "zrangebyscore", "zrevrangebyscore", "zcount",
+            "xlen", "xrange", "xrevrange", "xread", "xpending",
             "geopos", "geodist", "geohash", "geosearch", "info", "role", "lastsave", "object",
             "memory", "dump", "strlen", "getbit", "bitcount", "bitpos", "pfcount",
         ],
@@ -732,7 +733,8 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "setnx", "getdel", "getex", "incr", "decr", "incrby", "decrby", "expire", "pexpire", "expireat", "pexpireat", "persist", "expiretime", "pexpiretime",
             "hset", "hdel", "hincrby", "lpush", "rpush", "lpop", "rpop", "blpop", "brpop", "lset",
             "sadd", "srem", "sinterstore", "sunionstore", "sdiffstore", "smove", "spop",
-            "zadd", "zrem", "xadd", "xdel", "xtrim", "xgroup", "xack", "xreadgroup",
+            "zadd", "zrem", "zincrby", "zremrangebyrank", "zremrangebyscore",
+            "xadd", "xdel", "xtrim", "xgroup", "xack", "xreadgroup",
             "geoadd", "geosearchstore", "georadius", "georadiusbymember", "flushdb", "flushall",
             "setbit", "bitop", "bitfield", "pfadd", "pfmerge",
         ],
@@ -777,6 +779,8 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
         ],
         "sortedset" => &[
             "zadd", "zrange", "zrevrange", "zcard", "zscore", "zrem", "zrank", "zrevrank",
+            "zincrby", "zrangebyscore", "zrevrangebyscore", "zcount",
+            "zremrangebyrank", "zremrangebyscore",
         ],
         "stream" => &[
             "xadd", "xlen", "xrange", "xrevrange", "xdel", "xtrim", "xread", "xgroup", "xreadgroup",

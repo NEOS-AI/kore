@@ -532,6 +532,12 @@ impl CommandHandler {
             "ZREM" => self.handle_zrem(&args[1..]),
             "ZRANK" => self.handle_zrank(&args[1..]),
             "ZREVRANK" => self.handle_zrevrank(&args[1..]),
+            "ZINCRBY" => self.handle_zincrby(&args[1..]),
+            "ZRANGEBYSCORE" => self.handle_zrangebyscore(&args[1..]),
+            "ZREVRANGEBYSCORE" => self.handle_zrevrangebyscore(&args[1..]),
+            "ZCOUNT" => self.handle_zcount(&args[1..]),
+            "ZREMRANGEBYRANK" => self.handle_zremrangebyrank(&args[1..]),
+            "ZREMRANGEBYSCORE" => self.handle_zremrangebyscore(&args[1..]),
 
             // Geospatial commands
             "GEOADD" => self.handle_geoadd(&args[1..]),
@@ -989,6 +995,9 @@ fn is_write_command(cmd: &str) -> bool {
             | "FLUSHALL"
             | "ZADD"
             | "ZREM"
+            | "ZINCRBY"
+            | "ZREMRANGEBYRANK"
+            | "ZREMRANGEBYSCORE"
             | "GEOADD"
             | "GEOSEARCHSTORE"
             | "HSET"

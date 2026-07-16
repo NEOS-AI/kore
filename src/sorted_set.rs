@@ -13,6 +13,74 @@ const SKIPLIST_MAXLEVEL: usize = 32;
 /// P = 1/4 probability of promoting a level (Redis default).
 const SKIPLIST_P: f64 = 0.25;
 
+/// Inclusive/exclusive score bound for ZRANGEBYSCORE / ZCOUNT / ZREMRANGEBYSCORE.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScoreBound {
+    pub value: f64,
+    pub exclusive: bool,
+}
+
+impl ScoreBound {
+    pub fn inclusive(value: f64) -> Self {
+        Self {
+            value,
+            exclusive: false,
+        }
+    }
+
+    pub fn exclusive(value: f64) -> Self {
+        Self {
+            value,
+            exclusive: true,
+        }
+    }
+
+    /// Parse Redis score spec: `1.5`, `(1.5`, `-inf`, `+inf`, `inf`.
+    pub fn parse(s: &str) -> Result<Self, ()> {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("-inf") {
+            return Ok(Self::inclusive(f64::NEG_INFINITY));
+        }
+        if s.eq_ignore_ascii_case("+inf") || s.eq_ignore_ascii_case("inf") {
+            return Ok(Self::inclusive(f64::INFINITY));
+        }
+        let (exclusive, rest) = if let Some(r) = s.strip_prefix('(') {
+            (true, r)
+        } else {
+            (false, s)
+        };
+        let value: f64 = rest.parse().map_err(|_| ())?;
+        if value.is_nan() {
+            return Err(());
+        }
+        Ok(Self { value, exclusive })
+    }
+
+    fn accepts_as_min(self, score: f64) -> bool {
+        let s = OrderedFloat(score);
+        let b = OrderedFloat(self.value);
+        if self.exclusive {
+            s > b
+        } else {
+            s >= b
+        }
+    }
+
+    fn accepts_as_max(self, score: f64) -> bool {
+        let s = OrderedFloat(score);
+        let b = OrderedFloat(self.value);
+        if self.exclusive {
+            s < b
+        } else {
+            s <= b
+        }
+    }
+}
+
+fn score_in_range(score: f64, min: ScoreBound, max: ScoreBound) -> bool {
+    min.accepts_as_min(score) && max.accepts_as_max(score)
+}
+
 /// Member with its score
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScoredMember {
@@ -497,6 +565,71 @@ impl SortedSet {
         count
     }
 
+    /// Increment member score by `incr` (create with score `incr` if absent).
+    /// Returns the new score.
+    pub fn incr_by(&mut self, member: Bytes, incr: f64) -> f64 {
+        let new_score = self.member_map.get(&member).copied().unwrap_or(0.0) + incr;
+        // `add` returns false on update; we always want the new score stored.
+        let _ = self.add(member, new_score);
+        new_score
+    }
+
+    /// Members with scores in `[min, max]` (respecting exclusive bounds).
+    ///
+    /// When `reverse` is true, results are highest-score first.
+    /// `offset` / `count` apply after ordering (Redis LIMIT semantics).
+    pub fn range_by_score(
+        &self,
+        min: ScoreBound,
+        max: ScoreBound,
+        reverse: bool,
+        offset: usize,
+        count: Option<usize>,
+    ) -> Vec<ScoredMember> {
+        let mut matched: Vec<ScoredMember> = self
+            .list
+            .iter_keys()
+            .filter(|k| score_in_range(k.score.0, min, max))
+            .map(|k| ScoredMember::new(k.member.clone(), k.score.0))
+            .collect();
+        if reverse {
+            matched.reverse();
+        }
+        if offset >= matched.len() {
+            return Vec::new();
+        }
+        let end = match count {
+            Some(c) => (offset + c).min(matched.len()),
+            None => matched.len(),
+        };
+        matched[offset..end].to_vec()
+    }
+
+    /// Count members with scores in range.
+    pub fn count_by_score(&self, min: ScoreBound, max: ScoreBound) -> usize {
+        self.list
+            .iter_keys()
+            .filter(|k| score_in_range(k.score.0, min, max))
+            .count()
+    }
+
+    /// Remove members with scores in range. Returns number removed.
+    pub fn remove_range_by_score(&mut self, min: ScoreBound, max: ScoreBound) -> usize {
+        let members: Vec<Bytes> = self
+            .list
+            .iter_keys()
+            .filter(|k| score_in_range(k.score.0, min, max))
+            .map(|k| k.member.clone())
+            .collect();
+        let mut count = 0;
+        for m in members {
+            if self.remove(&m) {
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// Approximate heap size of zset contents (members only; key charged separately).
     pub fn memory_size(&self) -> usize {
         use crate::memory::{estimate_zset_member, with_alloc_overhead};
@@ -589,6 +722,67 @@ mod tests {
         assert_eq!(range.len(), 2);
         assert_eq!(range[0].member, Bytes::from("c"));
         assert_eq!(range[1].member, Bytes::from("d"));
+    }
+
+    #[test]
+    fn test_score_bound_parse() {
+        assert_eq!(
+            ScoreBound::parse("1.5").unwrap(),
+            ScoreBound::inclusive(1.5)
+        );
+        assert_eq!(
+            ScoreBound::parse("(2").unwrap(),
+            ScoreBound::exclusive(2.0)
+        );
+        assert!(ScoreBound::parse("-inf").unwrap().value.is_infinite());
+        assert!(ScoreBound::parse("+inf").unwrap().value.is_infinite());
+        assert!(ScoreBound::parse("nan").is_err());
+    }
+
+    #[test]
+    fn test_incr_by_and_range_by_score() {
+        let mut zset = SortedSet::new();
+        zset.add(Bytes::from("a"), 1.0);
+        zset.add(Bytes::from("b"), 2.0);
+        zset.add(Bytes::from("c"), 3.0);
+        zset.add(Bytes::from("d"), 4.0);
+
+        assert_eq!(zset.incr_by(Bytes::from("b"), 1.5), 3.5);
+        assert_eq!(zset.score(&Bytes::from("b")), Some(3.5));
+        // New member
+        assert_eq!(zset.incr_by(Bytes::from("e"), 0.5), 0.5);
+
+        let mid = zset.range_by_score(
+            ScoreBound::inclusive(2.0),
+            ScoreBound::inclusive(3.5),
+            false,
+            0,
+            None,
+        );
+        let names: Vec<_> = mid.iter().map(|m| m.member.as_ref()).collect();
+        assert_eq!(names, [b"c".as_ref(), b"b".as_ref()]);
+
+        // After incr: a=1, e=0.5, c=3, b=3.5, d=4 → exclusive (1,4) keeps c and b.
+        let excl = zset.range_by_score(
+            ScoreBound::exclusive(1.0),
+            ScoreBound::exclusive(4.0),
+            false,
+            0,
+            None,
+        );
+        assert_eq!(excl.len(), 2);
+
+        assert_eq!(
+            zset.count_by_score(ScoreBound::inclusive(3.0), ScoreBound::inclusive(4.0)),
+            3 // c, b, d
+        );
+
+        let n = zset.remove_range_by_score(
+            ScoreBound::inclusive(3.0),
+            ScoreBound::inclusive(3.5),
+        );
+        assert_eq!(n, 2); // c and b
+        assert_eq!(zset.len(), 3); // a, d, e
     }
 
     #[test]

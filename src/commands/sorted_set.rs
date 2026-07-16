@@ -1,6 +1,7 @@
 use crate::cache::KeyType;
 use crate::error::{Error, Result};
 use crate::protocol::RespValue;
+use crate::sorted_set::{ScoreBound, ScoredMember};
 use bytes::Bytes;
 use super::CommandHandler;
 
@@ -372,6 +373,266 @@ impl CommandHandler {
         }
     }
 
+    /// ZINCRBY key increment member
+    pub(super) fn handle_zincrby(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 3 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'zincrby' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        let incr = match self.parse_float(&args[1]) {
+            Ok(v) => v,
+            Err(_) => return Ok(RespValue::error("ERR value is not a valid float")),
+        };
+        if incr.is_nan() {
+            return Ok(RespValue::error("ERR resulting score is not a number (NaN)"));
+        }
+        let member = match args[2].as_bulk_string() {
+            Some(m) => m.clone(),
+            None => return Ok(RespValue::error("ERR invalid member")),
+        };
+
+        let est = member.len() + 64;
+        if let Err(e) = self.cache.ensure_non_string_capacity(est) {
+            return Ok(RespValue::error(e.to_resp_string()));
+        }
+        let zset = match self.cache.get_or_create_sorted_set(&key) {
+            Ok(z) => z,
+            Err(Error::WrongType) => {
+                return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+            }
+            Err(e) => return Ok(RespValue::error(e.to_resp_string())),
+        };
+        let mut set = zset.write();
+        // Reject NaN result (Redis)
+        let old = set.score(&member).unwrap_or(0.0);
+        if (old + incr).is_nan() {
+            return Ok(RespValue::error("ERR resulting score is not a number (NaN)"));
+        }
+        let before = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
+        let new_score = set.incr_by(member, incr);
+        let after = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
+        drop(set);
+        self.cache.account_sorted_set_delta(before, after);
+        Ok(RespValue::BulkString(Some(Bytes::from(format_score(new_score)))))
+    }
+
+    /// ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count]
+    pub(super) fn handle_zrangebyscore(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.handle_zrangebyscore_impl(args, false, "zrangebyscore")
+    }
+
+    /// ZREVRANGEBYSCORE key max min [WITHSCORES] [LIMIT offset count]
+    pub(super) fn handle_zrevrangebyscore(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.handle_zrangebyscore_impl(args, true, "zrevrangebyscore")
+    }
+
+    /// ZCOUNT key min max
+    pub(super) fn handle_zcount(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 3 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'zcount' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_zset_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+        let min = match parse_score_bound(&args[1]) {
+            Ok(b) => b,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+        let max = match parse_score_bound(&args[2]) {
+            Ok(b) => b,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+        let n = match self.cache.get_sorted_set(key) {
+            Some(z) => z.read().count_by_score(min, max),
+            None => 0,
+        };
+        Ok(RespValue::Integer(n as i64))
+    }
+
+    /// ZREMRANGEBYRANK key start stop
+    pub(super) fn handle_zremrangebyrank(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 3 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'zremrangebyrank' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_zset_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+        let start = match self.parse_integer(&args[1]) {
+            Ok(s) => s as isize,
+            Err(_) => {
+                return Ok(RespValue::error(
+                    "ERR value is not an integer or out of range",
+                ));
+            }
+        };
+        let stop = match self.parse_integer(&args[2]) {
+            Ok(s) => s as isize,
+            Err(_) => {
+                return Ok(RespValue::error(
+                    "ERR value is not an integer or out of range",
+                ));
+            }
+        };
+        let zset = match self.cache.get_sorted_set(key) {
+            Some(z) => z,
+            None => return Ok(RespValue::Integer(0)),
+        };
+        let mut set = zset.write();
+        let before = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
+        let removed = set.remove_range_by_rank(start, stop);
+        let empty = set.is_empty();
+        let after = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
+        drop(set);
+        self.cache.account_sorted_set_delta(before, after);
+        if empty {
+            self.cache.remove_sorted_set(key);
+        }
+        Ok(RespValue::Integer(removed as i64))
+    }
+
+    /// ZREMRANGEBYSCORE key min max
+    pub(super) fn handle_zremrangebyscore(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 3 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'zremrangebyscore' command",
+            ));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_zset_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+        let min = match parse_score_bound(&args[1]) {
+            Ok(b) => b,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+        let max = match parse_score_bound(&args[2]) {
+            Ok(b) => b,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+        let zset = match self.cache.get_sorted_set(key) {
+            Some(z) => z,
+            None => return Ok(RespValue::Integer(0)),
+        };
+        let mut set = zset.write();
+        let before = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
+        let removed = set.remove_range_by_score(min, max);
+        let empty = set.is_empty();
+        let after = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
+        drop(set);
+        self.cache.account_sorted_set_delta(before, after);
+        if empty {
+            self.cache.remove_sorted_set(key);
+        }
+        Ok(RespValue::Integer(removed as i64))
+    }
+
+    fn handle_zrangebyscore_impl(
+        &self,
+        args: &[RespValue],
+        reverse: bool,
+        name: &str,
+    ) -> Result<RespValue> {
+        if args.len() < 3 {
+            return Ok(RespValue::error(format!(
+                "ERR wrong number of arguments for '{}' command",
+                name
+            )));
+        }
+        let key = match args[0].as_bulk_string() {
+            Some(k) => k,
+            None => return Ok(RespValue::error("ERR invalid key")),
+        };
+        if let Err(Error::WrongType) = self.ensure_zset_key(key) {
+            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        }
+
+        // ZRANGEBYSCORE: min max; ZREVRANGEBYSCORE: max min (still score bounds).
+        let bound_a = match parse_score_bound(&args[1]) {
+            Ok(b) => b,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+        let bound_b = match parse_score_bound(&args[2]) {
+            Ok(b) => b,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+        let (min, max) = if reverse {
+            // args are max min — normalize to min/max for filtering
+            (bound_b, bound_a)
+        } else {
+            (bound_a, bound_b)
+        };
+
+        let mut with_scores = false;
+        let mut offset: usize = 0;
+        let mut count: Option<usize> = None;
+        let mut i = 3;
+        while i < args.len() {
+            let opt = match args[i].as_bulk_string() {
+                Some(s) => String::from_utf8_lossy(s).to_uppercase(),
+                None => return Ok(RespValue::error("ERR syntax error")),
+            };
+            match opt.as_str() {
+                "WITHSCORES" => {
+                    with_scores = true;
+                    i += 1;
+                }
+                "LIMIT" => {
+                    if i + 2 >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    offset = match self.parse_integer(&args[i + 1]) {
+                        Ok(n) if n >= 0 => n as usize,
+                        _ => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ));
+                        }
+                    };
+                    let c = match self.parse_integer(&args[i + 2]) {
+                        Ok(n) => n,
+                        _ => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ));
+                        }
+                    };
+                    // Redis: negative count means "all from offset"
+                    count = if c < 0 { None } else { Some(c as usize) };
+                    i += 3;
+                }
+                _ => return Ok(RespValue::error("ERR syntax error")),
+            }
+        }
+
+        let members = match self.cache.get_sorted_set(key) {
+            Some(z) => z
+                .read()
+                .range_by_score(min, max, reverse, offset, count),
+            None => Vec::new(),
+        };
+        Ok(scored_members_to_resp(members, with_scores))
+    }
+
     // Helper method to parse float from RespValue
     pub(super) fn parse_float(&self, value: &RespValue) -> Result<f64> {
         match value.as_bulk_string() {
@@ -383,4 +644,38 @@ impl CommandHandler {
             None => Err(Error::InvalidArgument("not a bulk string".into())),
         }
     }
+}
+
+fn parse_score_bound(value: &RespValue) -> std::result::Result<ScoreBound, String> {
+    match value.as_bulk_string() {
+        Some(bytes) => {
+            let s = String::from_utf8_lossy(bytes);
+            ScoreBound::parse(&s).map_err(|_| "ERR min or max is not a float".to_string())
+        }
+        None => Err("ERR min or max is not a float".to_string()),
+    }
+}
+
+fn format_score(score: f64) -> String {
+    // Prefer integer-looking scores without trailing .0 when exact.
+    if score.fract() == 0.0 && score.is_finite() && score.abs() < 1e15 {
+        format!("{}", score as i64)
+    } else {
+        // Redis-style: enough precision, trim trailing zeros lightly via default Display.
+        let s = format!("{}", score);
+        s
+    }
+}
+
+fn scored_members_to_resp(members: Vec<ScoredMember>, with_scores: bool) -> RespValue {
+    let mut result = Vec::with_capacity(members.len() * if with_scores { 2 } else { 1 });
+    for sm in members {
+        result.push(RespValue::BulkString(Some(sm.member)));
+        if with_scores {
+            result.push(RespValue::BulkString(Some(Bytes::from(format_score(
+                sm.score,
+            )))));
+        }
+    }
+    RespValue::Array(result)
 }

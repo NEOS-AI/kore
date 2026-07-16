@@ -152,7 +152,8 @@ impl CommandHandler {
 fn write_keys(cmd: &str, args: &[RespValue]) -> Vec<Bytes> {
     match cmd {
         "SET" | "SETNX" | "GETDEL" | "GETEX" | "APPEND" | "SETEX" | "GETSET" | "INCR"
-        | "DECR" | "INCRBY" | "DECRBY" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "PERSIST" | "ZADD" | "ZREM" | "GEOADD"
+        | "DECR" | "INCRBY" | "DECRBY" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "PERSIST" | "ZADD" | "ZREM" | "ZINCRBY"
+        | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "GEOADD"
         | "GEOSEARCHSTORE" | "HSET" | "HDEL" | "HINCRBY" | "LPUSH" | "RPUSH" | "LPOP"
         | "RPOP" | "LSET" | "SADD" | "SREM" | "SPOP" | "XADD" | "XDEL" | "XTRIM" | "XACK"
         | "SETBIT" | "BITFIELD" | "PFADD" | "TOUCH" | "MOVE" => args
