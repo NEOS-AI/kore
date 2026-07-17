@@ -24,6 +24,7 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     CmdSpec { name: "auth", arity: -2, flags: &["noscript", "loading", "stale", "fast", "no_auth", "ok_loading"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "quit", arity: -1, flags: &["admin", "noscript", "loading", "stale", "fast"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "shutdown", arity: -1, flags: &["admin", "noscript", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "debug", arity: -2, flags: &["admin", "noscript", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "reset", arity: 1, flags: &["noscript", "loading", "stale", "fast"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "hello", arity: -1, flags: &["noscript", "loading", "stale", "fast", "no_auth"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "command", arity: -1, flags: &["loading", "stale", "random"], first_key: 0, last_key: 0, step: 0 },

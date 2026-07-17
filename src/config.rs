@@ -5,9 +5,10 @@ use std::net::SocketAddr;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "kore")]
 #[command(about = "A low-latency, high-performance caching database", long_about = None)]
+// Keep clap's `-h`/`--help`; bind address is long-only (`--host`) so short names stay unique.
 pub struct Config {
     /// Host address to bind to
-    #[arg(short = 'h', long, default_value = "127.0.0.1")]
+    #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
 
     /// Port to bind to

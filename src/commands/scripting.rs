@@ -34,7 +34,10 @@ const SCRIPT_CALL_ALLOWLIST: &[&str] = &[
     "SETBIT", "GETBIT", "BITCOUNT", "BITPOS", "BITOP", "BITFIELD", "BITFIELD_RO", //
     "PFADD", "PFCOUNT", "PFMERGE", //
     "DBSIZE", "KEYS", "SWAPDB", //
-    "GEORADIUS_RO", "GEORADIUSBYMEMBER_RO", //
+    "GEOADD", "GEODIST", "GEOPOS", "GEOHASH", "GEOSEARCH", "GEOSEARCHSTORE", //
+    "GEORADIUS", "GEORADIUSBYMEMBER", "GEORADIUS_RO", "GEORADIUSBYMEMBER_RO", //
+    "XADD", "XLEN", "XRANGE", "XREVRANGE", "XDEL", "XTRIM", "XACK", //
+    "TOUCH", "RANDOMKEY", "SCAN", //
 ];
 
 impl CommandHandler {
@@ -626,8 +629,26 @@ impl CommandHandler {
             "BITOP" => self.handle_bitop(args),
             "BITFIELD" => self.handle_bitfield(args),
             "BITFIELD_RO" => self.handle_bitfield_ro(args),
+            "GEOADD" => self.handle_geoadd(args),
+            "GEODIST" => self.handle_geodist(args),
+            "GEOPOS" => self.handle_geopos(args),
+            "GEOHASH" => self.handle_geohash(args),
+            "GEOSEARCH" => self.handle_geosearch(args),
+            "GEOSEARCHSTORE" => self.handle_geosearchstore(args),
+            "GEORADIUS" => self.handle_georadius(args),
+            "GEORADIUSBYMEMBER" => self.handle_georadiusbymember(args),
             "GEORADIUS_RO" => self.handle_georadius_ro(args),
             "GEORADIUSBYMEMBER_RO" => self.handle_georadiusbymember_ro(args),
+            "XADD" => self.handle_xadd(args),
+            "XLEN" => self.handle_xlen(args),
+            "XRANGE" => self.handle_xrange(args),
+            "XREVRANGE" => self.handle_xrevrange(args),
+            "XDEL" => self.handle_xdel(args),
+            "XTRIM" => self.handle_xtrim(args),
+            "XACK" => self.handle_xack(args),
+            "TOUCH" => self.handle_touch(args),
+            "RANDOMKEY" => self.handle_randomkey(args),
+            "SCAN" => self.handle_scan(args),
             "SWAPDB" => self.handle_swapdb(args),
             "DUMP" => self.handle_dump(args),
             "RESTORE" => self.handle_restore(args),

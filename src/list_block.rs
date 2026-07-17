@@ -81,9 +81,22 @@ impl ListBlockers {
     }
 
     /// Number of waiter slots across all keys (for tests / INFO).
-    #[cfg(test)]
     pub fn waiter_slots(&self) -> usize {
         self.by_key.lock().values().map(|q| q.len()).sum()
+    }
+
+    /// Approximate count of unique blocked clients (distinct waiter ids).
+    pub fn blocked_clients(&self) -> usize {
+        let map = self.by_key.lock();
+        let mut ids = std::collections::HashSet::new();
+        for q in map.values() {
+            for w in q {
+                if w.active.load(Ordering::Acquire) {
+                    ids.insert(w.id);
+                }
+            }
+        }
+        ids.len()
     }
 }
 

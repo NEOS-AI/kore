@@ -845,6 +845,15 @@ impl CommandHandler {
              total_connections:{}\r\n\
              active_connections:{}\r\n\
              \r\n\
+             # Clients\r\n\
+             {}\
+             \r\n\
+             # CPU\r\n\
+             {}\
+             \r\n\
+             # Persistence\r\n\
+             {}\
+             \r\n\
              # Replication\r\n\
              {}\
              \r\n\
@@ -908,11 +917,196 @@ impl CommandHandler {
             stats.bytes_received.load(Ordering::Relaxed),
             stats.total_connections.load(Ordering::Relaxed),
             stats.active_connections.load(Ordering::Relaxed),
+            self.clients_info_section(),
+            self.cpu_info_section(),
+            self.persistence_info_section(),
             self.replication_info_section(),
             health.to_info_lines(),
             self.cache.dbsize(),
             self.cache.geo_set_count(),
         )
+    }
+
+    /// Redis-compatible `# Clients` section.
+    fn clients_info_section(&self) -> String {
+        let connected = self
+            .cache
+            .stats
+            .active_connections
+            .load(Ordering::Relaxed);
+        let mut blocked = 0usize;
+        for db in self.databases.iter() {
+            blocked += db.list_blockers.blocked_clients();
+            blocked += db.stream_blockers.blocked_clients();
+        }
+        format!(
+            "connected_clients:{}\r\n\
+             blocked_clients:{}\r\n\
+             tracking_clients:0\r\n\
+             clients_in_timeout_table:0\r\n",
+            connected, blocked
+        )
+    }
+
+    /// Redis-compatible `# CPU` section (process CPU when available).
+    fn cpu_info_section(&self) -> String {
+        let (user, sys) = process_cpu_seconds();
+        format!(
+            "used_cpu_sys:{:.6}\r\n\
+             used_cpu_user:{:.6}\r\n\
+             used_cpu_sys_children:0.000000\r\n\
+             used_cpu_user_children:0.000000\r\n\
+             used_cpu_sys_main_thread:{:.6}\r\n\
+             used_cpu_user_main_thread:{:.6}\r\n",
+            sys, user, sys, user
+        )
+    }
+
+    /// Redis-compatible `# Persistence` section.
+    fn persistence_info_section(&self) -> String {
+        let (loading, rdb_changes, rdb_last_save, aof_enabled) =
+            match self.persistence.as_ref() {
+                Some(p) => (
+                    0u64,
+                    p.dirty_changes(),
+                    p.last_save_unix(),
+                    if p.appendonly() { 1 } else { 0 },
+                ),
+                None => (0, 0, 0, 0),
+            };
+        format!(
+            "loading:{}\r\n\
+             async_loading:0\r\n\
+             rdb_changes_since_last_save:{}\r\n\
+             rdb_bgsave_in_progress:0\r\n\
+             rdb_last_save_time:{}\r\n\
+             rdb_last_bgsave_status:ok\r\n\
+             rdb_last_bgsave_time_sec:-1\r\n\
+             aof_enabled:{}\r\n\
+             aof_rewrite_in_progress:0\r\n\
+             aof_rewrite_scheduled:0\r\n\
+             aof_last_rewrite_time_sec:-1\r\n\
+             aof_last_bgrewrite_status:ok\r\n\
+             aof_last_write_status:ok\r\n",
+            loading, rdb_changes, rdb_last_save, aof_enabled
+        )
+    }
+
+    /// DEBUG HELP | SLEEP seconds | OBJECT key — diagnostics (Redis-compatible subset).
+    pub(super) fn handle_debug(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'debug' command",
+            ));
+        }
+        let sub = match args[0].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+            None => return Ok(RespValue::error("ERR syntax error")),
+        };
+        match sub.as_str() {
+            "HELP" => Ok(RespValue::Array(vec![
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"DEBUG <subcommand> [<arg> ...]. Subcommands are:",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"OBJECT <key> -- show low-level info about `key`",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"SLEEP <seconds> -- stop processing commands for the specified number of seconds",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(b"HELP -- print this help"))),
+            ])),
+            "SLEEP" => {
+                if args.len() != 2 {
+                    return Ok(RespValue::error(
+                        "ERR wrong number of arguments for 'debug|sleep' command",
+                    ));
+                }
+                let secs = match self.parse_integer(&args[1]) {
+                    Ok(n) if n >= 0 => n as u64,
+                    Ok(_) => {
+                        return Ok(RespValue::error(
+                            "ERR value is not an integer or out of range",
+                        ))
+                    }
+                    Err(_) => {
+                        // Redis accepts fractional seconds as bulk float
+                        match args[1].as_bulk_string() {
+                            Some(b) => match std::str::from_utf8(b)
+                                .ok()
+                                .and_then(|s| s.parse::<f64>().ok())
+                            {
+                                Some(f) if f >= 0.0 => {
+                                    let dur = std::time::Duration::from_secs_f64(f.min(3600.0));
+                                    std::thread::sleep(dur);
+                                    return Ok(RespValue::ok());
+                                }
+                                _ => {
+                                    return Ok(RespValue::error(
+                                        "ERR value is not an integer or out of range",
+                                    ))
+                                }
+                            },
+                            None => {
+                                return Ok(RespValue::error(
+                                    "ERR value is not an integer or out of range",
+                                ))
+                            }
+                        }
+                    }
+                };
+                // Cap sleep to 1 hour for safety (tests use small values).
+                let secs = secs.min(3600);
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+                Ok(RespValue::ok())
+            }
+            "OBJECT" => {
+                if args.len() != 2 {
+                    return Ok(RespValue::error(
+                        "ERR wrong number of arguments for 'debug|object' command",
+                    ));
+                }
+                let key = match args[1].as_bulk_string() {
+                    Some(k) => k,
+                    None => return Ok(RespValue::error("ERR invalid key")),
+                };
+                use crate::cache::KeyType;
+                match self.cache.key_type(key) {
+                    KeyType::None => Ok(RespValue::error("ERR no such key")),
+                    kt => {
+                        let encoding = match kt {
+                            KeyType::String => "raw",
+                            KeyType::Hash => "hashtable",
+                            KeyType::List => "linkedlist",
+                            KeyType::Set => "hashtable",
+                            KeyType::ZSet | KeyType::Geo => "skiplist",
+                            KeyType::Stream => "stream",
+                            KeyType::None => "none",
+                        };
+                        let mem = self.key_memory_bytes(key).unwrap_or(0);
+                        let idle = match self.handle_object_idletime(&[args[1].clone()]) {
+                            Ok(RespValue::Integer(n)) => n,
+                            _ => 0,
+                        };
+                        let info = format!(
+                            "Value at:0x0 refcount:1 encoding:{} serializedlength:{} lru:0 lru_seconds_idle:{}",
+                            encoding, mem, idle
+                        );
+                        Ok(RespValue::BulkString(Some(Bytes::from(info))))
+                    }
+                }
+            }
+            "RELOAD" | "RESTART" | "SEGFAULT" | "OOM" | "ASSERT" | "PROTOCOL" => {
+                Ok(RespValue::error(format!(
+                    "ERR DEBUG {} is not supported",
+                    sub
+                )))
+            }
+            _ => Ok(RespValue::error(format!(
+                "ERR Unknown subcommand or wrong number of arguments for '{}'. Try DEBUG HELP.",
+                sub
+            ))),
+        }
     }
 
     /// HEALTH [PING|FULL] — liveness / structured readiness.
@@ -1403,6 +1597,16 @@ impl CommandHandler {
             ))),
         }
     }
+}
+
+/// Process user/sys CPU seconds.
+/// Best-effort: without a direct `libc` dependency we report wall-clock
+/// process uptime as user time (sys stays 0). Field presence matters for clients.
+fn process_cpu_seconds() -> (f64, f64) {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    let user = start.elapsed().as_secs_f64();
+    (user, 0.0)
 }
 
 /// Parse optional FLUSHDB/FLUSHALL mode: empty, ASYNC, or SYNC.

@@ -637,6 +637,7 @@ impl CommandHandler {
                 Ok(RespValue::ok())
             }
             "SHUTDOWN" => self.handle_shutdown(&args[1..]),
+            "DEBUG" => self.handle_debug(&args[1..]),
 
             // Client handshake / introspection
             "CLIENT" => self.handle_client(&args[1..]),
