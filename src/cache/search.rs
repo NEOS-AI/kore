@@ -73,6 +73,21 @@ impl Cache {
         })
     }
 
+    /// FT.ALIASADD alias index
+    pub fn alias_add(&self, alias: &str, index: &str) -> Result<(), String> {
+        self.search_index_manager.alias_add(alias, index)
+    }
+
+    /// FT.ALIASDEL alias
+    pub fn alias_del(&self, alias: &str) -> Result<(), String> {
+        self.search_index_manager.alias_del(alias)
+    }
+
+    /// FT.ALIASUPDATE alias index
+    pub fn alias_update(&self, alias: &str, index: &str) -> Result<(), String> {
+        self.search_index_manager.alias_update(alias, index)
+    }
+
     /// Distinct tag values for a TAG field (`FT.TAGVALS index field`).
     ///
     /// Returns `Ok(None)` if the index is missing, `Err` if the field is not a TAG field.

@@ -452,17 +452,40 @@ impl DocumentField {
 #[derive(Debug)]
 pub struct SearchIndexManager {
     indices: Arc<RwLock<HashMap<String, Arc<RwLock<SearchIndex>>>>>,
+    /// Alias name → real index name (RediSearch FT.ALIAS*)
+    aliases: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl SearchIndexManager {
     pub fn new() -> Self {
         Self {
             indices: Arc::new(RwLock::new(HashMap::new())),
+            aliases: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Resolve `name` if it is an alias; otherwise return `name` unchanged.
+    pub fn resolve_name(&self, name: &str) -> String {
+        let aliases = self.aliases.read();
+        aliases
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
     }
 
     /// Create a new index
     pub fn create_index(&self, definition: IndexDefinition) -> Result<(), String> {
+        // Alias names and index names share a namespace.
+        {
+            let aliases = self.aliases.read();
+            if aliases.contains_key(&definition.name) {
+                return Err(format!(
+                    "Index name '{}' clashes with an existing alias",
+                    definition.name
+                ));
+            }
+        }
+
         let mut indices = self.indices.write();
 
         if indices.contains_key(&definition.name) {
@@ -474,32 +497,86 @@ impl SearchIndexManager {
         Ok(())
     }
 
-    /// Drop an index
+    /// Drop an index (resolves aliases). Removes all aliases that pointed at it.
     pub fn drop_index(&self, name: &str) -> Result<(), String> {
-        let mut indices = self.indices.write();
+        // Lock order: aliases then indices (consistent across alias ops).
+        let mut aliases = self.aliases.write();
+        let real_name = aliases
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string());
 
-        if indices.remove(name).is_none() {
+        let mut indices = self.indices.write();
+        if indices.remove(&real_name).is_none() {
             return Err(format!("Index '{}' does not exist", name));
         }
+
+        aliases.retain(|_, target| target != &real_name);
         Ok(())
     }
 
-    /// Get an index
+    /// Get an index (resolves aliases)
     pub fn get_index(&self, name: &str) -> Option<Arc<RwLock<SearchIndex>>> {
+        let real = self.resolve_name(name);
         let indices = self.indices.read();
-        indices.get(name).cloned()
+        indices.get(&real).cloned()
     }
 
-    /// List all index names
+    /// List all index names (aliases are not listed)
     pub fn list_indices(&self) -> Vec<String> {
         let indices = self.indices.read();
         indices.keys().cloned().collect()
     }
 
-    /// Get index definition
+    /// Get index definition (resolves aliases)
     pub fn get_definition(&self, name: &str) -> Option<IndexDefinition> {
+        let index = self.get_index(name)?;
+        let def = index.read().definition.clone();
+        Some(def)
+    }
+
+    /// FT.ALIASADD alias index — create a new alias (fails if alias exists).
+    pub fn alias_add(&self, alias: &str, index: &str) -> Result<(), String> {
         let indices = self.indices.read();
-        indices.get(name).map(|idx| idx.read().definition.clone())
+        if !indices.contains_key(index) {
+            return Err(format!("Unknown index name '{}'", index));
+        }
+        if indices.contains_key(alias) {
+            return Err(format!("Alias clashes with an existing index name '{}'", alias));
+        }
+        drop(indices);
+
+        let mut aliases = self.aliases.write();
+        if aliases.contains_key(alias) {
+            return Err(format!("Alias '{}' already exists", alias));
+        }
+        aliases.insert(alias.to_string(), index.to_string());
+        Ok(())
+    }
+
+    /// FT.ALIASDEL alias — remove an alias.
+    pub fn alias_del(&self, alias: &str) -> Result<(), String> {
+        let mut aliases = self.aliases.write();
+        if aliases.remove(alias).is_none() {
+            return Err(format!("Alias '{}' does not exist", alias));
+        }
+        Ok(())
+    }
+
+    /// FT.ALIASUPDATE alias index — create or retarget an alias.
+    pub fn alias_update(&self, alias: &str, index: &str) -> Result<(), String> {
+        let indices = self.indices.read();
+        if !indices.contains_key(index) {
+            return Err(format!("Unknown index name '{}'", index));
+        }
+        if indices.contains_key(alias) {
+            return Err(format!("Alias clashes with an existing index name '{}'", alias));
+        }
+        drop(indices);
+
+        let mut aliases = self.aliases.write();
+        aliases.insert(alias.to_string(), index.to_string());
+        Ok(())
     }
 
     /// Find indices that match a key prefix
@@ -619,5 +696,60 @@ mod tests {
         assert_eq!(manager.list_indices().len(), 1);
         assert!(manager.drop_index("test_idx").is_ok());
         assert_eq!(manager.list_indices().len(), 0);
+    }
+
+    #[test]
+    fn test_search_index_aliases() {
+        let manager = SearchIndexManager::new();
+
+        let definition = IndexDefinition::new(
+            "idx".to_string(),
+            vec![],
+            vec![FieldDefinition {
+                name: "t".to_string(),
+                field_type: FieldType::Text {
+                    weight: 1.0,
+                    sortable: false,
+                },
+            }],
+        );
+        manager.create_index(definition).unwrap();
+
+        assert!(manager.alias_add("a1", "idx").is_ok());
+        assert!(manager.get_index("a1").is_some());
+        assert_eq!(manager.resolve_name("a1"), "idx");
+
+        // duplicate alias
+        assert!(manager.alias_add("a1", "idx").is_err());
+        // unknown index
+        assert!(manager.alias_add("a2", "nope").is_err());
+        // clash with index name
+        assert!(manager.alias_add("idx", "idx").is_err());
+
+        // retarget via update (create new)
+        let def2 = IndexDefinition::new(
+            "idx2".to_string(),
+            vec![],
+            vec![FieldDefinition {
+                name: "t".to_string(),
+                field_type: FieldType::Text {
+                    weight: 1.0,
+                    sortable: false,
+                },
+            }],
+        );
+        manager.create_index(def2).unwrap();
+        assert!(manager.alias_update("a1", "idx2").is_ok());
+        assert_eq!(manager.resolve_name("a1"), "idx2");
+
+        assert!(manager.alias_del("a1").is_ok());
+        assert!(manager.get_index("a1").is_none());
+        assert!(manager.alias_del("a1").is_err());
+
+        // dropindex cleans aliases
+        manager.alias_add("gone", "idx").unwrap();
+        manager.drop_index("idx").unwrap();
+        assert!(manager.get_index("gone").is_none());
+        assert!(manager.alias_del("gone").is_err());
     }
 }

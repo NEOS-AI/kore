@@ -33,7 +33,7 @@ const SCRIPT_CALL_ALLOWLIST: &[&str] = &[
     "ZPOPMIN", "ZPOPMAX", "ZMPOP", //
     "SETBIT", "GETBIT", "BITCOUNT", "BITPOS", "BITOP", "BITFIELD", "BITFIELD_RO", //
     "PFADD", "PFCOUNT", "PFMERGE", //
-    "DBSIZE", "KEYS", "SWAPDB", //
+    "DBSIZE", "KEYS", "SWAPDB", "SELECT", "FLUSHDB", //
     "GEOADD", "GEODIST", "GEOPOS", "GEOHASH", "GEOSEARCH", "GEOSEARCHSTORE", //
     "GEORADIUS", "GEORADIUSBYMEMBER", "GEORADIUS_RO", "GEORADIUSBYMEMBER_RO", //
     "XADD", "XLEN", "XRANGE", "XREVRANGE", "XDEL", "XTRIM", "XACK", //
@@ -652,6 +652,8 @@ impl CommandHandler {
             "RANDOMKEY" => self.handle_randomkey(args),
             "SCAN" => self.handle_scan(args),
             "SWAPDB" => self.handle_swapdb(args),
+            "SELECT" => self.handle_select(args),
+            "FLUSHDB" => self.handle_flushdb(args),
             "DUMP" => self.handle_dump(args),
             "RESTORE" => self.handle_restore(args),
             "PFADD" => self.handle_pfadd(args),

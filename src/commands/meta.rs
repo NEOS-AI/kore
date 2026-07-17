@@ -274,6 +274,9 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     CmdSpec { name: "ft.info", arity: 2, flags: &["readonly", "random"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "ft.search", arity: -3, flags: &["readonly"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "ft.tagvals", arity: 3, flags: &["readonly", "random"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "ft.aliasadd", arity: 3, flags: &["write"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "ft.aliasdel", arity: 2, flags: &["write"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "ft.aliasupdate", arity: 3, flags: &["write"], first_key: 0, last_key: 0, step: 0 },
 ];
 
 fn bulk(s: impl Into<Bytes>) -> RespValue {

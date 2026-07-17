@@ -298,6 +298,9 @@ impl CommandHandler {
     }
 
     /// FT.DROPINDEX index [DD]
+    ///
+    /// `index` may be a real index name or an alias; on success all aliases that
+    /// pointed at the dropped index are removed.
     pub fn handle_ft_dropindex(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.is_empty() {
             return Ok(RespValue::error("ERR wrong number of arguments for 'FT.DROPINDEX' command"));
@@ -309,6 +312,65 @@ impl CommandHandler {
         };
 
         match self.cache.drop_search_index(&index_name) {
+            Ok(_) => Ok(RespValue::ok()),
+            Err(e) => Ok(RespValue::error(format!("ERR {}", e))),
+        }
+    }
+
+    /// FT.ALIASADD alias index — bind a new alias to an existing index.
+    pub fn handle_ft_aliasadd(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'FT.ALIASADD' command",
+            ));
+        }
+        let alias = match args[0].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_string(),
+            None => return Ok(RespValue::error("ERR invalid alias name")),
+        };
+        let index = match args[1].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_string(),
+            None => return Ok(RespValue::error("ERR invalid index name")),
+        };
+        match self.cache.alias_add(&alias, &index) {
+            Ok(_) => Ok(RespValue::ok()),
+            Err(e) => Ok(RespValue::error(format!("ERR {}", e))),
+        }
+    }
+
+    /// FT.ALIASDEL alias — remove an alias.
+    pub fn handle_ft_aliasdel(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 1 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'FT.ALIASDEL' command",
+            ));
+        }
+        let alias = match args[0].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_string(),
+            None => return Ok(RespValue::error("ERR invalid alias name")),
+        };
+        match self.cache.alias_del(&alias) {
+            Ok(_) => Ok(RespValue::ok()),
+            Err(e) => Ok(RespValue::error(format!("ERR {}", e))),
+        }
+    }
+
+    /// FT.ALIASUPDATE alias index — create or retarget an alias.
+    pub fn handle_ft_aliasupdate(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'FT.ALIASUPDATE' command",
+            ));
+        }
+        let alias = match args[0].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_string(),
+            None => return Ok(RespValue::error("ERR invalid alias name")),
+        };
+        let index = match args[1].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_string(),
+            None => return Ok(RespValue::error("ERR invalid index name")),
+        };
+        match self.cache.alias_update(&alias, &index) {
             Ok(_) => Ok(RespValue::ok()),
             Err(e) => Ok(RespValue::error(format!("ERR {}", e))),
         }

@@ -954,6 +954,9 @@ impl CommandHandler {
             "FT.INFO" => self.handle_ft_info(&args[1..]),
             "FT.SEARCH" => self.handle_ft_search(&args[1..]),
             "FT.TAGVALS" => self.handle_ft_tagvals(&args[1..]),
+            "FT.ALIASADD" => self.handle_ft_aliasadd(&args[1..]),
+            "FT.ALIASDEL" => self.handle_ft_aliasdel(&args[1..]),
+            "FT.ALIASUPDATE" => self.handle_ft_aliasupdate(&args[1..]),
 
             // Shard Pub/Sub commands (Redis 7.0+)
             "SSUBSCRIBE" => self.handle_ssubscribe(&args[1..]).await,
