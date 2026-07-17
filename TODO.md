@@ -372,6 +372,10 @@ Also tracked in `docs/roadmap.md`.
   - *Found*: rewrite emits `HNSW M <n>` only; load hardcodes `ef_construction: 200` (command path also hardcodes 200 / unused `mut`)
   - *Fix*: when EF becomes configurable, encode/parse `EF_CONSTRUCTION` and store on `VectorAlgorithm::HNSW`
 - [ ] **`[P2]`** **Code review (BU nit):** VECTOR/NUMERIC AOF rewrite round-trip test; `has_search_state` can avoid double list locks
+- [ ] **`[P2]`** **Code review (BV):** AOF load is not transactional on FT failure
+  - *Found*: mid-file FT.CREATE/ALIAS error returns `Err` after earlier commands already applied (BV tests assert first CREATE remains); `load_at_startup` propagates `?` so process should not serve, but in-memory DBs stay partially filled if a caller ignores the error
+  - *Fix*: on load failure, flush all DBs (or load into a scratch Databases and swap only on success)
+- [ ] **`[P2]`** **Code review (BV nit):** map search OOM strings to `Error::OutOfMemory`; add DROPINDEX/ALIASDEL-missing apply tests (stricter than DEL no-op — intentional Redis-Search-style fail)
 
 ### Pub/Sub
 
@@ -403,7 +407,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). BT P1 AOF rewrite closed in BU; BU review adds load error-handling + parser hygiene.
+Prioritized for next letter batch(es). BV closed silent FT load errors; remaining are P2 durability/parser/hygiene.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -416,8 +420,10 @@ Prioritized for next letter batch(es). BT P1 AOF rewrite closed in BU; BU review
 | P2 | ACL `@search` | open |
 | P2 | Shared FT.CREATE parser (cmd + AOF load) | open |
 | P2 | HNSW `ef_construction` AOF round-trip | open |
+| P2 | AOF load all-or-nothing on FT failure (BV review) | open |
 | P2 | `get_index` atomic resolve; min-replicas FT test | open |
 | P2 | VECTOR/NUMERIC rewrite tests; `has_search_state` lock nit | open |
+| P2 | OOM→OutOfMemory map; DROPINDEX/ALIASDEL missing tests | open |
 | P2 | Lua SELECT DB side-effect test | done (BT) |
 
 ---
