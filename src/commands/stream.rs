@@ -114,7 +114,7 @@ impl CommandHandler {
         Ok(out)
     }
 
-    /// XADD key [NOMKSTREAM] [MAXLEN|MINID [~|=] threshold] [* | ID] field value ...
+    /// XADD key [NOMKSTREAM] [MAXLEN|MINID [~|=] threshold [LIMIT count]] [* | ID] field value ...
     pub(super) fn handle_xadd(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.len() < 3 {
             return Ok(RespValue::error(
@@ -130,8 +130,9 @@ impl CommandHandler {
         let mut nomkstream = false;
         let mut maxlen: Option<usize> = None;
         let mut minid: Option<StreamId> = None;
+        let mut limit: Option<usize> = None;
 
-        // Optional NOMKSTREAM / MAXLEN / MINID (in any order before the ID).
+        // Optional NOMKSTREAM / MAXLEN / MINID / LIMIT (in any order before the ID).
         while i < args.len() {
             let tok = match args[i].as_bulk_string() {
                 Some(s) => s,
@@ -203,6 +204,29 @@ impl CommandHandler {
                 i += 1;
                 continue;
             }
+            if tok.eq_ignore_ascii_case(b"LIMIT") {
+                i += 1;
+                let n = match args.get(i).and_then(|a| a.as_bulk_string()) {
+                    Some(b) => {
+                        match std::str::from_utf8(b).ok().and_then(|s| s.parse::<i64>().ok()) {
+                            Some(v) if v >= 0 => v as usize,
+                            _ => {
+                                return Ok(RespValue::error(
+                                    "ERR value is not an integer or out of range",
+                                ));
+                            }
+                        }
+                    }
+                    None => {
+                        return Ok(RespValue::error(
+                            "ERR wrong number of arguments for 'xadd' command",
+                        ));
+                    }
+                };
+                limit = Some(n);
+                i += 1;
+                continue;
+            }
             break;
         }
 
@@ -250,9 +274,14 @@ impl CommandHandler {
             }
         };
 
+        // LIMIT without MAXLEN/MINID is a syntax error.
+        if limit.is_some() && maxlen.is_none() && minid.is_none() {
+            return Ok(RespValue::error("ERR syntax error"));
+        }
+
         let mut s = stream.write();
         let before = crate::memory::estimate_keyed_object(key.len(), s.memory_size());
-        let id = match s.xadd_with_trim(&id_spec, fields, maxlen, minid) {
+        let id = match s.xadd_with_trim(&id_spec, fields, maxlen, minid, limit) {
             Ok(id) => id,
             Err(e) => return Ok(RespValue::error(e)),
         };
@@ -434,7 +463,7 @@ impl CommandHandler {
         }
     }
 
-    /// XTRIM key MAXLEN|MINID [~|=] threshold
+    /// XTRIM key MAXLEN|MINID [~|=] threshold [LIMIT count]
     pub(super) fn handle_xtrim(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.len() < 3 {
             return Ok(RespValue::error(
@@ -476,6 +505,7 @@ impl CommandHandler {
                     }
                     None => return Ok(RespValue::error("ERR syntax error")),
                 };
+                i += 1;
                 TrimKind::Maxlen(count)
             }
             "MINID" => {
@@ -491,10 +521,41 @@ impl CommandHandler {
                         ));
                     }
                 };
+                i += 1;
                 TrimKind::Minid(id)
             }
             _ => return Ok(RespValue::error("ERR syntax error")),
         };
+
+        // Optional LIMIT count
+        let mut limit: Option<usize> = None;
+        if i < args.len() {
+            let opt = match args[i].as_bulk_string() {
+                Some(b) => String::from_utf8_lossy(b).to_ascii_uppercase(),
+                None => return Ok(RespValue::error("ERR syntax error")),
+            };
+            if opt == "LIMIT" {
+                i += 1;
+                let n = match args.get(i).and_then(|a| a.as_bulk_string()) {
+                    Some(b) => {
+                        match std::str::from_utf8(b).ok().and_then(|s| s.parse::<i64>().ok()) {
+                            Some(v) if v >= 0 => v as usize,
+                            _ => {
+                                return Ok(RespValue::error(
+                                    "ERR value is not an integer or out of range",
+                                ));
+                            }
+                        }
+                    }
+                    None => return Ok(RespValue::error("ERR syntax error")),
+                };
+                limit = Some(n);
+                i += 1;
+            }
+        }
+        if i != args.len() {
+            return Ok(RespValue::error("ERR syntax error"));
+        }
 
         match self.cache.key_type(&key) {
             KeyType::None => Ok(RespValue::Integer(0)),
@@ -506,8 +567,8 @@ impl CommandHandler {
                 let mut s = stream.write();
                 let before = crate::memory::estimate_keyed_object(key.len(), s.memory_size());
                 let n = match trim {
-                    TrimKind::Maxlen(count) => s.trim_maxlen(count) as i64,
-                    TrimKind::Minid(id) => s.trim_minid(id) as i64,
+                    TrimKind::Maxlen(count) => s.trim_maxlen_limit(count, limit) as i64,
+                    TrimKind::Minid(id) => s.trim_minid_limit(id, limit) as i64,
                 };
                 let after = crate::memory::estimate_keyed_object(key.len(), s.memory_size());
                 drop(s);

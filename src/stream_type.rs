@@ -355,22 +355,24 @@ impl RedisStream {
         fields: Vec<(Bytes, Bytes)>,
         maxlen: Option<usize>,
     ) -> Result<StreamId, String> {
-        self.xadd_with_trim(id_spec, fields, maxlen, None)
+        self.xadd_with_trim(id_spec, fields, maxlen, None, None)
     }
 
     /// XADD with optional MAXLEN or MINID trim after insert.
+    /// `limit` caps how many entries are deleted in this trim (Redis LIMIT).
     pub fn xadd_with_trim(
         &mut self,
         id_spec: &str,
         fields: Vec<(Bytes, Bytes)>,
         maxlen: Option<usize>,
         minid: Option<StreamId>,
+        limit: Option<usize>,
     ) -> Result<StreamId, String> {
         let id = self.xadd(id_spec, fields)?;
         if let Some(max) = maxlen {
-            self.trim_maxlen(max);
+            self.trim_maxlen_limit(max, limit);
         } else if let Some(min) = minid {
-            self.trim_minid(min);
+            self.trim_minid_limit(min, limit);
         }
         Ok(id)
     }
@@ -396,10 +398,18 @@ impl RedisStream {
 
     /// Keep only the newest `max` entries.
     pub fn trim_maxlen(&mut self, max: usize) -> usize {
+        self.trim_maxlen_limit(max, None)
+    }
+
+    /// Keep newest `max` entries; if `limit` is set, delete at most that many.
+    pub fn trim_maxlen_limit(&mut self, max: usize, limit: Option<usize>) -> usize {
         if self.entries.len() <= max {
             return 0;
         }
-        let remove_count = self.entries.len() - max;
+        let mut remove_count = self.entries.len() - max;
+        if let Some(lim) = limit {
+            remove_count = remove_count.min(lim);
+        }
         let mut removed = 0;
         let ids: Vec<StreamId> = self.entries.keys().copied().take(remove_count).collect();
         for id in ids {
@@ -411,11 +421,21 @@ impl RedisStream {
 
     /// Evict entries with IDs strictly lower than `minid` (Redis MINID).
     pub fn trim_minid(&mut self, minid: StreamId) -> usize {
-        let ids: Vec<StreamId> = self
+        self.trim_minid_limit(minid, None)
+    }
+
+    /// Evict entries with IDs strictly lower than `minid`; cap deletions with `limit`.
+    pub fn trim_minid_limit(&mut self, minid: StreamId, limit: Option<usize>) -> usize {
+        let mut ids: Vec<StreamId> = self
             .entries
             .range(..minid)
             .map(|(id, _)| *id)
             .collect();
+        if let Some(lim) = limit {
+            if ids.len() > lim {
+                ids.truncate(lim);
+            }
+        }
         let mut removed = 0;
         for id in ids {
             self.remove_entry_and_pel(id);

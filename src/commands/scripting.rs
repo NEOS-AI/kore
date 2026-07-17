@@ -179,6 +179,26 @@ impl CommandHandler {
                     "NOTBUSY No scripts in execution right now.",
                 ))
             }
+            "HELP" => Ok(RespValue::Array(vec![
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"SCRIPT <subcommand> [<arg> ...]. Subcommands are:",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"LOAD <script> -- load a script into the cache, return its SHA1",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"EXISTS <sha1> [<sha1> ...] -- return array of 0/1 existence flags",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"FLUSH [ASYNC|SYNC] -- flush the script cache",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"KILL -- kill the currently executing script (NOTBUSY if none)",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"HELP -- print this help",
+                ))),
+            ])),
             _ => Ok(RespValue::error(format!(
                 "ERR unknown subcommand or wrong number of arguments for '{}'. \
                  Try SCRIPT HELP.",

@@ -180,6 +180,7 @@ Also tracked in `docs/roadmap.md`.
   - *Batch BI*: `XGROUP CREATE` `ENTRIESREAD` (surfaced in `XINFO GROUPS`)
   - *Batch BJ*: `XINFO STREAM FULL` [`COUNT`]; `XGROUP SETID` `ENTRIESREAD`
   - *Batch BK*: `XSETID` `ENTRIESADDED`/`MAXDELETEDID`; real `entries-added` / `max-deleted-entry-id` counters
+  - *Batch BL*: `XADD`/`XTRIM` `LIMIT` (cap deletions per trim)
 - [x] **`[P2]`** Bitmaps / bitfields, HyperLogLog
   - *Done (MVP)*: `SETBIT`/`GETBIT`/`BITCOUNT`/`BITPOS`/`BITOP` (AND/OR/XOR/NOT)/`BITFIELD` (GET/SET/INCRBY + OVERFLOW WRAP|SAT|FAIL); `PFADD`/`PFCOUNT`/`PFMERGE` dense HLL (p=14, Kore `KHLL` format). String-key backed; ACL `@bitmap`/`@hyperloglog`.
   - *Batch AZ*: `BITFIELD_RO` (GET only)
@@ -205,6 +206,7 @@ Also tracked in `docs/roadmap.md`.
   - *Batch BI*: `INFO` section filter; `COMMAND GETKEYSANDFLAGS` / `DOCS`; `XGROUP CREATE` `ENTRIESREAD`
   - *Batch BJ*: `XINFO STREAM FULL` [`COUNT`]; `XGROUP SETID` `ENTRIESREAD`; `COMMAND HELP` / `CLIENT HELP`
   - *Batch BK*: `CLIENT TRACKING`/`CACHING`; `XSETID` `ENTRIESADDED`/`MAXDELETEDID`; stream counters in `XINFO`
+  - *Batch BL*: `XADD`/`XTRIM` `LIMIT`; `SCRIPT HELP`; `CONFIG HELP`
 - [x] **`[P1]`** `CLIENT`, `COMMAND`, `HELLO`
   - *Done*: HELLO (RESP2 + RESP3; AUTH/SETNAME); CLIENT ID/SETNAME/GETNAME/SETINFO/LIST/INFO; COMMAND / COUNT / LIST / INFO catalog
   - *Batch BE*: `CLIENT NO-EVICT` / `NO-TOUCH`
@@ -218,6 +220,7 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** Lua scripting / functions
   - *Done (MVP)*: `EVAL` / `EVALSHA` / `SCRIPT LOAD|EXISTS|FLUSH|KILL` via mlua Lua 5.4 (vendored); shared `ScriptCache`; `redis.call` / `redis.pcall` whitelist for core string/hash/list/set/zset/bitmap/HLL ops; KEYS/ARGV; RESP↔Lua mapping (nil bulk→false, status→`{ok=…}`); ACL `@scripting`; cluster key extract from numkeys. Not yet: FUNCTIONS library, `redis.setresp`, full movablekeys COMMAND, nested scripts, script time limits.
   - *Batch BG*: `EVAL_RO` / `EVALSHA_RO` (reject write `redis.call`); `CLIENT GETREDIR` / `TRACKINGINFO` (tracking off)
+  - *Batch BL*: `SCRIPT HELP`; `CONFIG HELP`
 
 ### Memory & expiration policy
 

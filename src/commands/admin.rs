@@ -1250,7 +1250,26 @@ impl CommandHandler {
                 }
                 Ok(RespValue::ok())
             }
-            _ => Ok(RespValue::error("ERR Unknown subcommand or wrong number of arguments")),
+            "HELP" => Ok(RespValue::Array(vec![
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"CONFIG <subcommand> [<arg> ...]. Subcommands are:",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"GET <parameter> -- get the value of a configuration parameter",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"SET <parameter> <value> -- set a configuration parameter",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"RESETSTAT -- reset statistics reported by INFO",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"HELP -- print this help",
+                ))),
+            ])),
+            _ => Ok(RespValue::error(
+                "ERR Unknown subcommand or wrong number of arguments for 'config'. Try CONFIG HELP.",
+            )),
         }
     }
 
