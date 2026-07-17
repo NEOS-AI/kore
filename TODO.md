@@ -215,6 +215,7 @@ Also tracked in `docs/roadmap.md`.
   - *Batch BQ*: `DEBUG` HELP/SLEEP/OBJECT; INFO Clients/CPU/Persistence; Lua GEO/stream allowlist
   - *Batch BR*: `CONFIG GET` ops params (`port`/`bind`/`dir`/`dbfilename`/`appendonly`/…); `MEMORY MALLOC-STATS`; `FT.TAGVALS`; Lua `COPY`/`MOVE`; TAG/NUMERIC coerce on HSET auto-index
   - *Batch BS*: `FT.ALIASADD`/`FT.ALIASDEL`/`FT.ALIASUPDATE`; alias resolution on `FT.INFO`/`FT.SEARCH`/`FT.TAGVALS`/`FT.DROPINDEX` (+ alias cleanup on drop); Lua `SELECT`/`FLUSHDB`
+  - *Batch BT*: mutating `FT.*` classified as writes (`is_write_command` → AOF / replica / READONLY); alias→alias stores real index name; atomic create/alias namespace locks; Lua SELECT connection DB side-effect test
 - [x] **`[P1]`** `CLIENT`, `COMMAND`, `HELLO`
   - *Done*: HELLO (RESP2 + RESP3; AUTH/SETNAME); CLIENT ID/SETNAME/GETNAME/SETINFO/LIST/INFO; COMMAND / COUNT / LIST / INFO catalog
   - *Batch BE*: `CLIENT NO-EVICT` / `NO-TOUCH`
@@ -238,6 +239,7 @@ Also tracked in `docs/roadmap.md`.
   - *Batch BQ*: `DEBUG` HELP/SLEEP/OBJECT; INFO `# Clients`/`# CPU`/`# Persistence`; `redis.call` GEO* + XADD/XLEN/XRANGE/XDEL/XTRIM/XACK + TOUCH/SCAN/RANDOMKEY
   - *Batch BR*: `CONFIG GET` port/bind/dir/dbfilename/appendonly/appendfilename/unixsocket/cluster-enabled; `MEMORY MALLOC-STATS`; `FT.TAGVALS`; `redis.call` COPY/MOVE; schema coerce TAG/NUMERIC from HSET text
   - *Batch BS*: `FT.ALIASADD`/`DEL`/`UPDATE` + alias map; `redis.call` SELECT/FLUSHDB (multi-DB)
+  - *Batch BT*: FT write classification; alias target resolve + locking; post-EVAL SELECT DB test
 
 ### Memory & expiration policy
 
@@ -346,12 +348,13 @@ Also tracked in `docs/roadmap.md`.
   - *Done*: `tests/search_resp_test.rs` — FT.CREATE / HSET auto-index / FT.SEARCH / FT.DROPINDEX via `CommandHandler`; DEL/UNLINK remove from indices
 - [x] **`[P1]`** Memory limits and eviction interaction for indexes
   - *Done (MVP + Batch AD)*: `MemoryCategory::Search`; `index_document` / `auto_index_key` allocate approx size; remove/drop deallocate; counts toward maxmemory. Under `allkeys-*`, sampled **search documents** are eviction victims (drop index entry + free Search bytes; underlying hash key kept). Account path may `evict_memory` before OOM. Search docs still not volatile victims (no search TTL).
-- [ ] **`[P0]`** **Code review (BS):** classify mutating `FT.*` as writes in `is_write_command`
-  - *Found*: `FT.CREATE` / `FT.DROPINDEX` / `FT.ALIASADD` / `FT.ALIASDEL` / `FT.ALIASUPDATE` skip AOF, replica feed, and readonly-replica / min-replicas gates
-  - *Fix*: add them to `is_write_command`; regression test (READONLY on replica and/or AOF contains command)
-- [ ] **`[P1]`** **Code review (BS):** resolve alias targets in `alias_add` / `alias_update` (store real index name; allow alias→alias retarget)
-- [ ] **`[P1]`** **Code review (BS):** hold a single critical section for FT create/alias namespace checks (avoid TOCTOU between index and alias maps)
-- [ ] **`[P2]`** Persist FT indices + aliases (AOF once writes classified; optional RDB section later)
+- [x] **`[P0]`** **Code review (BS):** classify mutating `FT.*` as writes in `is_write_command`
+  - *Done (Batch BT)*: `FT.CREATE` / `FT.DROPINDEX` / `FT.ALIASADD` / `FT.ALIASDEL` / `FT.ALIASUPDATE` in `is_write_command`; READONLY on replica + AOF contains commands (`tests/bt_ft_write_alias_resolve_test.rs`)
+- [x] **`[P1]`** **Code review (BS):** resolve alias targets in `alias_add` / `alias_update` (store real index name; allow alias→alias retarget)
+  - *Done (Batch BT)*: resolve `index` arg through alias map; store real name; DROPINDEX cleanup consistent
+- [x] **`[P1]`** **Code review (BS):** hold a single critical section for FT create/alias namespace checks (avoid TOCTOU between index and alias maps)
+  - *Done (Batch BT)*: `create_index` / `alias_add` / `alias_update` hold aliases then indices locks for full check-and-insert (matches `drop_index`)
+- [ ] **`[P2]`** Persist FT indices + aliases (AOF now logs mutators; optional RDB section later)
 - [ ] **`[P2]`** ACL `@search` category for FT.* (fine-grained users; default `+@all` unaffected)
 - [ ] **`[P2]`** HNSW correctness/performance benchmarks vs FLAT
 
@@ -380,7 +383,8 @@ Also tracked in `docs/roadmap.md`.
 - [ ] **`[P2]`** Align version strings in docs/`INFO` examples with `Cargo.toml` (currently 0.6.0)
 - [ ] **`[P2]`** Consistent locking and error handling guidelines in contributor docs
 - [ ] **`[P2]`** Keep `docs/roadmap.md` in sync with this file (or make this the single source of truth)
-- [ ] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
+- [x] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
+  - *Done (Batch BT)*: `bt_eval_select_persists_connection_db` — connection remains on selected DB after EVAL
 
 ### Code review backlog (from scheduled review of Batch BS `55bbf70`)
 
@@ -388,12 +392,12 @@ Prioritized for next letter batch(es); full notes under scratch review files whe
 
 | Pri | Item | Status |
 |-----|------|--------|
-| P0 | `FT.*` mutators in `is_write_command` (AOF / repl / READONLY) | open |
-| P1 | Alias target resolve + real-name storage | open |
-| P1 | Atomic create/alias namespace critical section | open |
-| P2 | FT state durability (AOF/RDB) | open |
+| P0 | `FT.*` mutators in `is_write_command` (AOF / repl / READONLY) | done (BT) |
+| P1 | Alias target resolve + real-name storage | done (BT) |
+| P1 | Atomic create/alias namespace critical section | done (BT) |
+| P2 | FT state durability (AOF/RDB) | open (AOF logs mutators; RDB section still open) |
 | P2 | ACL `@search` | open |
-| P2 | Lua SELECT DB side-effect test | open |
+| P2 | Lua SELECT DB side-effect test | done (BT) |
 
 ---
 

@@ -1485,6 +1485,12 @@ pub(super) fn is_write_command(cmd: &str) -> bool {
             // FCALL may mutate; FCALL_RO is read-only.
             | "FCALL"
             | "FUNCTION"
+            // RediSearch index/alias mutations (AOF + replica feed + READONLY gate).
+            | "FT.CREATE"
+            | "FT.DROPINDEX"
+            | "FT.ALIASADD"
+            | "FT.ALIASDEL"
+            | "FT.ALIASUPDATE"
     )
 }
 

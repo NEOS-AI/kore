@@ -467,6 +467,11 @@ impl SearchIndexManager {
     /// Resolve `name` if it is an alias; otherwise return `name` unchanged.
     pub fn resolve_name(&self, name: &str) -> String {
         let aliases = self.aliases.read();
+        Self::resolve_name_locked(&aliases, name)
+    }
+
+    /// Resolve under an already-held aliases lock (one hop; aliases always store real names).
+    fn resolve_name_locked(aliases: &HashMap<String, String>, name: &str) -> String {
         aliases
             .get(name)
             .cloned()
@@ -475,18 +480,18 @@ impl SearchIndexManager {
 
     /// Create a new index
     pub fn create_index(&self, definition: IndexDefinition) -> Result<(), String> {
-        // Alias names and index names share a namespace.
-        {
-            let aliases = self.aliases.read();
-            if aliases.contains_key(&definition.name) {
-                return Err(format!(
-                    "Index name '{}' clashes with an existing alias",
-                    definition.name
-                ));
-            }
-        }
-
+        // Lock order: aliases then indices (matches drop_index / alias_*).
+        // Hold both for the full check-and-insert so create vs alias cannot TOCTOU.
+        let aliases = self.aliases.write();
         let mut indices = self.indices.write();
+
+        // Alias names and index names share a namespace.
+        if aliases.contains_key(&definition.name) {
+            return Err(format!(
+                "Index name '{}' clashes with an existing alias",
+                definition.name
+            ));
+        }
 
         if indices.contains_key(&definition.name) {
             return Err(format!("Index '{}' already exists", definition.name));
@@ -501,10 +506,7 @@ impl SearchIndexManager {
     pub fn drop_index(&self, name: &str) -> Result<(), String> {
         // Lock order: aliases then indices (consistent across alias ops).
         let mut aliases = self.aliases.write();
-        let real_name = aliases
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| name.to_string());
+        let real_name = Self::resolve_name_locked(&aliases, name);
 
         let mut indices = self.indices.write();
         if indices.remove(&real_name).is_none() {
@@ -536,21 +538,27 @@ impl SearchIndexManager {
     }
 
     /// FT.ALIASADD alias index — create a new alias (fails if alias exists).
+    ///
+    /// If `index` is itself an alias, the real index name is resolved and stored
+    /// so DROPINDEX cleanup by real name stays consistent.
     pub fn alias_add(&self, alias: &str, index: &str) -> Result<(), String> {
+        // Lock order: aliases then indices (matches create_index / drop_index).
+        let mut aliases = self.aliases.write();
         let indices = self.indices.read();
-        if !indices.contains_key(index) {
-            return Err(format!("Unknown index name '{}'", index));
-        }
+
         if indices.contains_key(alias) {
             return Err(format!("Alias clashes with an existing index name '{}'", alias));
         }
-        drop(indices);
-
-        let mut aliases = self.aliases.write();
         if aliases.contains_key(alias) {
             return Err(format!("Alias '{}' already exists", alias));
         }
-        aliases.insert(alias.to_string(), index.to_string());
+
+        let real_index = Self::resolve_name_locked(&aliases, index);
+        if !indices.contains_key(&real_index) {
+            return Err(format!("Unknown index name '{}'", index));
+        }
+
+        aliases.insert(alias.to_string(), real_index);
         Ok(())
     }
 
@@ -564,18 +572,23 @@ impl SearchIndexManager {
     }
 
     /// FT.ALIASUPDATE alias index — create or retarget an alias.
+    ///
+    /// If `index` is itself an alias, the real index name is resolved and stored.
     pub fn alias_update(&self, alias: &str, index: &str) -> Result<(), String> {
+        // Lock order: aliases then indices (matches create_index / drop_index).
+        let mut aliases = self.aliases.write();
         let indices = self.indices.read();
-        if !indices.contains_key(index) {
-            return Err(format!("Unknown index name '{}'", index));
-        }
+
         if indices.contains_key(alias) {
             return Err(format!("Alias clashes with an existing index name '{}'", alias));
         }
-        drop(indices);
 
-        let mut aliases = self.aliases.write();
-        aliases.insert(alias.to_string(), index.to_string());
+        let real_index = Self::resolve_name_locked(&aliases, index);
+        if !indices.contains_key(&real_index) {
+            return Err(format!("Unknown index name '{}'", index));
+        }
+
+        aliases.insert(alias.to_string(), real_index);
         Ok(())
     }
 
@@ -726,6 +739,10 @@ mod tests {
         // clash with index name
         assert!(manager.alias_add("idx", "idx").is_err());
 
+        // alias → alias target resolves and stores the real index name
+        assert!(manager.alias_add("a2", "a1").is_ok());
+        assert_eq!(manager.resolve_name("a2"), "idx");
+
         // retarget via update (create new)
         let def2 = IndexDefinition::new(
             "idx2".to_string(),
@@ -742,14 +759,23 @@ mod tests {
         assert!(manager.alias_update("a1", "idx2").is_ok());
         assert_eq!(manager.resolve_name("a1"), "idx2");
 
+        // ALIASUPDATE with alias target stores real name
+        assert!(manager.alias_update("a2", "a1").is_ok());
+        assert_eq!(manager.resolve_name("a2"), "idx2");
+
         assert!(manager.alias_del("a1").is_ok());
         assert!(manager.get_index("a1").is_none());
         assert!(manager.alias_del("a1").is_err());
 
-        // dropindex cleans aliases
+        // dropindex cleans aliases that stored the real name (including a2 → idx2)
         manager.alias_add("gone", "idx").unwrap();
         manager.drop_index("idx").unwrap();
         assert!(manager.get_index("gone").is_none());
         assert!(manager.alias_del("gone").is_err());
+
+        // a2 still points at idx2; drop via real name cleans a2
+        manager.drop_index("idx2").unwrap();
+        assert!(manager.get_index("a2").is_none());
+        assert!(manager.alias_del("a2").is_err());
     }
 }
