@@ -81,7 +81,8 @@ impl Databases {
     }
 
     /// Full wipe of every logical database including FT index definitions/aliases.
-    /// Used on failed AOF load (all-or-nothing), not live FLUSHALL.
+    /// Used for RDB snapshot-replace load (`flush=true`) and failed AOF/RDB load
+    /// (all-or-nothing), not live FLUSHALL.
     pub fn flush_all_including_search(&self) {
         for db in &self.dbs {
             db.flush_all_including_search();

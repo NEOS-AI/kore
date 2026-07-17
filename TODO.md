@@ -363,12 +363,12 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch BV)*: propagate `create_search_index` / `drop_search_index` / `alias_*` as `Error::InvalidArgument`; non-truncated unparsable FT.CREATE → `ParseError` (truncated argv still skips like other AOF paths); `tests/bv_aof_ft_load_errors_test.rs`
 - [x] **`[P2]`** Persist FT indices + aliases in RDB (AOF rewrite done in BU; RDB FT section still open)
   - *Done (Batch BY)*: RDB version 5 search section (index definitions + aliases) per DB body after typed-expires; `from_cache` / `is_empty` / `load_into` create schema first then auto-index hashes; v1–v4 still load. Tests: `tests/by_rdb_ft_section_test.rs`
-- [ ] **`[P1]`** **Code review (BY):** RDB load with `flush=true` keeps FT schema (BX `flush`/`flush_all`), then `create_search_index` fails on name clash
+- [x] **`[P1]`** **Code review (BY):** RDB load with `flush=true` keeps FT schema (BX `flush`/`flush_all`), then `create_search_index` fails on name clash
   - *Found*: `load_bytes` / `load_databases_bytes` call `cache.flush()` / `databases.flush_all()` (clear_documents only). `DbSnapshot::load_into` always `create_search_index` — second FULLRESYNC / reload of a dump that includes the same index names returns `Index '…' already exists` and aborts. Affects replica `FULLRESYNC` (`replication.rs` loads with `flush=true`) and any non-empty-target RDB load after BX.
-  - *Fix*: when `flush=true` on RDB load, use `flush_all_including_search()` (snapshot replace semantics); keep live FLUSHDB/FLUSHALL on `clear_documents`. Add test: create index → save RDB → load with flush into same process → search still works.
-- [ ] **`[P2]`** **Code review (BY):** RDB load is not wiped on mid-`load_into` FT failure (AOF got BW/BX; RDB did not)
+  - *Done (Batch BZ)*: when `flush=true` on RDB load, use `flush_all_including_search()` (snapshot replace); live FLUSHDB/FLUSHALL still `clear_documents`. Tests: `tests/bz_rdb_load_wipes_ft_schema_test.rs`
+- [x] **`[P2]`** **Code review (BY):** RDB load is not wiped on mid-`load_into` FT failure (AOF got BW/BX; RDB did not)
   - *Found*: `create_search_index` / `alias_add` errors abort `load_into` after partial apply (earlier indices/keys remain). Callers (`load_databases_bytes`, FULLRESYNC) do not full-wipe on `Err`.
-  - *Fix*: on RDB load `Err` after mutate started, `flush_all_including_search` (mirror AOF); or scratch-load + swap (shared with BW scratch-load item).
+  - *Done (Batch BZ)*: on RDB load `Err` after decode (mutate started), `flush_all_including_search` (mirror AOF BW/BX). Tests: `tests/bz_rdb_load_wipes_ft_schema_test.rs`. Scratch-load swap for non-empty targets remains open (shared with BW item).
 - [ ] **`[P2]`** **Code review (BY nit):** no HNSW `M` / `ef_construction` RDB round-trip test (FLAT covered in `by_rdb_ft_section_test`; RDB encoder already writes both HNSW params)
 - [ ] **`[P2]`** **Code review (BY nit):** RDB FT mutator errors always `Error::InvalidArgument` — align with AOF `map_ft_mutator_error` (OOM → `OutOfMemory`) if search layer can return OOM on create
 - [ ] **`[P2]`** ACL `@search` category for FT.* (fine-grained users; default `+@all` unaffected)
@@ -429,7 +429,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). BY closed RDB FT section. **Next:** P1 RDB `flush=true` must wipe FT schema before recreate (FULLRESYNC); then RDB load error wipe / scratch-load; shared parser; ACL `@search`.
+Prioritized for next letter batch(es). BZ closed RDB `flush=true` schema wipe + load error wipe. **Next:** scratch-load swap; shared FT.CREATE parser; ACL `@search`; HNSW RDB round-trip test.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -438,9 +438,9 @@ Prioritized for next letter batch(es). BY closed RDB FT section. **Next:** P1 RD
 | P1 | Atomic create/alias namespace critical section | done (BT) |
 | P1 | AOF rewrite emits `FT.CREATE` + aliases (BT review) | done (BU) |
 | P1 | AOF load surfaces FT.CREATE / alias failures (BU review) | done (BV) |
-| P1 | RDB load `flush=true` must wipe FT schema (BY×BX clash) | open |
+| P1 | RDB load `flush=true` must wipe FT schema (BY×BX clash) | done (BZ) |
 | P2 | FT RDB section | done (BY) |
-| P2 | RDB load wipe-on-FT-failure (mirror AOF BW) | open |
+| P2 | RDB load wipe-on-FT-failure (mirror AOF BW) | done (BZ) |
 | P2 | ACL `@search` | open |
 | P2 | Shared FT.CREATE parser (cmd + AOF load) | open |
 | P2 | HNSW `ef_construction` AOF round-trip | open (RDB done in BY) |

@@ -1123,21 +1123,49 @@ pub fn load_databases(databases: &Databases, path: &Path, flush: bool) -> Result
 }
 
 /// Load RDB bytes into cache (DB 0 / first DB only).
+///
+/// When `flush` is true, the target is fully wiped first — keys **and** FT
+/// schema/aliases (`flush_all_including_search`). Snapshot-replace semantics
+/// (FULLRESYNC / reload) must clear definitions so `create_search_index` does
+/// not fail with "Index already exists". Live FLUSHDB keeps schema via
+/// [`Cache::flush`] instead.
+///
+/// On any `load_into` error after decode succeeds, the cache is fully wiped
+/// (keys + FT schema) so partial apply cannot leave a half-filled dataset
+/// (mirrors AOF load all-or-nothing).
 pub fn load_bytes(cache: &Cache, data: &[u8], flush: bool) -> Result<usize> {
     let snap = MultiDbSnapshot::decode(data)?;
     if flush {
-        cache.flush();
+        // Snapshot replace: wipe schema so recreated indices do not clash.
+        cache.flush_all_including_search();
     }
-    snap.load_into_cache(cache)
+    let result = snap.load_into_cache(cache);
+    if result.is_err() {
+        // Full wipe including FT definitions — not live FLUSHDB semantics.
+        cache.flush_all_including_search();
+    }
+    result
 }
 
 /// Load RDB bytes into multi-DB keyspaces.
+///
+/// When `flush` is true, every logical DB is fully wiped first (keys + FT
+/// schema/aliases). See [`load_bytes`] for snapshot-replace vs live FLUSHALL.
+///
+/// On any `load_into` error after decode succeeds, every database is fully
+/// wiped so partial multi-DB apply cannot leave half-filled state.
 pub fn load_databases_bytes(databases: &Databases, data: &[u8], flush: bool) -> Result<usize> {
     let snap = MultiDbSnapshot::decode(data)?;
     if flush {
-        databases.flush_all();
+        // Snapshot replace: wipe schema so recreated indices do not clash.
+        databases.flush_all_including_search();
     }
-    snap.load_into_databases(databases)
+    let result = snap.load_into_databases(databases);
+    if result.is_err() {
+        // Full wipe including FT definitions — not live FLUSHALL semantics.
+        databases.flush_all_including_search();
+    }
+    result
 }
 
 /// Convenience for callers with Arc.

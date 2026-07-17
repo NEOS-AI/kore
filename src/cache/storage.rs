@@ -468,8 +468,9 @@ impl Cache {
 
     /// Full wipe: keyspace + every search index definition and alias.
     ///
-    /// Used on failed AOF load so partial apply cannot leave a half-filled DB
-    /// (including orphaned FT schema). Live FLUSHDB/FLUSHALL use [`flush`] instead.
+    /// Used for RDB snapshot-replace load (`flush=true`), and on failed AOF/RDB
+    /// load so partial apply cannot leave a half-filled DB (including orphaned
+    /// FT schema). Live FLUSHDB/FLUSHALL use [`flush`] instead.
     pub fn flush_all_including_search(&self) {
         self.flush_keyspace();
         self.search_index_manager.clear();
