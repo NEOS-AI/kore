@@ -83,7 +83,9 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     CmdSpec { name: "swapdb", arity: 3, flags: &["write", "fast"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "dbsize", arity: 1, flags: &["readonly", "fast"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "keys", arity: 2, flags: &["readonly", "sort_for_script"], first_key: 0, last_key: 0, step: 0 },
+    // SCAN: MATCH / COUNT / TYPE
     CmdSpec { name: "scan", arity: -2, flags: &["readonly", "random"], first_key: 0, last_key: 0, step: 0 },
+    // FLUSHDB/FLUSHALL accept optional ASYNC|SYNC
     CmdSpec { name: "flushdb", arity: -1, flags: &["write"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "flushall", arity: -1, flags: &["write"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "info", arity: -1, flags: &["loading", "stale", "random"], first_key: 0, last_key: 0, step: 0 },
@@ -173,6 +175,7 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     CmdSpec { name: "xautoclaim", arity: -6, flags: &["write", "random"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "xsetid", arity: 3, flags: &["write", "denyoom", "fast"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "xinfo", arity: -2, flags: &["readonly", "random"], first_key: 2, last_key: 2, step: 1 },
+    // ZADD accepts optional NX|XX|GT|LT|CH|INCR before score-member pairs.
     CmdSpec { name: "zadd", arity: -4, flags: &["write", "denyoom", "fast"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "zrange", arity: -4, flags: &["readonly"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "zrangestore", arity: -5, flags: &["write", "denyoom"], first_key: 1, last_key: 2, step: 1 },
@@ -227,6 +230,10 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     CmdSpec { name: "psubscribe", arity: -2, flags: &["pubsub", "noscript", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "punsubscribe", arity: -1, flags: &["pubsub", "noscript", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "pubsub", arity: -2, flags: &["pubsub", "random", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },
+    // Redis 7.0+ Shard Pub/Sub
+    CmdSpec { name: "spublish", arity: 3, flags: &["pubsub", "loading", "stale", "fast"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "ssubscribe", arity: -2, flags: &["pubsub", "noscript", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "sunsubscribe", arity: -1, flags: &["pubsub", "noscript", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "replicaof", arity: -3, flags: &["admin", "noscript", "stale"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "slaveof", arity: -3, flags: &["admin", "noscript", "stale"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "failover", arity: -1, flags: &["admin", "noscript", "stale"], first_key: 0, last_key: 0, step: 0 },

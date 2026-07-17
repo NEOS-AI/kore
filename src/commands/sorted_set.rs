@@ -43,9 +43,10 @@ impl CommandHandler {
         }
     }
 
+    /// ZADD key [NX|XX] [GT|LT] [CH] [INCR] score member [score member ...]
     pub(super) fn handle_zadd(&self, args: &[RespValue]) -> Result<RespValue> {
         self.cache.stats.incr(&self.cache.stats.cmd_zadd);
-        
+
         if args.len() < 3 {
             return Ok(RespValue::error("ERR wrong number of arguments for 'zadd'"));
         }
@@ -55,30 +56,104 @@ impl CommandHandler {
             None => return Ok(RespValue::error("ERR invalid key")),
         };
 
+        // Leading options (before the first score).
+        let mut nx = false;
+        let mut xx = false;
+        let mut gt = false;
+        let mut lt = false;
+        let mut ch = false;
+        let mut incr = false;
+        let mut i = 1;
+        while i < args.len() {
+            let opt = match args[i].as_bulk_string() {
+                Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+                None => break,
+            };
+            match opt.as_str() {
+                "NX" => {
+                    nx = true;
+                    i += 1;
+                }
+                "XX" => {
+                    xx = true;
+                    i += 1;
+                }
+                "GT" => {
+                    gt = true;
+                    i += 1;
+                }
+                "LT" => {
+                    lt = true;
+                    i += 1;
+                }
+                "CH" => {
+                    ch = true;
+                    i += 1;
+                }
+                "INCR" => {
+                    incr = true;
+                    i += 1;
+                }
+                _ => break,
+            }
+        }
+
+        if nx && xx {
+            return Ok(RespValue::error(
+                "ERR XX and NX options at the same time are not compatible",
+            ));
+        }
+        if gt && lt {
+            return Ok(RespValue::error(
+                "ERR GT, LT, and/or NX options at the same time are not compatible",
+            ));
+        }
+        // Redis: NX is incompatible with GT/LT.
+        if nx && (gt || lt) {
+            return Ok(RespValue::error(
+                "ERR GT, LT, and/or NX options at the same time are not compatible",
+            ));
+        }
+
         // Parse score-member pairs
         let mut pairs = Vec::new();
-        let mut i = 1;
-        
         while i + 1 < args.len() {
             let score = match self.parse_float(&args[i]) {
                 Ok(s) => s,
                 Err(_) => return Ok(RespValue::error("ERR value is not a valid float")),
             };
-
             let member = match args[i + 1].as_bulk_string() {
                 Some(m) => m.clone(),
                 None => return Ok(RespValue::error("ERR invalid member")),
             };
-
             pairs.push((score, member));
             i += 2;
         }
-
-        if pairs.is_empty() {
+        if i != args.len() || pairs.is_empty() {
             return Ok(RespValue::error("ERR wrong number of arguments for 'zadd'"));
         }
+        if incr && pairs.len() != 1 {
+            return Ok(RespValue::error(
+                "ERR INCR option supports a single increment-element pair",
+            ));
+        }
 
-        // Rough pre-check for member growth against maxmemory
+        // XX on a missing key: nothing to do (do not create empty zset).
+        match self.ensure_zset_key(&key) {
+            Ok(None) if xx => {
+                return Ok(if incr {
+                    RespValue::null()
+                } else {
+                    RespValue::Integer(0)
+                });
+            }
+            Ok(_) => {}
+            Err(Error::WrongType) => {
+                return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+            }
+            Err(e) => return Ok(RespValue::error(e.to_resp_string())),
+        }
+
         let est_growth: usize = pairs.iter().map(|(_, m)| m.len() + 64).sum();
         if let Err(e) = self.cache.ensure_non_string_capacity(est_growth) {
             return Ok(RespValue::error(e.to_resp_string()));
@@ -94,20 +169,92 @@ impl CommandHandler {
         let mut set = zset.write();
         let before = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
 
-        let mut added = 0;
+        if incr {
+            let (delta, member) = pairs.into_iter().next().unwrap();
+            let old = set.score(&member);
+            // NX: only if missing; XX already handled for missing key above.
+            if nx && old.is_some() {
+                drop(set);
+                return Ok(RespValue::null());
+            }
+            if xx && old.is_none() {
+                drop(set);
+                return Ok(RespValue::null());
+            }
+            let base = old.unwrap_or(0.0);
+            let new_score = base + delta;
+            if new_score.is_nan() {
+                return Ok(RespValue::error(
+                    "ERR resulting score is not a number (NaN)",
+                ));
+            }
+            // GT/LT apply when updating an existing member.
+            if let Some(o) = old {
+                if gt && !(new_score > o) {
+                    drop(set);
+                    return Ok(RespValue::null());
+                }
+                if lt && !(new_score < o) {
+                    drop(set);
+                    return Ok(RespValue::null());
+                }
+            }
+            let _ = set.add(member, new_score);
+            let after = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
+            drop(set);
+            self.cache.account_sorted_set_delta(before, after);
+            self.cache.list_blockers.notify_key(&key);
+            return Ok(RespValue::BulkString(Some(Bytes::from(format_score(
+                new_score,
+            )))));
+        }
+
+        let mut added = 0i64;
+        let mut changed = 0i64;
         for (score, member) in pairs {
-            if set.add(member, score) {
-                added += 1;
+            let old = set.score(&member);
+            match old {
+                Some(o) => {
+                    if nx {
+                        continue;
+                    }
+                    if gt && !(score > o) {
+                        continue;
+                    }
+                    if lt && !(score < o) {
+                        continue;
+                    }
+                    // Same score → no change (Redis CH does not count).
+                    if scores_equal(o, score) {
+                        continue;
+                    }
+                    let _ = set.add(member, score);
+                    changed += 1;
+                }
+                None => {
+                    if xx {
+                        continue;
+                    }
+                    // GT/LT only constrain updates of existing elements.
+                    let _ = set.add(member, score);
+                    added += 1;
+                    changed += 1;
+                }
             }
         }
 
         let after = crate::memory::estimate_keyed_object(key.len(), set.memory_size());
+        let empty = set.is_empty();
         drop(set);
         self.cache.account_sorted_set_delta(before, after);
-        // Wake BZPOPMIN/BZPOPMAX waiters.
-        self.cache.list_blockers.notify_key(&key);
+        if empty {
+            // All ops skipped after create — drop empty key (Redis does not leave it).
+            let _ = self.cache.delete(&key);
+        } else {
+            self.cache.list_blockers.notify_key(&key);
+        }
 
-        Ok(RespValue::Integer(added as i64))
+        Ok(RespValue::Integer(if ch { changed } else { added }))
     }
 
     pub(super) fn handle_zrange(&self, args: &[RespValue]) -> Result<RespValue> {
@@ -968,6 +1115,11 @@ fn format_score(score: f64) -> String {
     }
 }
 
+/// Score equality for ZADD CH (treat NaN == NaN like SortedSet::add).
+fn scores_equal(a: f64, b: f64) -> bool {
+    (a.is_nan() && b.is_nan()) || a == b
+}
+
 fn scored_members_to_resp(members: Vec<ScoredMember>, with_scores: bool) -> RespValue {
     let mut result = Vec::with_capacity(members.len() * if with_scores { 2 } else { 1 });
     for sm in members {
@@ -1000,7 +1152,7 @@ impl CommandHandler {
             Ok(c) if c >= 0 => c as u64,
             _ => return Ok(RespValue::error("ERR invalid cursor")),
         };
-        let (pattern, count) = match self.parse_scan_options(&args[2..]) {
+        let (pattern, count, _type) = match self.parse_scan_options(&args[2..]) {
             Ok(v) => v,
             Err(e) => return Ok(e),
         };

@@ -759,7 +759,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
         ],
         "pubsub" => &[
             "publish", "subscribe", "unsubscribe", "psubscribe", "punsubscribe", "pubsub",
-            "ssubscribe", "sunsubscribe", "spublish",
+            "ssubscribe", "sunsubscribe", "spublish", // shard pub/sub (Redis 7+)
         ],
         "keyspace" => &[
             "del", "exists", "expire", "pexpire", "expireat", "pexpireat", "persist", "expiretime", "pexpiretime", "keys", "scan", "move", "copy", "randomkey", "touch", "rename", "renamenx",

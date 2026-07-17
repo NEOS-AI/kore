@@ -29,7 +29,7 @@ impl CommandHandler {
         Ok(RespValue::Array(resp_keys))
     }
 
-    /// SCAN cursor [MATCH pattern] [COUNT count]
+    /// SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]
     pub(super) fn handle_scan(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.is_empty() {
             return Ok(RespValue::error(
@@ -44,13 +44,21 @@ impl CommandHandler {
             }
         };
 
-        let (pattern, count) = match self.parse_scan_options(&args[1..]) {
+        let (pattern, count, type_filter) = match self.parse_scan_options(&args[1..]) {
             Ok(v) => v,
             Err(e) => return Ok(e),
         };
 
         let pattern_ref = pattern.as_deref();
         let (next_cursor, keys) = self.cache.scan(cursor, pattern_ref, count);
+
+        let keys = if let Some(ref want) = type_filter {
+            keys.into_iter()
+                .filter(|k| self.cache.key_type(k).as_redis_str() == want.as_str())
+                .collect()
+        } else {
+            keys
+        };
 
         let resp_keys: Vec<RespValue> = keys
             .into_iter()
@@ -60,13 +68,15 @@ impl CommandHandler {
         Ok(scan_reply(next_cursor, resp_keys))
     }
 
-    /// Parse optional `MATCH pattern` / `COUNT n` after the cursor (or key+cursor).
+    /// Parse optional `MATCH pattern` / `COUNT n` / `TYPE type` after the cursor (or key+cursor).
+    /// Returns `(pattern, count, type_filter)`.
     pub(super) fn parse_scan_options(
         &self,
         args: &[RespValue],
-    ) -> std::result::Result<(Option<String>, usize), RespValue> {
+    ) -> std::result::Result<(Option<String>, usize, Option<String>), RespValue> {
         let mut pattern: Option<String> = None;
         let mut count: usize = 10; // Redis-compatible default
+        let mut type_filter: Option<String> = None;
         let mut i = 0;
         while i < args.len() {
             let opt = match args[i].as_bulk_string() {
@@ -98,11 +108,33 @@ impl CommandHandler {
                         }
                     }
                 }
+                "TYPE" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err(RespValue::error("ERR syntax error"));
+                    }
+                    match args[i].as_bulk_string() {
+                        Some(s) => {
+                            let t = String::from_utf8_lossy(s).to_ascii_lowercase();
+                            match t.as_str() {
+                                "string" | "list" | "set" | "zset" | "hash" | "stream" => {
+                                    type_filter = Some(t);
+                                }
+                                _ => {
+                                    return Err(RespValue::error(
+                                        "ERR type not supported for TYPE filter",
+                                    ));
+                                }
+                            }
+                        }
+                        None => return Err(RespValue::error("ERR syntax error")),
+                    }
+                }
                 _ => return Err(RespValue::error("ERR syntax error")),
             }
             i += 1;
         }
-        Ok((pattern, count))
+        Ok((pattern, count, type_filter))
     }
 
     /// SELECT index — switch the connection to another logical database.
@@ -136,14 +168,21 @@ impl CommandHandler {
         Ok(RespValue::ok())
     }
 
-    /// FLUSHDB — clear only the currently selected database.
-    pub(super) fn handle_flushdb(&self, _args: &[RespValue]) -> Result<RespValue> {
+    /// FLUSHDB [ASYNC|SYNC] — clear only the currently selected database.
+    /// ASYNC is accepted for client compatibility; flush is still synchronous.
+    pub(super) fn handle_flushdb(&self, args: &[RespValue]) -> Result<RespValue> {
+        if let Err(e) = parse_flush_mode(args) {
+            return Ok(e);
+        }
         self.cache.flush();
         Ok(RespValue::ok())
     }
 
-    /// FLUSHALL — clear every logical database.
-    pub(super) fn handle_flushall(&self, _args: &[RespValue]) -> Result<RespValue> {
+    /// FLUSHALL [ASYNC|SYNC] — clear every logical database.
+    pub(super) fn handle_flushall(&self, args: &[RespValue]) -> Result<RespValue> {
+        if let Err(e) = parse_flush_mode(args) {
+            return Ok(e);
+        }
         self.databases.flush_all();
         Ok(RespValue::ok())
     }
@@ -1175,6 +1214,27 @@ impl CommandHandler {
             }
             _ => Ok(RespValue::error("ERR Unknown subcommand or wrong number of arguments")),
         }
+    }
+}
+
+/// Parse optional FLUSHDB/FLUSHALL mode: empty, ASYNC, or SYNC.
+fn parse_flush_mode(args: &[RespValue]) -> std::result::Result<(), RespValue> {
+    if args.is_empty() {
+        return Ok(());
+    }
+    if args.len() > 1 {
+        return Err(RespValue::error(
+            "ERR wrong number of arguments for flush command",
+        ));
+    }
+    match args[0].as_bulk_string() {
+        Some(s) => match String::from_utf8_lossy(s).to_ascii_uppercase().as_str() {
+            "ASYNC" | "SYNC" => Ok(()),
+            _ => Err(RespValue::error(
+                "ERR syntax error, try FLUSH[ASYNC|SYNC]",
+            )),
+        },
+        None => Err(RespValue::error("ERR syntax error")),
     }
 }
 

@@ -768,7 +768,7 @@ impl CommandHandler {
             Ok(c) if c >= 0 => c as u64,
             _ => return Ok(RespValue::error("ERR invalid cursor")),
         };
-        let (pattern, count) = match self.parse_scan_options(&args[2..]) {
+        let (pattern, count, _type) = match self.parse_scan_options(&args[2..]) {
             Ok(v) => v,
             Err(e) => return Ok(e),
         };
