@@ -327,8 +327,31 @@ impl Cache {
                 }
                 Ok(RespValue::Array(result))
             }
+            "HELP" => Ok(RespValue::Array(vec![
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"PUBSUB <subcommand> [<arg> ...]. Subcommands are:",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"CHANNELS [pattern] -- list active channels",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"NUMSUB [channel ...] -- subscriber counts per channel",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"NUMPAT -- number of pattern subscriptions",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"SHARDCHANNELS [pattern] -- list active shard channels",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"SHARDNUMSUB [shardchannel ...] -- shard subscriber counts",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"HELP -- print this help",
+                ))),
+            ])),
             _ => Ok(RespValue::error(format!(
-                "ERR unknown subcommand '{}'",
+                "ERR unknown subcommand '{}'. Try PUBSUB HELP.",
                 subcommand
             ))),
         }

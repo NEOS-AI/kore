@@ -1122,8 +1122,17 @@ impl CommandHandler {
                     _ => Ok(RespValue::error(Error::WrongType.to_resp_string())),
                 }
             }
+            "HELP" => Ok(RespValue::Array(vec![
+                bulk_static(b"XGROUP <subcommand> [<arg> ...]. Subcommands are:"),
+                bulk_static(b"CREATE <key> <groupname> <id|$> [MKSTREAM] [ENTRIESREAD <n>]"),
+                bulk_static(b"DESTROY <key> <groupname>"),
+                bulk_static(b"CREATECONSUMER <key> <groupname> <consumername>"),
+                bulk_static(b"DELCONSUMER <key> <groupname> <consumername>"),
+                bulk_static(b"SETID <key> <groupname> <id|$> [ENTRIESREAD <n>]"),
+                bulk_static(b"HELP -- print this help"),
+            ])),
             _ => Ok(RespValue::error(format!(
-                "ERR unknown subcommand '{}'",
+                "ERR unknown subcommand '{}'. Try XGROUP HELP.",
                 sub
             ))),
         }

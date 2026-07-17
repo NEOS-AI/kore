@@ -246,15 +246,120 @@ impl CommandHandler {
 
     /// CONFIG GET style key/value reply: flat array (RESP2) or map (RESP3).
     pub(super) fn config_kv_reply(&self, key: &str, value: &str) -> RespValue {
-        let k = RespValue::BulkString(Some(Bytes::from(key.to_string())));
-        let v = RespValue::BulkString(Some(Bytes::from(value.to_string())));
+        self.config_kvs_reply(vec![(key.to_string(), value.to_string())])
+    }
+
+    /// Multi-pair CONFIG GET reply (RESP2 flat array or RESP3 map).
+    pub(super) fn config_kvs_reply(&self, pairs: Vec<(String, String)>) -> RespValue {
         if self.protocol_version >= 3 {
-            RespValue::Map(vec![(k, v)])
+            let map: Vec<(RespValue, RespValue)> = pairs
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        RespValue::BulkString(Some(Bytes::from(k))),
+                        RespValue::BulkString(Some(Bytes::from(v))),
+                    )
+                })
+                .collect();
+            RespValue::Map(map)
         } else {
-            RespValue::Array(vec![k, v])
+            let mut arr = Vec::with_capacity(pairs.len() * 2);
+            for (k, v) in pairs {
+                arr.push(RespValue::BulkString(Some(Bytes::from(k))));
+                arr.push(RespValue::BulkString(Some(Bytes::from(v))));
+            }
+            RespValue::Array(arr)
         }
     }
 
+    /// Snapshot of supported CONFIG parameters (canonical names).
+    pub(super) fn config_known_params(&self) -> Vec<(String, String)> {
+        let save = self
+            .persistence
+            .as_ref()
+            .map(|p| p.save_rules_string())
+            .unwrap_or_default();
+        let min_replicas = self
+            .persistence
+            .as_ref()
+            .map(|p| p.replication.min_replicas_to_write())
+            .unwrap_or(0);
+        let min_lag = self
+            .persistence
+            .as_ref()
+            .map(|p| p.replication.min_replicas_max_lag())
+            .unwrap_or(10);
+        vec![
+            (
+                "maxentrysize".into(),
+                self.cache.get_max_entry_size().to_string(),
+            ),
+            ("maxmemory".into(), self.cache.max_memory().to_string()),
+            ("save".into(), save),
+            (
+                "maxmemory-policy".into(),
+                self.cache.eviction_policy().as_str().to_string(),
+            ),
+            (
+                "lfu-log-factor".into(),
+                self.cache.lfu_log_factor().to_string(),
+            ),
+            (
+                "lfu-decay-time".into(),
+                self.cache.lfu_decay_time().to_string(),
+            ),
+            (
+                "slowlog-log-slower-than".into(),
+                self.cache.slowlog.slower_than_us().to_string(),
+            ),
+            (
+                "slowlog-max-len".into(),
+                self.cache.slowlog.max_len().to_string(),
+            ),
+            ("databases".into(), self.databases.len().to_string()),
+            (
+                "min-replicas-to-write".into(),
+                min_replicas.to_string(),
+            ),
+            (
+                "min-replicas-max-lag".into(),
+                min_lag.to_string(),
+            ),
+        ]
+    }
+
+    /// True if `pattern` matches the canonical CONFIG name or a known alias.
+    pub(super) fn config_param_matches(pattern: &str, canonical: &str) -> bool {
+        if crate::hashmap::pattern_match(pattern, canonical) {
+            return true;
+        }
+        for alias in config_param_aliases(canonical) {
+            if crate::hashmap::pattern_match(pattern, alias) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Alternate names accepted by CONFIG GET (reply always uses the canonical key).
+fn config_param_aliases(canonical: &str) -> &'static [&'static str] {
+    match canonical {
+        "maxentrysize" => &["max-entry-size"],
+        "maxmemory" => &["max-memory"],
+        "maxmemory-policy" => &["maxmemory_policy"],
+        "lfu-log-factor" => &["lfu_log_factor"],
+        "lfu-decay-time" => &["lfu_decay_time"],
+        "slowlog-log-slower-than" => &["slowlog_log_slower_than"],
+        "slowlog-max-len" => &["slowlog_max_len"],
+        "min-replicas-to-write" => &["min-slaves-to-write"],
+        "min-replicas-max-lag" => &["min-slaves-max-lag"],
+        _ => &[],
+    }
+}
+
+// Keep methods on CommandHandler contiguous for the rest of the impl.
+impl CommandHandler {
     /// Convert subscribe confirmation frames to Push when on RESP3.
     fn maybe_pubsub_push_frames(&self, responses: Vec<RespValue>) -> Vec<RespValue> {
         if self.protocol_version < 3 {

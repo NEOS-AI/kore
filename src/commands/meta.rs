@@ -924,11 +924,7 @@ impl CommandHandler {
                 }
                 Ok(RespValue::Array(out))
             }
-            "LIST" => {
-                // COMMAND LIST → array of command name bulk strings
-                let names: Vec<RespValue> = COMMAND_SPECS.iter().map(|s| bulk(s.name)).collect();
-                Ok(RespValue::Array(names))
-            }
+            "LIST" => self.command_list(&args[1..]),
             "GETKEYS" => self.command_getkeys(&args[1..]),
             "GETKEYSANDFLAGS" => self.command_getkeysandflags(&args[1..]),
             "DOCS" => self.command_docs(&args[1..]),
@@ -940,7 +936,7 @@ impl CommandHandler {
                     b"COUNT -- return total number of commands in the catalog",
                 ))),
                 RespValue::BulkString(Some(Bytes::from_static(
-                    b"LIST -- return array of command names",
+                    b"LIST [FILTERBY MODULE|ACLCAT|PATTERN ...] -- list command names",
                 ))),
                 RespValue::BulkString(Some(Bytes::from_static(
                     b"INFO [<command-name> ...] -- details for given commands",
@@ -966,6 +962,82 @@ impl CommandHandler {
                     sub
                 )))
             }
+        }
+    }
+
+    /// COMMAND LIST [FILTERBY MODULE module-name | ACLCAT category | PATTERN pattern]
+    fn command_list(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            let names: Vec<RespValue> = COMMAND_SPECS.iter().map(|s| bulk(s.name)).collect();
+            return Ok(RespValue::Array(names));
+        }
+        // Optional FILTERBY clause.
+        let mut i = 0;
+        let filter_word = match args[i].as_bulk_string() {
+            Some(b) => String::from_utf8_lossy(b).to_ascii_uppercase(),
+            None => return Ok(RespValue::error("ERR syntax error")),
+        };
+        if filter_word != "FILTERBY" {
+            return Ok(RespValue::error("ERR syntax error"));
+        }
+        i += 1;
+        if i >= args.len() {
+            return Ok(RespValue::error("ERR syntax error"));
+        }
+        let kind = match args[i].as_bulk_string() {
+            Some(b) => String::from_utf8_lossy(b).to_ascii_uppercase(),
+            None => return Ok(RespValue::error("ERR syntax error")),
+        };
+        i += 1;
+        match kind.as_str() {
+            "PATTERN" => {
+                if i >= args.len() {
+                    return Ok(RespValue::error("ERR syntax error"));
+                }
+                let pat = match args[i].as_bulk_string() {
+                    Some(b) => String::from_utf8_lossy(b).into_owned(),
+                    None => return Ok(RespValue::error("ERR syntax error")),
+                };
+                if i + 1 != args.len() {
+                    return Ok(RespValue::error("ERR syntax error"));
+                }
+                let names: Vec<RespValue> = COMMAND_SPECS
+                    .iter()
+                    .filter(|s| crate::hashmap::pattern_match(&pat, s.name))
+                    .map(|s| bulk(s.name))
+                    .collect();
+                Ok(RespValue::Array(names))
+            }
+            "MODULE" => {
+                // No loadable modules — empty list (ignore module name if present).
+                if i >= args.len() {
+                    return Ok(RespValue::error("ERR syntax error"));
+                }
+                if i + 1 != args.len() {
+                    return Ok(RespValue::error("ERR syntax error"));
+                }
+                Ok(RespValue::Array(vec![]))
+            }
+            "ACLCAT" => {
+                if i >= args.len() {
+                    return Ok(RespValue::error("ERR syntax error"));
+                }
+                let cat = match args[i].as_bulk_string() {
+                    Some(b) => String::from_utf8_lossy(b).to_ascii_lowercase(),
+                    None => return Ok(RespValue::error("ERR syntax error")),
+                };
+                if i + 1 != args.len() {
+                    return Ok(RespValue::error("ERR syntax error"));
+                }
+                // Approximate categories from command flags / name prefixes.
+                let names: Vec<RespValue> = COMMAND_SPECS
+                    .iter()
+                    .filter(|s| command_matches_aclcat(s, &cat))
+                    .map(|s| bulk(s.name))
+                    .collect();
+                Ok(RespValue::Array(names))
+            }
+            _ => Ok(RespValue::error("ERR syntax error")),
         }
     }
 
@@ -1080,6 +1152,67 @@ impl CommandHandler {
             spec.last_key,
             spec.step,
         ))
+    }
+}
+
+/// Approximate ACL category membership for COMMAND LIST FILTERBY ACLCAT.
+fn command_matches_aclcat(spec: &CmdSpec, cat: &str) -> bool {
+    // Normalize aliases Redis accepts.
+    let cat = match cat {
+        "read" => "read",
+        "write" => "write",
+        "admin" => "admin",
+        "pubsub" => "pubsub",
+        "scripting" => "scripting",
+        "fast" => "fast",
+        "slow" => "slow",
+        "dangerous" => "dangerous",
+        "connection" => "connection",
+        "transaction" => "transaction",
+        "keyspace" => "keyspace",
+        "string" | "hash" | "list" | "set" | "sortedset" | "sorted_set" | "stream"
+        | "bitmap" | "hyperloglog" | "geo" | "server" => cat,
+        _ => cat,
+    };
+    let flags = spec.flags;
+    let has = |f: &str| flags.iter().any(|x| *x == f);
+    match cat {
+        "read" | "readonly" => has("readonly"),
+        "write" => has("write"),
+        "admin" => has("admin"),
+        "pubsub" => has("pubsub") || matches!(spec.name, "publish" | "subscribe" | "unsubscribe" | "psubscribe" | "punsubscribe" | "pubsub" | "spublish" | "ssubscribe" | "sunsubscribe"),
+        "scripting" => {
+            has("scripting")
+                || spec.name.starts_with("eval")
+                || spec.name == "script"
+        }
+        "fast" => has("fast"),
+        "slow" => !has("fast"),
+        "dangerous" => {
+            has("admin")
+                || matches!(
+                    spec.name,
+                    "flushdb" | "flushall" | "keys" | "shutdown" | "config" | "replicaof" | "slaveof"
+                )
+        }
+        "connection" => matches!(
+            spec.name,
+            "auth" | "hello" | "ping" | "echo" | "quit" | "reset" | "select" | "client" | "command"
+        ),
+        "transaction" => matches!(spec.name, "multi" | "exec" | "discard" | "watch" | "unwatch"),
+        "keyspace" => matches!(
+            spec.name,
+            "del" | "unlink" | "exists" | "expire" | "pexpire" | "expireat" | "pexpireat"
+                | "ttl" | "pttl" | "persist" | "type" | "rename" | "renamenx" | "move"
+                | "copy" | "keys" | "scan" | "randomkey" | "touch" | "dump" | "restore"
+                | "object" | "memory" | "expiretime" | "pexpiretime"
+        ),
+        "string" | "hash" | "list" | "set" | "sortedset" | "sorted_set" | "stream"
+        | "bitmap" | "hyperloglog" | "geo" | "server" => {
+            let g = docs_group_for(spec);
+            g == cat || (cat == "sortedset" && g == "sorted_set") || (cat == "sorted_set" && g == "sorted_set")
+        }
+        _ => false,
     }
 }
 

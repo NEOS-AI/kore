@@ -974,92 +974,30 @@ impl CommandHandler {
 
         match subcmd.as_str() {
             "GET" => {
-                if args.len() != 2 {
-                    return Ok(RespValue::error("ERR wrong number of arguments for 'config get'"));
+                // CONFIG GET <pattern> [pattern ...] — glob match against known params.
+                if args.len() < 2 {
+                    return Ok(RespValue::error(
+                        "ERR wrong number of arguments for 'config get'",
+                    ));
                 }
-
-                let param = match args[1].as_bulk_string() {
-                    Some(s) => String::from_utf8_lossy(s).to_lowercase(),
-                    None => return Ok(RespValue::error("ERR invalid parameter")),
-                };
-
-                match param.as_str() {
-                    "maxentrysize" | "max-entry-size" => {
-                        let value = self.cache.get_max_entry_size();
-                        Ok(self.config_kv_reply(
-                            "maxentrysize",
-                            &value.to_string(),
-                        ))
+                let mut patterns = Vec::with_capacity(args.len() - 1);
+                for arg in &args[1..] {
+                    match arg.as_bulk_string() {
+                        Some(s) => patterns.push(String::from_utf8_lossy(s).to_lowercase()),
+                        None => return Ok(RespValue::error("ERR invalid parameter")),
                     }
-                    "maxmemory" | "max-memory" => {
-                        let value = self.cache.max_memory();
-                        Ok(self.config_kv_reply("maxmemory", &value.to_string()))
-                    }
-                    "save" => {
-                        let value = self
-                            .persistence
-                            .as_ref()
-                            .map(|p| p.save_rules_string())
-                            .unwrap_or_default();
-                        Ok(self.config_kv_reply("save", &value))
-                    }
-                    "maxmemory-policy" | "maxmemory_policy" => {
-                        let value = self.cache.eviction_policy().as_str();
-                        Ok(self.config_kv_reply("maxmemory-policy", value))
-                    }
-                    "lfu-log-factor" | "lfu_log_factor" => Ok(self.config_kv_reply(
-                        "lfu-log-factor",
-                        &self.cache.lfu_log_factor().to_string(),
-                    )),
-                    "lfu-decay-time" | "lfu_decay_time" => Ok(self.config_kv_reply(
-                        "lfu-decay-time",
-                        &self.cache.lfu_decay_time().to_string(),
-                    )),
-                    "slowlog-log-slower-than" | "slowlog_log_slower_than" => Ok(self
-                        .config_kv_reply(
-                            "slowlog-log-slower-than",
-                            &self.cache.slowlog.slower_than_us().to_string(),
-                        )),
-                    "slowlog-max-len" | "slowlog_max_len" => Ok(self.config_kv_reply(
-                        "slowlog-max-len",
-                        &self.cache.slowlog.max_len().to_string(),
-                    )),
-                    "databases" => Ok(self.config_kv_reply(
-                        "databases",
-                        &self.databases.len().to_string(),
-                    )),
-                    "min-replicas-to-write" | "min-slaves-to-write" => {
-                        let n = self
-                            .persistence
-                            .as_ref()
-                            .map(|p| p.replication.min_replicas_to_write())
-                            .unwrap_or(0);
-                        Ok(self.config_kv_reply(
-                            "min-replicas-to-write",
-                            &n.to_string(),
-                        ))
-                    }
-                    "min-replicas-max-lag" | "min-slaves-max-lag" => {
-                        let n = self
-                            .persistence
-                            .as_ref()
-                            .map(|p| p.replication.min_replicas_max_lag())
-                            .unwrap_or(10);
-                        Ok(self.config_kv_reply(
-                            "min-replicas-max-lag",
-                            &n.to_string(),
-                        ))
-                    }
-                    _ => {
-                        // Empty reply for unknown parameters (Redis behavior).
-                        // RESP3 uses an empty map.
-                        if self.protocol_version() >= 3 {
-                            Ok(RespValue::Map(vec![]))
-                        } else {
-                            Ok(RespValue::Array(vec![]))
+                }
+                let all = self.config_known_params();
+                let mut matched: Vec<(String, String)> = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                for pat in &patterns {
+                    for (k, v) in &all {
+                        if Self::config_param_matches(pat, k) && seen.insert(k.clone()) {
+                            matched.push((k.clone(), v.clone()));
                         }
                     }
                 }
+                Ok(self.config_kvs_reply(matched))
             }
             "SET" => {
                 if args.len() != 3 {
@@ -1255,7 +1193,7 @@ impl CommandHandler {
                     b"CONFIG <subcommand> [<arg> ...]. Subcommands are:",
                 ))),
                 RespValue::BulkString(Some(Bytes::from_static(
-                    b"GET <parameter> -- get the value of a configuration parameter",
+                    b"GET <pattern> [pattern ...] -- get config params (glob; * = all)",
                 ))),
                 RespValue::BulkString(Some(Bytes::from_static(
                     b"SET <parameter> <value> -- set a configuration parameter",
