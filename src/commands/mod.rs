@@ -316,6 +316,11 @@ impl CommandHandler {
             .as_ref()
             .map(|p| p.replication.min_replicas_max_lag())
             .unwrap_or(10);
+        let appendonly = self
+            .persistence
+            .as_ref()
+            .map(|p| p.appendonly())
+            .unwrap_or(self.config.appendonly);
         vec![
             (
                 "maxentrysize".into(),
@@ -356,6 +361,31 @@ impl CommandHandler {
                 "min-replicas-max-lag".into(),
                 min_lag.to_string(),
             ),
+            // Ops / networking / persistence paths (CONFIG GET read-only snapshot)
+            ("port".into(), self.config.port.to_string()),
+            ("bind".into(), self.config.host.clone()),
+            ("dir".into(), self.config.dir.clone()),
+            ("dbfilename".into(), self.config.dbfilename.clone()),
+            (
+                "appendonly".into(),
+                if appendonly { "yes".into() } else { "no".into() },
+            ),
+            (
+                "appendfilename".into(),
+                self.config.appendfilename.clone(),
+            ),
+            (
+                "unixsocket".into(),
+                self.config.unixsocket.clone(),
+            ),
+            (
+                "cluster-enabled".into(),
+                if self.config.cluster_enabled {
+                    "yes".into()
+                } else {
+                    "no".into()
+                },
+            ),
         ]
     }
 
@@ -386,6 +416,11 @@ fn config_param_aliases(canonical: &str) -> &'static [&'static str] {
         "acllog-max-len" => &["acllog_max_len", "acl-log-max-len"],
         "min-replicas-to-write" => &["min-slaves-to-write"],
         "min-replicas-max-lag" => &["min-slaves-max-lag"],
+        "bind" => &["host"],
+        "cluster-enabled" => &["cluster_enabled"],
+        "appendfilename" => &["append-filename"],
+        "dbfilename" => &["db-filename"],
+        "unixsocket" => &["unix-socket"],
         _ => &[],
     }
 }
@@ -918,6 +953,7 @@ impl CommandHandler {
             "FT._LIST" => self.handle_ft_list(&args[1..]),
             "FT.INFO" => self.handle_ft_info(&args[1..]),
             "FT.SEARCH" => self.handle_ft_search(&args[1..]),
+            "FT.TAGVALS" => self.handle_ft_tagvals(&args[1..]),
 
             // Shard Pub/Sub commands (Redis 7.0+)
             "SSUBSCRIBE" => self.handle_ssubscribe(&args[1..]).await,

@@ -204,6 +204,7 @@ impl CommandHandler {
             "STATS" => self.handle_memory_stats(&args[1..]),
             "DOCTOR" => self.handle_memory_doctor(&args[1..]),
             "PURGE" => self.handle_memory_purge(&args[1..]),
+            "MALLOC-STATS" | "MALLOC_STATS" => self.handle_memory_malloc_stats(&args[1..]),
             "HELP" => Ok(RespValue::Array(vec![
                 RespValue::BulkString(Some(Bytes::from_static(
                     b"MEMORY <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
@@ -219,6 +220,9 @@ impl CommandHandler {
                 ))),
                 RespValue::BulkString(Some(Bytes::from_static(
                     b"PURGE -- best-effort allocator trim (no-op if unsupported)",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"MALLOC-STATS -- allocator stats (structural estimates in Kore)",
                 ))),
                 RespValue::BulkString(Some(Bytes::from_static(
                     b"HELP -- print this help",
@@ -360,6 +364,55 @@ impl CommandHandler {
         }
         // No jemalloc control in Kore; acknowledge for client compatibility.
         Ok(RespValue::ok())
+    }
+
+    /// MEMORY MALLOC-STATS — Redis dumps jemalloc stats; Kore reports structural estimates.
+    fn handle_memory_malloc_stats(&self, args: &[RespValue]) -> Result<RespValue> {
+        if !args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'memory|malloc-stats' command",
+            ));
+        }
+        use crate::memory::MemoryCategory;
+        let used = self.cache.memory_usage();
+        let max = self.cache.max_memory();
+        let text = format!(
+            "___ Begin kore malloc stats ___\n\
+             Version: kore (structural estimates; not jemalloc)\n\
+             Allocated: {}\n\
+             Active: {}\n\
+             Resident: {}\n\
+             Mapped: {}\n\
+             Maxmemory: {}\n\
+             Keys: {}\n\
+             Categories:\n\
+               cache: {}\n\
+               hashes: {}\n\
+               lists: {}\n\
+               sets: {}\n\
+               sorted_sets: {}\n\
+               geo_sets: {}\n\
+               streams: {}\n\
+               pubsub: {}\n\
+               search: {}\n\
+             ___ End kore malloc stats ___\n",
+            used,
+            used,
+            used,
+            used,
+            max,
+            self.cache.dbsize(),
+            self.cache.category_memory(MemoryCategory::Cache),
+            self.cache.category_memory(MemoryCategory::Hashes),
+            self.cache.category_memory(MemoryCategory::Lists),
+            self.cache.category_memory(MemoryCategory::Sets),
+            self.cache.category_memory(MemoryCategory::SortedSets),
+            self.cache.category_memory(MemoryCategory::GeoSets),
+            self.cache.category_memory(MemoryCategory::Streams),
+            self.cache.category_memory(MemoryCategory::PubSub),
+            self.cache.category_memory(MemoryCategory::Search),
+        );
+        Ok(RespValue::BulkString(Some(Bytes::from(text))))
     }
 
     /// SLOWLOG GET [count] | LEN | RESET | HELP

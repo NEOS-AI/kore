@@ -14,7 +14,7 @@ const SCRIPT_CALL_ALLOWLIST: &[&str] = &[
     "PING", "ECHO", //
     "GET", "SET", "DEL", "EXISTS", "TYPE", "MGET", "MSET", "MSETNX", "APPEND", "STRLEN", "LCS",
     "GETRANGE", "SUBSTR", "SETRANGE", "SETEX", "PSETEX", "DUMP", "RESTORE",
-    "GETSET", "UNLINK", "RENAME", "RENAMENX", "SETNX", "GETDEL", "GETEX", //
+    "GETSET", "UNLINK", "RENAME", "RENAMENX", "SETNX", "GETDEL", "GETEX", "COPY", "MOVE", //
     "INCR", "DECR", "INCRBY", "DECRBY", "INCRBYFLOAT", //
     "TIME", //
     "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST", "TTL", "PTTL", "EXPIRETIME", "PEXPIRETIME", //
@@ -519,6 +519,8 @@ impl CommandHandler {
             "SETNX" => self.handle_setnx(args),
             "GETDEL" => self.handle_getdel(args),
             "GETEX" => self.handle_getex(args),
+            "COPY" => self.handle_copy(args),
+            "MOVE" => self.handle_move(args),
             "LCS" => self.handle_lcs(args),
             "OBJECT" => self.handle_object(args),
             "MEMORY" => self.handle_memory(args),

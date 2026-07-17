@@ -73,6 +73,27 @@ impl Cache {
         })
     }
 
+    /// Distinct tag values for a TAG field (`FT.TAGVALS index field`).
+    ///
+    /// Returns `Ok(None)` if the index is missing, `Err` if the field is not a TAG field.
+    pub fn get_tag_values(&self, index_name: &str, field: &str) -> Result<Option<Vec<String>>, String> {
+        let Some(index) = self.search_index_manager.get_index(index_name) else {
+            return Ok(None);
+        };
+        let guard = index.read();
+        let Some(field_def) = guard.definition.get_field(field) else {
+            return Err(format!("Unknown field '{}'", field));
+        };
+        if !matches!(field_def.field_type, crate::search_index::FieldType::Tag { .. }) {
+            return Err(format!("Field '{}' is not a TAG field", field));
+        }
+        let values = guard
+            .get_tag_index(field)
+            .map(|ti| ti.tag_values())
+            .unwrap_or_default();
+        Ok(Some(values))
+    }
+
     /// Account search memory for indexing `doc_id` with `fields` into an index
     /// that currently holds `old_fields` (if any). Returns Err on maxmemory.
     fn account_search_index_write(

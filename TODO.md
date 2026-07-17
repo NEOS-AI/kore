@@ -213,6 +213,7 @@ Also tracked in `docs/roadmap.md`.
   - *Batch BO*: `FUNCTION`/`FCALL` stubs; GETKEYS zset algebra; `CONFIG REWRITE`; FT.* catalog
   - *Batch BP*: `ACL LOG`; GEORADIUS GETKEYS STORE/STOREDIST; `SHUTDOWN`; `QUIT`/`CLIENT KILL ID` close
   - *Batch BQ*: `DEBUG` HELP/SLEEP/OBJECT; INFO Clients/CPU/Persistence; Lua GEO/stream allowlist
+  - *Batch BR*: `CONFIG GET` ops params (`port`/`bind`/`dir`/`dbfilename`/`appendonly`/…); `MEMORY MALLOC-STATS`; `FT.TAGVALS`; Lua `COPY`/`MOVE`; TAG/NUMERIC coerce on HSET auto-index
 - [x] **`[P1]`** `CLIENT`, `COMMAND`, `HELLO`
   - *Done*: HELLO (RESP2 + RESP3; AUTH/SETNAME); CLIENT ID/SETNAME/GETNAME/SETINFO/LIST/INFO; COMMAND / COUNT / LIST / INFO catalog
   - *Batch BE*: `CLIENT NO-EVICT` / `NO-TOUCH`
@@ -234,6 +235,7 @@ Also tracked in `docs/roadmap.md`.
   - *Batch BO*: `FUNCTION` HELP/LIST/STATS (empty); `FCALL`/`FCALL_RO` not-found; `CONFIG REWRITE` (no conf file)
   - *Batch BP*: `ACL LOG` GET/LEN/RESET + denial recording; `SHUTDOWN` [NOSAVE|SAVE]; connection close after `QUIT`/`SHUTDOWN`/`CLIENT KILL ID … SKIPME no`; `acllog-max-len` CONFIG
   - *Batch BQ*: `DEBUG` HELP/SLEEP/OBJECT; INFO `# Clients`/`# CPU`/`# Persistence`; `redis.call` GEO* + XADD/XLEN/XRANGE/XDEL/XTRIM/XACK + TOUCH/SCAN/RANDOMKEY
+  - *Batch BR*: `CONFIG GET` port/bind/dir/dbfilename/appendonly/appendfilename/unixsocket/cluster-enabled; `MEMORY MALLOC-STATS`; `FT.TAGVALS`; `redis.call` COPY/MOVE; schema coerce TAG/NUMERIC from HSET text
 
 ### Memory & expiration policy
 

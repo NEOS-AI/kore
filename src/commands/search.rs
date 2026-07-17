@@ -361,6 +361,38 @@ impl CommandHandler {
         }
     }
 
+    /// FT.TAGVALS index fieldName — distinct tag values for a TAG field.
+    pub fn handle_ft_tagvals(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'FT.TAGVALS' command",
+            ));
+        }
+        let index_name = match args[0].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_string(),
+            None => return Ok(RespValue::error("ERR invalid index name")),
+        };
+        let field_name = match args[1].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_string(),
+            None => return Ok(RespValue::error("ERR invalid field name")),
+        };
+
+        match self.cache.get_tag_values(&index_name, &field_name) {
+            Ok(Some(values)) => {
+                let arr = values
+                    .into_iter()
+                    .map(|v| RespValue::BulkString(Some(Bytes::from(v))))
+                    .collect();
+                Ok(RespValue::Array(arr))
+            }
+            Ok(None) => Ok(RespValue::error(format!(
+                "ERR Unknown index name '{}'",
+                index_name
+            ))),
+            Err(e) => Ok(RespValue::error(format!("ERR {}", e))),
+        }
+    }
+
     /// FT.SEARCH index query [options...]
     pub fn handle_ft_search(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.len() < 2 {

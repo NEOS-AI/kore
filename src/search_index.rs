@@ -236,6 +236,13 @@ impl TagIndex {
     pub fn search(&self, tag: &str) -> HashSet<Bytes> {
         self.tags.get(tag).cloned().unwrap_or_default()
     }
+
+    /// All distinct tag values currently indexed (for FT.TAGVALS).
+    pub fn tag_values(&self) -> Vec<String> {
+        let mut vals: Vec<String> = self.tags.keys().cloned().collect();
+        vals.sort();
+        vals
+    }
 }
 
 /// Complete search index
@@ -294,19 +301,35 @@ impl SearchIndex {
                         }
                     }
                     FieldType::Numeric { .. } => {
-                        if let DocumentField::Numeric(value) = field_value {
+                        let value = match field_value {
+                            DocumentField::Numeric(v) => Some(*v),
+                            // HSET stores raw strings; coerce for NUMERIC schema fields.
+                            DocumentField::Text(s) => s.parse::<f64>().ok(),
+                            _ => None,
+                        };
+                        if let Some(value) = value {
                             let index = self.numeric_indices
                                 .entry(field_def.name.clone())
                                 .or_insert_with(NumericIndex::new);
-                            index.add(doc_id.clone(), *value);
+                            index.add(doc_id.clone(), value);
                         }
                     }
                     FieldType::Tag { separator, .. } => {
-                        if let DocumentField::Tag(tags) = field_value {
+                        let tags = match field_value {
+                            DocumentField::Tag(tags) => tags.clone(),
+                            // HSET stores raw strings; split by TAG SEPARATOR.
+                            DocumentField::Text(text) => text
+                                .split(separator.as_str())
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        if !tags.is_empty() {
                             let index = self.tag_indices
                                 .entry(field_def.name.clone())
                                 .or_insert_with(TagIndex::new);
-                            index.add(doc_id.clone(), tags.clone());
+                            index.add(doc_id.clone(), tags);
                         }
                     }
                     FieldType::Vector { dimensions, .. } => {
