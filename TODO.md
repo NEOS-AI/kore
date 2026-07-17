@@ -358,9 +358,9 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch BT)*: `create_index` / `alias_add` / `alias_update` hold aliases then indices locks for full check-and-insert (matches `drop_index`)
 - [x] **`[P1]`** **Code review (BT):** emit `FT.CREATE` + `FT.ALIASADD` during AOF rewrite
   - *Done (Batch BU)*: rewrite order **FT.CREATE → key dumps (HSET…) → FT.ALIASADD**; `list_definitions` / `list_aliases` on SearchIndexManager; load applies `FT.CREATE`/`FT.ALIAS*`/`FT.DROPINDEX` and HSET auto-indexes (`tests/bu_aof_ft_rewrite_test.rs`)
-- [ ] **`[P1]`** **Code review (BU):** AOF load must not silently drop FT mutator failures
+- [x] **`[P1]`** **Code review (BU):** AOF load must not silently drop FT mutator failures
   - *Found*: `apply_command_to_cache` FT.CREATE / FT.ALIAS* / FT.DROPINDEX use `let _ = …` and always `Ok(())` — create/alias errors (OOM, name conflict, bad def) leave hashes restored but search empty with no load error
-  - *Fix*: propagate `create_search_index` / alias errors (or log + fail load count); add test that corrupt/conflict FT.CREATE surfaces
+  - *Done (Batch BV)*: propagate `create_search_index` / `drop_search_index` / `alias_*` as `Error::InvalidArgument`; non-truncated unparsable FT.CREATE → `ParseError` (truncated argv still skips like other AOF paths); `tests/bv_aof_ft_load_errors_test.rs`
 - [ ] **`[P2]`** Persist FT indices + aliases in RDB (AOF rewrite done in BU; RDB FT section still open)
 - [ ] **`[P2]`** ACL `@search` category for FT.* (fine-grained users; default `+@all` unaffected)
 - [ ] **`[P2]`** HNSW correctness/performance benchmarks vs FLAT
@@ -411,7 +411,7 @@ Prioritized for next letter batch(es). BT P1 AOF rewrite closed in BU; BU review
 | P1 | Alias target resolve + real-name storage | done (BT) |
 | P1 | Atomic create/alias namespace critical section | done (BT) |
 | P1 | AOF rewrite emits `FT.CREATE` + aliases (BT review) | done (BU) |
-| P1 | AOF load surfaces FT.CREATE / alias failures (BU review) | open |
+| P1 | AOF load surfaces FT.CREATE / alias failures (BU review) | done (BV) |
 | P2 | FT RDB section | open |
 | P2 | ACL `@search` | open |
 | P2 | Shared FT.CREATE parser (cmd + AOF load) | open |

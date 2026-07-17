@@ -436,7 +436,11 @@ where
 }
 
 /// Parse `FT.CREATE` argv (command name at [0]) into an IndexDefinition.
-/// Best-effort: returns None on incomplete / invalid input (AOF load skips).
+///
+/// Returns `None` on incomplete / invalid input. Callers in AOF load treat
+/// truncated argv (`len < 4`) as a liberal skip (like other apply paths) and
+/// non-truncated parse failures as load errors so rewrite-produced commands
+/// never disappear silently.
 fn parse_ft_create_definition(argv: &[Bytes]) -> Option<IndexDefinition> {
     if argv.len() < 4 {
         return None;
@@ -868,15 +872,29 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             Ok(())
         }
         "FT.CREATE" => {
-            if let Some(def) = parse_ft_create_definition(argv) {
-                let _ = cache.create_search_index(def);
+            // Truncated argv: match other AOF apply paths (skip liberally).
+            // Parsed but mutator fails, or non-truncated unparsable schema: fail load.
+            if argv.len() < 4 {
+                return Ok(());
+            }
+            match parse_ft_create_definition(argv) {
+                Some(def) => cache
+                    .create_search_index(def)
+                    .map_err(Error::InvalidArgument)?,
+                None => {
+                    return Err(Error::ParseError(
+                        "invalid or incomplete FT.CREATE in AOF".into(),
+                    ));
+                }
             }
             Ok(())
         }
         "FT.DROPINDEX" => {
             if argv.len() >= 2 {
                 let name = String::from_utf8_lossy(&argv[1]);
-                let _ = cache.drop_search_index(&name);
+                cache
+                    .drop_search_index(&name)
+                    .map_err(Error::InvalidArgument)?;
             }
             Ok(())
         }
@@ -884,14 +902,16 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             if argv.len() >= 3 {
                 let alias = String::from_utf8_lossy(&argv[1]);
                 let index = String::from_utf8_lossy(&argv[2]);
-                let _ = cache.alias_add(&alias, &index);
+                cache
+                    .alias_add(&alias, &index)
+                    .map_err(Error::InvalidArgument)?;
             }
             Ok(())
         }
         "FT.ALIASDEL" => {
             if argv.len() >= 2 {
                 let alias = String::from_utf8_lossy(&argv[1]);
-                let _ = cache.alias_del(&alias);
+                cache.alias_del(&alias).map_err(Error::InvalidArgument)?;
             }
             Ok(())
         }
@@ -899,7 +919,9 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             if argv.len() >= 3 {
                 let alias = String::from_utf8_lossy(&argv[1]);
                 let index = String::from_utf8_lossy(&argv[2]);
-                let _ = cache.alias_update(&alias, &index);
+                cache
+                    .alias_update(&alias, &index)
+                    .map_err(Error::InvalidArgument)?;
             }
             Ok(())
         }
