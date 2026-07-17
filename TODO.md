@@ -209,6 +209,7 @@ Also tracked in `docs/roadmap.md`.
   - *Batch BK*: `CLIENT TRACKING`/`CACHING`; `XSETID` `ENTRIESADDED`/`MAXDELETEDID`; stream counters in `XINFO`
   - *Batch BL*: `XADD`/`XTRIM` `LIMIT`; `SCRIPT HELP`; `CONFIG HELP`
   - *Batch BM*: `CONFIG GET` glob + multi-pattern; `COMMAND LIST FILTERBY`; `PUBSUB HELP` / `XGROUP HELP`
+  - *Batch BN*: `COMMAND GETKEYS` movablekeys; `CLUSTER HELP`; `ACL DRYRUN`
 - [x] **`[P1]`** `CLIENT`, `COMMAND`, `HELLO`
   - *Done*: HELLO (RESP2 + RESP3; AUTH/SETNAME); CLIENT ID/SETNAME/GETNAME/SETINFO/LIST/INFO; COMMAND / COUNT / LIST / INFO catalog
   - *Batch BE*: `CLIENT NO-EVICT` / `NO-TOUCH`
@@ -217,6 +218,7 @@ Also tracked in `docs/roadmap.md`.
   - *Batch BJ*: `COMMAND HELP` / `CLIENT HELP`
   - *Batch BK*: `CLIENT TRACKING ON|OFF` (+ REDIRECT/PREFIX/BCAST/OPTIN/OPTOUT/NOLOOP); `CLIENT CACHING`; GETREDIR/TRACKINGINFO live
   - *Batch BM*: `COMMAND LIST FILTERBY` `PATTERN`|`MODULE`|`ACLCAT`
+  - *Batch BN*: `COMMAND GETKEYS` for LMPOP/ZMPOP/SINTERCARD/XREAD/XREADGROUP/MEMORY USAGE
 - [x] **`[P1]`** Multi-DB: `SELECT` (or explicitly document single-DB only)
   - *Done*: `--databases` (default 16); per-connection `SELECT`; key isolation; `FLUSHDB` vs `FLUSHALL`; shared pub/sub+stats; **RDB v3 multi-DB + AOF SELECT** on save/rewrite/load/startup
   - *Batch AZ*: `SWAPDB` (content swap all types + TTL via dump/restore)
@@ -293,6 +295,7 @@ Also tracked in `docs/roadmap.md`.
   - *Batch BC*: `SORT`; `LOLWUT`; `READONLY`/`READWRITE`
   - *Batch BD*: `ZADD` options; `SCAN TYPE`; flush ASYNC|SYNC; shard pub/sub catalog
   - *Batch BE*: modern `ZRANGE`; `CLIENT NO-EVICT`/`NO-TOUCH`
+  - *Batch BN*: `ACL DRYRUN`; `CLUSTER HELP`
 - [x] **`[P1]`** TLS
   - *Done (MVP)*: `--tls` / `--tls-cert` / `--tls-key`; tokio-rustls server wrap on accept; fail-fast cert/key load; plaintext path unchanged; no mTLS / dual listener / replica link TLS
 - [x] **`[P2]`** Unix domain socket option

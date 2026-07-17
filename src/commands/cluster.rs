@@ -26,14 +26,8 @@ impl CommandHandler {
     }
 
     /// CLUSTER subcommands: KEYSLOT, MYID, INFO, NODES, SLOTS, SETSLOT,
-    /// MIGRATEKEYS, MEET, MEETPEER, REPLICATE.
+    /// MIGRATEKEYS, MEET, MEETPEER, REPLICATE, HELP.
     pub(super) async fn handle_cluster(&self, args: &[RespValue]) -> Result<RespValue> {
-        let Some(cluster) = self.cluster.as_ref() else {
-            return Ok(RespValue::error(
-                "ERR This instance has cluster support disabled",
-            ));
-        };
-
         if args.is_empty() {
             return Ok(RespValue::error(
                 "ERR wrong number of arguments for 'cluster' command",
@@ -43,6 +37,17 @@ impl CommandHandler {
         let sub = match args[0].as_bulk_string() {
             Some(s) => String::from_utf8_lossy(s).to_uppercase(),
             None => return Ok(RespValue::error("ERR unknown subcommand")),
+        };
+
+        // HELP is available even when cluster support is disabled.
+        if sub == "HELP" {
+            return Ok(cluster_help());
+        }
+
+        let Some(cluster) = self.cluster.as_ref() else {
+            return Ok(RespValue::error(
+                "ERR This instance has cluster support disabled",
+            ));
         };
 
         match sub.as_str() {
@@ -336,6 +341,26 @@ impl CommandHandler {
 
 fn bulk(s: impl Into<Bytes>) -> RespValue {
     RespValue::BulkString(Some(s.into()))
+}
+
+fn bulk_static(s: &'static [u8]) -> RespValue {
+    RespValue::BulkString(Some(Bytes::from_static(s)))
+}
+
+fn cluster_help() -> RespValue {
+    RespValue::Array(vec![
+        bulk_static(b"CLUSTER <subcommand> [<arg> ...]. Subcommands are:"),
+        bulk_static(b"KEYSLOT <key> -- return the hash slot for key"),
+        bulk_static(b"MYID -- return this node's cluster id"),
+        bulk_static(b"INFO -- cluster state summary"),
+        bulk_static(b"NODES -- node list in CLUSTER NODES format"),
+        bulk_static(b"SLOTS -- slot ranges owned by nodes"),
+        bulk_static(b"SETSLOT <slot> MIGRATING|IMPORTING|STABLE|NODE [node-id]"),
+        bulk_static(b"MIGRATEKEYS <slot> <ip> <port> -- move keys in slot to dest"),
+        bulk_static(b"MEET <ip> <port> -- introduce peer into the cluster"),
+        bulk_static(b"REPLICATE <node-id> -- become replica of node"),
+        bulk_static(b"HELP -- print this help"),
+    ])
 }
 
 fn cluster_slots_reply(cluster: &ClusterState) -> RespValue {

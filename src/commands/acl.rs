@@ -33,12 +33,83 @@ impl CommandHandler {
             "LOAD" => self.acl_load(&args[1..]),
             "SAVE" => self.acl_save(&args[1..]),
             "GENPASS" => self.acl_genpass(&args[1..]),
+            "DRYRUN" => self.acl_dryrun(&args[1..]),
             "HELP" => Ok(acl_help()),
             _ => Ok(RespValue::error(format!(
                 "ERR Unknown subcommand or wrong number of arguments for '{}'. Try ACL HELP.",
                 sub
             ))),
         }
+    }
+
+    /// ACL DRYRUN <username> <command> [arg ...]
+    /// Simulate whether `username` may run the given command (command + keys + channels).
+    fn acl_dryrun(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() < 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'acl|dryrun' command",
+            ));
+        }
+        let username = match args[0].as_bulk_string() {
+            Some(u) => String::from_utf8_lossy(u).into_owned(),
+            None => return Ok(RespValue::error("ERR invalid username")),
+        };
+        if self.acl.get_user(&username).is_none() {
+            return Ok(RespValue::error(format!(
+                "ERR User '{}' not found",
+                username
+            )));
+        }
+        let cmd = match args[1].as_bulk_string() {
+            Some(c) => String::from_utf8_lossy(c).to_ascii_lowercase(),
+            None => return Ok(RespValue::error("ERR invalid command name")),
+        };
+        let cmd_args = &args[2..];
+
+        if !self.acl.can_execute(&username, &cmd) {
+            return Ok(RespValue::error(format!(
+                "NOPERM this user has no permissions to run the '{}' command",
+                cmd
+            )));
+        }
+
+        // Key checks via COMMAND GETKEYS extraction.
+        let mut getkeys_args = Vec::with_capacity(2 + cmd_args.len());
+        getkeys_args.push(bulk("GETKEYS"));
+        getkeys_args.push(bulk(cmd.clone()));
+        getkeys_args.extend_from_slice(cmd_args);
+        match self.handle_command(&getkeys_args) {
+            Ok(RespValue::Array(keys)) => {
+                for k in keys {
+                    if let Some(kb) = k.as_bulk_string() {
+                        let key = String::from_utf8_lossy(kb);
+                        if !self.acl.can_access_key(&username, &key) {
+                            return Ok(RespValue::error(
+                                "NOPERM this user has no permissions to access one of the keys used as arguments",
+                            ));
+                        }
+                    }
+                }
+            }
+            Ok(RespValue::Error(_)) => {
+                // Unknown/invalid for GETKEYS — command-level check already passed.
+            }
+            _ => {}
+        }
+
+        // Channel checks for pub/sub.
+        let cmd_upper = cmd.to_ascii_uppercase();
+        if let Some(channels) = dryrun_pubsub_channels(&cmd_upper, cmd_args) {
+            for ch in channels {
+                if !self.acl.can_access_channel(&username, &ch) {
+                    return Ok(RespValue::error(
+                        "NOPERM this user has no permissions to access one of the channels used as arguments",
+                    ));
+                }
+            }
+        }
+
+        Ok(RespValue::ok())
     }
 
     /// ACL GENPASS [bits] — random hex password (default 256 bits; bits rounded up to multiple of 4).
@@ -316,6 +387,8 @@ fn acl_help() -> RespValue {
             "    Create or modify a user.",
             "GENPASS [<bits>]",
             "    Generate a secure random password (default 256 bits).",
+            "DRYRUN <username> <command> [arg ...]",
+            "    Simulate whether a user can run a command.",
             "USERS",
             "    List all usernames.",
             "WHOAMI",
@@ -327,4 +400,27 @@ fn acl_help() -> RespValue {
         .map(|s| bulk(*s))
         .collect(),
     )
+}
+
+/// Channel names for ACL DRYRUN pub/sub checks (mirrors dispatch ACL path).
+fn dryrun_pubsub_channels(cmd_upper: &str, args: &[RespValue]) -> Option<Vec<String>> {
+    let channels: Vec<String> = match cmd_upper {
+        "SUBSCRIBE" | "UNSUBSCRIBE" | "SSUBSCRIBE" | "SUNSUBSCRIBE" | "SPUBLISH"
+        | "PSUBSCRIBE" | "PUNSUBSCRIBE" => args
+            .iter()
+            .filter_map(|a| {
+                a.as_bulk_string()
+                    .map(|b| String::from_utf8_lossy(b).into_owned())
+            })
+            .collect(),
+        "PUBLISH" => {
+            if let Some(b) = args.first().and_then(|a| a.as_bulk_string()) {
+                vec![String::from_utf8_lossy(b).into_owned()]
+            } else {
+                Vec::new()
+            }
+        }
+        _ => return None,
+    };
+    Some(channels)
 }

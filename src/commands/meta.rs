@@ -1140,6 +1140,17 @@ impl CommandHandler {
             return Ok(extract_sort_keys_for_getkeys(cmd_args));
         }
 
+        // Movablekeys / special layouts (first_key=0 in catalog).
+        match cmd_name.as_str() {
+            "lmpop" | "zmpop" => return Ok(extract_numkeys_keys_for_getkeys(cmd_args, 0)),
+            "blmpop" | "bzmpop" => return Ok(extract_numkeys_keys_for_getkeys(cmd_args, 1)),
+            "sintercard" => return Ok(extract_numkeys_keys_for_getkeys(cmd_args, 0)),
+            "xread" => return Ok(extract_xread_keys_for_getkeys(cmd_args, false)),
+            "xreadgroup" => return Ok(extract_xread_keys_for_getkeys(cmd_args, true)),
+            "memory" => return Ok(extract_memory_keys_for_getkeys(cmd_args)),
+            _ => {}
+        }
+
         let Some(spec) = find_spec(&cmd_name) else {
             return Err("ERR Invalid command specified".into());
         };
@@ -1456,6 +1467,96 @@ fn extract_eval_keys_for_getkeys(args: &[RespValue]) -> Vec<Bytes> {
     key_slice[..numkeys]
         .iter()
         .filter_map(|k| k.as_bulk_string().cloned())
+        .collect()
+}
+
+/// Keys after a `numkeys` integer at `numkeys_idx` (LMPOP/ZMPOP/SINTERCARD/BLMPOP…).
+fn extract_numkeys_keys_for_getkeys(args: &[RespValue], numkeys_idx: usize) -> Vec<Bytes> {
+    let Some(nk_arg) = args.get(numkeys_idx) else {
+        return Vec::new();
+    };
+    let n = match nk_arg {
+        RespValue::Integer(i) if *i > 0 => *i as usize,
+        RespValue::BulkString(Some(b)) => {
+            match std::str::from_utf8(b)
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+            {
+                Some(i) if i > 0 => i as usize,
+                _ => return Vec::new(),
+            }
+        }
+        _ => return Vec::new(),
+    };
+    let start = numkeys_idx + 1;
+    let end = (start + n).min(args.len());
+    args[start..end]
+        .iter()
+        .filter_map(|a| a.as_bulk_string().cloned())
+        .collect()
+}
+
+/// XREAD [COUNT c] [BLOCK ms] STREAMS key… id…
+/// XREADGROUP GROUP g c [COUNT c] [BLOCK ms] [NOACK] STREAMS key… id…
+fn extract_xread_keys_for_getkeys(args: &[RespValue], group: bool) -> Vec<Bytes> {
+    let mut i = 0;
+    if group {
+        // Require GROUP group consumer at the start (skip if malformed).
+        if args.len() < 3 {
+            return Vec::new();
+        }
+        let gword = args[0]
+            .as_bulk_string()
+            .map(|b| String::from_utf8_lossy(b).to_ascii_uppercase())
+            .unwrap_or_default();
+        if gword != "GROUP" {
+            return Vec::new();
+        }
+        i = 3;
+    }
+    while i < args.len() {
+        let tok = match args[i].as_bulk_string() {
+            Some(b) => String::from_utf8_lossy(b).to_ascii_uppercase(),
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        match tok.as_str() {
+            "COUNT" | "BLOCK" => i += 2,
+            "NOACK" => i += 1,
+            "STREAMS" => {
+                i += 1;
+                let rest = args.len().saturating_sub(i);
+                // Half keys, half ids.
+                let nkeys = rest / 2;
+                return args[i..i + nkeys]
+                    .iter()
+                    .filter_map(|a| a.as_bulk_string().cloned())
+                    .collect();
+            }
+            _ => i += 1,
+        }
+    }
+    Vec::new()
+}
+
+/// MEMORY USAGE key [SAMPLES n] — key is the arg after USAGE.
+fn extract_memory_keys_for_getkeys(args: &[RespValue]) -> Vec<Bytes> {
+    if args.is_empty() {
+        return Vec::new();
+    }
+    let sub = match args[0].as_bulk_string() {
+        Some(b) => String::from_utf8_lossy(b).to_ascii_uppercase(),
+        None => return Vec::new(),
+    };
+    if sub != "USAGE" || args.len() < 2 {
+        return Vec::new();
+    }
+    args[1]
+        .as_bulk_string()
+        .cloned()
+        .into_iter()
         .collect()
 }
 
