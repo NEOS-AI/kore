@@ -788,7 +788,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             if let Some(stream) = cache.get_stream(&argv[1]) {
                 let mut s = stream
                     .write();
-                let _ = s.xsetid(id);
+                let _ = s.xsetid(id, None, None);
             }
             Ok(())
         }

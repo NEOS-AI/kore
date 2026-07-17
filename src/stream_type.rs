@@ -106,6 +106,8 @@ impl StreamEntry {
 pub struct XInfoStream {
     pub length: usize,
     pub last_generated_id: StreamId,
+    pub entries_added: u64,
+    pub max_deleted_entry_id: StreamId,
     pub groups: usize,
     pub first_entry: Option<StreamEntry>,
     pub last_entry: Option<StreamEntry>,
@@ -220,6 +222,10 @@ pub struct RedisStream {
     entries: BTreeMap<StreamId, StreamEntry>,
     /// Highest ID ever assigned (for auto-ID generation).
     last_generated_id: StreamId,
+    /// Logical entries-added counter (XADD increments; XSETID ENTRIESADDED can set).
+    entries_added: u64,
+    /// Highest ID deleted via XDEL/trim (XSETID MAXDELETEDID can set).
+    max_deleted_entry_id: StreamId,
     /// Consumer groups by name.
     groups: HashMap<Bytes, ConsumerGroup>,
 }
@@ -229,6 +235,8 @@ impl RedisStream {
         Self {
             entries: BTreeMap::new(),
             last_generated_id: StreamId::ZERO,
+            entries_added: 0,
+            max_deleted_entry_id: StreamId::ZERO,
             groups: HashMap::new(),
         }
     }
@@ -336,6 +344,7 @@ impl RedisStream {
         };
         self.entries.insert(id, entry);
         self.last_generated_id = id;
+        self.entries_added = self.entries_added.saturating_add(1);
         Ok(id)
     }
 
@@ -368,7 +377,11 @@ impl RedisStream {
 
     /// Drop entry `id` from the stream and consumer-group PELs.
     fn remove_entry_and_pel(&mut self, id: StreamId) {
-        self.entries.remove(&id);
+        if self.entries.remove(&id).is_some() {
+            if id > self.max_deleted_entry_id {
+                self.max_deleted_entry_id = id;
+            }
+        }
         for g in self.groups.values_mut() {
             if g.pending.remove(&id).is_some() {
                 for c in g.consumers.values_mut() {
@@ -458,6 +471,9 @@ impl RedisStream {
         for id in ids {
             if self.entries.remove(id).is_some() {
                 n += 1;
+                if *id > self.max_deleted_entry_id {
+                    self.max_deleted_entry_id = *id;
+                }
                 for g in self.groups.values_mut() {
                     if let Some(pe) = g.pending.remove(id) {
                         if let Some(c) = g.consumers.get_mut(&pe.consumer) {
@@ -583,7 +599,13 @@ impl RedisStream {
     }
 
     /// XSETID — set stream last_generated_id (must be ≥ max entry id).
-    pub fn xsetid(&mut self, id: StreamId) -> Result<(), String> {
+    /// Optional ENTRIESADDED / MAXDELETEDID update logical counters.
+    pub fn xsetid(
+        &mut self,
+        id: StreamId,
+        entries_added: Option<u64>,
+        max_deleted_entry_id: Option<StreamId>,
+    ) -> Result<(), String> {
         if let Some(max_id) = self.entries.keys().next_back().copied() {
             if id < max_id {
                 return Err(
@@ -592,6 +614,12 @@ impl RedisStream {
             }
         }
         self.last_generated_id = id;
+        if let Some(n) = entries_added {
+            self.entries_added = n;
+        }
+        if let Some(mid) = max_deleted_entry_id {
+            self.max_deleted_entry_id = mid;
+        }
         Ok(())
     }
 
@@ -846,6 +874,8 @@ impl RedisStream {
         XInfoStream {
             length: self.entries.len(),
             last_generated_id: self.last_generated_id,
+            entries_added: self.entries_added,
+            max_deleted_entry_id: self.max_deleted_entry_id,
             groups: self.groups.len(),
             first_entry: first,
             last_entry: last,
@@ -1223,6 +1253,9 @@ impl RedisStream {
                 self.last_generated_id = max_id;
             }
         }
+        // RDB/AOF snapshots do not yet persist these counters; approximate from length.
+        self.entries_added = self.entries.len() as u64;
+        self.max_deleted_entry_id = StreamId::ZERO;
         for g in state.groups {
             let mut group = ConsumerGroup::new(g.name.clone(), g.last_delivered_id);
             for c in g.consumers {

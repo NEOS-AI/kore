@@ -98,6 +98,22 @@ pub struct CommandHandler {
     client_no_evict: bool,
     /// CLIENT NO-TOUCH ON — reads do not update LRU/LFU idle times.
     client_no_touch: bool,
+    /// CLIENT TRACKING ON — client-side caching enabled (no invalidation push yet).
+    client_tracking: bool,
+    /// CLIENT TRACKING REDIRECT target client id (-1 = none).
+    client_tracking_redirect: i64,
+    /// CLIENT TRACKING PREFIX list.
+    client_tracking_prefixes: Vec<Bytes>,
+    /// CLIENT TRACKING BCAST mode.
+    client_tracking_bcast: bool,
+    /// CLIENT TRACKING OPTIN mode.
+    client_tracking_optin: bool,
+    /// CLIENT TRACKING OPTOUT mode.
+    client_tracking_optout: bool,
+    /// CLIENT TRACKING NOLOOP mode.
+    client_tracking_noloop: bool,
+    /// CLIENT CACHING YES|NO (opt-in/opt-out next-command flag).
+    client_caching: Option<bool>,
 }
 
 impl CommandHandler {
@@ -175,6 +191,14 @@ impl CommandHandler {
             cluster_readonly: false,
             client_no_evict: false,
             client_no_touch: false,
+            client_tracking: false,
+            client_tracking_redirect: -1,
+            client_tracking_prefixes: Vec::new(),
+            client_tracking_bcast: false,
+            client_tracking_optin: false,
+            client_tracking_optout: false,
+            client_tracking_noloop: false,
+            client_caching: None,
         }
     }
 
@@ -499,6 +523,14 @@ impl CommandHandler {
                 self.cluster_readonly = false;
                 self.client_no_evict = false;
                 self.client_no_touch = false;
+                self.client_tracking = false;
+                self.client_tracking_redirect = -1;
+                self.client_tracking_prefixes.clear();
+                self.client_tracking_bcast = false;
+                self.client_tracking_optin = false;
+                self.client_tracking_optout = false;
+                self.client_tracking_noloop = false;
+                self.client_caching = None;
                 if let Some(id) = self.client_id {
                     self.cache.pubsub.set_client_protocol(id, 2).await;
                 }

@@ -1910,9 +1910,9 @@ impl CommandHandler {
         }
     }
 
-    /// XSETID key last-id
+    /// XSETID key last-id [ENTRIESADDED n] [MAXDELETEDID id]
     pub(super) fn handle_xsetid(&self, args: &[RespValue]) -> Result<RespValue> {
-        if args.len() != 2 {
+        if args.len() < 2 {
             return Ok(RespValue::error(
                 "ERR wrong number of arguments for 'xsetid' command",
             ));
@@ -1933,6 +1933,54 @@ impl CommandHandler {
                 ));
             }
         };
+        let mut entries_added: Option<u64> = None;
+        let mut max_deleted: Option<StreamId> = None;
+        let mut i = 2;
+        while i < args.len() {
+            let opt = match args[i].as_bulk_string() {
+                Some(b) => String::from_utf8_lossy(b).to_ascii_uppercase(),
+                None => return Ok(RespValue::error("ERR syntax error")),
+            };
+            match opt.as_str() {
+                "ENTRIESADDED" => {
+                    if i + 1 >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    let n = match self.parse_integer(&args[i + 1]) {
+                        Ok(v) if v >= 0 => v as u64,
+                        _ => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ));
+                        }
+                    };
+                    entries_added = Some(n);
+                    i += 2;
+                }
+                "MAXDELETEDID" => {
+                    if i + 1 >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    let mid_s = match args[i + 1].as_bulk_string() {
+                        Some(b) => String::from_utf8_lossy(b).into_owned(),
+                        None => return Ok(RespValue::error("ERR invalid stream ID")),
+                    };
+                    let mid = match StreamId::parse_explicit(&mid_s)
+                        .or_else(|| StreamId::parse(&mid_s))
+                    {
+                        Some(id) => id,
+                        None => {
+                            return Ok(RespValue::error(
+                                "ERR Invalid stream ID specified as stream command argument",
+                            ));
+                        }
+                    };
+                    max_deleted = Some(mid);
+                    i += 2;
+                }
+                _ => return Ok(RespValue::error("ERR syntax error")),
+            }
+        }
         match self.cache.key_type(&key) {
             KeyType::None => Ok(RespValue::error("ERR no such key")),
             KeyType::Stream => {
@@ -1941,7 +1989,7 @@ impl CommandHandler {
                     None => return Ok(RespValue::error("ERR no such key")),
                 };
                 let mut s = stream.write();
-                match s.xsetid(id) {
+                match s.xsetid(id, entries_added, max_deleted) {
                     Ok(()) => Ok(RespValue::ok()),
                     Err(e) => Ok(RespValue::error(e)),
                 }
@@ -2033,9 +2081,9 @@ impl CommandHandler {
                             bulk_static(b"last-generated-id"),
                             RespValue::BulkString(Some(info.last_generated_id.to_bytes())),
                             bulk_static(b"max-deleted-entry-id"),
-                            RespValue::BulkString(Some(Bytes::from_static(b"0-0"))),
+                            RespValue::BulkString(Some(info.max_deleted_entry_id.to_bytes())),
                             bulk_static(b"entries-added"),
-                            RespValue::Integer(info.length as i64),
+                            RespValue::Integer(info.entries_added as i64),
                         ];
                         if full {
                             let entries = s.xinfo_stream_entries(full_count);

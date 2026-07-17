@@ -567,6 +567,8 @@ impl CommandHandler {
             "NO-TOUCH" => self.client_no_touch_cmd(&args[1..]),
             "GETREDIR" => self.client_getredir(&args[1..]),
             "TRACKINGINFO" => self.client_trackinginfo(&args[1..]),
+            "TRACKING" => self.client_tracking_cmd(&args[1..]),
+            "CACHING" => self.client_caching_cmd(&args[1..]),
             "HELP" => Ok(RespValue::Array(vec![
                 RespValue::BulkString(Some(Bytes::from_static(
                     b"CLIENT <subcommand> [<arg> ...]. Subcommands are:",
@@ -590,15 +592,22 @@ impl CommandHandler {
                     b"NO-EVICT ON|OFF / NO-TOUCH ON|OFF -- client flags",
                 ))),
                 RespValue::BulkString(Some(Bytes::from_static(
+                    b"TRACKING ON|OFF [REDIRECT id] [PREFIX p] [BCAST|OPTIN|OPTOUT|NOLOOP]",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"CACHING YES|NO -- opt-in/opt-out caching for next command",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
                     b"GETREDIR / TRACKINGINFO -- client-side caching status",
                 ))),
                 RespValue::BulkString(Some(Bytes::from_static(
                     b"HELP -- print this help",
                 ))),
             ])),
-            "KILL" | "PAUSE" | "UNPAUSE" | "TRACKING" | "CACHING" => Ok(RespValue::error(
-                format!("ERR CLIENT {} is not supported yet", sub),
-            )),
+            "KILL" | "PAUSE" | "UNPAUSE" => Ok(RespValue::error(format!(
+                "ERR CLIENT {} is not supported yet",
+                sub
+            ))),
             _ => Ok(RespValue::error(format!(
                 "ERR unknown subcommand '{}'. Try CLIENT HELP.",
                 sub
@@ -606,33 +615,214 @@ impl CommandHandler {
         }
     }
 
-    /// CLIENT GETREDIR — client-side caching redirect target, or -1 when tracking is off.
+    /// CLIENT GETREDIR — redirect target client id, or -1 when tracking is off / no redirect.
     fn client_getredir(&self, args: &[RespValue]) -> Result<RespValue> {
         if !args.is_empty() {
             return Ok(RespValue::error(
                 "ERR wrong number of arguments for 'client|getredir' command",
             ));
         }
-        // Client tracking not implemented → always -1 (Redis: no redirect).
-        Ok(RespValue::Integer(-1))
+        if !self.client_tracking {
+            return Ok(RespValue::Integer(-1));
+        }
+        Ok(RespValue::Integer(self.client_tracking_redirect))
     }
 
-    /// CLIENT TRACKINGINFO — report tracking state (off until TRACKING is implemented).
+    /// CLIENT TRACKINGINFO — report tracking flags / redirect / prefixes.
     fn client_trackinginfo(&self, args: &[RespValue]) -> Result<RespValue> {
         if !args.is_empty() {
             return Ok(RespValue::error(
                 "ERR wrong number of arguments for 'client|trackinginfo' command",
             ));
         }
-        // Redis returns a map/array of field-value pairs.
+        let mut flags: Vec<RespValue> = Vec::new();
+        if self.client_tracking {
+            flags.push(bulk("on"));
+            if self.client_tracking_bcast {
+                flags.push(bulk("bcast"));
+            }
+            if self.client_tracking_optin {
+                flags.push(bulk("optin"));
+            }
+            if self.client_tracking_optout {
+                flags.push(bulk("optout"));
+            }
+            if self.client_tracking_noloop {
+                flags.push(bulk("noloop"));
+            }
+            if self.client_caching == Some(true) {
+                flags.push(bulk("caching-yes"));
+            } else if self.client_caching == Some(false) {
+                flags.push(bulk("caching-no"));
+            }
+        } else {
+            flags.push(bulk("off"));
+        }
+        let prefixes: Vec<RespValue> = self
+            .client_tracking_prefixes
+            .iter()
+            .map(|p| RespValue::BulkString(Some(p.clone())))
+            .collect();
+        let redirect = if self.client_tracking {
+            self.client_tracking_redirect
+        } else {
+            -1
+        };
         Ok(RespValue::Array(vec![
             bulk("flags"),
-            RespValue::Array(vec![bulk("off")]),
+            RespValue::Array(flags),
             bulk("redirect"),
-            RespValue::Integer(-1),
+            RespValue::Integer(redirect),
             bulk("prefixes"),
-            RespValue::Array(vec![]),
+            RespValue::Array(prefixes),
         ]))
+    }
+
+    /// CLIENT TRACKING ON|OFF [REDIRECT id] [PREFIX p]… [BCAST] [OPTIN] [OPTOUT] [NOLOOP]
+    ///
+    /// Stores tracking state for GETREDIR/TRACKINGINFO. Does not yet emit invalidation
+    /// pushes (no BCAST fan-out / key-touch notifications).
+    fn client_tracking_cmd(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'client|tracking' command",
+            ));
+        }
+        let mode = match args[0].as_bulk_string() {
+            Some(b) => String::from_utf8_lossy(b).to_ascii_uppercase(),
+            None => return Ok(RespValue::error("ERR syntax error")),
+        };
+        match mode.as_str() {
+            "OFF" => {
+                if args.len() != 1 {
+                    return Ok(RespValue::error("ERR syntax error"));
+                }
+                self.client_tracking = false;
+                self.client_tracking_redirect = -1;
+                self.client_tracking_prefixes.clear();
+                self.client_tracking_bcast = false;
+                self.client_tracking_optin = false;
+                self.client_tracking_optout = false;
+                self.client_tracking_noloop = false;
+                self.client_caching = None;
+                Ok(RespValue::ok())
+            }
+            "ON" => {
+                let mut redirect: i64 = -1;
+                let mut prefixes: Vec<Bytes> = Vec::new();
+                let mut bcast = false;
+                let mut optin = false;
+                let mut optout = false;
+                let mut noloop = false;
+                let mut i = 1;
+                while i < args.len() {
+                    let opt = match args[i].as_bulk_string() {
+                        Some(b) => String::from_utf8_lossy(b).to_ascii_uppercase(),
+                        None => return Ok(RespValue::error("ERR syntax error")),
+                    };
+                    match opt.as_str() {
+                        "REDIRECT" => {
+                            if i + 1 >= args.len() {
+                                return Ok(RespValue::error("ERR syntax error"));
+                            }
+                            let id = match self.parse_integer(&args[i + 1]) {
+                                Ok(v) if v >= 0 => v,
+                                _ => {
+                                    return Ok(RespValue::error(
+                                        "ERR value is not an integer or out of range",
+                                    ));
+                                }
+                            };
+                            redirect = id;
+                            i += 2;
+                        }
+                        "PREFIX" => {
+                            if i + 1 >= args.len() {
+                                return Ok(RespValue::error("ERR syntax error"));
+                            }
+                            match args[i + 1].as_bulk_string() {
+                                Some(p) => prefixes.push(p.clone()),
+                                None => return Ok(RespValue::error("ERR syntax error")),
+                            }
+                            i += 2;
+                        }
+                        "BCAST" => {
+                            bcast = true;
+                            i += 1;
+                        }
+                        "OPTIN" => {
+                            optin = true;
+                            i += 1;
+                        }
+                        "OPTOUT" => {
+                            optout = true;
+                            i += 1;
+                        }
+                        "NOLOOP" => {
+                            noloop = true;
+                            i += 1;
+                        }
+                        _ => return Ok(RespValue::error("ERR syntax error")),
+                    }
+                }
+                if optin && optout {
+                    return Ok(RespValue::error(
+                        "ERR OPTIN and OPTOUT are mutually exclusive",
+                    ));
+                }
+                if bcast && (optin || optout) {
+                    return Ok(RespValue::error(
+                        "ERR BCAST and OPTIN/OPTOUT are mutually exclusive",
+                    ));
+                }
+                self.client_tracking = true;
+                self.client_tracking_redirect = redirect;
+                self.client_tracking_prefixes = prefixes;
+                self.client_tracking_bcast = bcast;
+                self.client_tracking_optin = optin;
+                self.client_tracking_optout = optout;
+                self.client_tracking_noloop = noloop;
+                self.client_caching = None;
+                Ok(RespValue::ok())
+            }
+            _ => Ok(RespValue::error(
+                "ERR syntax error, try CLIENT TRACKING ON|OFF ...",
+            )),
+        }
+    }
+
+    /// CLIENT CACHING YES|NO — mark next command for opt-in/opt-out tracking.
+    fn client_caching_cmd(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 1 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'client|caching' command",
+            ));
+        }
+        if !self.client_tracking {
+            return Ok(RespValue::error(
+                "ERR CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or OPTOUT mode enabled",
+            ));
+        }
+        if !self.client_tracking_optin && !self.client_tracking_optout {
+            return Ok(RespValue::error(
+                "ERR CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or OPTOUT mode enabled",
+            ));
+        }
+        let mode = match args[0].as_bulk_string() {
+            Some(b) => String::from_utf8_lossy(b).to_ascii_uppercase(),
+            None => return Ok(RespValue::error("ERR syntax error")),
+        };
+        match mode.as_str() {
+            "YES" => {
+                self.client_caching = Some(true);
+                Ok(RespValue::ok())
+            }
+            "NO" => {
+                self.client_caching = Some(false);
+                Ok(RespValue::ok())
+            }
+            _ => Ok(RespValue::error("ERR syntax error, try CLIENT CACHING YES|NO")),
+        }
     }
 
     /// CLIENT NO-EVICT ON|OFF
