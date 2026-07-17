@@ -133,6 +133,27 @@ pub struct XInfoConsumer {
     pub inactive_ms: u64,
 }
 
+/// Nested group detail for XINFO STREAM FULL.
+#[derive(Debug, Clone)]
+pub struct XInfoStreamFullGroup {
+    pub name: Bytes,
+    pub last_delivered_id: StreamId,
+    pub entries_read: Option<u64>,
+    pub lag: usize,
+    pub pel_count: usize,
+    pub pending: Vec<PendingEntry>,
+    pub consumers: Vec<XInfoStreamFullConsumer>,
+}
+
+/// Nested consumer detail for XINFO STREAM FULL.
+#[derive(Debug, Clone)]
+pub struct XInfoStreamFullConsumer {
+    pub name: Bytes,
+    pub seen_time_ms: u64,
+    pub pel_count: usize,
+    pub pending: Vec<PendingEntry>,
+}
+
 /// Pending entry in a consumer group's PEL.
 #[derive(Debug, Clone)]
 pub struct PendingEntry {
@@ -543,12 +564,21 @@ impl RedisStream {
     }
 
     /// XGROUP SETID — set the group's last_delivered_id cursor.
-    pub fn group_setid(&mut self, name: &Bytes, id: StreamId) -> Result<(), String> {
+    /// Update last-delivered-id; when `entries_read` is `Some`, also set the counter.
+    pub fn group_setid(
+        &mut self,
+        name: &Bytes,
+        id: StreamId,
+        entries_read: Option<u64>,
+    ) -> Result<(), String> {
         let group = self
             .groups
             .get_mut(name)
             .ok_or_else(|| "NOGROUP No such key '' or consumer group".to_string())?;
         group.last_delivered_id = id;
+        if let Some(v) = entries_read {
+            group.entries_read = Some(v);
+        }
         Ok(())
     }
 
@@ -820,6 +850,76 @@ impl RedisStream {
             first_entry: first,
             last_entry: last,
         }
+    }
+
+    /// Entries for XINFO STREAM FULL, optionally limited by `count`.
+    pub fn xinfo_stream_entries(&self, count: Option<usize>) -> Vec<StreamEntry> {
+        let mut out: Vec<StreamEntry> = self.entries.values().cloned().collect();
+        if let Some(n) = count {
+            if out.len() > n {
+                out.truncate(n);
+            }
+        }
+        out
+    }
+
+    /// Group detail for XINFO STREAM FULL (PEL/consumer pending limited by `count`).
+    pub fn xinfo_stream_full_groups(&self, count: Option<usize>) -> Vec<XInfoStreamFullGroup> {
+        let mut groups: Vec<XInfoStreamFullGroup> = self
+            .groups
+            .values()
+            .map(|g| {
+                let lag = self
+                    .entries
+                    .range(next_id(g.last_delivered_id)..)
+                    .count();
+                let mut pending: Vec<PendingEntry> = g.pending.values().cloned().collect();
+                if let Some(n) = count {
+                    if pending.len() > n {
+                        pending.truncate(n);
+                    }
+                }
+                let mut consumers: Vec<XInfoStreamFullConsumer> = g
+                    .consumers
+                    .values()
+                    .map(|c| {
+                        let mut c_pending: Vec<PendingEntry> = g
+                            .pending
+                            .values()
+                            .filter(|pe| pe.consumer == c.name)
+                            .cloned()
+                            .collect();
+                        if let Some(n) = count {
+                            if c_pending.len() > n {
+                                c_pending.truncate(n);
+                            }
+                        }
+                        XInfoStreamFullConsumer {
+                            name: c.name.clone(),
+                            seen_time_ms: c.seen_time_ms,
+                            pel_count: g
+                                .pending
+                                .values()
+                                .filter(|pe| pe.consumer == c.name)
+                                .count(),
+                            pending: c_pending,
+                        }
+                    })
+                    .collect();
+                consumers.sort_by(|a, b| a.name.cmp(&b.name));
+                XInfoStreamFullGroup {
+                    name: g.name.clone(),
+                    last_delivered_id: g.last_delivered_id,
+                    entries_read: g.entries_read,
+                    lag,
+                    pel_count: g.pending.len(),
+                    pending,
+                    consumers,
+                }
+            })
+            .collect();
+        groups.sort_by(|a, b| a.name.cmp(&b.name));
+        groups
     }
 
     /// Snapshot for XINFO GROUPS.

@@ -4,7 +4,9 @@
 use crate::cache::KeyType;
 use crate::error::{Error, Result};
 use crate::protocol::RespValue;
-use crate::stream_type::{StreamEntry, StreamId, XClaimOpts};
+use crate::stream_type::{
+    PendingEntry, StreamEntry, StreamId, XClaimOpts, XInfoStreamFullGroup,
+};
 use bytes::Bytes;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use super::CommandHandler;
@@ -19,6 +21,63 @@ impl CommandHandler {
         RespValue::Array(vec![
             RespValue::BulkString(Some(entry.id.to_bytes())),
             RespValue::Array(fields),
+        ])
+    }
+
+    fn pending_entry_to_resp(pe: &PendingEntry) -> RespValue {
+        RespValue::Array(vec![
+            RespValue::BulkString(Some(pe.id.to_bytes())),
+            RespValue::BulkString(Some(pe.consumer.clone())),
+            RespValue::Integer(pe.delivery_time_ms as i64),
+            RespValue::Integer(pe.delivery_count as i64),
+        ])
+    }
+
+    fn xinfo_full_group_to_resp(g: XInfoStreamFullGroup) -> RespValue {
+        let pending: Vec<RespValue> = g
+            .pending
+            .iter()
+            .map(|pe| Self::pending_entry_to_resp(pe))
+            .collect();
+        let consumers: Vec<RespValue> = g
+            .consumers
+            .into_iter()
+            .map(|c| {
+                let c_pending: Vec<RespValue> = c
+                    .pending
+                    .iter()
+                    .map(|pe| Self::pending_entry_to_resp(pe))
+                    .collect();
+                RespValue::Array(vec![
+                    bulk_static(b"name"),
+                    RespValue::BulkString(Some(c.name)),
+                    bulk_static(b"seen-time"),
+                    RespValue::Integer(c.seen_time_ms as i64),
+                    bulk_static(b"pel-count"),
+                    RespValue::Integer(c.pel_count as i64),
+                    bulk_static(b"pending"),
+                    RespValue::Array(c_pending),
+                ])
+            })
+            .collect();
+        RespValue::Array(vec![
+            bulk_static(b"name"),
+            RespValue::BulkString(Some(g.name)),
+            bulk_static(b"last-delivered-id"),
+            RespValue::BulkString(Some(g.last_delivered_id.to_bytes())),
+            bulk_static(b"entries-read"),
+            match g.entries_read {
+                Some(n) => RespValue::Integer(n as i64),
+                None => RespValue::null(),
+            },
+            bulk_static(b"lag"),
+            RespValue::Integer(g.lag as i64),
+            bulk_static(b"pel-count"),
+            RespValue::Integer(g.pel_count as i64),
+            bulk_static(b"pending"),
+            RespValue::Array(pending),
+            bulk_static(b"consumers"),
+            RespValue::Array(consumers),
         ])
     }
 
@@ -806,8 +865,8 @@ impl CommandHandler {
                 }
             }
             "SETID" => {
-                // XGROUP SETID key groupname id|$
-                if args.len() != 4 {
+                // XGROUP SETID key groupname id|$ [ENTRIESREAD entries-read]
+                if args.len() < 4 {
                     return Ok(RespValue::error(
                         "ERR wrong number of arguments for 'xgroup|setid' command",
                     ));
@@ -824,6 +883,32 @@ impl CommandHandler {
                     Some(b) => String::from_utf8_lossy(b).into_owned(),
                     None => return Ok(RespValue::error("ERR invalid stream ID")),
                 };
+                let mut entries_read: Option<u64> = None;
+                let mut i = 4;
+                while i < args.len() {
+                    let opt = match args[i].as_bulk_string() {
+                        Some(b) => String::from_utf8_lossy(b).to_ascii_uppercase(),
+                        None => return Ok(RespValue::error("ERR syntax error")),
+                    };
+                    match opt.as_str() {
+                        "ENTRIESREAD" => {
+                            if i + 1 >= args.len() {
+                                return Ok(RespValue::error("ERR syntax error"));
+                            }
+                            let n = match self.parse_integer(&args[i + 1]) {
+                                Ok(v) if v >= 0 => v as u64,
+                                _ => {
+                                    return Ok(RespValue::error(
+                                        "ERR value is not an integer or out of range",
+                                    ));
+                                }
+                            };
+                            entries_read = Some(n);
+                            i += 2;
+                        }
+                        _ => return Ok(RespValue::error("ERR syntax error")),
+                    }
+                }
                 match self.cache.key_type(&key) {
                     KeyType::None => Ok(RespValue::error(format!(
                         "NOGROUP No such key '{}' or consumer group",
@@ -855,7 +940,7 @@ impl CommandHandler {
                             }
                         };
                         let mut s = stream.write();
-                        match s.group_setid(&group, id) {
+                        match s.group_setid(&group, id, entries_read) {
                             Ok(()) => Ok(RespValue::ok()),
                             Err(e) => {
                                 if e.starts_with("NOGROUP") {
@@ -1885,11 +1970,50 @@ impl CommandHandler {
                         "ERR wrong number of arguments for 'xinfo|stream' command",
                     ));
                 }
-                // FULL is accepted but not expanded beyond summary for now.
                 let key = match args[1].as_bulk_string() {
                     Some(k) => k.clone(),
                     None => return Ok(RespValue::error("ERR invalid key")),
                 };
+                // Optional: FULL [COUNT count]
+                let mut full = false;
+                let mut full_count: Option<usize> = None;
+                let mut i = 2;
+                while i < args.len() {
+                    let opt = match args[i].as_bulk_string() {
+                        Some(b) => String::from_utf8_lossy(b).to_ascii_uppercase(),
+                        None => return Ok(RespValue::error("ERR syntax error")),
+                    };
+                    match opt.as_str() {
+                        "FULL" => {
+                            full = true;
+                            i += 1;
+                        }
+                        "COUNT" => {
+                            if i + 1 >= args.len() {
+                                return Ok(RespValue::error("ERR syntax error"));
+                            }
+                            let n = match self.parse_integer(&args[i + 1]) {
+                                Ok(v) if v >= 0 => v as usize,
+                                _ => {
+                                    return Ok(RespValue::error(
+                                        "ERR value is not an integer or out of range",
+                                    ));
+                                }
+                            };
+                            full_count = Some(n);
+                            i += 2;
+                        }
+                        _ => return Ok(RespValue::error("ERR syntax error")),
+                    }
+                }
+                // COUNT without FULL is invalid; Redis requires FULL for COUNT.
+                if full_count.is_some() && !full {
+                    return Ok(RespValue::error("ERR syntax error"));
+                }
+                // Redis default COUNT for FULL is 10.
+                if full && full_count.is_none() {
+                    full_count = Some(10);
+                }
                 match self.cache.key_type(&key) {
                     KeyType::None => Ok(RespValue::error("ERR no such key")),
                     KeyType::Stream => {
@@ -1897,16 +2021,9 @@ impl CommandHandler {
                             Some(s) => s,
                             None => return Ok(RespValue::error("ERR no such key")),
                         };
-                        let info = stream.read().xinfo_stream();
-                        let first = match info.first_entry {
-                            Some(ref e) => Self::stream_entry_to_resp(e),
-                            None => RespValue::null(),
-                        };
-                        let last = match info.last_entry {
-                            Some(ref e) => Self::stream_entry_to_resp(e),
-                            None => RespValue::null(),
-                        };
-                        Ok(RespValue::Array(vec![
+                        let s = stream.read();
+                        let info = s.xinfo_stream();
+                        let mut reply = vec![
                             bulk_static(b"length"),
                             RespValue::Integer(info.length as i64),
                             bulk_static(b"radix-tree-keys"),
@@ -1919,13 +2036,39 @@ impl CommandHandler {
                             RespValue::BulkString(Some(Bytes::from_static(b"0-0"))),
                             bulk_static(b"entries-added"),
                             RespValue::Integer(info.length as i64),
-                            bulk_static(b"groups"),
-                            RespValue::Integer(info.groups as i64),
-                            bulk_static(b"first-entry"),
-                            first,
-                            bulk_static(b"last-entry"),
-                            last,
-                        ]))
+                        ];
+                        if full {
+                            let entries = s.xinfo_stream_entries(full_count);
+                            let entry_resp: Vec<RespValue> = entries
+                                .iter()
+                                .map(|e| Self::stream_entry_to_resp(e))
+                                .collect();
+                            let groups = s.xinfo_stream_full_groups(full_count);
+                            let groups_resp: Vec<RespValue> = groups
+                                .into_iter()
+                                .map(|g| Self::xinfo_full_group_to_resp(g))
+                                .collect();
+                            reply.push(bulk_static(b"entries"));
+                            reply.push(RespValue::Array(entry_resp));
+                            reply.push(bulk_static(b"groups"));
+                            reply.push(RespValue::Array(groups_resp));
+                        } else {
+                            let first = match info.first_entry {
+                                Some(ref e) => Self::stream_entry_to_resp(e),
+                                None => RespValue::null(),
+                            };
+                            let last = match info.last_entry {
+                                Some(ref e) => Self::stream_entry_to_resp(e),
+                                None => RespValue::null(),
+                            };
+                            reply.push(bulk_static(b"groups"));
+                            reply.push(RespValue::Integer(info.groups as i64));
+                            reply.push(bulk_static(b"first-entry"));
+                            reply.push(first);
+                            reply.push(bulk_static(b"last-entry"));
+                            reply.push(last);
+                        }
+                        Ok(RespValue::Array(reply))
                     }
                     _ => Ok(RespValue::error(Error::WrongType.to_resp_string())),
                 }

@@ -567,6 +567,35 @@ impl CommandHandler {
             "NO-TOUCH" => self.client_no_touch_cmd(&args[1..]),
             "GETREDIR" => self.client_getredir(&args[1..]),
             "TRACKINGINFO" => self.client_trackinginfo(&args[1..]),
+            "HELP" => Ok(RespValue::Array(vec![
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"CLIENT <subcommand> [<arg> ...]. Subcommands are:",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"ID -- return this connection's client id",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"GETNAME / SETNAME <name> -- get or set connection name",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"SETINFO <lib-name|lib-ver> <value> -- set client library info",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"LIST / INFO -- connection info (this client)",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"REPLY ON|OFF|SKIP -- control command replies",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"NO-EVICT ON|OFF / NO-TOUCH ON|OFF -- client flags",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"GETREDIR / TRACKINGINFO -- client-side caching status",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"HELP -- print this help",
+                ))),
+            ])),
             "KILL" | "PAUSE" | "UNPAUSE" | "TRACKING" | "CACHING" => Ok(RespValue::error(
                 format!("ERR CLIENT {} is not supported yet", sub),
             )),
@@ -713,6 +742,32 @@ impl CommandHandler {
             "GETKEYS" => self.command_getkeys(&args[1..]),
             "GETKEYSANDFLAGS" => self.command_getkeysandflags(&args[1..]),
             "DOCS" => self.command_docs(&args[1..]),
+            "HELP" => Ok(RespValue::Array(vec![
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"COMMAND <subcommand> [<arg> ...]. Subcommands are:",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"COUNT -- return total number of commands in the catalog",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"LIST -- return array of command names",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"INFO [<command-name> ...] -- details for given commands",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"GETKEYS <command> [arg ...] -- extract key names",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"GETKEYSANDFLAGS <command> [arg ...] -- keys with access flags",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"DOCS [command-name ...] -- documentation map",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"HELP -- print this help",
+                ))),
+            ])),
             // Bare COMMAND with unknown first arg: try as INFO
             _ => {
                 // Redis: COMMAND <name> is not valid; only subcommands

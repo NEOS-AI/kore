@@ -769,7 +769,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
                     if let Some(stream) = cache.get_stream(&argv[2]) {
                         let mut s = stream
                             .write();
-                        let _ = s.group_setid(&argv[3], id);
+                        let _ = s.group_setid(&argv[3], id, None);
                     }
                     Ok(())
                 }
