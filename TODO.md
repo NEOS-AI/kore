@@ -386,6 +386,8 @@ Also tracked in `docs/roadmap.md`.
   - *Fix*: load into scratch Databases and swap on success (true transactional load); or document load APIs as empty-target-only
 - [x] **`[P2]`** **Code review (BW nit):** `map_ft_mutator_error` uses `msg.contains("OOM")` (substring); prefer exact/prefix match or typed errors from search layer
   - *Done (Batch BX)*: match `starts_with("OOM:")` / `starts_with("OOM ")` / exact `"OOM"` (search layer emits `"OOM: …"`)
+- [ ] **`[P2]`** **Code review (BX nit):** `has_search_state` still double-lists (indices + aliases locks); optional single snapshot API
+- [ ] **`[P2]`** **Code review (BX nit):** `clear_documents` does not adjust `MemoryTracker` Search bytes by itself — safe only because `flush` always `memory_tracker.reset()` afterward; document or pair with deallocate if reused outside flush
 
 ### Pub/Sub
 
@@ -417,7 +419,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). BW closed all-or-nothing AOF load; remaining P2 are RDB FT, parser share, FLUSHDB/search semantics.
+Prioritized for next letter batch(es). BX closed FLUSHDB/FT schema decoupling; remaining P2: RDB FT (durability), shared parser, scratch-load.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -434,7 +436,9 @@ Prioritized for next letter batch(es). BW closed all-or-nothing AOF load; remain
 | P2 | FLUSHDB vs FT schema (BW: flush clears indices) | done (BX) |
 | P2 | Scratch-load swap if AOF load targets non-empty DB | open |
 | P2 | `get_index` atomic resolve; min-replicas FT test | open |
-| P2 | VECTOR/NUMERIC rewrite tests; `has_search_state` lock nit | done (BX partial: VECTOR/NUMERIC rewrite test; lock nit still open) |
+| P2 | VECTOR/NUMERIC rewrite tests | done (BX) |
+| P2 | `has_search_state` double-list lock nit | open |
+| P2 | `clear_documents` + MemoryTracker coupling (flush-only) | open |
 | P2 | OOM→OutOfMemory map; DROPINDEX/ALIASDEL missing tests | done (BW) |
 | P2 | `map_ft_mutator_error` OOM match hygiene | done (BX) |
 | P2 | Lua SELECT DB side-effect test | done (BT) |
