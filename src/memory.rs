@@ -228,6 +228,40 @@ impl MemoryTracker {
         self.search_memory.store(0, Ordering::Relaxed);
     }
 
+    /// Keyspace categories moved by scratch-load swap (everything except PubSub).
+    const KEYSPACE_CATEGORIES: [MemoryCategory; 8] = [
+        MemoryCategory::Cache,
+        MemoryCategory::SortedSets,
+        MemoryCategory::GeoSets,
+        MemoryCategory::Hashes,
+        MemoryCategory::Lists,
+        MemoryCategory::Sets,
+        MemoryCategory::Streams,
+        MemoryCategory::Search,
+    ];
+
+    /// Take keyspace category counters (zeros them). PubSub is left untouched.
+    pub fn take_keyspace_counts(&self) -> [(MemoryCategory, usize); 8] {
+        let mut out = [(MemoryCategory::Cache, 0usize); 8];
+        for (i, cat) in Self::KEYSPACE_CATEGORIES.iter().enumerate() {
+            let v = self.category_atomic(*cat).swap(0, Ordering::Relaxed);
+            out[i] = (*cat, v);
+        }
+        out
+    }
+
+    /// Install keyspace category counters (overwrites; PubSub untouched).
+    ///
+    /// Always writes the fixed [`Self::KEYSPACE_CATEGORIES`] slots; the category
+    /// tags in `counts` are ignored so a fabricated PubSub entry cannot clobber
+    /// the PubSub counter.
+    pub fn install_keyspace_counts(&self, counts: &[(MemoryCategory, usize); 8]) {
+        for (i, cat) in Self::KEYSPACE_CATEGORIES.iter().enumerate() {
+            self.category_atomic(*cat)
+                .store(counts[i].1, Ordering::Relaxed);
+        }
+    }
+
     /// Reset a single category counter to zero
     pub fn reset_category(&self, category: MemoryCategory) {
         self.category_atomic(category).store(0, Ordering::Relaxed);

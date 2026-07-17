@@ -81,11 +81,33 @@ impl Databases {
     }
 
     /// Full wipe of every logical database including FT index definitions/aliases.
-    /// Used for RDB snapshot-replace load (`flush=true`) and failed AOF/RDB load
-    /// (all-or-nothing), not live FLUSHALL.
+    /// Hard reset helper — not live FLUSHALL. AOF/RDB public load paths use
+    /// scratch-load + [`replace_keyspaces_from`] instead of wiping on failure.
     pub fn flush_all_including_search(&self) {
         for db in &self.dbs {
             db.flush_all_including_search();
+        }
+    }
+
+    /// Empty multi-DB collection matching this instance's DB count and per-DB
+    /// shard / memory config. Shares pubsub (via each DB's `empty_keyspace_like`)
+    /// and does **not** start background sweeps — exclusive load-time use only.
+    pub fn empty_like(&self) -> Arc<Self> {
+        let mut dbs = Vec::with_capacity(self.dbs.len());
+        for db in &self.dbs {
+            dbs.push(db.empty_keyspace_like());
+        }
+        Arc::new(Self { dbs })
+    }
+
+    /// Move full keyspace state of every DB from `other` into `self`.
+    ///
+    /// **Exclusive access required** (see [`Cache::replace_keyspace_from`]).
+    /// DB count is matched by index; extra DBs on either side are ignored.
+    pub fn replace_keyspaces_from(&self, other: &Self) {
+        let n = self.dbs.len().min(other.dbs.len());
+        for i in 0..n {
+            self.dbs[i].replace_keyspace_from(&other.dbs[i]);
         }
     }
 

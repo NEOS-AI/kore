@@ -759,6 +759,35 @@ impl SearchIndexManager {
         indices.clear();
     }
 
+    /// Take every index + alias, leaving this manager empty.
+    ///
+    /// Used by scratch-load swap: move search state between caches without
+    /// re-creating definitions/documents.
+    pub fn take_all(
+        &self,
+    ) -> (
+        HashMap<String, Arc<RwLock<SearchIndex>>>,
+        HashMap<String, String>,
+    ) {
+        // Lock order: aliases then indices (matches create/drop/alias_*).
+        let mut aliases = self.aliases.write();
+        let mut indices = self.indices.write();
+        (std::mem::take(&mut *indices), std::mem::take(&mut *aliases))
+    }
+
+    /// Install index + alias maps (replaces any existing state).
+    pub fn install(
+        &self,
+        indices: HashMap<String, Arc<RwLock<SearchIndex>>>,
+        aliases: HashMap<String, String>,
+    ) {
+        // Lock order: aliases then indices (matches create/drop/alias_*).
+        let mut a = self.aliases.write();
+        let mut i = self.indices.write();
+        *a = aliases;
+        *i = indices;
+    }
+
     /// Clear documents from every index while keeping definitions and aliases.
     ///
     /// Used by FLUSHDB/FLUSHALL (RediSearch-style: keys/docs gone, schema remains).

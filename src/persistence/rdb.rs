@@ -1124,48 +1124,54 @@ pub fn load_databases(databases: &Databases, path: &Path, flush: bool) -> Result
 
 /// Load RDB bytes into cache (DB 0 / first DB only).
 ///
-/// When `flush` is true, the target is fully wiped first — keys **and** FT
-/// schema/aliases (`flush_all_including_search`). Snapshot-replace semantics
-/// (FULLRESYNC / reload) must clear definitions so `create_search_index` does
-/// not fail with "Index already exists". Live FLUSHDB keeps schema via
-/// [`Cache::flush`] instead.
+/// **Scratch-load (transactional):** after a successful decode, the snapshot is
+/// applied to a scratch keyspace and swapped into `cache` only on `Ok`. On
+/// `Err` (including mid-`load_into` failures), `cache` is left completely
+/// untouched. Requires exclusive access to `cache` for the commit swap.
 ///
-/// On any `load_into` error after decode succeeds, the cache is fully wiped
-/// (keys + FT schema) so partial apply cannot leave a half-filled dataset
-/// (mirrors AOF load all-or-nothing).
+/// - `flush = true` (snapshot replace / FULLRESYNC): scratch starts empty, so
+///   a successful load replaces the entire keyspace (keys + FT schema).
+/// - `flush = false` (merge): scratch is seeded with a deep copy of the current
+///   keyspace (via encode/decode snapshot), then the RDB is merged into that
+///   copy before swap — so failure still preserves the live target.
 pub fn load_bytes(cache: &Cache, data: &[u8], flush: bool) -> Result<usize> {
     let snap = MultiDbSnapshot::decode(data)?;
-    if flush {
-        // Snapshot replace: wipe schema so recreated indices do not clash.
-        cache.flush_all_including_search();
+    let scratch = cache.empty_keyspace_like();
+    if !flush {
+        // Seed scratch with current keyspace so merge is transactional.
+        let seed = MultiDbSnapshot::from_cache(cache)?;
+        seed.load_into_cache(&scratch)?;
     }
-    let result = snap.load_into_cache(cache);
-    if result.is_err() {
-        // Full wipe including FT definitions — not live FLUSHDB semantics.
-        cache.flush_all_including_search();
+    match snap.load_into_cache(&scratch) {
+        Ok(n) => {
+            cache.replace_keyspace_from(&scratch);
+            Ok(n)
+        }
+        Err(e) => Err(e),
     }
-    result
 }
 
 /// Load RDB bytes into multi-DB keyspaces.
 ///
-/// When `flush` is true, every logical DB is fully wiped first (keys + FT
-/// schema/aliases). See [`load_bytes`] for snapshot-replace vs live FLUSHALL.
+/// **Scratch-load (transactional):** see [`load_bytes`]. On `Ok`, every DB
+/// keyspace is swapped from scratch; on `Err`, `databases` is untouched.
 ///
-/// On any `load_into` error after decode succeeds, every database is fully
-/// wiped so partial multi-DB apply cannot leave half-filled state.
+/// - `flush = true`: empty scratch (snapshot replace of all DBs).
+/// - `flush = false`: scratch seeded from current multi-DB state, then merged.
 pub fn load_databases_bytes(databases: &Databases, data: &[u8], flush: bool) -> Result<usize> {
     let snap = MultiDbSnapshot::decode(data)?;
-    if flush {
-        // Snapshot replace: wipe schema so recreated indices do not clash.
-        databases.flush_all_including_search();
+    let scratch = databases.empty_like();
+    if !flush {
+        let seed = MultiDbSnapshot::from_databases(databases)?;
+        seed.load_into_databases(&scratch)?;
     }
-    let result = snap.load_into_databases(databases);
-    if result.is_err() {
-        // Full wipe including FT definitions — not live FLUSHALL semantics.
-        databases.flush_all_including_search();
+    match snap.load_into_databases(&scratch) {
+        Ok(n) => {
+            databases.replace_keyspaces_from(&scratch);
+            Ok(n)
+        }
+        Err(e) => Err(e),
     }
-    result
 }
 
 /// Convenience for callers with Arc.

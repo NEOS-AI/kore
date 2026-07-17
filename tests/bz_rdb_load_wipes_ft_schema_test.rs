@@ -1,5 +1,6 @@
-//! Batch BZ: RDB load with flush=true wipes FT schema (snapshot replace);
-//! mid-load FT failure full-wipes; live FLUSHDB still keeps schema.
+//! Batch BZ / CB: RDB load with flush=true replaces FT schema (snapshot swap);
+//! mid-load FT failure leaves target untouched (scratch discarded);
+//! live FLUSHDB still keeps schema.
 
 use bytes::Bytes;
 use kore::commands::CommandHandler;
@@ -267,11 +268,11 @@ fn live_flushdb_still_keeps_ft_schema() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Mid-load FT.ALIASADD failure → full wipe (keys + schema), no partial state.
+/// Mid-load FT.ALIASADD failure → Err; target (incl. pre-existing) untouched.
 #[test]
 fn rdb_load_mid_ft_failure_wipes_partial_state() {
     // Hand-built snapshot: valid index + hash, then alias to missing index.
-    // load_into creates schema + keys first, then fails on ALIASADD.
+    // load_into creates schema + keys first, then fails on ALIASADD (on scratch).
     let def = IndexDefinition::new(
         "idx".to_string(),
         vec!["doc:".to_string()],
@@ -306,7 +307,7 @@ fn rdb_load_mid_ft_failure_wipes_partial_state() {
     let bytes = Bytes::from(snap.encode().unwrap());
 
     let loaded = make_databases();
-    // Pre-existing key so we can assert wipe clears more than just partial load.
+    // Pre-existing key + FT schema must survive failed load (Batch CB).
     loaded
         .get(0)
         .unwrap()
@@ -315,6 +316,21 @@ fn rdb_load_mid_ft_failure_wipes_partial_state() {
             Bytes::from("value"),
             Default::default(),
         )
+        .unwrap();
+    loaded
+        .get(0)
+        .unwrap()
+        .create_search_index(IndexDefinition::new(
+            "keep_me".to_string(),
+            vec!["keep:".to_string()],
+            vec![FieldDefinition {
+                name: "t".to_string(),
+                field_type: FieldType::Text {
+                    weight: 1.0,
+                    sortable: false,
+                },
+            }],
+        ))
         .unwrap();
 
     let err = rdb::load_databases_bytes(&loaded, &bytes, false)
@@ -330,27 +346,32 @@ fn rdb_load_mid_ft_failure_wipes_partial_state() {
     }
 
     let cache = loaded.get(0).unwrap();
+    // Partial scratch must not commit.
     assert!(
-        cache.list_search_indices().is_empty(),
-        "indices must be wiped after failed load; got {:?}",
+        !cache.list_search_indices().iter().any(|n| n == "idx"),
+        "partial index from failed load must not commit; got {:?}",
         cache.list_search_indices()
     );
     assert!(
         cache.list_search_aliases().is_empty(),
-        "aliases must be wiped after failed load; got {:?}",
+        "partial aliases from failed load must not commit; got {:?}",
         cache.list_search_aliases()
     );
     assert!(
         cache
             .get_hash(&Bytes::from_static(b"doc:1"))
             .is_none(),
-        "partial hash from failed load must be wiped"
+        "partial hash from failed load must not commit"
     );
+    // Pre-existing target state preserved.
+    let pre = cache
+        .load(&Bytes::from("preexisting"), Default::default())
+        .unwrap()
+        .expect("pre-existing key must survive failed RDB load");
+    assert_eq!(pre.value.as_ref(), b"value");
     assert!(
-        cache
-            .load(&Bytes::from("preexisting"), Default::default())
-            .unwrap()
-            .is_none(),
-        "pre-existing keys must also be wiped on load Err (mirror AOF BW)"
+        cache.list_search_indices().iter().any(|n| n == "keep_me"),
+        "pre-existing FT schema must survive failed RDB load; got {:?}",
+        cache.list_search_indices()
     );
 }

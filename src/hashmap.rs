@@ -165,6 +165,14 @@ impl Shard {
         self.size.store(0, Ordering::Relaxed);
     }
 
+    /// Drain every entry, leaving the shard empty.
+    fn drain_all(&self) -> Vec<(Bytes, SharedEntry)> {
+        let mut map = self.map.write();
+        let entries: Vec<_> = map.drain().collect();
+        self.size.store(0, Ordering::Relaxed);
+        entries
+    }
+
     /// Iterate over entries and remove expired ones (full shard scan).
     /// Prefer `active_expire_sample` for background work on large datasets.
     /// Returns (count removed, bytes freed).
@@ -367,6 +375,34 @@ impl ShardedHashMap {
     pub fn clear(&self) {
         for shard in &self.shards {
             shard.clear();
+        }
+    }
+
+    /// Number of shards in this map.
+    pub fn num_shards(&self) -> usize {
+        self.num_shards
+    }
+
+    /// Drain every entry across shards (leaves the map empty).
+    ///
+    /// **Exclusive access**: not atomic under concurrent writers. Used by
+    /// scratch-load keyspace swap. Pre-reserves `len()` to reduce mid-drain realloc.
+    pub fn drain_all(&self) -> Vec<(Bytes, SharedEntry)> {
+        let mut out = Vec::with_capacity(self.len());
+        for shard in &self.shards {
+            out.extend(shard.drain_all());
+        }
+        out
+    }
+
+    /// Replace contents with `entries` (rehashes into this map's shards).
+    ///
+    /// **Exclusive access**: destructive clear-then-fill; not failure-atomic
+    /// under concurrent traffic. Prefer drain-then-replace for commit paths.
+    pub fn replace_all(&self, entries: Vec<(Bytes, SharedEntry)>) {
+        self.clear();
+        for (k, v) in entries {
+            self.insert(k, v);
         }
     }
 
@@ -597,6 +633,28 @@ impl<V: Clone> ShardedKeyMap<V> {
     pub fn clear(&self) {
         for s in &self.shards {
             s.write().clear();
+        }
+    }
+
+    /// Drain every entry across shards (leaves the map empty).
+    ///
+    /// **Exclusive access**: not atomic under concurrent writers. Pre-reserves
+    /// `len()` to reduce mid-drain realloc.
+    pub fn drain_all(&self) -> Vec<(Bytes, V)> {
+        let mut out = Vec::with_capacity(self.len());
+        for s in &self.shards {
+            out.extend(s.write().drain());
+        }
+        out
+    }
+
+    /// Replace contents with `entries` (rehashes into this map's shards).
+    ///
+    /// **Exclusive access**: destructive clear-then-fill.
+    pub fn replace_all(&self, entries: Vec<(Bytes, V)>) {
+        self.clear();
+        for (k, v) in entries {
+            self.insert(k, v);
         }
     }
 

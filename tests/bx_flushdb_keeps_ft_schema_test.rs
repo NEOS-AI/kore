@@ -297,7 +297,7 @@ fn flushall_keeps_ft_schema_multi_db() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Failed AOF load still fully empties target (keys + FT indices + aliases).
+/// Failed AOF load into empty target commits nothing (scratch discarded).
 #[test]
 fn aof_load_failure_still_wipes_ft_schema() {
     let dir = tmp_dir("aof-fail-wipe");

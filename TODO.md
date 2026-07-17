@@ -369,13 +369,13 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BY):** RDB load is not wiped on mid-`load_into` FT failure (AOF got BW/BX; RDB did not)
   - *Found*: `create_search_index` / `alias_add` errors abort `load_into` after partial apply (earlier indices/keys remain). Callers (`load_databases_bytes`, FULLRESYNC) do not full-wipe on `Err`.
   - *Done (Batch BZ)*: on RDB load `Err` after decode (mutate started), `flush_all_including_search` (mirror AOF BW/BX). Tests: `tests/bz_rdb_load_wipes_ft_schema_test.rs`. Scratch-load swap for non-empty targets remains open (shared with BW item).
-- [ ] **`[P2]`** **Code review (BZ):** RDB `flush=false` still merges into live FT schema — name clash / partial apply risk
-  - *Found*: BZ only full-wipes schema when `flush=true` (or on load `Err`). A `flush=false` load into a DB that already has the same index name still fails at `create_search_index`; on other mid-load FT errors, Err-path wipe destroys pre-existing keys (same tradeoff as AOF BW). Startup / FULLRESYNC use `flush=true` and are fine.
-  - *Fix*: document load APIs as snapshot-replace (`flush=true`) or empty-target; or scratch-load + swap (shared BW item); optional: skip/recreate indices when merging.
+- [ ] **`[P2]`** **Code review (BZ):** RDB `flush=false` still merges into FT schema — name clash risk on merge
+  - *Found*: BZ only full-wipes schema when `flush=true`. A `flush=false` load into a DB that already has the same index name still fails at `create_search_index` (now on scratch; target preserved on Err after CB). Startup / FULLRESYNC use `flush=true` and are fine.
+  - *Partial (Batch CB)*: scratch-load means Err no longer destroys pre-existing keys; true merge still fails on name clash. Optional: skip/recreate indices when merging.
 - [ ] **`[P2]`** **Code review (BZ nit):** `rdb_load_mid_ft_failure_wipes_partial_state` accepts almost any `InvalidArgument` message (`!msg.is_empty()`); tighten to `RDB FT.ALIASADD` / unknown index
-- [ ] **`[P2]`** **Code review (BZ nit):** wipe-on-error only wraps `load_bytes` / `load_databases_bytes`
-  - *Found*: public `DbSnapshot::load_into` / `MultiDbSnapshot::load_into_databases` still leave partial state on `Err` if called directly (decode + load without the wrapper). Production paths (startup, FULLRESYNC, `load_file`/`load_databases`) use the safe wrappers.
-  - *Fix*: move wipe into `load_into_databases`/`load_into_cache`, or document wrappers as the only supported load API; prefer scratch-load long-term.
+- [ ] **`[P2]`** **Code review (BZ nit):** raw `DbSnapshot::load_into` / `MultiDbSnapshot::load_into_*` still leave partial state on `Err` if called directly
+  - *Found*: production paths use `load_bytes` / `load_databases_bytes` / AOF `load_into_*` wrappers (scratch-load after CB). Direct `load_into` remains non-transactional.
+  - *Fix*: document wrappers as the only supported load API; or route raw `load_into` through scratch as well.
 - [ ] **`[P2]`** **Code review (BY nit):** no HNSW `M` / `ef_construction` RDB round-trip test (FLAT covered in `by_rdb_ft_section_test`; RDB encoder already writes both HNSW params)
 - [ ] **`[P2]`** **Code review (BY nit):** RDB FT mutator errors always `Error::InvalidArgument` — align with AOF `map_ft_mutator_error` (OOM → `OutOfMemory`) if search layer can return OOM on create
 - [ ] **`[P2]`** ACL `@search` category for FT.* (fine-grained users; default `+@all` unaffected)
@@ -398,14 +398,22 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BW):** FLUSHDB/FLUSHALL now drop FT indices (via `Cache::flush` → `search_index_manager.clear`)
   - *Found*: BW cleared search on flush so failed AOF load is fully empty; this also changes live `FLUSHDB`/`FLUSHALL` — RediSearch typically keeps index definitions after FLUSHDB (docs gone, schema remains)
   - *Done (Batch BX)*: decouple paths — `Cache::flush()` / `Databases::flush_all()` clear keyspace + `SearchIndexManager::clear_documents()` (schema + aliases kept); AOF load `Err` uses `flush_all_including_search()` / `SearchIndexManager::clear()` (full wipe). Tests: `tests/bx_flushdb_keeps_ft_schema_test.rs`
-- [ ] **`[P2]`** **Code review (BW):** failed AOF/RDB load flush wipes pre-existing data if target was non-empty
+- [x] **`[P2]`** **Code review (BW):** failed AOF/RDB load flush wipes pre-existing data if target was non-empty
   - *Found*: `flush_all`/`flush` on load `Err` is correct for empty startup DBs, but a mid-load failure on a non-empty target would destroy prior keys/indices too
-  - *Note (BZ)*: RDB load `Err` now also `flush_all_including_search` (test asserts pre-existing key is gone) — same tradeoff for AOF and RDB
-  - *Fix*: load into scratch Databases and swap on success (true transactional load); or document load APIs as empty-target-only
+  - *Done (Batch CB)*: scratch-load + swap — AOF `load_into_*` and RDB `load_*_bytes` apply into empty (or merge-seeded) scratch; on `Ok` `replace_keyspace_from` / `replace_keyspaces_from`; on `Err` target untouched. Tests: `tests/cb_scratch_load_preserves_target_test.rs`; BW/BZ tests updated for preserve-on-Err semantics.
 - [x] **`[P2]`** **Code review (BW nit):** `map_ft_mutator_error` uses `msg.contains("OOM")` (substring); prefer exact/prefix match or typed errors from search layer
   - *Done (Batch BX)*: match `starts_with("OOM:")` / `starts_with("OOM ")` / exact `"OOM"` (search layer emits `"OOM: …"`)
 - [ ] **`[P2]`** **Code review (BX nit):** `has_search_state` still double-lists (indices + aliases locks); optional single snapshot API
 - [ ] **`[P2]`** **Code review (BX nit):** `clear_documents` does not adjust `MemoryTracker` Search bytes by itself — safe only because `flush` always `memory_tracker.reset()` afterward; document or pair with deallocate if reused outside flush
+- [x] **`[P1]`** **Code review (CB):** wire full keyspace swap under quiesce (not just sharded maps)
+  - *Done (Batch CB)*: `Cache::empty_keyspace_like` / `replace_keyspace_from` move strings + sorted_sets + geo_sets + hashes/lists/sets/streams + typed_expires + watch_gens + search take/install + tracker keyspace counts + `memory_usage`; leave pubsub/stats/blockers/maxmemory. Scratch uses `start_sweep: false`; helpers document exclusive-access / load-time quiesce. `Databases::empty_like` / `replace_keyspaces_from` wrap per-DB swap.
+- [x] **`[P1]`** **Code review (CB):** keep `Cache.memory_usage` in sync with tracker on swap
+  - *Done (Batch CB)*: `replace_keyspace_from` pairs tracker take/install with `memory_usage` store; no per-key `account` after `replace_all`. Drain scratch first, then drain target to discard + install (map-level mem::replace style).
+- [ ] **`[P2]`** **Code review (CB):** `drain_all` not fully failure-atomic across shards
+  - *Partial (Batch CB)*: pre-`reserve(self.len())` on `ShardedHashMap`/`ShardedKeyMap` `drain_all`; docs note exclusive access. Mid-panic after partial shard drain still drops drained entries (true OOM-abort policy remains open).
+- [x] **`[P2]`** **Code review (CB nit):** `install_keyspace_counts` not closed over `KEYSPACE_CATEGORIES`
+  - *Done (Batch CB)*: install always writes fixed `KEYSPACE_CATEGORIES` slots (ignores fabricated category tags; PubSub cannot be clobbered).
+- [ ] **`[P2]`** **Code review (CB nit):** `SearchIndexManager::install` does not validate alias targets exist in indices (fine if only fed `take_all` output)
 
 ### Pub/Sub
 
@@ -437,7 +445,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). BZ closed RDB snapshot-replace schema wipe + load error wipe (no new P0/P1). CA closed shared FT.CREATE parser. Second-pass: only nits (wrapper-only wipe, test assert, flush=false merge). **Next:** scratch-load swap (AOF+RDB non-empty targets); ACL `@search`; HNSW RDB round-trip test; HNSW `ef_construction` AOF round-trip.
+Prioritized for next letter batch(es). **Batch CB done**: full keyspace scratch-load + swap for AOF/RDB public load entry points (pre-existing target survives `Err`; success commits via replace). Remaining CB nits: `drain_all` mid-panic shard loss (partial reserve done), optional alias-target validate on search `install`. **Next:** ACL `@search`; HNSW RDB round-trip; HNSW `ef_construction` AOF; BZ remaining nits (`flush=false` FT name-clash merge policy; raw `load_into` docs; tighten mid-fail assert).
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -447,21 +455,26 @@ Prioritized for next letter batch(es). BZ closed RDB snapshot-replace schema wip
 | P1 | AOF rewrite emits `FT.CREATE` + aliases (BT review) | done (BU) |
 | P1 | AOF load surfaces FT.CREATE / alias failures (BU review) | done (BV) |
 | P1 | RDB load `flush=true` must wipe FT schema (BY×BX clash) | done (BZ) |
+| P1 | CB: full keyspace swap under quiesce (typed maps, expires, watch) | done (CB) |
+| P1 | CB: `Cache.memory_usage` + tracker paired install (no double-account) | done (CB) |
 | P2 | FT RDB section | done (BY) |
 | P2 | RDB load wipe-on-FT-failure (mirror AOF BW) | done (BZ) |
-| P2 | RDB `flush=false` FT merge / name-clash semantics | open |
+| P2 | RDB `flush=false` FT merge / name-clash semantics | open (Err preserves after CB) |
 | P2 | ACL `@search` | open |
 | P2 | Shared FT.CREATE parser (cmd + AOF load) | done (CA) |
 | P2 | HNSW `ef_construction` AOF round-trip | open (RDB done in BY) |
 | P2 | AOF load all-or-nothing on FT failure (BV review) | done (BW) |
 | P2 | FLUSHDB vs FT schema (BW: flush clears indices) | done (BX) |
-| P2 | Scratch-load swap if AOF/RDB load targets non-empty DB | open |
+| P2 | Scratch-load swap if AOF/RDB load targets non-empty DB | done (CB) |
+| P2 | CB: `drain_all` failure-atomic / reserve-before-drain | partial (reserve done) |
+| P2 | CB: `install_keyspace_counts` closed over KEYSPACE_CATEGORIES | done (CB) |
+| P2 | CB: optional alias-target validate on search `install` | open |
 | P2 | `get_index` atomic resolve; min-replicas FT test | open |
 | P2 | VECTOR/NUMERIC rewrite tests | done (BX) |
 | P2 | HNSW RDB round-trip test | open |
 | P2 | RDB FT OOM → OutOfMemory map | open |
 | P2 | BZ mid-fail test: tighten InvalidArgument assert | open |
-| P2 | wipe-on-error only on load_bytes wrappers (not raw load_into) | open |
+| P2 | raw load_into non-transactional (wrappers are safe) | open |
 | P2 | `has_search_state` double-list lock nit | open |
 | P2 | `clear_documents` + MemoryTracker coupling (flush-only) | open |
 | P2 | OOM→OutOfMemory map; DROPINDEX/ALIASDEL missing tests | done (BW) |

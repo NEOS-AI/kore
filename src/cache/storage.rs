@@ -468,14 +468,77 @@ impl Cache {
 
     /// Full wipe: keyspace + every search index definition and alias.
     ///
-    /// Used for RDB snapshot-replace load (`flush=true`), and on failed AOF/RDB
-    /// load so partial apply cannot leave a half-filled DB (including orphaned
-    /// FT schema). Live FLUSHDB/FLUSHALL use [`flush`] instead.
+    /// Used when a hard reset of definitions is required. Live FLUSHDB/FLUSHALL
+    /// use [`flush`] instead. AOF/RDB public load paths use scratch-load +
+    /// [`replace_keyspace_from`] and do **not** wipe the target on failure.
     pub fn flush_all_including_search(&self) {
         self.flush_keyspace();
         self.search_index_manager.clear();
         self.memory_usage.store(0, Ordering::Relaxed);
         self.memory_tracker.reset();
+    }
+
+    /// Move full keyspace state from `other` into `self` (map-level swap).
+    ///
+    /// **Exclusive access required** on both caches for the whole call: no
+    /// concurrent client commands and no background sweep. Intended only for
+    /// AOF/RDB scratch-load commit after a successful decode/replay into
+    /// `other`.
+    ///
+    /// Swaps: string map, sorted_sets, geo_sets, hashes, lists, sets, streams,
+    /// typed_expires, watch_gens, search indices/aliases, MemoryTracker
+    /// keyspace category counts, and `memory_usage`. Memory is moved only via
+    /// tracker take/install + `memory_usage` store (never per-key `account`
+    /// after map replace).
+    ///
+    /// Leaves **unchanged** on `self`: pubsub, connection stats, list/stream
+    /// blockers, maxmemory / eviction config, slowlog, acl_log.
+    ///
+    /// After return, `self` holds `other`'s keyspace; `other` is empty (safe to
+    /// drop). Drain-then-replace: scratch is fully drained first, then the
+    /// target is drained into discard and filled — so a panic while preparing
+    /// scratch leaves `self` intact.
+    pub fn replace_keyspace_from(&self, other: &Self) {
+        // 1. Drain scratch completely first (self still intact if this panics).
+        let other_map = other.map.drain_all();
+        let other_zsets = other.sorted_sets.drain_all();
+        let other_geos = other.geo_sets.drain_all();
+        let other_hashes = std::mem::take(&mut *other.hashes.write());
+        let other_lists = std::mem::take(&mut *other.lists.write());
+        let other_sets = std::mem::take(&mut *other.sets.write());
+        let other_streams = std::mem::take(&mut *other.streams.write());
+        let other_expires = std::mem::take(&mut *other.typed_expires.write());
+        let other_watch = std::mem::take(&mut *other.watch_gens.lock());
+        let (other_indices, other_aliases) = other.search_index_manager.take_all();
+        let other_counts = other.memory_tracker.take_keyspace_counts();
+        let other_mem = other.memory_usage.swap(0, Ordering::Relaxed);
+
+        // 2. Drain target into discard, then install scratch state.
+        let _discard_map = self.map.drain_all();
+        let _discard_zsets = self.sorted_sets.drain_all();
+        let _discard_geos = self.geo_sets.drain_all();
+        let _discard_hashes = std::mem::take(&mut *self.hashes.write());
+        let _discard_lists = std::mem::take(&mut *self.lists.write());
+        let _discard_sets = std::mem::take(&mut *self.sets.write());
+        let _discard_streams = std::mem::take(&mut *self.streams.write());
+        let _discard_expires = std::mem::take(&mut *self.typed_expires.write());
+        let _discard_watch = std::mem::take(&mut *self.watch_gens.lock());
+        let _ = self.search_index_manager.take_all();
+        let _ = self.memory_tracker.take_keyspace_counts();
+
+        self.map.replace_all(other_map);
+        self.sorted_sets.replace_all(other_zsets);
+        self.geo_sets.replace_all(other_geos);
+        *self.hashes.write() = other_hashes;
+        *self.lists.write() = other_lists;
+        *self.sets.write() = other_sets;
+        *self.streams.write() = other_streams;
+        *self.typed_expires.write() = other_expires;
+        *self.watch_gens.lock() = other_watch;
+        self.search_index_manager
+            .install(other_indices, other_aliases);
+        self.memory_tracker.install_keyspace_counts(&other_counts);
+        self.memory_usage.store(other_mem, Ordering::Relaxed);
     }
 
     /// Clear all typed key maps / expires (not search schema).

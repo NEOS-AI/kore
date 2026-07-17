@@ -95,7 +95,7 @@ pub struct Cache {
     pub(super) lfu_decay_time: AtomicU8,
     /// Per-key generation counters for WATCH / optimistic locking.
     /// Only keys that have been WATCHed (or modified while watched) appear here.
-    watch_gens: Mutex<HashMap<Bytes, u64>>,
+    pub(super) watch_gens: Mutex<HashMap<Bytes, u64>>,
 }
 
 impl Cache {
@@ -244,6 +244,25 @@ impl Cache {
         }
 
         cache
+    }
+
+    /// Empty keyspace sibling for scratch-load (AOF/RDB).
+    ///
+    /// Same shard count / maxmemory / max-entry-size as `self`, shares pubsub +
+    /// connection stats / slowlog / acl_log (multi-DB sibling pattern), but has
+    /// independent maps, search manager, and zeroed memory. Background sweep is
+    /// **not** started — callers must use this only under exclusive access
+    /// (no concurrent client commands against the scratch).
+    pub fn empty_keyspace_like(&self) -> Arc<Self> {
+        Self::new_keyspace_sharing(
+            self,
+            self.map.num_shards(),
+            self.max_memory.load(std::sync::atomic::Ordering::Relaxed),
+            self.max_entry_size
+                .load(std::sync::atomic::Ordering::Relaxed),
+            false, // start_sweep: load-time exclusive use
+            0.75,  // loadfactor only sizes initial shard capacity
+        )
     }
 
     /// Current max memory limit in bytes.

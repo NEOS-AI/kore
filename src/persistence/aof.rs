@@ -1146,28 +1146,37 @@ fn map_ft_mutator_error(msg: String) -> Error {
 
 /// Replay AOF into a single cache. SELECT is ignored (all commands hit this cache).
 ///
-/// On any load error, the cache is fully wiped (keys + FT schema/aliases) so
-/// partial apply does not leave a half-filled live dataset (all-or-nothing).
+/// **Scratch-load (transactional):** commands are applied to an empty scratch
+/// keyspace. On `Ok`, the scratch keyspace is swapped into `cache` via
+/// [`Cache::replace_keyspace_from`]. On `Err`, `cache` is left completely
+/// untouched (scratch is dropped). Requires exclusive access to `cache` for
+/// the commit swap (no concurrent client traffic / sweep during load).
 pub fn load_into_cache(cache: &Arc<Cache>, path: &Path) -> Result<usize> {
+    let scratch = cache.empty_keyspace_like();
     let result = load_file_with(path, |argv| {
         let cmd = String::from_utf8_lossy(&argv[0]).to_uppercase();
         if cmd == "SELECT" {
             return Ok(());
         }
-        apply_command_to_cache(cache, &argv)
+        apply_command_to_cache(&scratch, &argv)
     });
-    if result.is_err() {
-        // Full wipe including FT definitions — not live FLUSHDB semantics.
-        cache.flush_all_including_search();
+    match result {
+        Ok(n) => {
+            cache.replace_keyspace_from(&scratch);
+            Ok(n)
+        }
+        Err(e) => Err(e),
     }
-    result
 }
 
 /// Replay AOF into multi-DB keyspaces. Handles SELECT and FLUSHALL across DBs.
 ///
-/// On any load error, every database is fully wiped (keys + FT schema/aliases)
-/// so partial apply does not leave a half-filled live dataset (all-or-nothing).
+/// **Scratch-load (transactional):** replay targets an empty multi-DB scratch
+/// collection. On `Ok`, each DB keyspace is swapped into `databases` via
+/// [`Databases::replace_keyspaces_from`]. On `Err`, `databases` is left
+/// completely untouched. Requires exclusive access for the commit swap.
 pub fn load_into_databases(databases: &Databases, path: &Path) -> Result<usize> {
+    let scratch = databases.empty_like();
     let mut current = 0usize;
     let result = load_file_with(path, |argv| {
         let cmd = String::from_utf8_lossy(&argv[0]).to_uppercase();
@@ -1176,7 +1185,7 @@ pub fn load_into_databases(databases: &Databases, path: &Path) -> Result<usize> 
                 if argv.len() >= 2 {
                     if let Ok(s) = std::str::from_utf8(&argv[1]) {
                         if let Ok(idx) = s.parse::<usize>() {
-                            if databases.get(idx).is_some() {
+                            if scratch.get(idx).is_some() {
                                 current = idx;
                             }
                         }
@@ -1187,20 +1196,22 @@ pub fn load_into_databases(databases: &Databases, path: &Path) -> Result<usize> 
             "FLUSHALL" => {
                 // Live FLUSHALL during AOF replay: keys/docs only, keep schema
                 // if any had been created earlier in the file (matches runtime).
-                databases.flush_all();
+                scratch.flush_all();
                 Ok(())
             }
             _ => {
-                let Some(cache) = databases.get(current) else {
+                let Some(cache) = scratch.get(current) else {
                     return Ok(());
                 };
                 apply_command_to_cache(&cache, &argv)
             }
         }
     });
-    if result.is_err() {
-        // Full wipe including FT definitions — not live FLUSHALL semantics.
-        databases.flush_all_including_search();
+    match result {
+        Ok(n) => {
+            databases.replace_keyspaces_from(&scratch);
+            Ok(n)
+        }
+        Err(e) => Err(e),
     }
-    result
 }

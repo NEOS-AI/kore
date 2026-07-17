@@ -1,4 +1,5 @@
-//! Batch BW: AOF load is all-or-nothing — flush target DBs on apply failure.
+//! Batch BW / CB: AOF load is all-or-nothing via scratch-load.
+//! Failed apply leaves the target untouched (partial state lives only on scratch).
 
 use bytes::Bytes;
 use kore::commands::CommandHandler;
@@ -91,7 +92,8 @@ fn argv(parts: &[&str]) -> Vec<Bytes> {
     parts.iter().map(|p| Bytes::from(p.to_string())).collect()
 }
 
-/// Successful CREATE + HSET then failing second CREATE → Err and empty target.
+/// Successful CREATE + HSET then failing second CREATE → Err; empty target stays empty
+/// (partial scratch state is discarded, not committed).
 #[test]
 fn failed_load_flushes_partial_create_and_hset() {
     let dir = tmp_dir("partial-flush");
@@ -142,16 +144,16 @@ fn failed_load_flushes_partial_create_and_hset() {
     let cache = loaded.get(0).unwrap();
     assert!(
         cache.list_search_indices().is_empty(),
-        "indices must be flushed after failed load"
+        "indices must not be committed after failed load"
     );
     assert!(
         cache.list_search_aliases().is_empty(),
-        "aliases must be flushed after failed load"
+        "aliases must not be committed after failed load"
     );
-    // Hash key from partial HSET must not remain.
+    // Hash key from partial HSET must not remain (scratch discarded).
     assert!(
         cache.get_hash(&Bytes::from_static(b"doc:1")).is_none(),
-        "partial HSET key must be flushed"
+        "partial HSET key must not be committed"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -222,7 +224,7 @@ fn successful_load_preserves_search_and_keys() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// load_into_cache also flushes on FT failure.
+/// load_into_cache also discards partial scratch on FT failure.
 #[test]
 fn failed_load_into_cache_flushes() {
     let dir = tmp_dir("cache-flush");
