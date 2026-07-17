@@ -250,7 +250,9 @@ fn main() -> anyhow::Result<()> {
         let server = Server::with_databases_and_persistence(databases, config, persistence)
             .with_redlock(redlock);
 
-        server.run_with_shutdown(shutdown_rx).await?;
+        // Pass the Sender so SHUTDOWN can exit the accept loop (signals still use clones).
+        let _shutdown_rx = shutdown_rx;
+        server.run_with_shutdown_tx(shutdown_tx).await?;
 
         Ok(())
     })

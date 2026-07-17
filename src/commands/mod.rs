@@ -114,6 +114,12 @@ pub struct CommandHandler {
     client_tracking_noloop: bool,
     /// CLIENT CACHING YES|NO (opt-in/opt-out next-command flag).
     client_caching: Option<bool>,
+    /// After writing the reply, network should close this connection (QUIT / SHUTDOWN / KILL).
+    close_after_reply: bool,
+    /// Optional server-wide shutdown trigger (SHUTDOWN command).
+    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    /// When SHUTDOWN NOSAVE is used, set so the accept loop skips SAVE.
+    shutdown_nosave: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl CommandHandler {
@@ -199,7 +205,28 @@ impl CommandHandler {
             client_tracking_optout: false,
             client_tracking_noloop: false,
             client_caching: None,
+            close_after_reply: false,
+            shutdown_tx: None,
+            shutdown_nosave: None,
         }
+    }
+
+    /// Whether the network layer should close the connection after the current reply.
+    pub fn take_close_after_reply(&mut self) -> bool {
+        let c = self.close_after_reply;
+        self.close_after_reply = false;
+        c
+    }
+
+    /// Wire the process-wide shutdown channel (server accept loop).
+    pub fn with_shutdown(
+        mut self,
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+        nosave: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.shutdown_tx = Some(shutdown_tx);
+        self.shutdown_nosave = Some(nosave);
+        self
     }
 
     /// Load options honoring CLIENT NO-TOUCH.
@@ -316,6 +343,10 @@ impl CommandHandler {
                 "slowlog-max-len".into(),
                 self.cache.slowlog.max_len().to_string(),
             ),
+            (
+                "acllog-max-len".into(),
+                self.cache.acl_log.max_len().to_string(),
+            ),
             ("databases".into(), self.databases.len().to_string()),
             (
                 "min-replicas-to-write".into(),
@@ -352,6 +383,7 @@ fn config_param_aliases(canonical: &str) -> &'static [&'static str] {
         "lfu-decay-time" => &["lfu_decay_time"],
         "slowlog-log-slower-than" => &["slowlog_log_slower_than"],
         "slowlog-max-len" => &["slowlog_max_len"],
+        "acllog-max-len" => &["acllog_max_len", "acl-log-max-len"],
         "min-replicas-to-write" => &["min-slaves-to-write"],
         "min-replicas-max-lag" => &["min-slaves-max-lag"],
         _ => &[],
@@ -600,7 +632,11 @@ impl CommandHandler {
             "LOLWUT" => self.handle_lolwut(&args[1..]),
             "READONLY" => self.handle_readonly(&args[1..]),
             "READWRITE" => self.handle_readwrite(&args[1..]),
-            "QUIT" => Ok(RespValue::ok()),
+            "QUIT" => {
+                self.close_after_reply = true;
+                Ok(RespValue::ok())
+            }
+            "SHUTDOWN" => self.handle_shutdown(&args[1..]),
 
             // Client handshake / introspection
             "CLIENT" => self.handle_client(&args[1..]),
@@ -941,8 +977,12 @@ impl CommandHandler {
     fn check_acl_permission(&self, cmd_upper: &str, args: &[RespValue]) -> Option<RespValue> {
         let username = self.username.as_deref().unwrap_or("default");
         let cmd_lower = cmd_upper.to_ascii_lowercase();
+        let client_id = self.client_id.unwrap_or(0);
 
         if !self.acl.can_execute(username, &cmd_lower) {
+            self.cache
+                .acl_log
+                .push("command", &cmd_lower, username, client_id);
             return Some(RespValue::error(format!(
                 "NOPERM this user has no permissions to run the '{}' command",
                 cmd_lower
@@ -955,6 +995,9 @@ impl CommandHandler {
         if let Some(keys) = script_keys {
             for key in keys {
                 if !self.acl.can_access_key(username, &key) {
+                    self.cache
+                        .acl_log
+                        .push("key", &key, username, client_id);
                     return Some(RespValue::error(
                         "NOPERM this user has no permissions to access one of the keys used as arguments",
                     ));
@@ -965,6 +1008,9 @@ impl CommandHandler {
                 let keys = extract_command_keys(args, first_key, last_key, step);
                 for key in keys {
                     if !self.acl.can_access_key(username, &key) {
+                        self.cache
+                            .acl_log
+                            .push("key", &key, username, client_id);
                         return Some(RespValue::error(
                             "NOPERM this user has no permissions to access one of the keys used as arguments",
                         ));
@@ -977,6 +1023,9 @@ impl CommandHandler {
         if let Some(channels) = extract_pubsub_channels(cmd_upper, args) {
             for ch in channels {
                 if !self.acl.can_access_channel(username, &ch) {
+                    self.cache
+                        .acl_log
+                        .push("channel", &ch, username, client_id);
                     return Some(RespValue::error(
                         "NOPERM this user has no permissions to access one of the channels used as arguments",
                     ));

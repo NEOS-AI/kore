@@ -35,6 +35,8 @@ pub struct Server {
     cluster: Option<Arc<ClusterState>>,
     /// Shared SCRIPT LOAD / EVALSHA cache for all connections.
     script_cache: Arc<ScriptCache>,
+    /// When true, skip SAVE on process shutdown (SHUTDOWN NOSAVE).
+    shutdown_nosave: Arc<std::sync::atomic::AtomicBool>,
 }
 
 const BUFFER_SIZE: usize = 8192;
@@ -102,6 +104,7 @@ impl Server {
             redlock: None,
             cluster,
             script_cache: ScriptCache::shared(),
+            shutdown_nosave: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -153,16 +156,35 @@ impl Server {
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
-        let (_tx, rx) = watch::channel(false);
-        self.run_with_shutdown(rx).await
+        let (tx, _rx) = watch::channel(false);
+        self.run_with_shutdown_tx(tx).await
     }
 
     /// Run the accept loop until `shutdown` becomes `true`.
-    /// On shutdown: stop accepting, optionally SAVE if persistence is present, then return.
+    /// Prefer [`run_with_shutdown_tx`] so the SHUTDOWN command can signal exit.
     pub async fn run_with_shutdown(
         &self,
+        shutdown: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        self.run_with_shutdown_inner(None, shutdown).await
+    }
+
+    /// Preferred entry: provide the shutdown Sender so SHUTDOWN and signals share one channel.
+    pub async fn run_with_shutdown_tx(
+        &self,
+        shutdown_tx: watch::Sender<bool>,
+    ) -> anyhow::Result<()> {
+        let rx = shutdown_tx.subscribe();
+        self.run_with_shutdown_inner(Some(shutdown_tx), rx).await
+    }
+
+    async fn run_with_shutdown_inner(
+        &self,
+        shutdown_tx: Option<watch::Sender<bool>>,
         mut shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
+        let shutdown_tx = shutdown_tx.map(Arc::new);
+        let shutdown_nosave = Arc::clone(&self.shutdown_nosave);
         let addr = self.config.socket_addr();
         let listener = TcpListener::bind(&addr).await?;
 
@@ -286,6 +308,8 @@ impl Server {
                                     peer_addr.to_string(),
                                     conn_limit.clone(),
                                     tls_acceptor.clone(),
+                                    shutdown_tx.clone(),
+                                    Arc::clone(&shutdown_nosave),
                                 );
                             }
                             Err(e) => error!("Failed to accept connection: {}", e),
@@ -300,6 +324,8 @@ impl Server {
                                     peer,
                                     conn_limit.clone(),
                                     None,
+                                    shutdown_tx.clone(),
+                                    Arc::clone(&shutdown_nosave),
                                 );
                             }
                             Err(e) => error!("Failed to accept unix connection: {}", e),
@@ -327,6 +353,8 @@ impl Server {
                                     peer_addr.to_string(),
                                     conn_limit.clone(),
                                     tls_acceptor.clone(),
+                                    shutdown_tx.clone(),
+                                    Arc::clone(&shutdown_nosave),
                                 );
                             }
                             Err(e) => error!("Failed to accept connection: {}", e),
@@ -336,13 +364,18 @@ impl Server {
             }
         }
 
-        // Best-effort multi-DB persistence flush on shutdown
-        if let Some(ref p) = self.persistence {
-            info!("Saving database before shutdown...");
-            match p.save(&self.databases) {
-                Ok(()) => info!("Database saved successfully"),
-                Err(e) => warn!("Failed to save database on shutdown: {}", e),
+        // Best-effort multi-DB persistence flush on shutdown (unless SHUTDOWN NOSAVE).
+        let skip_save = shutdown_nosave.load(std::sync::atomic::Ordering::SeqCst);
+        if !skip_save {
+            if let Some(ref p) = self.persistence {
+                info!("Saving database before shutdown...");
+                match p.save(&self.databases) {
+                    Ok(()) => info!("Database saved successfully"),
+                    Err(e) => warn!("Failed to save database on shutdown: {}", e),
+                }
             }
+        } else {
+            info!("Skipping SAVE on shutdown (NOSAVE)");
         }
 
         // Remove unix socket file so the next bind is clean.
@@ -362,6 +395,8 @@ impl Server {
         peer_label: String,
         conn_limit: Arc<Semaphore>,
         tls_acceptor: Option<TlsAcceptor>,
+        shutdown_tx: Option<Arc<watch::Sender<bool>>>,
+        shutdown_nosave: Arc<std::sync::atomic::AtomicBool>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -404,6 +439,8 @@ impl Server {
                             cluster,
                             redlock,
                             script_cache,
+                            shutdown_tx,
+                            shutdown_nosave,
                         )
                         .await
                     }
@@ -419,6 +456,8 @@ impl Server {
                     cluster,
                     redlock,
                     script_cache,
+                    shutdown_tx,
+                    shutdown_nosave,
                 )
                 .await
             };
@@ -479,6 +518,8 @@ async fn handle_connection<S>(
     cluster: Option<Arc<ClusterState>>,
     redlock: Option<Arc<Redlock>>,
     script_cache: Arc<ScriptCache>,
+    shutdown_tx: Option<Arc<watch::Sender<bool>>>,
+    shutdown_nosave: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -497,6 +538,10 @@ where
             .with_cluster(cluster)
             .with_redlock(redlock)
             .with_script_cache(script_cache);
+    if let Some(tx) = shutdown_tx {
+        // watch::Sender is Clone; Arc unwraps to a clone for the handler field.
+        handler = handler.with_shutdown((*tx).clone(), shutdown_nosave);
+    }
     handler.set_client_id(client_id);
     let mut buf = vec![0u8; BUFFER_SIZE]; // 8KB buffer
 
@@ -620,8 +665,13 @@ where
 
             // CLIENT REPLY OFF/SKIP: execute command but omit response on the wire.
             if handler.take_suppress_reply() {
+                if handler.take_close_after_reply() {
+                    break 'conn Ok(());
+                }
                 continue;
             }
+
+            let close_after = handler.take_close_after_reply();
 
             // SYNC / PSYNC: flush any prior pipeline bytes, then handshake + feed.
             if let Some(raw) = handler.take_raw_response() {
@@ -728,6 +778,13 @@ where
                 {
                     break 'conn Ok(());
                 }
+            }
+            // QUIT / SHUTDOWN / CLIENT KILL: flush reply then close.
+            if close_after {
+                if !pipeline_buf.is_empty() {
+                    let _ = send_response_buf(&response_tx, std::mem::take(&mut pipeline_buf)).await;
+                }
+                break 'conn Ok(());
             }
         }
 

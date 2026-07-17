@@ -34,12 +34,72 @@ impl CommandHandler {
             "SAVE" => self.acl_save(&args[1..]),
             "GENPASS" => self.acl_genpass(&args[1..]),
             "DRYRUN" => self.acl_dryrun(&args[1..]),
+            "LOG" => self.acl_log(&args[1..]),
             "HELP" => Ok(acl_help()),
             _ => Ok(RespValue::error(format!(
                 "ERR Unknown subcommand or wrong number of arguments for '{}'. Try ACL HELP.",
                 sub
             ))),
         }
+    }
+
+    /// ACL LOG [count|RESET]
+    fn acl_log(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            let entries = self.cache.acl_log.get(10);
+            return Ok(RespValue::Array(
+                entries
+                    .iter()
+                    .map(crate::acl_log::entry_to_resp)
+                    .collect(),
+            ));
+        }
+        if args.len() > 1 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'acl|log' command",
+            ));
+        }
+        let arg = match args[0].as_bulk_string() {
+            Some(b) => String::from_utf8_lossy(b).to_ascii_uppercase(),
+            None => match args[0].as_integer() {
+                Some(n) => n.to_string(),
+                None => {
+                    return Ok(RespValue::error(
+                        "ERR wrong number of arguments for 'acl|log' command",
+                    ))
+                }
+            },
+        };
+        if arg == "RESET" {
+            self.cache.acl_log.reset();
+            return Ok(RespValue::ok());
+        }
+        if arg == "LEN" {
+            return Ok(RespValue::Integer(self.cache.acl_log.len() as i64));
+        }
+        // count
+        let count = match arg.parse::<i64>() {
+            Ok(n) if n >= 0 => n as usize,
+            Ok(_) => 0,
+            Err(_) => {
+                // Redis also accepts bare integer bulk; try original integer form
+                match self.parse_integer(&args[0]) {
+                    Ok(n) if n >= 0 => n as usize,
+                    _ => {
+                        return Ok(RespValue::error(
+                            "ERR ACL LOG takes either an integer to count entries or RESET",
+                        ))
+                    }
+                }
+            }
+        };
+        let entries = self.cache.acl_log.get(count);
+        Ok(RespValue::Array(
+            entries
+                .iter()
+                .map(crate::acl_log::entry_to_resp)
+                .collect(),
+        ))
     }
 
     /// ACL DRYRUN <username> <command> [arg ...]
@@ -389,6 +449,8 @@ fn acl_help() -> RespValue {
             "    Generate a secure random password (default 256 bits).",
             "DRYRUN <username> <command> [arg ...]",
             "    Simulate whether a user can run a command.",
+            "LOG [count|RESET]",
+            "    Show recent ACL security events, or RESET the log.",
             "USERS",
             "    List all usernames.",
             "WHOAMI",

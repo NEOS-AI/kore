@@ -30,6 +30,7 @@ pub mod persistence;
 pub mod metrics;
 pub mod scripting;
 pub mod slowlog;
+pub mod acl_log;
 
 pub use acl::{AclStore, AclUser};
 pub use cache::{Cache, EvictionPolicy};
@@ -75,4 +76,5 @@ pub use query_engine::{Query, QueryFilter, QueryExecutor};
 pub use vector_search::{VectorIndex, VectorSearchResult};
 pub use scripting::{script_sha1, ScriptCache};
 pub use slowlog::{SlowLog, SlowLogEntry, DEFAULT_MAX_LEN as SLOWLOG_DEFAULT_MAX_LEN, DEFAULT_SLOWER_THAN_US};
+pub use acl_log::{AclLog, AclLogEntry, DEFAULT_MAX_LEN as ACLLOG_DEFAULT_MAX_LEN};
 

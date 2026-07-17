@@ -1112,6 +1112,23 @@ impl CommandHandler {
                         self.cache.slowlog.set_max_len(n as usize);
                         Ok(RespValue::ok())
                     }
+                    "acllog-max-len" | "acllog_max_len" | "acl-log-max-len" => {
+                        let n: i64 = match value_str.parse() {
+                            Ok(n) if n >= 0 => n,
+                            Ok(_) => {
+                                return Ok(RespValue::error(
+                                    "ERR acllog-max-len must be >= 0",
+                                ))
+                            }
+                            Err(_) => {
+                                return Ok(RespValue::error(
+                                    "ERR invalid acllog-max-len value",
+                                ))
+                            }
+                        };
+                        self.cache.acl_log.set_max_len(n as usize);
+                        Ok(RespValue::ok())
+                    }
                     "lfu-decay-time" | "lfu_decay_time" => {
                         let n: u64 = match value_str.parse() {
                             Ok(n) => n,
@@ -1292,6 +1309,58 @@ impl CommandHandler {
                 sub
             ))),
         }
+    }
+
+    /// SHUTDOWN [NOSAVE|SAVE] [NOW|FORCE|ABORT]
+    /// Signal graceful server shutdown and close this connection after the reply.
+    pub(super) fn handle_shutdown(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        let mut nosave = false;
+        let mut save = false;
+        for a in args {
+            let tok = match a.as_bulk_string() {
+                Some(b) => String::from_utf8_lossy(b).to_ascii_uppercase(),
+                None => return Ok(RespValue::error("ERR syntax error")),
+            };
+            match tok.as_str() {
+                "NOSAVE" => nosave = true,
+                "SAVE" => save = true,
+                "NOW" | "FORCE" => {
+                    // Accepted for client compatibility; Kore always exits the accept loop promptly.
+                }
+                "ABORT" => {
+                    return Ok(RespValue::error(
+                        "ERR Errors trying to SHUTDOWN. Check logs.",
+                    ));
+                }
+                _ => {
+                    return Ok(RespValue::error(
+                        "ERR syntax error, try SHUTDOWN [NOSAVE|SAVE] [NOW|FORCE|ABORT]",
+                    ));
+                }
+            }
+        }
+        if nosave && save {
+            return Ok(RespValue::error(
+                "ERR syntax error, try SHUTDOWN [NOSAVE|SAVE] [NOW|FORCE|ABORT]",
+            ));
+        }
+        if let Some(ref flag) = self.shutdown_nosave {
+            flag.store(nosave, std::sync::atomic::Ordering::SeqCst);
+        }
+        // Best-effort SAVE before signaling when requested and persistence is present.
+        if save {
+            if let Some(ref p) = self.persistence {
+                if let Err(e) = p.save(&self.databases) {
+                    return Ok(RespValue::error(format!("ERR {}", e)));
+                }
+            }
+        }
+        if let Some(ref tx) = self.shutdown_tx {
+            let _ = tx.send(true);
+        }
+        self.close_after_reply = true;
+        // Redis often closes without a reply on SHUTDOWN; we still return OK then close.
+        Ok(RespValue::ok())
     }
 
     /// MODULE LIST | HELP — module subsystem (no loadable modules yet).

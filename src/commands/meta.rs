@@ -23,6 +23,7 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     CmdSpec { name: "time", arity: 1, flags: &["loading", "stale", "fast", "random"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "auth", arity: -2, flags: &["noscript", "loading", "stale", "fast", "no_auth", "ok_loading"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "quit", arity: -1, flags: &["admin", "noscript", "loading", "stale", "fast"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "shutdown", arity: -1, flags: &["admin", "noscript", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "reset", arity: 1, flags: &["noscript", "loading", "stale", "fast"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "hello", arity: -1, flags: &["noscript", "loading", "stale", "fast", "no_auth"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "command", arity: -1, flags: &["loading", "stale", "random"], first_key: 0, last_key: 0, step: 0 },
@@ -611,10 +612,14 @@ impl CommandHandler {
                     b"GETREDIR / TRACKINGINFO -- client-side caching status",
                 ))),
                 RespValue::BulkString(Some(Bytes::from_static(
+                    b"KILL ID <id> [SKIPME yes|no] -- close a connection by id",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
                     b"HELP -- print this help",
                 ))),
             ])),
-            "KILL" | "PAUSE" | "UNPAUSE" => Ok(RespValue::error(format!(
+            "KILL" => self.client_kill(&args[1..]),
+            "PAUSE" | "UNPAUSE" => Ok(RespValue::error(format!(
                 "ERR CLIENT {} is not supported yet",
                 sub
             ))),
@@ -623,6 +628,93 @@ impl CommandHandler {
                 sub
             ))),
         }
+    }
+
+    /// CLIENT KILL [ID client-id] … — MVP: kill this connection by ID (returns count).
+    fn client_kill(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'client|kill' command",
+            ));
+        }
+        // Old form: CLIENT KILL addr (not supported without registry).
+        // New form: CLIENT KILL ID <id> [SKIPME yes|no]
+        let mut i = 0;
+        let mut kill_id: Option<usize> = None;
+        let mut skipme = true;
+        while i < args.len() {
+            let tok = match args[i].as_bulk_string() {
+                Some(b) => String::from_utf8_lossy(b).to_ascii_uppercase(),
+                None => {
+                    return Ok(RespValue::error("ERR syntax error"));
+                }
+            };
+            match tok.as_str() {
+                "ID" => {
+                    if i + 1 >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    let id = match self.parse_integer(&args[i + 1]) {
+                        Ok(n) if n >= 0 => n as usize,
+                        _ => {
+                            return Ok(RespValue::error(
+                                "ERR value is not an integer or out of range",
+                            ))
+                        }
+                    };
+                    kill_id = Some(id);
+                    i += 2;
+                }
+                "SKIPME" => {
+                    if i + 1 >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    let v = match args[i + 1].as_bulk_string() {
+                        Some(b) => String::from_utf8_lossy(b).to_ascii_lowercase(),
+                        None => return Ok(RespValue::error("ERR syntax error")),
+                    };
+                    skipme = match v.as_str() {
+                        "yes" => true,
+                        "no" => false,
+                        _ => {
+                            return Ok(RespValue::error(
+                                "ERR SKIPME accepts only YES or NO",
+                            ))
+                        }
+                    };
+                    i += 2;
+                }
+                "TYPE" | "USER" | "ADDR" | "LADDR" | "MAXAGE" => {
+                    // Filters not yet supported without multi-client registry.
+                    if i + 1 >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    i += 2;
+                }
+                _ => {
+                    // Legacy: CLIENT KILL ip:port — not supported.
+                    return Ok(RespValue::error(
+                        "ERR CLIENT KILL address form is not supported; use CLIENT KILL ID <id>",
+                    ));
+                }
+            }
+        }
+        let Some(id) = kill_id else {
+            return Ok(RespValue::error(
+                "ERR CLIENT KILL requires ID <client-id> (multi-client filters not yet supported)",
+            ));
+        };
+        let my_id = self.client_id.unwrap_or(0);
+        if id == my_id {
+            if skipme {
+                // Redis SKIPME yes: do not kill self → 0
+                return Ok(RespValue::Integer(0));
+            }
+            self.close_after_reply = true;
+            return Ok(RespValue::Integer(1));
+        }
+        // Other client IDs: no registry yet.
+        Ok(RespValue::Integer(0))
     }
 
     /// CLIENT GETREDIR — redirect target client id, or -1 when tracking is off / no redirect.
@@ -1166,6 +1258,10 @@ impl CommandHandler {
             "memory" => return Ok(extract_memory_keys_for_getkeys(cmd_args)),
             // FCALL / FCALL_RO: numkeys after function name
             "fcall" | "fcall_ro" => return Ok(extract_fcall_keys_for_getkeys(cmd_args)),
+            // GEORADIUS / GEORADIUSBYMEMBER: source + optional STORE/STOREDIST dest
+            "georadius" | "georadiusbymember" => {
+                return Ok(extract_georadius_keys_for_getkeys(cmd_args))
+            }
             _ => {}
         }
 
@@ -1603,6 +1699,51 @@ fn extract_fcall_keys_for_getkeys(args: &[RespValue]) -> Vec<Bytes> {
         return Vec::new();
     }
     extract_numkeys_keys_for_getkeys(&args[1..], 0)
+}
+
+/// GEORADIUS key lon lat radius unit [opts] [STORE d] [STOREDIST d]
+/// GEORADIUSBYMEMBER key member radius unit [opts] [STORE d] [STOREDIST d]
+fn extract_georadius_keys_for_getkeys(args: &[RespValue]) -> Vec<Bytes> {
+    if args.is_empty() {
+        return Vec::new();
+    }
+    let mut keys = Vec::new();
+    if let Some(k) = args[0].as_bulk_string() {
+        keys.push(k.clone());
+    }
+    let mut i = 1;
+    while i < args.len() {
+        let opt = match args[i].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        match opt.as_str() {
+            "STORE" | "STOREDIST" => {
+                if i + 1 < args.len() {
+                    if let Some(d) = args[i + 1].as_bulk_string() {
+                        keys.push(d.clone());
+                    }
+                }
+                i += 2;
+            }
+            "COUNT" => {
+                // COUNT n [ANY]
+                i += 2;
+                if i < args.len() {
+                    if let Some(b) = args[i].as_bulk_string() {
+                        if String::from_utf8_lossy(b).eq_ignore_ascii_case("ANY") {
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    keys
 }
 
 fn is_hello_keyword(b: &Bytes) -> bool {
