@@ -358,10 +358,20 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch BT)*: `create_index` / `alias_add` / `alias_update` hold aliases then indices locks for full check-and-insert (matches `drop_index`)
 - [x] **`[P1]`** **Code review (BT):** emit `FT.CREATE` + `FT.ALIASADD` during AOF rewrite
   - *Done (Batch BU)*: rewrite order **FT.CREATE → key dumps (HSET…) → FT.ALIASADD**; `list_definitions` / `list_aliases` on SearchIndexManager; load applies `FT.CREATE`/`FT.ALIAS*`/`FT.DROPINDEX` and HSET auto-indexes (`tests/bu_aof_ft_rewrite_test.rs`)
+- [ ] **`[P1]`** **Code review (BU):** AOF load must not silently drop FT mutator failures
+  - *Found*: `apply_command_to_cache` FT.CREATE / FT.ALIAS* / FT.DROPINDEX use `let _ = …` and always `Ok(())` — create/alias errors (OOM, name conflict, bad def) leave hashes restored but search empty with no load error
+  - *Fix*: propagate `create_search_index` / alias errors (or log + fail load count); add test that corrupt/conflict FT.CREATE surfaces
 - [ ] **`[P2]`** Persist FT indices + aliases in RDB (AOF rewrite done in BU; RDB FT section still open)
 - [ ] **`[P2]`** ACL `@search` category for FT.* (fine-grained users; default `+@all` unaffected)
 - [ ] **`[P2]`** HNSW correctness/performance benchmarks vs FLAT
 - [ ] **`[P2]`** **Code review (BT nit):** optional single critical section for `get_index` resolve+lookup; min-replicas FT test
+- [ ] **`[P2]`** **Code review (BU):** share one FT.CREATE parser between command path and AOF load
+  - *Found*: `parse_ft_create_definition` in `aof.rs` duplicates `handle_ft_create` in `commands/search.rs` — schema options can drift (already two HNSW option loops)
+  - *Fix*: extract shared `IndexDefinition::from_ft_create_argv` (or similar) used by both
+- [ ] **`[P2]`** **Code review (BU):** HNSW `ef_construction` not round-tripped in AOF rewrite
+  - *Found*: rewrite emits `HNSW M <n>` only; load hardcodes `ef_construction: 200` (command path also hardcodes 200 / unused `mut`)
+  - *Fix*: when EF becomes configurable, encode/parse `EF_CONSTRUCTION` and store on `VectorAlgorithm::HNSW`
+- [ ] **`[P2]`** **Code review (BU nit):** VECTOR/NUMERIC AOF rewrite round-trip test; `has_search_state` can avoid double list locks
 
 ### Pub/Sub
 
@@ -393,7 +403,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). BS review items closed in BT; BT review adds AOF rewrite gap.
+Prioritized for next letter batch(es). BT P1 AOF rewrite closed in BU; BU review adds load error-handling + parser hygiene.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -401,9 +411,13 @@ Prioritized for next letter batch(es). BS review items closed in BT; BT review a
 | P1 | Alias target resolve + real-name storage | done (BT) |
 | P1 | Atomic create/alias namespace critical section | done (BT) |
 | P1 | AOF rewrite emits `FT.CREATE` + aliases (BT review) | done (BU) |
+| P1 | AOF load surfaces FT.CREATE / alias failures (BU review) | open |
 | P2 | FT RDB section | open |
 | P2 | ACL `@search` | open |
+| P2 | Shared FT.CREATE parser (cmd + AOF load) | open |
+| P2 | HNSW `ef_construction` AOF round-trip | open |
 | P2 | `get_index` atomic resolve; min-replicas FT test | open |
+| P2 | VECTOR/NUMERIC rewrite tests; `has_search_state` lock nit | open |
 | P2 | Lua SELECT DB side-effect test | done (BT) |
 
 ---
