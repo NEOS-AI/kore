@@ -662,7 +662,7 @@ impl CommandHandler {
         }
     }
 
-    /// XGROUP CREATE key groupname id|$ [MKSTREAM]
+    /// XGROUP CREATE key groupname id|$ [MKSTREAM] [ENTRIESREAD entries-read]
     /// XGROUP DESTROY key groupname
     pub(super) fn handle_xgroup(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.is_empty() {
@@ -694,11 +694,44 @@ impl CommandHandler {
                     Some(b) => String::from_utf8_lossy(b).into_owned(),
                     None => return Ok(RespValue::error("ERR invalid stream ID")),
                 };
-                let mkstream = args.iter().skip(4).any(|a| {
-                    a.as_bulk_string()
-                        .map(|b| b.eq_ignore_ascii_case(b"MKSTREAM"))
-                        .unwrap_or(false)
-                });
+                // Optional trailing flags: MKSTREAM, ENTRIESREAD <n> (any order).
+                let mut mkstream = false;
+                let mut entries_read: Option<u64> = None;
+                let mut i = 4;
+                while i < args.len() {
+                    let opt = match args[i].as_bulk_string() {
+                        Some(b) => String::from_utf8_lossy(b).to_ascii_uppercase(),
+                        None => {
+                            return Ok(RespValue::error("ERR syntax error"));
+                        }
+                    };
+                    match opt.as_str() {
+                        "MKSTREAM" => {
+                            mkstream = true;
+                            i += 1;
+                        }
+                        "ENTRIESREAD" => {
+                            if i + 1 >= args.len() {
+                                return Ok(RespValue::error(
+                                    "ERR syntax error",
+                                ));
+                            }
+                            let n = match self.parse_integer(&args[i + 1]) {
+                                Ok(v) if v >= 0 => v as u64,
+                                _ => {
+                                    return Ok(RespValue::error(
+                                        "ERR value is not an integer or out of range",
+                                    ));
+                                }
+                            };
+                            entries_read = Some(n);
+                            i += 2;
+                        }
+                        _ => {
+                            return Ok(RespValue::error("ERR syntax error"));
+                        }
+                    }
+                }
 
                 let exists = self.cache.stream_exists(&key);
                 if !exists {
@@ -740,7 +773,7 @@ impl CommandHandler {
                     None => return Ok(RespValue::error("ERR no such key")),
                 };
                 let mut s = stream.write();
-                match s.group_create(group, id, mkstream) {
+                match s.group_create(group, id, mkstream, entries_read) {
                     Ok(()) => Ok(RespValue::ok()),
                     Err(e) => Ok(RespValue::error(e)),
                 }
@@ -1928,7 +1961,10 @@ impl CommandHandler {
                                     bulk_static(b"last-delivered-id"),
                                     RespValue::BulkString(Some(g.last_delivered_id.to_bytes())),
                                     bulk_static(b"entries-read"),
-                                    RespValue::null(),
+                                    match g.entries_read {
+                                        Some(n) => RespValue::Integer(n as i64),
+                                        None => RespValue::null(),
+                                    },
                                     bulk_static(b"lag"),
                                     RespValue::Integer(g.lag as i64),
                                 ])

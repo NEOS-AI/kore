@@ -726,7 +726,32 @@ impl CommandHandler {
         }
     }
 
-    pub(super) fn handle_info(&self, _args: &[RespValue]) -> Result<RespValue> {
+    /// INFO [section [section ...]] — full report or selected sections.
+    pub(super) fn handle_info(&self, args: &[RespValue]) -> Result<RespValue> {
+        let full = self.build_info_report();
+        if args.is_empty() {
+            return Ok(RespValue::BulkString(Some(Bytes::from(full))));
+        }
+        // Collect requested section names (case-insensitive). "all" / "default" → full.
+        let mut want: Vec<String> = Vec::new();
+        for arg in args {
+            let name = match arg.as_bulk_string() {
+                Some(b) => String::from_utf8_lossy(b).to_ascii_lowercase(),
+                None => continue,
+            };
+            if name == "all" || name == "default" {
+                return Ok(RespValue::BulkString(Some(Bytes::from(full))));
+            }
+            want.push(name);
+        }
+        if want.is_empty() {
+            return Ok(RespValue::BulkString(Some(Bytes::from(full))));
+        }
+        let filtered = filter_info_sections(&full, &want);
+        Ok(RespValue::BulkString(Some(Bytes::from(filtered))))
+    }
+
+    fn build_info_report(&self) -> String {
         let stats = &self.cache.stats;
         let total_cmds = stats.total_commands_processed();
         let health = self.health_status();
@@ -752,7 +777,7 @@ impl CommandHandler {
             }
         };
 
-        let info = format!(
+        format!(
             "# Server\r\n\
              kore_version:{}\r\n\
              redlock_enabled:{}\r\n\
@@ -887,9 +912,7 @@ impl CommandHandler {
             health.to_info_lines(),
             self.cache.dbsize(),
             self.cache.geo_set_count(),
-        );
-
-        Ok(RespValue::BulkString(Some(Bytes::from(info))))
+        )
     }
 
     /// HEALTH [PING|FULL] — liveness / structured readiness.
@@ -1391,4 +1414,44 @@ pub(super) fn scan_name_matches(pattern: Option<&str>, name: &[u8]) -> bool {
             crate::hashmap::pattern_match(pat, text)
         }
     }
+}
+
+/// Keep only INFO sections whose header names match `want` (case-insensitive).
+/// Unknown sections are silently omitted (Redis returns empty bulk for all-unknown).
+fn filter_info_sections(full: &str, want: &[String]) -> String {
+    // Split on section headers: lines starting with "# ".
+    let mut sections: Vec<(String, String)> = Vec::new();
+    let mut current_name: Option<String> = None;
+    let mut current_body = String::new();
+
+    for line in full.split("\r\n") {
+        if let Some(rest) = line.strip_prefix("# ") {
+            if let Some(name) = current_name.take() {
+                sections.push((name, std::mem::take(&mut current_body)));
+            }
+            current_name = Some(rest.to_ascii_lowercase());
+            current_body.push_str(line);
+            current_body.push_str("\r\n");
+        } else if current_name.is_some() {
+            current_body.push_str(line);
+            current_body.push_str("\r\n");
+        }
+    }
+    if let Some(name) = current_name.take() {
+        sections.push((name, current_body));
+    }
+
+    let mut out = String::new();
+    for w in want {
+        for (name, body) in &sections {
+            if name == w {
+                // Trim trailing blank lines then ensure one blank separator between sections.
+                let trimmed = body.trim_end_matches("\r\n");
+                out.push_str(trimmed);
+                out.push_str("\r\n\r\n");
+                break;
+            }
+        }
+    }
+    out
 }

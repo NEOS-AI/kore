@@ -743,7 +743,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
                     if let Some(stream) = cache.get_stream(key) {
                         let mut s = stream
                             .write();
-                        let _ = s.group_create(gname, id, true);
+                        let _ = s.group_create(gname, id, true, None);
                     }
                     Ok(())
                 }

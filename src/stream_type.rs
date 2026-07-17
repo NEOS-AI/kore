@@ -118,6 +118,8 @@ pub struct XInfoGroup {
     pub consumers: usize,
     pub pending: usize,
     pub last_delivered_id: StreamId,
+    /// Logical entries-read counter (None → null in XINFO).
+    pub entries_read: Option<u64>,
     /// Entries with ID greater than last-delivered-id (approximate lag).
     pub lag: usize,
 }
@@ -171,6 +173,8 @@ pub struct ConsumerGroup {
     pub name: Bytes,
     /// Last ID delivered to the group (for `>` reads).
     pub last_delivered_id: StreamId,
+    /// Logical entries-read counter for lag accounting (XGROUP CREATE/SETID ENTRIESREAD).
+    pub entries_read: Option<u64>,
     pub consumers: HashMap<Bytes, Consumer>,
     /// Pending entries list (PEL), keyed by stream ID.
     pub pending: BTreeMap<StreamId, PendingEntry>,
@@ -181,6 +185,7 @@ impl ConsumerGroup {
         Self {
             name,
             last_delivered_id,
+            entries_read: None,
             consumers: HashMap::new(),
             pending: BTreeMap::new(),
         }
@@ -467,13 +472,15 @@ impl RedisStream {
         name: Bytes,
         id: StreamId,
         mkstream_ok: bool,
+        entries_read: Option<u64>,
     ) -> Result<(), String> {
         let _ = mkstream_ok; // stream existence checked by caller
         if self.groups.contains_key(&name) {
             return Err("BUSYGROUP Consumer Group name already exists".into());
         }
-        self.groups
-            .insert(name.clone(), ConsumerGroup::new(name, id));
+        let mut group = ConsumerGroup::new(name.clone(), id);
+        group.entries_read = entries_read;
+        self.groups.insert(name, group);
         Ok(())
     }
 
@@ -830,6 +837,7 @@ impl RedisStream {
                     consumers: g.consumers.len(),
                     pending: g.pending.len(),
                     last_delivered_id: g.last_delivered_id,
+                    entries_read: g.entries_read,
                     lag,
                 }
             })
@@ -1247,7 +1255,7 @@ mod tests {
             .unwrap();
         s.xadd("1-1", vec![(Bytes::from("a"), Bytes::from("2"))])
             .unwrap();
-        s.group_create(Bytes::from("g"), StreamId::ZERO, true)
+        s.group_create(Bytes::from("g"), StreamId::ZERO, true, None)
             .unwrap();
         let msgs = s
             .xreadgroup(&Bytes::from("g"), &Bytes::from("c1"), ">", Some(10))

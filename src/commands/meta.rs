@@ -711,10 +711,8 @@ impl CommandHandler {
                 Ok(RespValue::Array(names))
             }
             "GETKEYS" => self.command_getkeys(&args[1..]),
-            "DOCS" | "GETKEYSANDFLAGS" => Ok(RespValue::error(format!(
-                "ERR COMMAND {} is not supported yet",
-                sub
-            ))),
+            "GETKEYSANDFLAGS" => self.command_getkeysandflags(&args[1..]),
+            "DOCS" => self.command_docs(&args[1..]),
             // Bare COMMAND with unknown first arg: try as INFO
             _ => {
                 // Redis: COMMAND <name> is not valid; only subcommands
@@ -728,18 +726,86 @@ impl CommandHandler {
 
     /// COMMAND GETKEYS <command> [arg ...] — extract key arguments via catalog specs.
     fn command_getkeys(&self, args: &[RespValue]) -> Result<RespValue> {
+        match self.extract_command_keys(args) {
+            Ok(keys) => Ok(RespValue::Array(
+                keys.into_iter()
+                    .map(|b| RespValue::BulkString(Some(b)))
+                    .collect(),
+            )),
+            Err(e) => Ok(RespValue::error(e)),
+        }
+    }
+
+    /// COMMAND GETKEYSANDFLAGS <command> [arg ...] — keys with per-key access flags.
+    fn command_getkeysandflags(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.is_empty() {
             return Ok(RespValue::error(
-                "ERR wrong number of arguments for 'command|getkeys' command",
+                "ERR wrong number of arguments for 'command|getkeysandflags' command",
             ));
         }
         let cmd_name = match args[0].as_bulk_string() {
             Some(s) => String::from_utf8_lossy(s).to_ascii_lowercase(),
             None => {
-                return Ok(RespValue::error(
-                    "ERR Invalid command specified",
-                ))
+                return Ok(RespValue::error("ERR Invalid command specified"));
             }
+        };
+        let keys = match self.extract_command_keys(args) {
+            Ok(k) => k,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+        let flags = key_flags_for_command(&cmd_name);
+        let out: Vec<RespValue> = keys
+            .into_iter()
+            .map(|k| {
+                RespValue::Array(vec![
+                    RespValue::BulkString(Some(k)),
+                    RespValue::Array(
+                        flags
+                            .iter()
+                            .map(|f| RespValue::BulkString(Some(Bytes::from_static(f.as_bytes()))))
+                            .collect(),
+                    ),
+                ])
+            })
+            .collect();
+        Ok(RespValue::Array(out))
+    }
+
+    /// COMMAND DOCS [command-name ...] — minimal docs map from the catalog.
+    fn command_docs(&self, args: &[RespValue]) -> Result<RespValue> {
+        let specs: Vec<&CmdSpec> = if args.is_empty() {
+            COMMAND_SPECS.iter().collect()
+        } else {
+            let mut out = Vec::with_capacity(args.len());
+            for arg in args {
+                let name = match arg.as_bulk_string() {
+                    Some(n) => String::from_utf8_lossy(n),
+                    None => continue,
+                };
+                if let Some(spec) = find_spec(&name) {
+                    out.push(spec);
+                }
+            }
+            out
+        };
+        // RESP2 map: flat [name, doc, name, doc, ...]
+        let mut reply = Vec::with_capacity(specs.len() * 2);
+        for spec in specs {
+            reply.push(bulk(spec.name));
+            reply.push(spec_to_docs(spec));
+        }
+        Ok(RespValue::Array(reply))
+    }
+
+    /// Shared key extraction for GETKEYS / GETKEYSANDFLAGS.
+    /// Args are `[command, arg...]`. Returns Err string on invalid command.
+    fn extract_command_keys(&self, args: &[RespValue]) -> std::result::Result<Vec<Bytes>, String> {
+        if args.is_empty() {
+            return Err("ERR wrong number of arguments for 'command|getkeys' command".into());
+        }
+        let cmd_name = match args[0].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_ascii_lowercase(),
+            None => return Err("ERR Invalid command specified".into()),
         };
         let cmd_args = &args[1..];
 
@@ -749,37 +815,167 @@ impl CommandHandler {
             || cmd_name == "eval_ro"
             || cmd_name == "evalsha_ro"
         {
-            return Ok(RespValue::Array(
-                extract_eval_keys_for_getkeys(cmd_args)
-                    .into_iter()
-                    .map(|b| RespValue::BulkString(Some(b)))
-                    .collect(),
-            ));
+            return Ok(extract_eval_keys_for_getkeys(cmd_args));
         }
 
         // SORT key … [STORE dest] — source + optional destination.
         if cmd_name == "sort" {
-            return Ok(RespValue::Array(
-                extract_sort_keys_for_getkeys(cmd_args)
-                    .into_iter()
-                    .map(|b| RespValue::BulkString(Some(b)))
-                    .collect(),
-            ));
+            return Ok(extract_sort_keys_for_getkeys(cmd_args));
         }
 
         let Some(spec) = find_spec(&cmd_name) else {
-            return Ok(RespValue::error("ERR Invalid command specified"));
+            return Err("ERR Invalid command specified".into());
         };
         if spec.first_key <= 0 {
-            return Ok(RespValue::Array(vec![]));
+            return Ok(Vec::new());
         }
-        let keys = extract_keys_from_spec(cmd_args, spec.first_key, spec.last_key, spec.step);
-        Ok(RespValue::Array(
-            keys.into_iter()
-                .map(|b| RespValue::BulkString(Some(b)))
-                .collect(),
+        Ok(extract_keys_from_spec(
+            cmd_args,
+            spec.first_key,
+            spec.last_key,
+            spec.step,
         ))
     }
+}
+
+/// Approximate Redis key-spec flags from command-level flags.
+fn key_flags_for_command(cmd_name: &str) -> Vec<&'static str> {
+    let Some(spec) = find_spec(cmd_name) else {
+        return vec!["RW", "access"];
+    };
+    let is_write = spec.flags.iter().any(|f| *f == "write");
+    let is_readonly = spec.flags.iter().any(|f| *f == "readonly");
+    if is_write {
+        vec!["RW", "access", "update"]
+    } else if is_readonly {
+        vec!["RO", "access"]
+    } else {
+        vec!["RW", "access"]
+    }
+}
+
+/// Build a COMMAND DOCS entry (RESP2 map as flat array) from CmdSpec.
+fn spec_to_docs(spec: &CmdSpec) -> RespValue {
+    let flags: Vec<RespValue> = spec
+        .flags
+        .iter()
+        .map(|f| RespValue::BulkString(Some(Bytes::from_static(f.as_bytes()))))
+        .collect();
+    let group = docs_group_for(spec);
+    let summary = format!("{} command", spec.name);
+    RespValue::Array(vec![
+        bulk("summary"),
+        RespValue::BulkString(Some(Bytes::from(summary))),
+        bulk("group"),
+        bulk(group),
+        bulk("arity"),
+        RespValue::Integer(spec.arity),
+        bulk("flags"),
+        RespValue::Array(flags),
+    ])
+}
+
+fn docs_group_for(spec: &CmdSpec) -> &'static str {
+    if spec.flags.iter().any(|f| *f == "admin") {
+        return "server";
+    }
+    if spec.flags.iter().any(|f| *f == "pubsub") {
+        return "pubsub";
+    }
+    if spec.flags.iter().any(|f| *f == "scripting") {
+        return "scripting";
+    }
+    // Heuristic by name prefix / known families.
+    let n = spec.name;
+    if n.starts_with('x') && (n.starts_with("xadd") || n.starts_with("xread") || n.starts_with("xgroup")
+        || n.starts_with("xinfo") || n.starts_with("xack") || n.starts_with("xclaim")
+        || n.starts_with("xpending") || n.starts_with("xrange") || n.starts_with("xlen")
+        || n.starts_with("xdel") || n.starts_with("xtrim") || n.starts_with("xsetid")
+        || n.starts_with("xautoclaim") || n.starts_with("xrevrange"))
+    {
+        return "stream";
+    }
+    if n.starts_with('z') {
+        return "sorted_set";
+    }
+    if n.starts_with('h') && n != "hello" {
+        return "hash";
+    }
+    if n.starts_with('s')
+        && matches!(
+            n,
+            "sadd"
+                | "srem"
+                | "smembers"
+                | "sismember"
+                | "scard"
+                | "sinter"
+                | "sunion"
+                | "sdiff"
+                | "sinterstore"
+                | "sunionstore"
+                | "sdiffstore"
+                | "smove"
+                | "spop"
+                | "srandmember"
+                | "smismember"
+                | "sintercard"
+        )
+    {
+        return "set";
+    }
+    if n.starts_with('l')
+        || n == "rpush"
+        || n == "rpop"
+        || n == "rpoplpush"
+        || n == "brpoplpush"
+        || n == "blpop"
+        || n == "brpop"
+        || n == "blmove"
+        || n == "lmpop"
+        || n == "blmpop"
+    {
+        return "list";
+    }
+    if n.starts_with("geo") {
+        return "geo";
+    }
+    if n.starts_with("pf") {
+        return "hyperloglog";
+    }
+    if n.starts_with("bit") || n == "setbit" || n == "getbit" {
+        return "bitmap";
+    }
+    if n.starts_with("eval") || n.starts_with("script") {
+        return "scripting";
+    }
+    if matches!(
+        n,
+        "get" | "set"
+            | "mget"
+            | "mset"
+            | "msetnx"
+            | "append"
+            | "strlen"
+            | "getrange"
+            | "setrange"
+            | "substr"
+            | "setex"
+            | "psetex"
+            | "getset"
+            | "setnx"
+            | "getdel"
+            | "getex"
+            | "incr"
+            | "decr"
+            | "incrby"
+            | "decrby"
+            | "incrbyfloat"
+            | "lcs"
+    ) {
+        return "string";
+    }
+    "server"
 }
 
 /// Extract keys for COMMAND GETKEYS using Redis first/last/step on args after command name.

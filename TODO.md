@@ -177,6 +177,7 @@ Also tracked in `docs/roadmap.md`.
   - *Batch AU*: `XINFO STREAM|GROUPS|CONSUMERS`; `XGROUP CREATECONSUMER` / `DELCONSUMER`
   - *Batch BF*: `XADD` `NOMKSTREAM` / `MINID`; `XTRIM` `MINID`
   - *Batch BH*: `XREADGROUP` `NOACK` (skip PEL for `>` deliveries)
+  - *Batch BI*: `XGROUP CREATE` `ENTRIESREAD` (surfaced in `XINFO GROUPS`)
 - [x] **`[P2]`** Bitmaps / bitfields, HyperLogLog
   - *Done (MVP)*: `SETBIT`/`GETBIT`/`BITCOUNT`/`BITPOS`/`BITOP` (AND/OR/XOR/NOT)/`BITFIELD` (GET/SET/INCRBY + OVERFLOW WRAP|SAT|FAIL); `PFADD`/`PFCOUNT`/`PFMERGE` dense HLL (p=14, Kore `KHLL` format). String-key backed; ACL `@bitmap`/`@hyperloglog`.
   - *Batch AZ*: `BITFIELD_RO` (GET only)
@@ -199,10 +200,12 @@ Also tracked in `docs/roadmap.md`.
   - *Batch BF*: `BITCOUNT`/`BITPOS` `BYTE|BIT`; `XADD` `NOMKSTREAM`/`MINID`; `XTRIM` `MINID`
   - *Batch BG*: `EVAL_RO` / `EVALSHA_RO`; `CLIENT GETREDIR` / `TRACKINGINFO`
   - *Batch BH*: `XREADGROUP` `NOACK`; `CONFIG RESETSTAT`; `LATENCY` HELP/LATEST/HISTORY/RESET/DOCTOR; `MODULE LIST`
+  - *Batch BI*: `INFO` section filter; `COMMAND GETKEYSANDFLAGS` / `DOCS`; `XGROUP CREATE` `ENTRIESREAD`
 - [x] **`[P1]`** `CLIENT`, `COMMAND`, `HELLO`
   - *Done*: HELLO (RESP2 + RESP3; AUTH/SETNAME); CLIENT ID/SETNAME/GETNAME/SETINFO/LIST/INFO; COMMAND / COUNT / LIST / INFO catalog
   - *Batch BE*: `CLIENT NO-EVICT` / `NO-TOUCH`
   - *Batch BG*: `CLIENT GETREDIR` (-1) / `TRACKINGINFO` (flags off)
+  - *Batch BI*: `COMMAND GETKEYSANDFLAGS` / `DOCS`; `INFO [section…]`
 - [x] **`[P1]`** Multi-DB: `SELECT` (or explicitly document single-DB only)
   - *Done*: `--databases` (default 16); per-connection `SELECT`; key isolation; `FLUSHDB` vs `FLUSHALL`; shared pub/sub+stats; **RDB v3 multi-DB + AOF SELECT** on save/rewrite/load/startup
   - *Batch AZ*: `SWAPDB` (content swap all types + TTL via dump/restore)
