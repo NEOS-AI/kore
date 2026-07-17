@@ -730,6 +730,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "xlen", "xrange", "xrevrange", "xread", "xpending", "xinfo",
             "geopos", "geodist", "geohash", "geosearch", "georadius_ro", "georadiusbymember_ro", "info", "role", "lastsave", "object",
             "memory", "dump", "strlen", "getbit", "bitcount", "bitpos", "bitfield_ro", "pfcount", "time", "sort", "lolwut",
+            "eval_ro", "evalsha_ro",
         ],
         "write" => &[
             "set", "del", "mset", "msetnx", "append", "setrange", "setex", "psetex", "getset", "unlink", "rename", "renamenx",
@@ -803,7 +804,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "georadius_ro", "georadiusbymember", "georadiusbymember_ro",
         ],
         "transaction" => &["multi", "exec", "discard", "watch", "unwatch"],
-        "scripting" => &["eval", "evalsha", "script"],
+        "scripting" => &["eval", "eval_ro", "evalsha", "evalsha_ro", "script"],
         "fast" | "slow" | "blocking" => &[],
         _ => return Err(format!("ERR Unknown category '{}'", cat)),
     };

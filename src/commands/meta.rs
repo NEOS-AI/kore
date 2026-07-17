@@ -255,7 +255,9 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     CmdSpec { name: "pfmerge", arity: -2, flags: &["write", "denyoom"], first_key: 1, last_key: -1, step: 1 },
     // Lua scripting (keys are dynamic via numkeys; movablekeys in full Redis)
     CmdSpec { name: "eval", arity: -3, flags: &["noscript", "movablekeys"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "eval_ro", arity: -3, flags: &["readonly", "noscript", "movablekeys"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "evalsha", arity: -3, flags: &["noscript", "movablekeys"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "evalsha_ro", arity: -3, flags: &["readonly", "noscript", "movablekeys"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "script", arity: -2, flags: &["noscript"], first_key: 0, last_key: 0, step: 0 },
 ];
 
@@ -561,16 +563,45 @@ impl CommandHandler {
             "REPLY" => self.client_reply(&args[1..]),
             "NO-EVICT" => self.client_no_evict_cmd(&args[1..]),
             "NO-TOUCH" => self.client_no_touch_cmd(&args[1..]),
-            "KILL" | "PAUSE" | "UNPAUSE" | "TRACKING"
-            | "CACHING" | "GETREDIR" | "TRACKINGINFO" => Ok(RespValue::error(format!(
-                "ERR CLIENT {} is not supported yet",
-                sub
-            ))),
+            "GETREDIR" => self.client_getredir(&args[1..]),
+            "TRACKINGINFO" => self.client_trackinginfo(&args[1..]),
+            "KILL" | "PAUSE" | "UNPAUSE" | "TRACKING" | "CACHING" => Ok(RespValue::error(
+                format!("ERR CLIENT {} is not supported yet", sub),
+            )),
             _ => Ok(RespValue::error(format!(
                 "ERR unknown subcommand '{}'. Try CLIENT HELP.",
                 sub
             ))),
         }
+    }
+
+    /// CLIENT GETREDIR — client-side caching redirect target, or -1 when tracking is off.
+    fn client_getredir(&self, args: &[RespValue]) -> Result<RespValue> {
+        if !args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'client|getredir' command",
+            ));
+        }
+        // Client tracking not implemented → always -1 (Redis: no redirect).
+        Ok(RespValue::Integer(-1))
+    }
+
+    /// CLIENT TRACKINGINFO — report tracking state (off until TRACKING is implemented).
+    fn client_trackinginfo(&self, args: &[RespValue]) -> Result<RespValue> {
+        if !args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'client|trackinginfo' command",
+            ));
+        }
+        // Redis returns a map/array of field-value pairs.
+        Ok(RespValue::Array(vec![
+            bulk("flags"),
+            RespValue::Array(vec![bulk("off")]),
+            bulk("redirect"),
+            RespValue::Integer(-1),
+            bulk("prefixes"),
+            RespValue::Array(vec![]),
+        ]))
     }
 
     /// CLIENT NO-EVICT ON|OFF
@@ -710,8 +741,12 @@ impl CommandHandler {
         };
         let cmd_args = &args[1..];
 
-        // EVAL / EVALSHA: keys follow numkeys.
-        if cmd_name == "eval" || cmd_name == "evalsha" {
+        // EVAL / EVALSHA / EVAL_RO / EVALSHA_RO: keys follow numkeys.
+        if cmd_name == "eval"
+            || cmd_name == "evalsha"
+            || cmd_name == "eval_ro"
+            || cmd_name == "evalsha_ro"
+        {
             return Ok(RespValue::Array(
                 extract_eval_keys_for_getkeys(cmd_args)
                     .into_iter()

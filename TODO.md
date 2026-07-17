@@ -196,13 +196,17 @@ Also tracked in `docs/roadmap.md`.
   - *Batch BD*: `ZADD` `NX|XX|GT|LT|CH|INCR`; `SCAN TYPE`; `FLUSHDB`/`FLUSHALL` `ASYNC|SYNC`; shard pub/sub in `COMMAND` catalog
   - *Batch BE*: modern `ZRANGE` (`BYSCORE`/`BYLEX`/`REV`/`LIMIT`/`WITHSCORES`); `CLIENT NO-EVICT`/`NO-TOUCH` (flags + INFO; NO-TOUCH skips LRU on GET/MGET)
   - *Batch BF*: `BITCOUNT`/`BITPOS` `BYTE|BIT`; `XADD` `NOMKSTREAM`/`MINID`; `XTRIM` `MINID`
+  - *Batch BG*: `EVAL_RO` / `EVALSHA_RO`; `CLIENT GETREDIR` / `TRACKINGINFO`
 - [x] **`[P1]`** `CLIENT`, `COMMAND`, `HELLO`
   - *Done*: HELLO (RESP2 + RESP3; AUTH/SETNAME); CLIENT ID/SETNAME/GETNAME/SETINFO/LIST/INFO; COMMAND / COUNT / LIST / INFO catalog
+  - *Batch BE*: `CLIENT NO-EVICT` / `NO-TOUCH`
+  - *Batch BG*: `CLIENT GETREDIR` (-1) / `TRACKINGINFO` (flags off)
 - [x] **`[P1]`** Multi-DB: `SELECT` (or explicitly document single-DB only)
   - *Done*: `--databases` (default 16); per-connection `SELECT`; key isolation; `FLUSHDB` vs `FLUSHALL`; shared pub/sub+stats; **RDB v3 multi-DB + AOF SELECT** on save/rewrite/load/startup
   - *Batch AZ*: `SWAPDB` (content swap all types + TTL via dump/restore)
 - [x] **`[P2]`** Lua scripting / functions
   - *Done (MVP)*: `EVAL` / `EVALSHA` / `SCRIPT LOAD|EXISTS|FLUSH|KILL` via mlua Lua 5.4 (vendored); shared `ScriptCache`; `redis.call` / `redis.pcall` whitelist for core string/hash/list/set/zset/bitmap/HLL ops; KEYS/ARGV; RESP↔Lua mapping (nil bulk→false, status→`{ok=…}`); ACL `@scripting`; cluster key extract from numkeys. Not yet: FUNCTIONS library, `redis.setresp`, full movablekeys COMMAND, nested scripts, script time limits.
+  - *Batch BG*: `EVAL_RO` / `EVALSHA_RO` (reject write `redis.call`); `CLIENT GETREDIR` / `TRACKINGINFO` (tracking off)
 
 ### Memory & expiration policy
 

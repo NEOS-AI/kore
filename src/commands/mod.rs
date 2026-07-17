@@ -750,7 +750,9 @@ impl CommandHandler {
 
             // Lua scripting
             "EVAL" => self.handle_eval(&args[1..]),
+            "EVAL_RO" => self.handle_eval_ro(&args[1..]),
             "EVALSHA" => self.handle_evalsha(&args[1..]),
+            "EVALSHA_RO" => self.handle_evalsha_ro(&args[1..]),
             "SCRIPT" => self.handle_script(&args[1..]),
 
             _ => Ok(RespValue::error(format!("ERR unknown command '{}'", cmd_upper))),
@@ -1142,7 +1144,8 @@ fn sort_has_store(args: &[RespValue]) -> bool {
     false
 }
 
-fn is_write_command(cmd: &str) -> bool {
+/// Whether `cmd` mutates keyspace / server state (for replica write gate + EVAL_RO).
+pub(super) fn is_write_command(cmd: &str) -> bool {
     matches!(
         cmd,
         "SET"
@@ -1245,6 +1248,7 @@ fn is_write_command(cmd: &str) -> bool {
             | "PFADD"
             | "PFMERGE"
             // Scripts may mutate; propagate whole EVAL/EVALSHA (Redis-style).
+            // EVAL_RO / EVALSHA_RO are intentionally omitted (read-only).
             | "EVAL"
             | "EVALSHA"
     )
@@ -1281,9 +1285,13 @@ fn extract_eval_keys(cmd_upper: &str, args: &[RespValue]) -> Option<Vec<String>>
     })
 }
 
-/// EVAL / EVALSHA: args are [script|sha, numkeys, key1..keyN, arg…].
+/// EVAL / EVALSHA / EVAL_RO / EVALSHA_RO: args are [script|sha, numkeys, key1..keyN, arg…].
 fn extract_eval_key_bytes(cmd_upper: &str, args: &[RespValue]) -> Option<Vec<Bytes>> {
-    if cmd_upper != "EVAL" && cmd_upper != "EVALSHA" {
+    if cmd_upper != "EVAL"
+        && cmd_upper != "EVALSHA"
+        && cmd_upper != "EVAL_RO"
+        && cmd_upper != "EVALSHA_RO"
+    {
         return None;
     }
     if args.len() < 2 {

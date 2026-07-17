@@ -1,6 +1,6 @@
-//! EVAL / EVALSHA / SCRIPT — Redis Lua scripting (mlua Lua 5.4).
+//! EVAL / EVALSHA / EVAL_RO / EVALSHA_RO / SCRIPT — Redis Lua scripting (mlua Lua 5.4).
 
-use super::CommandHandler;
+use super::{is_write_command, CommandHandler};
 use crate::error::Result;
 use crate::protocol::RespValue;
 use crate::scripting::script_sha1;
@@ -40,24 +40,56 @@ const SCRIPT_CALL_ALLOWLIST: &[&str] = &[
 impl CommandHandler {
     /// EVAL script numkeys [key ...] [arg ...]
     pub(super) fn handle_eval(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        self.eval_from_source(args, false, "eval")
+    }
+
+    /// EVAL_RO — read-only EVAL (write redis.call rejected).
+    pub(super) fn handle_eval_ro(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        self.eval_from_source(args, true, "eval_ro")
+    }
+
+    /// EVALSHA sha1 numkeys [key ...] [arg ...]
+    pub(super) fn handle_evalsha(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        self.eval_from_sha(args, false, "evalsha")
+    }
+
+    /// EVALSHA_RO — read-only EVALSHA.
+    pub(super) fn handle_evalsha_ro(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        self.eval_from_sha(args, true, "evalsha_ro")
+    }
+
+    fn eval_from_source(
+        &mut self,
+        args: &[RespValue],
+        readonly: bool,
+        cmd: &str,
+    ) -> Result<RespValue> {
         if args.len() < 2 {
-            return Ok(RespValue::error("ERR wrong number of arguments for 'eval'"));
+            return Ok(RespValue::error(format!(
+                "ERR wrong number of arguments for '{}'",
+                cmd
+            )));
         }
         let script = match args[0].as_bulk_string() {
             Some(s) => String::from_utf8_lossy(s).into_owned(),
             None => return Ok(RespValue::error("ERR invalid script")),
         };
-        // Auto-cache so EVALSHA works after EVAL (Redis does this).
+        // Auto-cache so EVALSHA / EVALSHA_RO work after EVAL / EVAL_RO (Redis does this).
         let _ = self.script_cache.load(&script);
-        self.eval_script_body(&script, &args[1..])
+        self.eval_script_body(&script, &args[1..], readonly, cmd)
     }
 
-    /// EVALSHA sha1 numkeys [key ...] [arg ...]
-    pub(super) fn handle_evalsha(&mut self, args: &[RespValue]) -> Result<RespValue> {
+    fn eval_from_sha(
+        &mut self,
+        args: &[RespValue],
+        readonly: bool,
+        cmd: &str,
+    ) -> Result<RespValue> {
         if args.len() < 2 {
-            return Ok(RespValue::error(
-                "ERR wrong number of arguments for 'evalsha'",
-            ));
+            return Ok(RespValue::error(format!(
+                "ERR wrong number of arguments for '{}'",
+                cmd
+            )));
         }
         let sha = match args[0].as_bulk_string() {
             Some(s) => String::from_utf8_lossy(s).into_owned(),
@@ -72,7 +104,7 @@ impl CommandHandler {
                 )));
             }
         };
-        self.eval_script_body(&script, &args[1..])
+        self.eval_script_body(&script, &args[1..], readonly, cmd)
     }
 
     /// SCRIPT LOAD | EXISTS | FLUSH | KILL
@@ -156,11 +188,18 @@ impl CommandHandler {
     }
 
     /// Parse numkeys + KEYS/ARGV and run `source` under mlua with redis.call.
-    fn eval_script_body(&mut self, source: &str, args: &[RespValue]) -> Result<RespValue> {
+    fn eval_script_body(
+        &mut self,
+        source: &str,
+        args: &[RespValue],
+        readonly: bool,
+        cmd: &str,
+    ) -> Result<RespValue> {
         if args.is_empty() {
-            return Ok(RespValue::error(
-                "ERR wrong number of arguments for 'eval'",
-            ));
+            return Ok(RespValue::error(format!(
+                "ERR wrong number of arguments for '{}'",
+                cmd
+            )));
         }
         let numkeys = match self.parse_integer(&args[0]) {
             Ok(n) if n >= 0 => n as usize,
@@ -203,7 +242,7 @@ impl CommandHandler {
             }
         }
 
-        match self.run_lua(source, &keys, &argv) {
+        match self.run_lua(source, &keys, &argv, readonly) {
             Ok(v) => Ok(v),
             Err(e) => Ok(RespValue::error(e)),
         }
@@ -214,6 +253,7 @@ impl CommandHandler {
         source: &str,
         keys: &[Bytes],
         argv: &[Bytes],
+        readonly: bool,
     ) -> std::result::Result<RespValue, String> {
         let lua = Lua::new();
 
@@ -253,7 +293,7 @@ impl CommandHandler {
                 }
                 let result = (|| {
                     let h = unsafe { &mut *handler_ptr };
-                    dispatch_redis_call(lua_ctx, h, args, false)
+                    dispatch_redis_call(lua_ctx, h, args, false, readonly)
                 })();
                 in_call.store(false, Ordering::SeqCst);
                 result
@@ -272,7 +312,7 @@ impl CommandHandler {
                 }
                 let result = (|| {
                     let h = unsafe { &mut *handler_ptr };
-                    dispatch_redis_call(lua_ctx, h, args, true)
+                    dispatch_redis_call(lua_ctx, h, args, true, readonly)
                 })();
                 in_call.store(false, Ordering::SeqCst);
                 result
@@ -509,6 +549,7 @@ fn dispatch_redis_call(
     handler: &mut CommandHandler,
     args: mlua::Variadic<LuaValue>,
     is_pcall: bool,
+    readonly: bool,
 ) -> mlua::Result<LuaValue> {
     if args.is_empty() {
         let err = "ERR wrong number of arguments for 'redis.call'";
@@ -533,6 +574,15 @@ fn dispatch_redis_call(
         let err = format!("ERR This Redis command is not allowed from scripts: {}", cmd);
         if is_pcall {
             return pcall_err(lua, &err);
+        }
+        return Err(mlua::Error::runtime(err));
+    }
+
+    // EVAL_RO / EVALSHA_RO: reject write commands (Redis-compatible message).
+    if readonly && is_write_command(&cmd) {
+        let err = "ERR Write commands are not allowed from read-only scripts.";
+        if is_pcall {
+            return pcall_err(lua, err);
         }
         return Err(mlua::Error::runtime(err));
     }
