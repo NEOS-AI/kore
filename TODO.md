@@ -373,6 +373,9 @@ Also tracked in `docs/roadmap.md`.
   - *Found*: BZ only full-wipes schema when `flush=true` (or on load `Err`). A `flush=false` load into a DB that already has the same index name still fails at `create_search_index`; on other mid-load FT errors, Err-path wipe destroys pre-existing keys (same tradeoff as AOF BW). Startup / FULLRESYNC use `flush=true` and are fine.
   - *Fix*: document load APIs as snapshot-replace (`flush=true`) or empty-target; or scratch-load + swap (shared BW item); optional: skip/recreate indices when merging.
 - [ ] **`[P2]`** **Code review (BZ nit):** `rdb_load_mid_ft_failure_wipes_partial_state` accepts almost any `InvalidArgument` message (`!msg.is_empty()`); tighten to `RDB FT.ALIASADD` / unknown index
+- [ ] **`[P2]`** **Code review (BZ nit):** wipe-on-error only wraps `load_bytes` / `load_databases_bytes`
+  - *Found*: public `DbSnapshot::load_into` / `MultiDbSnapshot::load_into_databases` still leave partial state on `Err` if called directly (decode + load without the wrapper). Production paths (startup, FULLRESYNC, `load_file`/`load_databases`) use the safe wrappers.
+  - *Fix*: move wipe into `load_into_databases`/`load_into_cache`, or document wrappers as the only supported load API; prefer scratch-load long-term.
 - [ ] **`[P2]`** **Code review (BY nit):** no HNSW `M` / `ef_construction` RDB round-trip test (FLAT covered in `by_rdb_ft_section_test`; RDB encoder already writes both HNSW params)
 - [ ] **`[P2]`** **Code review (BY nit):** RDB FT mutator errors always `Error::InvalidArgument` — align with AOF `map_ft_mutator_error` (OOM → `OutOfMemory`) if search layer can return OOM on create
 - [ ] **`[P2]`** ACL `@search` category for FT.* (fine-grained users; default `+@all` unaffected)
@@ -434,7 +437,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). BZ closed RDB snapshot-replace schema wipe + load error wipe (no new P0/P1). **Next:** scratch-load swap (AOF+RDB non-empty targets); shared FT.CREATE parser; ACL `@search`; HNSW RDB round-trip test.
+Prioritized for next letter batch(es). BZ closed RDB snapshot-replace schema wipe + load error wipe (no new P0/P1). Second-pass: only nits (wrapper-only wipe, test assert, flush=false merge). **Next:** scratch-load swap (AOF+RDB non-empty targets); shared FT.CREATE parser; ACL `@search`; HNSW RDB round-trip test.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -458,6 +461,7 @@ Prioritized for next letter batch(es). BZ closed RDB snapshot-replace schema wip
 | P2 | HNSW RDB round-trip test | open |
 | P2 | RDB FT OOM → OutOfMemory map | open |
 | P2 | BZ mid-fail test: tighten InvalidArgument assert | open |
+| P2 | wipe-on-error only on load_bytes wrappers (not raw load_into) | open |
 | P2 | `has_search_state` double-list lock nit | open |
 | P2 | `clear_documents` + MemoryTracker coupling (flush-only) | open |
 | P2 | OOM→OutOfMemory map; DROPINDEX/ALIASDEL missing tests | done (BW) |
