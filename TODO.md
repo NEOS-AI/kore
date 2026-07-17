@@ -369,6 +369,10 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BY):** RDB load is not wiped on mid-`load_into` FT failure (AOF got BW/BX; RDB did not)
   - *Found*: `create_search_index` / `alias_add` errors abort `load_into` after partial apply (earlier indices/keys remain). Callers (`load_databases_bytes`, FULLRESYNC) do not full-wipe on `Err`.
   - *Done (Batch BZ)*: on RDB load `Err` after decode (mutate started), `flush_all_including_search` (mirror AOF BW/BX). Tests: `tests/bz_rdb_load_wipes_ft_schema_test.rs`. Scratch-load swap for non-empty targets remains open (shared with BW item).
+- [ ] **`[P2]`** **Code review (BZ):** RDB `flush=false` still merges into live FT schema — name clash / partial apply risk
+  - *Found*: BZ only full-wipes schema when `flush=true` (or on load `Err`). A `flush=false` load into a DB that already has the same index name still fails at `create_search_index`; on other mid-load FT errors, Err-path wipe destroys pre-existing keys (same tradeoff as AOF BW). Startup / FULLRESYNC use `flush=true` and are fine.
+  - *Fix*: document load APIs as snapshot-replace (`flush=true`) or empty-target; or scratch-load + swap (shared BW item); optional: skip/recreate indices when merging.
+- [ ] **`[P2]`** **Code review (BZ nit):** `rdb_load_mid_ft_failure_wipes_partial_state` accepts almost any `InvalidArgument` message (`!msg.is_empty()`); tighten to `RDB FT.ALIASADD` / unknown index
 - [ ] **`[P2]`** **Code review (BY nit):** no HNSW `M` / `ef_construction` RDB round-trip test (FLAT covered in `by_rdb_ft_section_test`; RDB encoder already writes both HNSW params)
 - [ ] **`[P2]`** **Code review (BY nit):** RDB FT mutator errors always `Error::InvalidArgument` — align with AOF `map_ft_mutator_error` (OOM → `OutOfMemory`) if search layer can return OOM on create
 - [ ] **`[P2]`** ACL `@search` category for FT.* (fine-grained users; default `+@all` unaffected)
@@ -391,8 +395,9 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BW):** FLUSHDB/FLUSHALL now drop FT indices (via `Cache::flush` → `search_index_manager.clear`)
   - *Found*: BW cleared search on flush so failed AOF load is fully empty; this also changes live `FLUSHDB`/`FLUSHALL` — RediSearch typically keeps index definitions after FLUSHDB (docs gone, schema remains)
   - *Done (Batch BX)*: decouple paths — `Cache::flush()` / `Databases::flush_all()` clear keyspace + `SearchIndexManager::clear_documents()` (schema + aliases kept); AOF load `Err` uses `flush_all_including_search()` / `SearchIndexManager::clear()` (full wipe). Tests: `tests/bx_flushdb_keeps_ft_schema_test.rs`
-- [ ] **`[P2]`** **Code review (BW):** failed AOF load flush wipes pre-existing data if target was non-empty
+- [ ] **`[P2]`** **Code review (BW):** failed AOF/RDB load flush wipes pre-existing data if target was non-empty
   - *Found*: `flush_all`/`flush` on load `Err` is correct for empty startup DBs, but a mid-load failure on a non-empty target would destroy prior keys/indices too
+  - *Note (BZ)*: RDB load `Err` now also `flush_all_including_search` (test asserts pre-existing key is gone) — same tradeoff for AOF and RDB
   - *Fix*: load into scratch Databases and swap on success (true transactional load); or document load APIs as empty-target-only
 - [x] **`[P2]`** **Code review (BW nit):** `map_ft_mutator_error` uses `msg.contains("OOM")` (substring); prefer exact/prefix match or typed errors from search layer
   - *Done (Batch BX)*: match `starts_with("OOM:")` / `starts_with("OOM ")` / exact `"OOM"` (search layer emits `"OOM: …"`)
@@ -429,7 +434,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). BZ closed RDB `flush=true` schema wipe + load error wipe. **Next:** scratch-load swap; shared FT.CREATE parser; ACL `@search`; HNSW RDB round-trip test.
+Prioritized for next letter batch(es). BZ closed RDB snapshot-replace schema wipe + load error wipe (no new P0/P1). **Next:** scratch-load swap (AOF+RDB non-empty targets); shared FT.CREATE parser; ACL `@search`; HNSW RDB round-trip test.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -441,6 +446,7 @@ Prioritized for next letter batch(es). BZ closed RDB `flush=true` schema wipe + 
 | P1 | RDB load `flush=true` must wipe FT schema (BY×BX clash) | done (BZ) |
 | P2 | FT RDB section | done (BY) |
 | P2 | RDB load wipe-on-FT-failure (mirror AOF BW) | done (BZ) |
+| P2 | RDB `flush=false` FT merge / name-clash semantics | open |
 | P2 | ACL `@search` | open |
 | P2 | Shared FT.CREATE parser (cmd + AOF load) | open |
 | P2 | HNSW `ef_construction` AOF round-trip | open (RDB done in BY) |
@@ -451,6 +457,7 @@ Prioritized for next letter batch(es). BZ closed RDB `flush=true` schema wipe + 
 | P2 | VECTOR/NUMERIC rewrite tests | done (BX) |
 | P2 | HNSW RDB round-trip test | open |
 | P2 | RDB FT OOM → OutOfMemory map | open |
+| P2 | BZ mid-fail test: tighten InvalidArgument assert | open |
 | P2 | `has_search_state` double-list lock nit | open |
 | P2 | `clear_documents` + MemoryTracker coupling (flush-only) | open |
 | P2 | OOM→OutOfMemory map; DROPINDEX/ALIASDEL missing tests | done (BW) |
