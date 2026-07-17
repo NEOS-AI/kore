@@ -257,9 +257,10 @@ impl CommandHandler {
         Ok(RespValue::Integer(if ch { changed } else { added }))
     }
 
+    /// ZRANGE key min max [BYSCORE|BYLEX] [REV] [LIMIT offset count] [WITHSCORES]
     pub(super) fn handle_zrange(&self, args: &[RespValue]) -> Result<RespValue> {
         self.cache.stats.incr(&self.cache.stats.cmd_zrange);
-        
+
         if args.len() < 3 {
             return Ok(RespValue::error("ERR wrong number of arguments for 'zrange'"));
         }
@@ -269,54 +270,94 @@ impl CommandHandler {
             None => return Ok(RespValue::error("ERR invalid key")),
         };
 
-        if let Err(Error::WrongType) = self.ensure_zset_key(key) {
-            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        let opts = match parse_zrange_tail_options(&args[3..], true) {
+            Ok(o) => o,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+
+        match self.collect_zrange_members(key, &args[1], &args[2], &opts) {
+            Ok(members) => Ok(scored_members_to_resp(members, opts.with_scores)),
+            Err(e) => Ok(RespValue::error(e)),
         }
+    }
 
-        let start = match self.parse_integer(&args[1]) {
-            Ok(s) => s as isize,
-            Err(_) => return Ok(RespValue::error("ERR value is not an integer or out of range")),
-        };
-
-        let stop = match self.parse_integer(&args[2]) {
-            Ok(s) => s as isize,
-            Err(_) => return Ok(RespValue::error("ERR value is not an integer or out of range")),
-        };
-
-        // Check for WITHSCORES option
-        let with_scores = if args.len() > 3 {
-            match args[3].as_bulk_string() {
-                Some(opt) => {
-                    let opt_str = String::from_utf8_lossy(opt).to_uppercase();
-                    if opt_str == "WITHSCORES" {
-                        true
-                    } else {
-                        return Ok(RespValue::error("ERR syntax error"));
-                    }
-                }
-                None => return Ok(RespValue::error("ERR syntax error")),
-            }
-        } else {
-            false
-        };
+    /// Shared ZRANGE / ZRANGESTORE member collection.
+    fn collect_zrange_members(
+        &self,
+        key: &Bytes,
+        min_arg: &RespValue,
+        max_arg: &RespValue,
+        opts: &ZRangeTailOpts,
+    ) -> std::result::Result<Vec<ScoredMember>, String> {
+        if let Err(Error::WrongType) = self.ensure_zset_key(key) {
+            return Err(Error::WrongType.to_resp_string());
+        }
 
         let zset = match self.cache.get_sorted_set(key) {
             Some(z) => z,
-            None => return Ok(RespValue::Array(vec![])),
+            None => return Ok(Vec::new()),
         };
-
         let set = zset.read();
-        let members = set.range(start, stop, false);
 
-        let mut result = Vec::new();
-        for scored_member in members {
-            result.push(RespValue::BulkString(Some(scored_member.member)));
-            if with_scores {
-                result.push(RespValue::BulkString(Some(Bytes::from(scored_member.score.to_string()))));
+        if opts.by_lex {
+            let bound_a = parse_lex_bound(min_arg)?;
+            let bound_b = parse_lex_bound(max_arg)?;
+            // REV with BYLEX: client passes max min — normalize like ZREVRANGEBYLEX.
+            let (min, max) = if opts.reverse {
+                (bound_b, bound_a)
+            } else {
+                (bound_a, bound_b)
+            };
+            Ok(set.range_by_lex(
+                &min,
+                &max,
+                opts.reverse,
+                opts.offset,
+                opts.count,
+            ))
+        } else if opts.by_score {
+            let bound_a = parse_score_bound(min_arg)?;
+            let bound_b = parse_score_bound(max_arg)?;
+            let (min, max) = if opts.reverse {
+                (bound_b, bound_a)
+            } else {
+                (bound_a, bound_b)
+            };
+            Ok(set.range_by_score(
+                min,
+                max,
+                opts.reverse,
+                opts.offset,
+                opts.count,
+            ))
+        } else {
+            // Rank range (legacy ZRANGE / ZREVRANGE form).
+            let start = match self.parse_integer(min_arg) {
+                Ok(s) => s as isize,
+                Err(_) => {
+                    return Err("ERR value is not an integer or out of range".into());
+                }
+            };
+            let stop = match self.parse_integer(max_arg) {
+                Ok(s) => s as isize,
+                Err(_) => {
+                    return Err("ERR value is not an integer or out of range".into());
+                }
+            };
+            let mut range = set.range(start, stop, opts.reverse);
+            if opts.offset > 0 || opts.count.is_some() {
+                if opts.offset >= range.len() {
+                    range.clear();
+                } else {
+                    let end = match opts.count {
+                        Some(c) => (opts.offset + c).min(range.len()),
+                        None => range.len(),
+                    };
+                    range = range[opts.offset..end].to_vec();
+                }
             }
+            Ok(range)
         }
-
-        Ok(RespValue::Array(result))
     }
 
     pub(super) fn handle_zrevrange(&self, args: &[RespValue]) -> Result<RespValue> {
@@ -1120,6 +1161,97 @@ fn scores_equal(a: f64, b: f64) -> bool {
     (a.is_nan() && b.is_nan()) || a == b
 }
 
+/// Trailing options shared by ZRANGE / ZRANGESTORE.
+struct ZRangeTailOpts {
+    by_score: bool,
+    by_lex: bool,
+    reverse: bool,
+    offset: usize,
+    count: Option<usize>,
+    with_scores: bool,
+}
+
+/// Parse `[BYSCORE|BYLEX] [REV] [LIMIT offset count] [WITHSCORES]` (WITHSCORES only when allowed).
+fn parse_zrange_tail_options(
+    args: &[RespValue],
+    allow_withscores: bool,
+) -> std::result::Result<ZRangeTailOpts, String> {
+    let mut opts = ZRangeTailOpts {
+        by_score: false,
+        by_lex: false,
+        reverse: false,
+        offset: 0,
+        count: None,
+        with_scores: false,
+    };
+    let mut i = 0;
+    while i < args.len() {
+        let opt = match args[i].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+            None => return Err("ERR syntax error".into()),
+        };
+        match opt.as_str() {
+            "BYSCORE" => {
+                if opts.by_lex {
+                    return Err("ERR syntax error".into());
+                }
+                opts.by_score = true;
+                i += 1;
+            }
+            "BYLEX" => {
+                if opts.by_score {
+                    return Err("ERR syntax error".into());
+                }
+                opts.by_lex = true;
+                i += 1;
+            }
+            "REV" => {
+                opts.reverse = true;
+                i += 1;
+            }
+            "LIMIT" => {
+                if i + 2 >= args.len() {
+                    return Err("ERR syntax error".into());
+                }
+                let off = match args[i + 1].as_bulk_string() {
+                    Some(b) => String::from_utf8_lossy(b)
+                        .parse::<i64>()
+                        .map_err(|_| "ERR value is not an integer or out of range".to_string())?,
+                    None => match args[i + 1].as_integer() {
+                        Some(n) => n,
+                        None => {
+                            return Err("ERR value is not an integer or out of range".into());
+                        }
+                    },
+                };
+                if off < 0 {
+                    return Err("ERR value is not an integer or out of range".into());
+                }
+                let c = match args[i + 2].as_bulk_string() {
+                    Some(b) => String::from_utf8_lossy(b)
+                        .parse::<i64>()
+                        .map_err(|_| "ERR value is not an integer or out of range".to_string())?,
+                    None => match args[i + 2].as_integer() {
+                        Some(n) => n,
+                        None => {
+                            return Err("ERR value is not an integer or out of range".into());
+                        }
+                    },
+                };
+                opts.offset = off as usize;
+                opts.count = if c < 0 { None } else { Some(c as usize) };
+                i += 3;
+            }
+            "WITHSCORES" if allow_withscores => {
+                opts.with_scores = true;
+                i += 1;
+            }
+            _ => return Err("ERR syntax error".into()),
+        }
+    }
+    Ok(opts)
+}
+
 fn scored_members_to_resp(members: Vec<ScoredMember>, with_scores: bool) -> RespValue {
     let mut result = Vec::with_capacity(members.len() * if with_scores { 2 } else { 1 });
     for sm in members {
@@ -1425,137 +1557,14 @@ impl CommandHandler {
             None => return Ok(RespValue::error("ERR invalid key")),
         };
 
-        // Parse trailing options before interpreting min/max (need BYSCORE/BYLEX mode).
-        let mut by_score = false;
-        let mut by_lex = false;
-        let mut reverse = false;
-        let mut offset: usize = 0;
-        let mut count: Option<usize> = None;
-        let mut i = 4;
-        while i < args.len() {
-            let opt = match args[i].as_bulk_string() {
-                Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
-                None => return Ok(RespValue::error("ERR syntax error")),
-            };
-            match opt.as_str() {
-                "BYSCORE" => {
-                    if by_lex {
-                        return Ok(RespValue::error("ERR syntax error"));
-                    }
-                    by_score = true;
-                    i += 1;
-                }
-                "BYLEX" => {
-                    if by_score {
-                        return Ok(RespValue::error("ERR syntax error"));
-                    }
-                    by_lex = true;
-                    i += 1;
-                }
-                "REV" => {
-                    reverse = true;
-                    i += 1;
-                }
-                "LIMIT" => {
-                    if i + 2 >= args.len() {
-                        return Ok(RespValue::error("ERR syntax error"));
-                    }
-                    offset = match self.parse_integer(&args[i + 1]) {
-                        Ok(n) if n >= 0 => n as usize,
-                        _ => {
-                            return Ok(RespValue::error(
-                                "ERR value is not an integer or out of range",
-                            ));
-                        }
-                    };
-                    let c = match self.parse_integer(&args[i + 2]) {
-                        Ok(n) => n,
-                        _ => {
-                            return Ok(RespValue::error(
-                                "ERR value is not an integer or out of range",
-                            ));
-                        }
-                    };
-                    count = if c < 0 { None } else { Some(c as usize) };
-                    i += 3;
-                }
-                _ => return Ok(RespValue::error("ERR syntax error")),
-            }
-        }
+        let opts = match parse_zrange_tail_options(&args[4..], false) {
+            Ok(o) => o,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
 
-        if let Err(Error::WrongType) = self.ensure_zset_key(source) {
-            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
-        }
-
-        let members: Vec<ScoredMember> = match self.cache.get_sorted_set(source) {
-            None => Vec::new(),
-            Some(z) => {
-                let set = z.read();
-                if by_lex {
-                    let bound_a = match parse_lex_bound(&args[2]) {
-                        Ok(b) => b,
-                        Err(e) => return Ok(RespValue::error(e)),
-                    };
-                    let bound_b = match parse_lex_bound(&args[3]) {
-                        Ok(b) => b,
-                        Err(e) => return Ok(RespValue::error(e)),
-                    };
-                    // REV with BYLEX: args are max min — normalize like ZREVRANGEBYLEX.
-                    let (min, max) = if reverse {
-                        (bound_b, bound_a)
-                    } else {
-                        (bound_a, bound_b)
-                    };
-                    set.range_by_lex(&min, &max, reverse, offset, count)
-                } else if by_score {
-                    let bound_a = match parse_score_bound(&args[2]) {
-                        Ok(b) => b,
-                        Err(e) => return Ok(RespValue::error(e)),
-                    };
-                    let bound_b = match parse_score_bound(&args[3]) {
-                        Ok(b) => b,
-                        Err(e) => return Ok(RespValue::error(e)),
-                    };
-                    let (min, max) = if reverse {
-                        (bound_b, bound_a)
-                    } else {
-                        (bound_a, bound_b)
-                    };
-                    set.range_by_score(min, max, reverse, offset, count)
-                } else {
-                    // Rank range
-                    let start = match self.parse_integer(&args[2]) {
-                        Ok(s) => s as isize,
-                        Err(_) => {
-                            return Ok(RespValue::error(
-                                "ERR value is not an integer or out of range",
-                            ));
-                        }
-                    };
-                    let stop = match self.parse_integer(&args[3]) {
-                        Ok(s) => s as isize,
-                        Err(_) => {
-                            return Ok(RespValue::error(
-                                "ERR value is not an integer or out of range",
-                            ));
-                        }
-                    };
-                    let mut range = set.range(start, stop, reverse);
-                    // Apply LIMIT to rank results (Redis does support LIMIT with rank form).
-                    if offset > 0 || count.is_some() {
-                        if offset >= range.len() {
-                            range.clear();
-                        } else {
-                            let end = match count {
-                                Some(c) => (offset + c).min(range.len()),
-                                None => range.len(),
-                            };
-                            range = range[offset..end].to_vec();
-                        }
-                    }
-                    range
-                }
-            }
+        let members = match self.collect_zrange_members(source, &args[2], &args[3], &opts) {
+            Ok(m) => m,
+            Err(e) => return Ok(RespValue::error(e)),
         };
 
         let pairs: Vec<(Bytes, f64)> = members

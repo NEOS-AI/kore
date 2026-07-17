@@ -121,7 +121,7 @@ impl CommandHandler {
             }
         }
 
-        match self.cache.load(key, LoadOptions::default())? {
+        match self.cache.load(key, self.load_options())? {
             Some(entry) => Ok(RespValue::BulkString(Some(entry.value.clone()))),
             None => Ok(RespValue::null()),
         }
@@ -173,7 +173,7 @@ impl CommandHandler {
 
         for arg in args {
             if let Some(key) = arg.as_bulk_string() {
-                match self.cache.load(key, LoadOptions::default())? {
+                match self.cache.load(key, self.load_options())? {
                     Some(entry) => results.push(RespValue::BulkString(Some(entry.value.clone()))),
                     None => results.push(RespValue::null()),
                 }

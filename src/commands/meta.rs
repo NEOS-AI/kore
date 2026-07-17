@@ -177,6 +177,7 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     CmdSpec { name: "xinfo", arity: -2, flags: &["readonly", "random"], first_key: 2, last_key: 2, step: 1 },
     // ZADD accepts optional NX|XX|GT|LT|CH|INCR before score-member pairs.
     CmdSpec { name: "zadd", arity: -4, flags: &["write", "denyoom", "fast"], first_key: 1, last_key: 1, step: 1 },
+    // ZRANGE key min max [BYSCORE|BYLEX] [REV] [LIMIT offset count] [WITHSCORES]
     CmdSpec { name: "zrange", arity: -4, flags: &["readonly"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "zrangestore", arity: -5, flags: &["write", "denyoom"], first_key: 1, last_key: 2, step: 1 },
     CmdSpec { name: "zrevrange", arity: -4, flags: &["readonly"], first_key: 1, last_key: 1, step: 1 },
@@ -260,6 +261,17 @@ const COMMAND_SPECS: &[CmdSpec] = &[
 
 fn bulk(s: impl Into<Bytes>) -> RespValue {
     RespValue::BulkString(Some(s.into()))
+}
+
+fn parse_on_off(value: &RespValue) -> std::result::Result<bool, String> {
+    match value.as_bulk_string() {
+        Some(s) => match String::from_utf8_lossy(s).to_ascii_uppercase().as_str() {
+            "ON" => Ok(true),
+            "OFF" => Ok(false),
+            _ => Err("ERR syntax error, try CLIENT [NO-EVICT|NO-TOUCH] ON|OFF".into()),
+        },
+        None => Err("ERR syntax error".into()),
+    }
 }
 
 fn spec_to_reply(spec: &CmdSpec) -> RespValue {
@@ -516,8 +528,14 @@ impl CommandHandler {
                     .map(|n| String::from_utf8_lossy(n).into_owned())
                     .unwrap_or_default();
                 let line = format!(
-                    "id={} addr= name={} db=0 sub={} psub=0\n",
-                    id, name, self.pubsub_subscriptions
+                    "id={} addr= name={} db={} sub={} psub=0 resp={} no-evict={} no-touch={}\n",
+                    id,
+                    name,
+                    self.selected_db,
+                    self.pubsub_subscriptions,
+                    self.protocol_version,
+                    if self.client_no_evict { 1 } else { 0 },
+                    if self.client_no_touch { 1 } else { 0 },
                 );
                 Ok(bulk(line))
             }
@@ -529,16 +547,21 @@ impl CommandHandler {
                     .map(|n| String::from_utf8_lossy(n).into_owned())
                     .unwrap_or_default();
                 let info = format!(
-                    "id={}\nname={}\ndb=0\nsub={}\npsub=0\nresp={}\n",
+                    "id={}\nname={}\ndb={}\nsub={}\npsub=0\nresp={}\nno-evict={}\nno-touch={}\n",
                     id,
                     name,
+                    self.selected_db,
                     self.pubsub_subscriptions,
-                    self.protocol_version
+                    self.protocol_version,
+                    if self.client_no_evict { 1 } else { 0 },
+                    if self.client_no_touch { 1 } else { 0 },
                 );
                 Ok(bulk(info))
             }
             "REPLY" => self.client_reply(&args[1..]),
-            "KILL" | "PAUSE" | "UNPAUSE" | "NO-EVICT" | "NO-TOUCH" | "TRACKING"
+            "NO-EVICT" => self.client_no_evict_cmd(&args[1..]),
+            "NO-TOUCH" => self.client_no_touch_cmd(&args[1..]),
+            "KILL" | "PAUSE" | "UNPAUSE" | "TRACKING"
             | "CACHING" | "GETREDIR" | "TRACKINGINFO" => Ok(RespValue::error(format!(
                 "ERR CLIENT {} is not supported yet",
                 sub
@@ -547,6 +570,38 @@ impl CommandHandler {
                 "ERR unknown subcommand '{}'. Try CLIENT HELP.",
                 sub
             ))),
+        }
+    }
+
+    /// CLIENT NO-EVICT ON|OFF
+    fn client_no_evict_cmd(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 1 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'client|no-evict' command",
+            ));
+        }
+        match parse_on_off(&args[0]) {
+            Ok(on) => {
+                self.client_no_evict = on;
+                Ok(RespValue::ok())
+            }
+            Err(e) => Ok(RespValue::error(e)),
+        }
+    }
+
+    /// CLIENT NO-TOUCH ON|OFF
+    fn client_no_touch_cmd(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 1 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'client|no-touch' command",
+            ));
+        }
+        match parse_on_off(&args[0]) {
+            Ok(on) => {
+                self.client_no_touch = on;
+                Ok(RespValue::ok())
+            }
+            Err(e) => Ok(RespValue::error(e)),
         }
     }
 

@@ -94,6 +94,10 @@ pub struct CommandHandler {
     suppress_reply: bool,
     /// READONLY mode for cluster replica reads on this connection.
     cluster_readonly: bool,
+    /// CLIENT NO-EVICT ON — keys written by this client prefer not to be evicted (flag stored).
+    client_no_evict: bool,
+    /// CLIENT NO-TOUCH ON — reads do not update LRU/LFU idle times.
+    client_no_touch: bool,
 }
 
 impl CommandHandler {
@@ -169,6 +173,16 @@ impl CommandHandler {
             client_reply_skip: false,
             suppress_reply: false,
             cluster_readonly: false,
+            client_no_evict: false,
+            client_no_touch: false,
+        }
+    }
+
+    /// Load options honoring CLIENT NO-TOUCH.
+    pub(crate) fn load_options(&self) -> crate::entry::LoadOptions {
+        crate::entry::LoadOptions {
+            touch: !self.client_no_touch,
+            with_cas: false,
         }
     }
 
@@ -483,6 +497,8 @@ impl CommandHandler {
                 self.protocol_version = 2;
                 self.asking = false;
                 self.cluster_readonly = false;
+                self.client_no_evict = false;
+                self.client_no_touch = false;
                 if let Some(id) = self.client_id {
                     self.cache.pubsub.set_client_protocol(id, 2).await;
                 }
