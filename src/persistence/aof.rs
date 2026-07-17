@@ -12,9 +12,7 @@ use crate::databases::Databases;
 use crate::error::{Error, Result};
 use crate::persistence::rdb::DbSnapshot;
 use crate::protocol::RespValue;
-use crate::search_index::{
-    DistanceMetric, FieldDefinition, FieldType, IndexDefinition, VectorAlgorithm,
-};
+use crate::search_index::{DistanceMetric, FieldType, IndexDefinition, VectorAlgorithm};
 use crate::stream_type::StreamId;
 use bytes::Bytes;
 use std::fs::{self, File, OpenOptions};
@@ -437,208 +435,15 @@ where
 
 /// Parse `FT.CREATE` argv (command name at [0]) into an IndexDefinition.
 ///
-/// Returns `None` on incomplete / invalid input. Callers in AOF load treat
-/// truncated argv (`len < 4`) as a liberal skip (like other apply paths) and
-/// non-truncated parse failures as load errors so rewrite-produced commands
-/// never disappear silently.
+/// Thin wrapper around the shared [`IndexDefinition::from_ft_create_argv`] so
+/// AOF load and the command path cannot drift. Returns `None` on incomplete /
+/// invalid input. Callers treat truncated argv (`len < 4`) as a liberal skip
+/// and non-truncated parse failures as load errors.
 fn parse_ft_create_definition(argv: &[Bytes]) -> Option<IndexDefinition> {
     if argv.len() < 4 {
         return None;
     }
-    let index_name = String::from_utf8_lossy(&argv[1]).into_owned();
-    let mut i = 2;
-    let mut prefix_list = Vec::new();
-
-    while i < argv.len() {
-        let arg = String::from_utf8_lossy(&argv[i]).to_uppercase();
-        match arg.as_str() {
-            "ON" => {
-                i += 2; // ON HASH
-            }
-            "PREFIX" => {
-                i += 1;
-                if i >= argv.len() {
-                    return None;
-                }
-                let count: usize = std::str::from_utf8(&argv[i]).ok()?.parse().ok()?;
-                i += 1;
-                for _ in 0..count {
-                    if i >= argv.len() {
-                        return None;
-                    }
-                    prefix_list.push(String::from_utf8_lossy(&argv[i]).into_owned());
-                    i += 1;
-                }
-            }
-            "SCHEMA" => {
-                i += 1;
-                break;
-            }
-            _ => return None,
-        }
-    }
-
-    let mut fields = Vec::new();
-    while i < argv.len() {
-        if i + 1 >= argv.len() {
-            break;
-        }
-        let field_name = String::from_utf8_lossy(&argv[i]).into_owned();
-        i += 1;
-        let type_str = String::from_utf8_lossy(&argv[i]).to_uppercase();
-        i += 1;
-
-        let field_type = match type_str.as_str() {
-            "TEXT" => {
-                let mut weight = 1.0f64;
-                let mut sortable = false;
-                while i < argv.len() {
-                    let opt = String::from_utf8_lossy(&argv[i]).to_uppercase();
-                    match opt.as_str() {
-                        "WEIGHT" => {
-                            i += 1;
-                            if i >= argv.len() {
-                                break;
-                            }
-                            weight = std::str::from_utf8(&argv[i])
-                                .ok()
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(1.0);
-                            i += 1;
-                        }
-                        "SORTABLE" => {
-                            sortable = true;
-                            i += 1;
-                        }
-                        _ => break,
-                    }
-                }
-                FieldType::Text { weight, sortable }
-            }
-            "NUMERIC" => {
-                let mut sortable = false;
-                if i < argv.len()
-                    && String::from_utf8_lossy(&argv[i]).eq_ignore_ascii_case("SORTABLE")
-                {
-                    sortable = true;
-                    i += 1;
-                }
-                FieldType::Numeric { sortable }
-            }
-            "TAG" => {
-                let mut separator = ",".to_string();
-                let mut sortable = false;
-                while i < argv.len() {
-                    let opt = String::from_utf8_lossy(&argv[i]).to_uppercase();
-                    match opt.as_str() {
-                        "SEPARATOR" => {
-                            i += 1;
-                            if i >= argv.len() {
-                                break;
-                            }
-                            separator = String::from_utf8_lossy(&argv[i]).into_owned();
-                            i += 1;
-                        }
-                        "SORTABLE" => {
-                            sortable = true;
-                            i += 1;
-                        }
-                        _ => break,
-                    }
-                }
-                FieldType::Tag { separator, sortable }
-            }
-            "VECTOR" => {
-                if i >= argv.len() {
-                    return None;
-                }
-                let algo_str = String::from_utf8_lossy(&argv[i]).to_uppercase();
-                i += 1;
-                let algorithm = match algo_str.as_str() {
-                    "FLAT" => VectorAlgorithm::Flat,
-                    "HNSW" => {
-                        let mut m = 16usize;
-                        if i < argv.len()
-                            && String::from_utf8_lossy(&argv[i]).eq_ignore_ascii_case("M")
-                        {
-                            i += 1;
-                            if i < argv.len() {
-                                m = std::str::from_utf8(&argv[i])
-                                    .ok()
-                                    .and_then(|s| s.parse().ok())
-                                    .unwrap_or(16);
-                                i += 1;
-                            }
-                        }
-                        VectorAlgorithm::HNSW {
-                            m,
-                            ef_construction: 200,
-                        }
-                    }
-                    _ => return None,
-                };
-                // TYPE FLOAT32
-                if i < argv.len()
-                    && String::from_utf8_lossy(&argv[i]).eq_ignore_ascii_case("TYPE")
-                {
-                    i += 1;
-                }
-                if i < argv.len() {
-                    i += 1; // skip FLOAT32
-                }
-                // DIM n
-                let mut dimensions = 0usize;
-                if i < argv.len() {
-                    let tok = String::from_utf8_lossy(&argv[i]).to_uppercase();
-                    if tok == "DIM" || tok == "DIMENSION" {
-                        i += 1;
-                        if i < argv.len() {
-                            dimensions = std::str::from_utf8(&argv[i])
-                                .ok()
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0);
-                            i += 1;
-                        }
-                    }
-                }
-                if dimensions == 0 {
-                    return None;
-                }
-                let mut distance_metric = DistanceMetric::Cosine;
-                if i < argv.len()
-                    && String::from_utf8_lossy(&argv[i])
-                        .eq_ignore_ascii_case("DISTANCE_METRIC")
-                {
-                    i += 1;
-                    if i < argv.len() {
-                        let m = String::from_utf8_lossy(&argv[i]).to_uppercase();
-                        distance_metric = match m.as_str() {
-                            "L2" => DistanceMetric::L2,
-                            "IP" => DistanceMetric::IP,
-                            _ => DistanceMetric::Cosine,
-                        };
-                        i += 1;
-                    }
-                }
-                FieldType::Vector {
-                    algorithm,
-                    dimensions,
-                    distance_metric,
-                }
-            }
-            _ => return None,
-        };
-
-        fields.push(FieldDefinition {
-            name: field_name,
-            field_type,
-        });
-    }
-
-    if fields.is_empty() {
-        return None;
-    }
-    Some(IndexDefinition::new(index_name, prefix_list, fields))
+    IndexDefinition::from_ft_create_argv(argv).ok()
 }
 
 /// Apply a single AOF write command against one cache.

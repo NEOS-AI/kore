@@ -381,9 +381,9 @@ Also tracked in `docs/roadmap.md`.
 - [ ] **`[P2]`** ACL `@search` category for FT.* (fine-grained users; default `+@all` unaffected)
 - [ ] **`[P2]`** HNSW correctness/performance benchmarks vs FLAT
 - [ ] **`[P2]`** **Code review (BT nit):** optional single critical section for `get_index` resolve+lookup; min-replicas FT test
-- [ ] **`[P2]`** **Code review (BU):** share one FT.CREATE parser between command path and AOF load
+- [x] **`[P2]`** **Code review (BU):** share one FT.CREATE parser between command path and AOF load
   - *Found*: `parse_ft_create_definition` in `aof.rs` duplicates `handle_ft_create` in `commands/search.rs` — schema options can drift (already two HNSW option loops)
-  - *Fix*: extract shared `IndexDefinition::from_ft_create_argv` (or similar) used by both
+  - *Done (Batch CA)*: shared `IndexDefinition::from_ft_create_argv` / `from_ft_create_args` in `search_index.rs`; command path + AOF load both call it (single `ef_construction` default 200). Tests: unit in `search_index`, `tests/ca_shared_ft_create_parser_test.rs`
 - [ ] **`[P2]`** **Code review (BU):** HNSW `ef_construction` not round-tripped in AOF rewrite
   - *Found*: rewrite emits `HNSW M <n>` only; load hardcodes `ef_construction: 200` (command path also hardcodes 200 / unused `mut`)
   - *Fix*: when EF becomes configurable, encode/parse `EF_CONSTRUCTION` and store on `VectorAlgorithm::HNSW`
@@ -437,7 +437,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). BZ closed RDB snapshot-replace schema wipe + load error wipe (no new P0/P1). Second-pass: only nits (wrapper-only wipe, test assert, flush=false merge). **Next:** scratch-load swap (AOF+RDB non-empty targets); shared FT.CREATE parser; ACL `@search`; HNSW RDB round-trip test.
+Prioritized for next letter batch(es). BZ closed RDB snapshot-replace schema wipe + load error wipe (no new P0/P1). CA closed shared FT.CREATE parser. Second-pass: only nits (wrapper-only wipe, test assert, flush=false merge). **Next:** scratch-load swap (AOF+RDB non-empty targets); ACL `@search`; HNSW RDB round-trip test; HNSW `ef_construction` AOF round-trip.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -451,7 +451,7 @@ Prioritized for next letter batch(es). BZ closed RDB snapshot-replace schema wip
 | P2 | RDB load wipe-on-FT-failure (mirror AOF BW) | done (BZ) |
 | P2 | RDB `flush=false` FT merge / name-clash semantics | open |
 | P2 | ACL `@search` | open |
-| P2 | Shared FT.CREATE parser (cmd + AOF load) | open |
+| P2 | Shared FT.CREATE parser (cmd + AOF load) | done (CA) |
 | P2 | HNSW `ef_construction` AOF round-trip | open (RDB done in BY) |
 | P2 | AOF load all-or-nothing on FT failure (BV review) | done (BW) |
 | P2 | FLUSHDB vs FT schema (BW: flush clears indices) | done (BX) |

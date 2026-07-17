@@ -53,7 +53,7 @@ pub enum DistanceMetric {
 }
 
 /// Field definition in an index
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FieldDefinition {
     pub name: String,
     pub field_type: FieldType,
@@ -81,6 +81,272 @@ impl IndexDefinition {
         }
     }
 
+    /// Parse an `FT.CREATE` argument list into an index definition.
+    ///
+    /// `argv` is the full command argv with the command name at `[0]`:
+    /// `["FT.CREATE", index, … OPTIONS …, "SCHEMA", field, type, …]`.
+    ///
+    /// This is the **single** FT.CREATE schema parser used by both the live
+    /// command path (`FT.CREATE`) and AOF load, so PREFIX / SCHEMA / field
+    /// options (TEXT WEIGHT/SORTABLE, TAG SEPARATOR, VECTOR HNSW M, metrics)
+    /// cannot drift between the two.
+    ///
+    /// HNSW `ef_construction` is not yet user-configurable via FT.CREATE; the
+    /// default (`200`) lives only here.
+    pub fn from_ft_create_argv(argv: &[Bytes]) -> Result<IndexDefinition, String> {
+        // Accept either full argv (`FT.CREATE` first) or args starting at the
+        // index name (command-handler slice after the command token).
+        let args = if !argv.is_empty()
+            && String::from_utf8_lossy(&argv[0]).eq_ignore_ascii_case("FT.CREATE")
+        {
+            &argv[1..]
+        } else {
+            argv
+        };
+        Self::from_ft_create_args(args)
+    }
+
+    /// Parse `FT.CREATE` args starting at the index name (no command token).
+    ///
+    /// Shape: `[index, ON HASH, PREFIX n p…, SCHEMA, field, type, options…]`.
+    pub fn from_ft_create_args(args: &[Bytes]) -> Result<IndexDefinition, String> {
+        if args.is_empty() {
+            return Err("ERR wrong number of arguments for 'FT.CREATE' command".into());
+        }
+
+        let index_name = String::from_utf8_lossy(&args[0]).into_owned();
+        let mut i = 1;
+        let mut prefix_list = Vec::new();
+        let mut fields = Vec::new();
+
+        // Optional ON / PREFIX, then SCHEMA.
+        while i < args.len() {
+            let arg = String::from_utf8_lossy(&args[i]).to_uppercase();
+            match arg.as_str() {
+                "ON" => {
+                    // Skip ON HASH (or ON JSON, etc.) — only HASH is supported.
+                    i += 2;
+                }
+                "PREFIX" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err("ERR missing prefix count".into());
+                    }
+                    let count = parse_ft_usize(&args[i])
+                        .ok_or_else(|| "ERR invalid prefix count".to_string())?;
+                    i += 1;
+                    for _ in 0..count {
+                        if i >= args.len() {
+                            return Err("ERR missing prefix".into());
+                        }
+                        prefix_list.push(String::from_utf8_lossy(&args[i]).into_owned());
+                        i += 1;
+                    }
+                }
+                "SCHEMA" => {
+                    i += 1;
+                    break;
+                }
+                _ => {
+                    return Err(format!("ERR unknown option '{}'", arg));
+                }
+            }
+        }
+
+        // SCHEMA fields.
+        while i < args.len() {
+            if i + 1 >= args.len() {
+                return Err("ERR incomplete field definition".into());
+            }
+
+            let field_name = String::from_utf8_lossy(&args[i]).into_owned();
+            i += 1;
+
+            let field_type_str = String::from_utf8_lossy(&args[i]).to_uppercase();
+            i += 1;
+
+            let field_type = match field_type_str.as_str() {
+                "TEXT" => {
+                    let mut weight = 1.0f64;
+                    let mut sortable = false;
+                    while i < args.len() {
+                        let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                        match opt.as_str() {
+                            "WEIGHT" => {
+                                i += 1;
+                                if i >= args.len() {
+                                    return Err("ERR missing weight value".into());
+                                }
+                                weight = std::str::from_utf8(&args[i])
+                                    .ok()
+                                    .and_then(|s| s.parse().ok())
+                                    .ok_or_else(|| "ERR invalid weight".to_string())?;
+                                i += 1;
+                            }
+                            "SORTABLE" => {
+                                sortable = true;
+                                i += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                    FieldType::Text { weight, sortable }
+                }
+                "NUMERIC" => {
+                    let mut sortable = false;
+                    if i < args.len()
+                        && String::from_utf8_lossy(&args[i]).eq_ignore_ascii_case("SORTABLE")
+                    {
+                        sortable = true;
+                        i += 1;
+                    }
+                    FieldType::Numeric { sortable }
+                }
+                "TAG" => {
+                    let mut separator = ",".to_string();
+                    let mut sortable = false;
+                    while i < args.len() {
+                        let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                        match opt.as_str() {
+                            "SEPARATOR" => {
+                                i += 1;
+                                if i >= args.len() {
+                                    return Err("ERR missing separator".into());
+                                }
+                                separator = String::from_utf8_lossy(&args[i]).into_owned();
+                                i += 1;
+                            }
+                            "SORTABLE" => {
+                                sortable = true;
+                                i += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                    FieldType::Tag { separator, sortable }
+                }
+                "VECTOR" => {
+                    // VECTOR algorithm [HNSW M n] TYPE FLOAT32 DIM n [DISTANCE_METRIC m]
+                    if i >= args.len() {
+                        return Err("ERR incomplete VECTOR field definition".into());
+                    }
+
+                    let algo_str = String::from_utf8_lossy(&args[i]).to_uppercase();
+                    i += 1;
+
+                    let algorithm = match algo_str.as_str() {
+                        "FLAT" => VectorAlgorithm::Flat,
+                        "HNSW" => {
+                            let mut m = 16usize;
+                            // Default only lives in this shared parser (not yet CLI-configurable).
+                            const DEFAULT_EF_CONSTRUCTION: usize = 200;
+                            if i < args.len()
+                                && String::from_utf8_lossy(&args[i]).eq_ignore_ascii_case("M")
+                            {
+                                i += 1;
+                                if i >= args.len() {
+                                    return Err("ERR missing HNSW M value".into());
+                                }
+                                m = parse_ft_usize(&args[i])
+                                    .ok_or_else(|| "ERR invalid HNSW M value".to_string())?;
+                                i += 1;
+                            }
+                            VectorAlgorithm::HNSW {
+                                m,
+                                ef_construction: DEFAULT_EF_CONSTRUCTION,
+                            }
+                        }
+                        _ => {
+                            return Err(format!(
+                                "ERR unknown vector algorithm '{}'",
+                                algo_str
+                            ));
+                        }
+                    };
+
+                    // Optional TYPE keyword, then type value (e.g. FLOAT32).
+                    if i < args.len()
+                        && String::from_utf8_lossy(&args[i]).eq_ignore_ascii_case("TYPE")
+                    {
+                        i += 1;
+                    }
+                    if i >= args.len() {
+                        return Err("ERR incomplete VECTOR field definition".into());
+                    }
+                    i += 1; // skip type value
+
+                    // DIM / DIMENSION
+                    let dimensions = if i < args.len() {
+                        let tok = String::from_utf8_lossy(&args[i]).to_uppercase();
+                        if tok == "DIM" || tok == "DIMENSION" {
+                            i += 1;
+                            if i >= args.len() {
+                                return Err("ERR missing dimension value".into());
+                            }
+                            let dim = parse_ft_usize(&args[i])
+                                .ok_or_else(|| "ERR invalid dimension value".to_string())?;
+                            i += 1;
+                            dim
+                        } else {
+                            return Err("ERR missing DIM keyword".into());
+                        }
+                    } else {
+                        return Err("ERR missing dimension".into());
+                    };
+                    if dimensions == 0 {
+                        return Err("ERR invalid dimension value".into());
+                    }
+
+                    // DISTANCE_METRIC (default Cosine)
+                    let distance_metric = if i < args.len()
+                        && String::from_utf8_lossy(&args[i])
+                            .eq_ignore_ascii_case("DISTANCE_METRIC")
+                    {
+                        i += 1;
+                        if i >= args.len() {
+                            return Err("ERR missing distance metric".into());
+                        }
+                        let metric_str = String::from_utf8_lossy(&args[i]).to_uppercase();
+                        i += 1;
+                        match metric_str.as_str() {
+                            "COSINE" => DistanceMetric::Cosine,
+                            "L2" => DistanceMetric::L2,
+                            "IP" => DistanceMetric::IP,
+                            _ => {
+                                return Err(format!(
+                                    "ERR unknown distance metric '{}'",
+                                    metric_str
+                                ));
+                            }
+                        }
+                    } else {
+                        DistanceMetric::Cosine
+                    };
+
+                    FieldType::Vector {
+                        algorithm,
+                        dimensions,
+                        distance_metric,
+                    }
+                }
+                _ => {
+                    return Err(format!("ERR unknown field type '{}'", field_type_str));
+                }
+            };
+
+            fields.push(FieldDefinition {
+                name: field_name,
+                field_type,
+            });
+        }
+
+        if fields.is_empty() {
+            return Err("ERR no fields defined".into());
+        }
+
+        Ok(IndexDefinition::new(index_name, prefix_list, fields))
+    }
+
     /// Check if a key matches this index's prefix
     pub fn matches_prefix(&self, key: &str) -> bool {
         if self.prefix.is_empty() {
@@ -93,6 +359,11 @@ impl IndexDefinition {
     pub fn get_field(&self, name: &str) -> Option<&FieldDefinition> {
         self.fields.iter().find(|f| f.name == name)
     }
+}
+
+/// Parse a decimal usize from a bulk FT.CREATE token.
+fn parse_ft_usize(tok: &[u8]) -> Option<usize> {
+    std::str::from_utf8(tok).ok()?.parse().ok()
 }
 
 /// Inverted index for text search
@@ -706,6 +977,143 @@ impl SearchIndexManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn b(s: &str) -> Bytes {
+        Bytes::from(s.to_string())
+    }
+
+    fn argv(parts: &[&str]) -> Vec<Bytes> {
+        parts.iter().map(|p| b(p)).collect()
+    }
+
+    #[test]
+    fn from_ft_create_argv_full_schema() {
+        let args = argv(&[
+            "FT.CREATE",
+            "idx",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "doc:",
+            "SCHEMA",
+            "title",
+            "TEXT",
+            "WEIGHT",
+            "2.0",
+            "SORTABLE",
+            "price",
+            "NUMERIC",
+            "SORTABLE",
+            "tags",
+            "TAG",
+            "SEPARATOR",
+            "|",
+            "emb",
+            "VECTOR",
+            "HNSW",
+            "M",
+            "32",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "4",
+            "DISTANCE_METRIC",
+            "L2",
+        ]);
+        let def = IndexDefinition::from_ft_create_argv(&args).expect("parse");
+        assert_eq!(def.name, "idx");
+        assert_eq!(def.prefix, vec!["doc:".to_string()]);
+        assert_eq!(def.fields.len(), 4);
+        assert_eq!(
+            def.fields[0],
+            FieldDefinition {
+                name: "title".into(),
+                field_type: FieldType::Text {
+                    weight: 2.0,
+                    sortable: true,
+                },
+            }
+        );
+        assert_eq!(
+            def.fields[1],
+            FieldDefinition {
+                name: "price".into(),
+                field_type: FieldType::Numeric { sortable: true },
+            }
+        );
+        assert_eq!(
+            def.fields[2],
+            FieldDefinition {
+                name: "tags".into(),
+                field_type: FieldType::Tag {
+                    separator: "|".into(),
+                    sortable: false,
+                },
+            }
+        );
+        assert_eq!(
+            def.fields[3],
+            FieldDefinition {
+                name: "emb".into(),
+                field_type: FieldType::Vector {
+                    algorithm: VectorAlgorithm::HNSW {
+                        m: 32,
+                        ef_construction: 200,
+                    },
+                    dimensions: 4,
+                    distance_metric: DistanceMetric::L2,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn from_ft_create_args_without_command_token() {
+        let with_cmd = argv(&[
+            "FT.CREATE",
+            "a",
+            "SCHEMA",
+            "t",
+            "TEXT",
+            "v",
+            "VECTOR",
+            "FLAT",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "2",
+            "DISTANCE_METRIC",
+            "IP",
+        ]);
+        let without_cmd = argv(&[
+            "a",
+            "SCHEMA",
+            "t",
+            "TEXT",
+            "v",
+            "VECTOR",
+            "FLAT",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "2",
+            "DISTANCE_METRIC",
+            "IP",
+        ]);
+        let d1 = IndexDefinition::from_ft_create_argv(&with_cmd).unwrap();
+        let d2 = IndexDefinition::from_ft_create_args(&without_cmd).unwrap();
+        assert_eq!(d1.name, d2.name);
+        assert_eq!(d1.prefix, d2.prefix);
+        assert_eq!(d1.fields, d2.fields);
+    }
+
+    #[test]
+    fn from_ft_create_rejects_empty_schema() {
+        let args = argv(&["FT.CREATE", "idx", "PREFIX", "1", "x:"]);
+        let err = IndexDefinition::from_ft_create_argv(&args).unwrap_err();
+        assert!(err.contains("no fields"), "got {err}");
+    }
 
     #[test]
     fn test_inverted_index() {
