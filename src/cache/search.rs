@@ -57,6 +57,22 @@ impl Cache {
         self.search_index_manager.list_indices()
     }
 
+    /// Full index definitions for AOF rewrite (sorted by name).
+    pub fn list_search_index_definitions(&self) -> Vec<IndexDefinition> {
+        self.search_index_manager.list_definitions()
+    }
+
+    /// Alias → real index mappings for AOF rewrite (sorted by alias).
+    pub fn list_search_aliases(&self) -> Vec<(String, String)> {
+        self.search_index_manager.list_aliases()
+    }
+
+    /// True when this DB has any search index or alias (rewrite even if keyspace empty).
+    pub fn has_search_state(&self) -> bool {
+        !self.search_index_manager.list_indices().is_empty()
+            || !self.search_index_manager.list_aliases().is_empty()
+    }
+
     /// Get search index information
     pub fn get_search_index_info(&self, name: &str) -> Option<IndexInfo> {
         let index = self.search_index_manager.get_index(name)?;

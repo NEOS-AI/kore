@@ -1,14 +1,20 @@
 //! Append-Only File (AOF) persistence.
 //!
 //! Format: stream of RESP arrays (Redis-compatible command log).
-//! Rewrite materializes the current DB as SET / ZADD / GEOADD / HSET / RPUSH /
-//! SADD / XADD / XGROUP CREATE commands, with SELECT between logical databases.
+//! Rewrite materializes the current DB as:
+//!   1. `FT.CREATE` (search schema) — before key dumps so HSET auto-index repopulates
+//!   2. SET / ZADD / GEOADD / HSET / RPUSH / SADD / XADD / XGROUP …
+//!   3. `FT.ALIASADD` (aliases after data is re-indexed)
+//! with SELECT between logical databases.
 
 use crate::cache::Cache;
 use crate::databases::Databases;
 use crate::error::{Error, Result};
 use crate::persistence::rdb::DbSnapshot;
 use crate::protocol::RespValue;
+use crate::search_index::{
+    DistanceMetric, FieldDefinition, FieldType, IndexDefinition, VectorAlgorithm,
+};
 use crate::stream_type::StreamId;
 use bytes::Bytes;
 use std::fs::{self, File, OpenOptions};
@@ -62,6 +68,108 @@ impl AofWriter {
         let encoded = encode_command(args);
         self.append_raw(&encoded)
     }
+}
+
+/// Encode `FT.CREATE` for every search index on this cache.
+///
+/// Emitted **before** key dumps so replay creates schema first; subsequent HSET
+/// commands auto-index documents into the recreated indices.
+fn encode_search_create_commands(cache: &Cache, buf: &mut Vec<u8>) {
+    for def in cache.list_search_index_definitions() {
+        let mut args = vec![
+            Bytes::from_static(b"FT.CREATE"),
+            Bytes::from(def.name.clone()),
+        ];
+        if !def.prefix.is_empty() {
+            args.push(Bytes::from_static(b"PREFIX"));
+            args.push(Bytes::from(def.prefix.len().to_string()));
+            for p in &def.prefix {
+                args.push(Bytes::from(p.clone()));
+            }
+        }
+        args.push(Bytes::from_static(b"SCHEMA"));
+        for field in &def.fields {
+            args.push(Bytes::from(field.name.clone()));
+            match &field.field_type {
+                FieldType::Text { weight, sortable } => {
+                    args.push(Bytes::from_static(b"TEXT"));
+                    if (*weight - 1.0).abs() > f64::EPSILON {
+                        args.push(Bytes::from_static(b"WEIGHT"));
+                        args.push(Bytes::from(weight.to_string()));
+                    }
+                    if *sortable {
+                        args.push(Bytes::from_static(b"SORTABLE"));
+                    }
+                }
+                FieldType::Numeric { sortable } => {
+                    args.push(Bytes::from_static(b"NUMERIC"));
+                    if *sortable {
+                        args.push(Bytes::from_static(b"SORTABLE"));
+                    }
+                }
+                FieldType::Tag { separator, sortable } => {
+                    args.push(Bytes::from_static(b"TAG"));
+                    if separator != "," {
+                        args.push(Bytes::from_static(b"SEPARATOR"));
+                        args.push(Bytes::from(separator.clone()));
+                    }
+                    if *sortable {
+                        args.push(Bytes::from_static(b"SORTABLE"));
+                    }
+                }
+                FieldType::Vector {
+                    algorithm,
+                    dimensions,
+                    distance_metric,
+                } => {
+                    args.push(Bytes::from_static(b"VECTOR"));
+                    match algorithm {
+                        VectorAlgorithm::Flat => {
+                            args.push(Bytes::from_static(b"FLAT"));
+                        }
+                        VectorAlgorithm::HNSW { m, .. } => {
+                            args.push(Bytes::from_static(b"HNSW"));
+                            args.push(Bytes::from_static(b"M"));
+                            args.push(Bytes::from(m.to_string()));
+                        }
+                    }
+                    args.push(Bytes::from_static(b"TYPE"));
+                    args.push(Bytes::from_static(b"FLOAT32"));
+                    args.push(Bytes::from_static(b"DIM"));
+                    args.push(Bytes::from(dimensions.to_string()));
+                    args.push(Bytes::from_static(b"DISTANCE_METRIC"));
+                    let metric = match distance_metric {
+                        DistanceMetric::Cosine => Bytes::from_static(b"COSINE"),
+                        DistanceMetric::L2 => Bytes::from_static(b"L2"),
+                        DistanceMetric::IP => Bytes::from_static(b"IP"),
+                    };
+                    args.push(metric);
+                }
+            }
+        }
+        buf.extend_from_slice(&encode_command(&args));
+    }
+}
+
+/// Encode `FT.ALIASADD` for every alias → real index mapping.
+///
+/// Emitted **after** key dumps so aliases attach once documents are re-indexed.
+fn encode_search_alias_commands(cache: &Cache, buf: &mut Vec<u8>) {
+    for (alias, index) in cache.list_search_aliases() {
+        let args = vec![
+            Bytes::from_static(b"FT.ALIASADD"),
+            Bytes::from(alias),
+            Bytes::from(index),
+        ];
+        buf.extend_from_slice(&encode_command(&args));
+    }
+}
+
+/// Encode one DB: FT.CREATE → keyspace dump → FT.ALIASADD (no SELECT).
+fn encode_db_commands(cache: &Cache, snap: &DbSnapshot, buf: &mut Vec<u8>) {
+    encode_search_create_commands(cache, buf);
+    encode_snapshot_commands(snap, buf);
+    encode_search_alias_commands(cache, buf);
 }
 
 /// Encode one DB snapshot as AOF rewrite commands (no SELECT).
@@ -246,23 +354,25 @@ fn write_aof_buffer(buf: &[u8], path: &Path) -> Result<()> {
 pub fn rewrite(cache: &Cache, path: &Path) -> Result<()> {
     let snap = DbSnapshot::from_cache(cache)?;
     let mut buf = Vec::with_capacity(4096);
-    encode_snapshot_commands(&snap, &mut buf);
+    encode_db_commands(cache, &snap, &mut buf);
     write_aof_buffer(&buf, path)
 }
 
 /// Rewrite AOF from all non-empty logical databases, emitting SELECT between them.
+///
+/// A DB is non-empty if it has keyspace data **or** search indices/aliases.
 pub fn rewrite_databases(databases: &Databases, path: &Path) -> Result<()> {
-    let mut non_empty: Vec<(usize, DbSnapshot)> = Vec::new();
+    let mut non_empty: Vec<(usize, Arc<Cache>, DbSnapshot)> = Vec::new();
     for (idx, cache) in databases.iter().enumerate() {
         let snap = DbSnapshot::from_cache(cache)?;
-        if !snap.is_empty() {
-            non_empty.push((idx, snap));
+        if !snap.is_empty() || cache.has_search_state() {
+            non_empty.push((idx, cache.clone(), snap));
         }
     }
 
     let mut buf = Vec::with_capacity(4096);
     let multi = non_empty.len() > 1;
-    for (idx, snap) in &non_empty {
+    for (idx, cache, snap) in &non_empty {
         // Emit SELECT for every DB when multiple are non-empty, and for any
         // non-zero single DB so load restores the correct keyspace.
         if multi || *idx != 0 {
@@ -272,7 +382,7 @@ pub fn rewrite_databases(databases: &Databases, path: &Path) -> Result<()> {
             ];
             buf.extend_from_slice(&encode_command(&args));
         }
-        encode_snapshot_commands(snap, &mut buf);
+        encode_db_commands(cache, snap, &mut buf);
     }
 
     write_aof_buffer(&buf, path)
@@ -325,9 +435,213 @@ where
     Ok(count)
 }
 
+/// Parse `FT.CREATE` argv (command name at [0]) into an IndexDefinition.
+/// Best-effort: returns None on incomplete / invalid input (AOF load skips).
+fn parse_ft_create_definition(argv: &[Bytes]) -> Option<IndexDefinition> {
+    if argv.len() < 4 {
+        return None;
+    }
+    let index_name = String::from_utf8_lossy(&argv[1]).into_owned();
+    let mut i = 2;
+    let mut prefix_list = Vec::new();
+
+    while i < argv.len() {
+        let arg = String::from_utf8_lossy(&argv[i]).to_uppercase();
+        match arg.as_str() {
+            "ON" => {
+                i += 2; // ON HASH
+            }
+            "PREFIX" => {
+                i += 1;
+                if i >= argv.len() {
+                    return None;
+                }
+                let count: usize = std::str::from_utf8(&argv[i]).ok()?.parse().ok()?;
+                i += 1;
+                for _ in 0..count {
+                    if i >= argv.len() {
+                        return None;
+                    }
+                    prefix_list.push(String::from_utf8_lossy(&argv[i]).into_owned());
+                    i += 1;
+                }
+            }
+            "SCHEMA" => {
+                i += 1;
+                break;
+            }
+            _ => return None,
+        }
+    }
+
+    let mut fields = Vec::new();
+    while i < argv.len() {
+        if i + 1 >= argv.len() {
+            break;
+        }
+        let field_name = String::from_utf8_lossy(&argv[i]).into_owned();
+        i += 1;
+        let type_str = String::from_utf8_lossy(&argv[i]).to_uppercase();
+        i += 1;
+
+        let field_type = match type_str.as_str() {
+            "TEXT" => {
+                let mut weight = 1.0f64;
+                let mut sortable = false;
+                while i < argv.len() {
+                    let opt = String::from_utf8_lossy(&argv[i]).to_uppercase();
+                    match opt.as_str() {
+                        "WEIGHT" => {
+                            i += 1;
+                            if i >= argv.len() {
+                                break;
+                            }
+                            weight = std::str::from_utf8(&argv[i])
+                                .ok()
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(1.0);
+                            i += 1;
+                        }
+                        "SORTABLE" => {
+                            sortable = true;
+                            i += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                FieldType::Text { weight, sortable }
+            }
+            "NUMERIC" => {
+                let mut sortable = false;
+                if i < argv.len()
+                    && String::from_utf8_lossy(&argv[i]).eq_ignore_ascii_case("SORTABLE")
+                {
+                    sortable = true;
+                    i += 1;
+                }
+                FieldType::Numeric { sortable }
+            }
+            "TAG" => {
+                let mut separator = ",".to_string();
+                let mut sortable = false;
+                while i < argv.len() {
+                    let opt = String::from_utf8_lossy(&argv[i]).to_uppercase();
+                    match opt.as_str() {
+                        "SEPARATOR" => {
+                            i += 1;
+                            if i >= argv.len() {
+                                break;
+                            }
+                            separator = String::from_utf8_lossy(&argv[i]).into_owned();
+                            i += 1;
+                        }
+                        "SORTABLE" => {
+                            sortable = true;
+                            i += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                FieldType::Tag { separator, sortable }
+            }
+            "VECTOR" => {
+                if i >= argv.len() {
+                    return None;
+                }
+                let algo_str = String::from_utf8_lossy(&argv[i]).to_uppercase();
+                i += 1;
+                let algorithm = match algo_str.as_str() {
+                    "FLAT" => VectorAlgorithm::Flat,
+                    "HNSW" => {
+                        let mut m = 16usize;
+                        if i < argv.len()
+                            && String::from_utf8_lossy(&argv[i]).eq_ignore_ascii_case("M")
+                        {
+                            i += 1;
+                            if i < argv.len() {
+                                m = std::str::from_utf8(&argv[i])
+                                    .ok()
+                                    .and_then(|s| s.parse().ok())
+                                    .unwrap_or(16);
+                                i += 1;
+                            }
+                        }
+                        VectorAlgorithm::HNSW {
+                            m,
+                            ef_construction: 200,
+                        }
+                    }
+                    _ => return None,
+                };
+                // TYPE FLOAT32
+                if i < argv.len()
+                    && String::from_utf8_lossy(&argv[i]).eq_ignore_ascii_case("TYPE")
+                {
+                    i += 1;
+                }
+                if i < argv.len() {
+                    i += 1; // skip FLOAT32
+                }
+                // DIM n
+                let mut dimensions = 0usize;
+                if i < argv.len() {
+                    let tok = String::from_utf8_lossy(&argv[i]).to_uppercase();
+                    if tok == "DIM" || tok == "DIMENSION" {
+                        i += 1;
+                        if i < argv.len() {
+                            dimensions = std::str::from_utf8(&argv[i])
+                                .ok()
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0);
+                            i += 1;
+                        }
+                    }
+                }
+                if dimensions == 0 {
+                    return None;
+                }
+                let mut distance_metric = DistanceMetric::Cosine;
+                if i < argv.len()
+                    && String::from_utf8_lossy(&argv[i])
+                        .eq_ignore_ascii_case("DISTANCE_METRIC")
+                {
+                    i += 1;
+                    if i < argv.len() {
+                        let m = String::from_utf8_lossy(&argv[i]).to_uppercase();
+                        distance_metric = match m.as_str() {
+                            "L2" => DistanceMetric::L2,
+                            "IP" => DistanceMetric::IP,
+                            _ => DistanceMetric::Cosine,
+                        };
+                        i += 1;
+                    }
+                }
+                FieldType::Vector {
+                    algorithm,
+                    dimensions,
+                    distance_metric,
+                }
+            }
+            _ => return None,
+        };
+
+        fields.push(FieldDefinition {
+            name: field_name,
+            field_type,
+        });
+    }
+
+    if fields.is_empty() {
+        return None;
+    }
+    Some(IndexDefinition::new(index_name, prefix_list, fields))
+}
+
 /// Apply a single AOF write command against one cache.
 pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
     use crate::entry::StoreOptions;
+    use crate::search_index::DocumentField;
+    use std::collections::HashMap;
 
     if argv.is_empty() {
         return Ok(());
@@ -532,13 +846,60 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             if argv.len() < 4 {
                 return Ok(());
             }
-            let hash = cache.get_or_create_hash(&argv[1])?;
-            let mut h = hash
-                .write();
-            let mut i = 2;
-            while i + 1 < argv.len() {
-                h.hset(argv[i].clone(), argv[i + 1].clone());
-                i += 2;
+            let key = argv[1].clone();
+            let hash = cache.get_or_create_hash(&key)?;
+            let index_fields = {
+                let mut h = hash.write();
+                let mut i = 2;
+                while i + 1 < argv.len() {
+                    h.hset(argv[i].clone(), argv[i + 1].clone());
+                    i += 2;
+                }
+                // Snapshot for search auto-index (same as command-path HSET).
+                let mut index_fields = HashMap::new();
+                for (f, v) in h.hgetall() {
+                    let fname = String::from_utf8_lossy(&f).into_owned();
+                    let fval = String::from_utf8_lossy(&v).into_owned();
+                    index_fields.insert(fname, DocumentField::Text(fval));
+                }
+                index_fields
+            };
+            cache.auto_index_key(&key, index_fields);
+            Ok(())
+        }
+        "FT.CREATE" => {
+            if let Some(def) = parse_ft_create_definition(argv) {
+                let _ = cache.create_search_index(def);
+            }
+            Ok(())
+        }
+        "FT.DROPINDEX" => {
+            if argv.len() >= 2 {
+                let name = String::from_utf8_lossy(&argv[1]);
+                let _ = cache.drop_search_index(&name);
+            }
+            Ok(())
+        }
+        "FT.ALIASADD" => {
+            if argv.len() >= 3 {
+                let alias = String::from_utf8_lossy(&argv[1]);
+                let index = String::from_utf8_lossy(&argv[2]);
+                let _ = cache.alias_add(&alias, &index);
+            }
+            Ok(())
+        }
+        "FT.ALIASDEL" => {
+            if argv.len() >= 2 {
+                let alias = String::from_utf8_lossy(&argv[1]);
+                let _ = cache.alias_del(&alias);
+            }
+            Ok(())
+        }
+        "FT.ALIASUPDATE" => {
+            if argv.len() >= 3 {
+                let alias = String::from_utf8_lossy(&argv[1]);
+                let index = String::from_utf8_lossy(&argv[2]);
+                let _ = cache.alias_update(&alias, &index);
             }
             Ok(())
         }

@@ -530,6 +530,28 @@ impl SearchIndexManager {
         indices.keys().cloned().collect()
     }
 
+    /// List all index definitions (real indices only; sorted by name for stable rewrite).
+    pub fn list_definitions(&self) -> Vec<IndexDefinition> {
+        let indices = self.indices.read();
+        let mut defs: Vec<IndexDefinition> = indices
+            .values()
+            .map(|idx| idx.read().definition.clone())
+            .collect();
+        defs.sort_by(|a, b| a.name.cmp(&b.name));
+        defs
+    }
+
+    /// List all aliases as `(alias, real_index_name)` pairs (sorted by alias for stable rewrite).
+    pub fn list_aliases(&self) -> Vec<(String, String)> {
+        let aliases = self.aliases.read();
+        let mut pairs: Vec<(String, String)> = aliases
+            .iter()
+            .map(|(a, i)| (a.clone(), i.clone()))
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        pairs
+    }
+
     /// Get index definition (resolves aliases)
     pub fn get_definition(&self, name: &str) -> Option<IndexDefinition> {
         let index = self.get_index(name)?;

@@ -216,6 +216,7 @@ Also tracked in `docs/roadmap.md`.
   - *Batch BR*: `CONFIG GET` ops params (`port`/`bind`/`dir`/`dbfilename`/`appendonly`/…); `MEMORY MALLOC-STATS`; `FT.TAGVALS`; Lua `COPY`/`MOVE`; TAG/NUMERIC coerce on HSET auto-index
   - *Batch BS*: `FT.ALIASADD`/`FT.ALIASDEL`/`FT.ALIASUPDATE`; alias resolution on `FT.INFO`/`FT.SEARCH`/`FT.TAGVALS`/`FT.DROPINDEX` (+ alias cleanup on drop); Lua `SELECT`/`FLUSHDB`
   - *Batch BT*: mutating `FT.*` classified as writes (`is_write_command` → AOF / replica / READONLY); alias→alias stores real index name; atomic create/alias namespace locks; Lua SELECT connection DB side-effect test
+  - *Batch BU*: AOF rewrite emits `FT.CREATE` (PREFIX/SCHEMA TEXT|NUMERIC|TAG|VECTOR) then key dumps then `FT.ALIASADD`; load applies FT.* + HSET auto-index (`tests/bu_aof_ft_rewrite_test.rs`)
 - [x] **`[P1]`** `CLIENT`, `COMMAND`, `HELLO`
   - *Done*: HELLO (RESP2 + RESP3; AUTH/SETNAME); CLIENT ID/SETNAME/GETNAME/SETINFO/LIST/INFO; COMMAND / COUNT / LIST / INFO catalog
   - *Batch BE*: `CLIENT NO-EVICT` / `NO-TOUCH`
@@ -240,6 +241,7 @@ Also tracked in `docs/roadmap.md`.
   - *Batch BR*: `CONFIG GET` port/bind/dir/dbfilename/appendonly/appendfilename/unixsocket/cluster-enabled; `MEMORY MALLOC-STATS`; `FT.TAGVALS`; `redis.call` COPY/MOVE; schema coerce TAG/NUMERIC from HSET text
   - *Batch BS*: `FT.ALIASADD`/`DEL`/`UPDATE` + alias map; `redis.call` SELECT/FLUSHDB (multi-DB)
   - *Batch BT*: FT write classification; alias target resolve + locking; post-EVAL SELECT DB test
+  - *Batch BU*: AOF rewrite FT schema/aliases + load-path FT apply / HSET auto-index
 
 ### Memory & expiration policy
 
@@ -354,10 +356,9 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch BT)*: resolve `index` arg through alias map; store real name; DROPINDEX cleanup consistent
 - [x] **`[P1]`** **Code review (BS):** hold a single critical section for FT create/alias namespace checks (avoid TOCTOU between index and alias maps)
   - *Done (Batch BT)*: `create_index` / `alias_add` / `alias_update` hold aliases then indices locks for full check-and-insert (matches `drop_index`)
-- [ ] **`[P1]`** **Code review (BT):** emit `FT.CREATE` + `FT.ALIASADD` during AOF rewrite
-  - *Found*: live AOF append logs FT mutators (BT), but `encode_snapshot_commands` / `BGREWRITEAOF` only dumps keyspace types — rewrite drops search schema/aliases while hashes remain
-  - *Fix*: serialize index definitions + aliases into rewrite stream; reload test after rewrite
-- [ ] **`[P2]`** Persist FT indices + aliases in RDB (AOF append OK; rewrite still open as P1 above)
+- [x] **`[P1]`** **Code review (BT):** emit `FT.CREATE` + `FT.ALIASADD` during AOF rewrite
+  - *Done (Batch BU)*: rewrite order **FT.CREATE → key dumps (HSET…) → FT.ALIASADD**; `list_definitions` / `list_aliases` on SearchIndexManager; load applies `FT.CREATE`/`FT.ALIAS*`/`FT.DROPINDEX` and HSET auto-indexes (`tests/bu_aof_ft_rewrite_test.rs`)
+- [ ] **`[P2]`** Persist FT indices + aliases in RDB (AOF rewrite done in BU; RDB FT section still open)
 - [ ] **`[P2]`** ACL `@search` category for FT.* (fine-grained users; default `+@all` unaffected)
 - [ ] **`[P2]`** HNSW correctness/performance benchmarks vs FLAT
 - [ ] **`[P2]`** **Code review (BT nit):** optional single critical section for `get_index` resolve+lookup; min-replicas FT test
@@ -399,7 +400,7 @@ Prioritized for next letter batch(es). BS review items closed in BT; BT review a
 | P0 | `FT.*` mutators in `is_write_command` (AOF / repl / READONLY) | done (BT) |
 | P1 | Alias target resolve + real-name storage | done (BT) |
 | P1 | Atomic create/alias namespace critical section | done (BT) |
-| P1 | AOF rewrite emits `FT.CREATE` + aliases (BT review) | open |
+| P1 | AOF rewrite emits `FT.CREATE` + aliases (BT review) | done (BU) |
 | P2 | FT RDB section | open |
 | P2 | ACL `@search` | open |
 | P2 | `get_index` atomic resolve; min-replicas FT test | open |
