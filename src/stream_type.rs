@@ -320,11 +320,39 @@ impl RedisStream {
         fields: Vec<(Bytes, Bytes)>,
         maxlen: Option<usize>,
     ) -> Result<StreamId, String> {
+        self.xadd_with_trim(id_spec, fields, maxlen, None)
+    }
+
+    /// XADD with optional MAXLEN or MINID trim after insert.
+    pub fn xadd_with_trim(
+        &mut self,
+        id_spec: &str,
+        fields: Vec<(Bytes, Bytes)>,
+        maxlen: Option<usize>,
+        minid: Option<StreamId>,
+    ) -> Result<StreamId, String> {
         let id = self.xadd(id_spec, fields)?;
         if let Some(max) = maxlen {
             self.trim_maxlen(max);
+        } else if let Some(min) = minid {
+            self.trim_minid(min);
         }
         Ok(id)
+    }
+
+    /// Drop entry `id` from the stream and consumer-group PELs.
+    fn remove_entry_and_pel(&mut self, id: StreamId) {
+        self.entries.remove(&id);
+        for g in self.groups.values_mut() {
+            if g.pending.remove(&id).is_some() {
+                for c in g.consumers.values_mut() {
+                    if c.pending > 0 {
+                        c.pending -= 1;
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// Keep only the newest `max` entries.
@@ -336,19 +364,22 @@ impl RedisStream {
         let mut removed = 0;
         let ids: Vec<StreamId> = self.entries.keys().copied().take(remove_count).collect();
         for id in ids {
-            self.entries.remove(&id);
-            // Drop from PELs
-            for g in self.groups.values_mut() {
-                if g.pending.remove(&id).is_some() {
-                    // fix consumer pending counts best-effort
-                    for c in g.consumers.values_mut() {
-                        if c.pending > 0 {
-                            c.pending -= 1;
-                            break;
-                        }
-                    }
-                }
-            }
+            self.remove_entry_and_pel(id);
+            removed += 1;
+        }
+        removed
+    }
+
+    /// Evict entries with IDs strictly lower than `minid` (Redis MINID).
+    pub fn trim_minid(&mut self, minid: StreamId) -> usize {
+        let ids: Vec<StreamId> = self
+            .entries
+            .range(..minid)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut removed = 0;
+        for id in ids {
+            self.remove_entry_and_pel(id);
             removed += 1;
         }
         removed

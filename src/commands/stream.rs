@@ -55,7 +55,7 @@ impl CommandHandler {
         Ok(out)
     }
 
-    /// XADD key [MAXLEN [~|=] count] [* | ID] field value [field value ...]
+    /// XADD key [NOMKSTREAM] [MAXLEN|MINID [~|=] threshold] [* | ID] field value ...
     pub(super) fn handle_xadd(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.len() < 3 {
             return Ok(RespValue::error(
@@ -68,27 +68,42 @@ impl CommandHandler {
         };
 
         let mut i = 1;
+        let mut nomkstream = false;
         let mut maxlen: Option<usize> = None;
+        let mut minid: Option<StreamId> = None;
 
-        // Optional MAXLEN
-        if let Some(s) = args.get(i).and_then(|a| a.as_bulk_string()) {
-            if s.eq_ignore_ascii_case(b"MAXLEN") {
+        // Optional NOMKSTREAM / MAXLEN / MINID (in any order before the ID).
+        while i < args.len() {
+            let tok = match args[i].as_bulk_string() {
+                Some(s) => s,
+                None => break,
+            };
+            if tok.eq_ignore_ascii_case(b"NOMKSTREAM") {
+                nomkstream = true;
                 i += 1;
-                // optional ~ or =
-                if let Some(tok) = args.get(i).and_then(|a| a.as_bulk_string()) {
-                    if tok.as_ref() == b"~" || tok.as_ref() == b"=" {
+                continue;
+            }
+            if tok.eq_ignore_ascii_case(b"MAXLEN") {
+                if minid.is_some() {
+                    return Ok(RespValue::error("ERR syntax error"));
+                }
+                i += 1;
+                if let Some(approx) = args.get(i).and_then(|a| a.as_bulk_string()) {
+                    if approx.as_ref() == b"~" || approx.as_ref() == b"=" {
                         i += 1;
                     }
                 }
                 let count = match args.get(i).and_then(|a| a.as_bulk_string()) {
-                    Some(b) => match std::str::from_utf8(b).ok().and_then(|s| s.parse::<i64>().ok()) {
-                        Some(n) if n >= 0 => n as usize,
-                        _ => {
-                            return Ok(RespValue::error(
-                                "ERR value is not an integer or out of range",
-                            ));
+                    Some(b) => {
+                        match std::str::from_utf8(b).ok().and_then(|s| s.parse::<i64>().ok()) {
+                            Some(n) if n >= 0 => n as usize,
+                            _ => {
+                                return Ok(RespValue::error(
+                                    "ERR value is not an integer or out of range",
+                                ));
+                            }
                         }
-                    },
+                    }
                     None => {
                         return Ok(RespValue::error(
                             "ERR wrong number of arguments for 'xadd' command",
@@ -97,7 +112,39 @@ impl CommandHandler {
                 };
                 maxlen = Some(count);
                 i += 1;
+                continue;
             }
+            if tok.eq_ignore_ascii_case(b"MINID") {
+                if maxlen.is_some() {
+                    return Ok(RespValue::error("ERR syntax error"));
+                }
+                i += 1;
+                if let Some(approx) = args.get(i).and_then(|a| a.as_bulk_string()) {
+                    if approx.as_ref() == b"~" || approx.as_ref() == b"=" {
+                        i += 1;
+                    }
+                }
+                let id_s = match args.get(i).and_then(|a| a.as_bulk_string()) {
+                    Some(b) => String::from_utf8_lossy(b).into_owned(),
+                    None => {
+                        return Ok(RespValue::error(
+                            "ERR wrong number of arguments for 'xadd' command",
+                        ));
+                    }
+                };
+                let id = match StreamId::parse_explicit(&id_s).or_else(|| StreamId::parse(&id_s)) {
+                    Some(id) => id,
+                    None => {
+                        return Ok(RespValue::error(
+                            "ERR Invalid stream ID specified as stream command argument",
+                        ));
+                    }
+                };
+                minid = Some(id);
+                i += 1;
+                continue;
+            }
+            break;
         }
 
         let id_spec = match args.get(i).and_then(|a| a.as_bulk_string()) {
@@ -115,22 +162,38 @@ impl CommandHandler {
             Err(e) => return Ok(RespValue::error(e)),
         };
 
+        // NOMKSTREAM: do not create a missing key; return null bulk.
+        if nomkstream {
+            match self.cache.key_type(&key) {
+                KeyType::None => return Ok(RespValue::null()),
+                KeyType::Stream => {}
+                _ => return Ok(RespValue::error(Error::WrongType.to_resp_string())),
+            }
+        }
+
         let est: usize = fields.iter().map(|(k, v)| k.len() + v.len() + 64).sum();
         if let Err(e) = self.cache.ensure_non_string_capacity(est) {
             return Ok(RespValue::error(e.to_resp_string()));
         }
 
-        let stream = match self.cache.get_or_create_stream(&key) {
-            Ok(s) => s,
-            Err(Error::WrongType) => {
-                return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+        let stream = if nomkstream {
+            match self.cache.get_stream(&key) {
+                Some(s) => s,
+                None => return Ok(RespValue::null()),
             }
-            Err(e) => return Ok(RespValue::error(e.to_resp_string())),
+        } else {
+            match self.cache.get_or_create_stream(&key) {
+                Ok(s) => s,
+                Err(Error::WrongType) => {
+                    return Ok(RespValue::error(Error::WrongType.to_resp_string()));
+                }
+                Err(e) => return Ok(RespValue::error(e.to_resp_string())),
+            }
         };
 
         let mut s = stream.write();
         let before = crate::memory::estimate_keyed_object(key.len(), s.memory_size());
-        let id = match s.xadd_maxlen(&id_spec, fields, maxlen) {
+        let id = match s.xadd_with_trim(&id_spec, fields, maxlen, minid) {
             Ok(id) => id,
             Err(e) => return Ok(RespValue::error(e)),
         };
@@ -312,7 +375,7 @@ impl CommandHandler {
         }
     }
 
-    /// XTRIM key MAXLEN [~|=] count
+    /// XTRIM key MAXLEN|MINID [~|=] threshold
     pub(super) fn handle_xtrim(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.len() < 3 {
             return Ok(RespValue::error(
@@ -328,25 +391,50 @@ impl CommandHandler {
             Some(s) => String::from_utf8_lossy(s).to_uppercase(),
             None => return Ok(RespValue::error("ERR syntax error")),
         };
-        if strategy != "MAXLEN" {
-            return Ok(RespValue::error("ERR syntax error"));
-        }
         i += 1;
         if let Some(tok) = args.get(i).and_then(|a| a.as_bulk_string()) {
             if tok.as_ref() == b"~" || tok.as_ref() == b"=" {
                 i += 1;
             }
         }
-        let count = match args.get(i).and_then(|a| a.as_bulk_string()) {
-            Some(b) => match std::str::from_utf8(b).ok().and_then(|s| s.parse::<i64>().ok()) {
-                Some(n) if n >= 0 => n as usize,
-                _ => {
-                    return Ok(RespValue::error(
-                        "ERR value is not an integer or out of range",
-                    ));
-                }
-            },
-            None => return Ok(RespValue::error("ERR syntax error")),
+
+        enum TrimKind {
+            Maxlen(usize),
+            Minid(StreamId),
+        }
+        let trim = match strategy.as_str() {
+            "MAXLEN" => {
+                let count = match args.get(i).and_then(|a| a.as_bulk_string()) {
+                    Some(b) => {
+                        match std::str::from_utf8(b).ok().and_then(|s| s.parse::<i64>().ok()) {
+                            Some(n) if n >= 0 => n as usize,
+                            _ => {
+                                return Ok(RespValue::error(
+                                    "ERR value is not an integer or out of range",
+                                ));
+                            }
+                        }
+                    }
+                    None => return Ok(RespValue::error("ERR syntax error")),
+                };
+                TrimKind::Maxlen(count)
+            }
+            "MINID" => {
+                let id_s = match args.get(i).and_then(|a| a.as_bulk_string()) {
+                    Some(b) => String::from_utf8_lossy(b).into_owned(),
+                    None => return Ok(RespValue::error("ERR syntax error")),
+                };
+                let id = match StreamId::parse_explicit(&id_s).or_else(|| StreamId::parse(&id_s)) {
+                    Some(id) => id,
+                    None => {
+                        return Ok(RespValue::error(
+                            "ERR Invalid stream ID specified as stream command argument",
+                        ));
+                    }
+                };
+                TrimKind::Minid(id)
+            }
+            _ => return Ok(RespValue::error("ERR syntax error")),
         };
 
         match self.cache.key_type(&key) {
@@ -358,7 +446,10 @@ impl CommandHandler {
                 };
                 let mut s = stream.write();
                 let before = crate::memory::estimate_keyed_object(key.len(), s.memory_size());
-                let n = s.trim_maxlen(count) as i64;
+                let n = match trim {
+                    TrimKind::Maxlen(count) => s.trim_maxlen(count) as i64,
+                    TrimKind::Minid(id) => s.trim_minid(id) as i64,
+                };
                 let after = crate::memory::estimate_keyed_object(key.len(), s.memory_size());
                 drop(s);
                 self.cache.account_stream_delta(before, after);

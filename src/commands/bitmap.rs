@@ -66,7 +66,8 @@ impl CommandHandler {
     }
 
     pub(super) fn handle_bitcount(&self, args: &[RespValue]) -> Result<RespValue> {
-        if args.is_empty() || args.len() > 3 {
+        // BITCOUNT key [start end [BYTE|BIT]]
+        if args.is_empty() || args.len() > 4 {
             return Ok(RespValue::error(
                 "ERR wrong number of arguments for 'bitcount'",
             ));
@@ -75,6 +76,7 @@ impl CommandHandler {
             Some(k) => k,
             None => return Ok(RespValue::error("ERR invalid key")),
         };
+        let mut bit_unit = false;
         let (start, end) = if args.len() == 1 {
             (None, None)
         } else if args.len() == 2 {
@@ -103,9 +105,15 @@ impl CommandHandler {
                     ))
                 }
             };
+            if args.len() == 4 {
+                bit_unit = match parse_bit_unit(&args[3]) {
+                    Ok(u) => u,
+                    Err(msg) => return Ok(RespValue::error(msg)),
+                };
+            }
             (Some(s), Some(e))
         };
-        match self.cache.bitcount(key, start, end) {
+        match self.cache.bitcount(key, start, end, bit_unit) {
             Ok(n) => Ok(RespValue::Integer(n)),
             Err(Error::WrongType) => Ok(RespValue::error(Error::WrongType.to_resp_string())),
             Err(e) => Ok(RespValue::error(e.to_resp_string())),
@@ -113,7 +121,8 @@ impl CommandHandler {
     }
 
     pub(super) fn handle_bitpos(&self, args: &[RespValue]) -> Result<RespValue> {
-        if args.len() < 2 || args.len() > 4 {
+        // BITPOS key bit [start [end [BYTE|BIT]]]
+        if args.len() < 2 || args.len() > 5 {
             return Ok(RespValue::error(
                 "ERR wrong number of arguments for 'bitpos'",
             ));
@@ -154,7 +163,15 @@ impl CommandHandler {
         } else {
             None
         };
-        match self.cache.bitpos(key, bit, start, end) {
+        let bit_unit = if args.len() == 5 {
+            match parse_bit_unit(&args[4]) {
+                Ok(u) => u,
+                Err(msg) => return Ok(RespValue::error(msg)),
+            }
+        } else {
+            false
+        };
+        match self.cache.bitpos(key, bit, start, end, bit_unit) {
             Ok(n) => Ok(RespValue::Integer(n)),
             Err(Error::WrongType) => Ok(RespValue::error(Error::WrongType.to_resp_string())),
             Err(e) => Ok(RespValue::error(e.to_resp_string())),
@@ -334,6 +351,19 @@ impl CommandHandler {
             })
             .collect();
         Ok(RespValue::Array(arr))
+    }
+}
+
+/// Parse optional BITCOUNT/BITPOS unit: BYTE (false) or BIT (true).
+fn parse_bit_unit(v: &RespValue) -> std::result::Result<bool, String> {
+    let s = match v.as_bulk_string() {
+        Some(b) => String::from_utf8_lossy(b).to_uppercase(),
+        None => return Err("ERR syntax error".into()),
+    };
+    match s.as_str() {
+        "BYTE" => Ok(false),
+        "BIT" => Ok(true),
+        _ => Err("ERR syntax error, try BYTE or BIT".into()),
     }
 }
 

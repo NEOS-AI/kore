@@ -178,8 +178,14 @@ impl Cache {
         })
     }
 
-    /// BITCOUNT key [start end] — byte-oriented range (Redis default).
-    pub fn bitcount(&self, key: &Bytes, start: Option<i64>, end: Option<i64>) -> Result<i64> {
+    /// BITCOUNT key [start end [BYTE|BIT]] — byte range by default; BIT uses bit offsets.
+    pub fn bitcount(
+        &self,
+        key: &Bytes,
+        start: Option<i64>,
+        end: Option<i64>,
+        bit_unit: bool,
+    ) -> Result<i64> {
         match self.key_type(key) {
             KeyType::None => return Ok(0),
             KeyType::String => {}
@@ -192,27 +198,54 @@ impl Cache {
             return Ok(0);
         }
         let bytes = &entry.value;
-        let len = bytes.len() as i64;
-        if len == 0 {
+        let byte_len = bytes.len() as i64;
+        if byte_len == 0 {
             return Ok(0);
+        }
+        if bit_unit {
+            let bit_len = byte_len * 8;
+            let (s, e) = match (start, end) {
+                (None, None) => (0i64, bit_len - 1),
+                (Some(s), None) => {
+                    let s = normalize_index(s, bit_len);
+                    (s, bit_len - 1)
+                }
+                (Some(s), Some(e)) => {
+                    let s = normalize_index(s, bit_len);
+                    let e = normalize_index(e, bit_len);
+                    (s, e)
+                }
+                (None, Some(_)) => (0, bit_len - 1),
+            };
+            if s > e || s >= bit_len {
+                return Ok(0);
+            }
+            let e = e.min(bit_len - 1);
+            let mut count = 0i64;
+            for pos in s..=e {
+                if get_bit_at(bytes, pos as u64) == 1 {
+                    count += 1;
+                }
+            }
+            return Ok(count);
         }
         let (s, e) = match (start, end) {
-            (None, None) => (0i64, len - 1),
+            (None, None) => (0i64, byte_len - 1),
             (Some(s), None) => {
-                let s = normalize_index(s, len);
-                (s, len - 1)
+                let s = normalize_index(s, byte_len);
+                (s, byte_len - 1)
             }
             (Some(s), Some(e)) => {
-                let s = normalize_index(s, len);
-                let e = normalize_index(e, len);
+                let s = normalize_index(s, byte_len);
+                let e = normalize_index(e, byte_len);
                 (s, e)
             }
-            (None, Some(_)) => (0, len - 1),
+            (None, Some(_)) => (0, byte_len - 1),
         };
-        if s > e || s >= len {
+        if s > e || s >= byte_len {
             return Ok(0);
         }
-        let e = e.min(len - 1);
+        let e = e.min(byte_len - 1);
         let slice = &bytes[s as usize..=e as usize];
         let mut count = 0i64;
         for &b in slice {
@@ -221,7 +254,8 @@ impl Cache {
         Ok(count)
     }
 
-    /// BITPOS key bit [start [end]] — first bit set to `bit` (0 or 1). Byte range.
+    /// BITPOS key bit [start [end [BYTE|BIT]]] — first bit set to `bit` (0 or 1).
+    /// Byte range by default; BIT uses bit offsets.
     /// Returns -1 when not found (for bit=1, or bit=0 with explicit end).
     pub fn bitpos(
         &self,
@@ -229,6 +263,7 @@ impl Cache {
         bit: u8,
         start: Option<i64>,
         end: Option<i64>,
+        bit_unit: bool,
     ) -> Result<i64> {
         if bit > 1 {
             return Err(Error::InvalidArgument(
@@ -250,31 +285,64 @@ impl Cache {
             return Ok(if bit == 0 { 0 } else { -1 });
         }
         let bytes = &entry.value;
-        let len = bytes.len() as i64;
-        if len == 0 {
+        let byte_len = bytes.len() as i64;
+        if byte_len == 0 {
             return Ok(if bit == 0 { 0 } else { -1 });
         }
         let end_given = end.is_some();
+        if bit_unit {
+            let bit_len = byte_len * 8;
+            let (s, e) = match (start, end) {
+                (None, None) => (0i64, bit_len - 1),
+                (Some(s), None) => {
+                    let s = normalize_index(s, bit_len);
+                    (s, bit_len - 1)
+                }
+                (Some(s), Some(e)) => {
+                    let s = normalize_index(s, bit_len);
+                    let e = normalize_index(e, bit_len);
+                    (s, e)
+                }
+                (None, Some(e)) => {
+                    let e = normalize_index(e, bit_len);
+                    (0, e)
+                }
+            };
+            if s > e || s >= bit_len {
+                return Ok(-1);
+            }
+            let e = e.min(bit_len - 1);
+            for pos in s..=e {
+                if get_bit_at(bytes, pos as u64) == bit {
+                    return Ok(pos);
+                }
+            }
+            // Redis: searching for 0 without end → bits past string are 0
+            if bit == 0 && !end_given {
+                return Ok(bit_len);
+            }
+            return Ok(-1);
+        }
         let (s, e) = match (start, end) {
-            (None, None) => (0i64, len - 1),
+            (None, None) => (0i64, byte_len - 1),
             (Some(s), None) => {
-                let s = normalize_index(s, len);
-                (s, len - 1)
+                let s = normalize_index(s, byte_len);
+                (s, byte_len - 1)
             }
             (Some(s), Some(e)) => {
-                let s = normalize_index(s, len);
-                let e = normalize_index(e, len);
+                let s = normalize_index(s, byte_len);
+                let e = normalize_index(e, byte_len);
                 (s, e)
             }
             (None, Some(e)) => {
-                let e = normalize_index(e, len);
+                let e = normalize_index(e, byte_len);
                 (0, e)
             }
         };
-        if s > e || s >= len {
+        if s > e || s >= byte_len {
             return Ok(-1);
         }
-        let e = e.min(len - 1);
+        let e = e.min(byte_len - 1);
         for bi in s as usize..=e as usize {
             let b = bytes[bi];
             let target = if bit == 1 { b } else { !b };
@@ -291,7 +359,7 @@ impl Cache {
         }
         // Redis: searching for 0 without end → bits past string are 0
         if bit == 0 && !end_given {
-            return Ok(len * 8);
+            return Ok(byte_len * 8);
         }
         Ok(-1)
     }
@@ -655,6 +723,20 @@ fn normalize_index(idx: i64, len: i64) -> i64 {
     }
 }
 
+/// Read a single bit at absolute bit offset (MSB-first within each byte).
+fn get_bit_at(bytes: &[u8], bit_offset: u64) -> u8 {
+    let byte_i = (bit_offset / 8) as usize;
+    let bit_i = (bit_offset % 8) as u8;
+    if byte_i >= bytes.len() {
+        return 0;
+    }
+    if bytes[byte_i] & (1u8 << (7 - bit_i)) != 0 {
+        1
+    } else {
+        0
+    }
+}
+
 fn ensure_len(bytes: &mut Vec<u8>, offset: u64, bits: u8) {
     let need = ((offset + bits as u64 + 7) / 8) as usize;
     if bytes.len() < need {
@@ -789,6 +871,6 @@ mod tests {
         assert_eq!(c.setbit(&k, 0, 1).unwrap(), 0);
         assert_eq!(c.getbit(&k, 0).unwrap(), 1);
         assert_eq!(c.setbit(&k, 0, 1).unwrap(), 1);
-        assert_eq!(c.bitcount(&k, None, None).unwrap(), 1);
+        assert_eq!(c.bitcount(&k, None, None, false).unwrap(), 1);
     }
 }
