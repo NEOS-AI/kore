@@ -73,10 +73,18 @@ impl Databases {
         self.dbs.iter()
     }
 
-    /// FLUSHALL: clear every logical database.
+    /// FLUSHALL: clear every logical database (keys + search docs; keep FT schema).
     pub fn flush_all(&self) {
         for db in &self.dbs {
             db.flush();
+        }
+    }
+
+    /// Full wipe of every logical database including FT index definitions/aliases.
+    /// Used on failed AOF load (all-or-nothing), not live FLUSHALL.
+    pub fn flush_all_including_search(&self) {
+        for db in &self.dbs {
+            db.flush_all_including_search();
         }
     }
 

@@ -452,8 +452,33 @@ impl Cache {
             .category_memory(MemoryCategory::Cache)
     }
 
-    /// Clear all entries (KV, sorted sets, geo, hash, list, set, search) and reset memory accounting
+    /// Clear all keyspace entries (KV, zset, geo, hash, list, set, stream) and
+    /// search *documents*, then reset memory accounting.
+    ///
+    /// FT index definitions and aliases are kept (RediSearch-style FLUSHDB:
+    /// docs gone, schema remains). For a full wipe including schema, use
+    /// [`flush_all_including_search`].
     pub fn flush(&self) {
+        self.flush_keyspace();
+        // Drop indexed docs so FT.SEARCH cannot return deleted keys; keep schema.
+        self.search_index_manager.clear_documents();
+        self.memory_usage.store(0, Ordering::Relaxed);
+        self.memory_tracker.reset();
+    }
+
+    /// Full wipe: keyspace + every search index definition and alias.
+    ///
+    /// Used on failed AOF load so partial apply cannot leave a half-filled DB
+    /// (including orphaned FT schema). Live FLUSHDB/FLUSHALL use [`flush`] instead.
+    pub fn flush_all_including_search(&self) {
+        self.flush_keyspace();
+        self.search_index_manager.clear();
+        self.memory_usage.store(0, Ordering::Relaxed);
+        self.memory_tracker.reset();
+    }
+
+    /// Clear all typed key maps / expires (not search schema).
+    fn flush_keyspace(&self) {
         self.map.clear();
         self.sorted_sets.clear();
         self.geo_sets.clear();
@@ -462,11 +487,6 @@ impl Cache {
         self.sets.write().clear();
         self.streams.write().clear();
         self.typed_expires.write().clear();
-        // Search indices / aliases live outside the key maps; clear them so
-        // FLUSHDB/FLUSHALL and failed AOF load leave a fully empty DB.
-        self.search_index_manager.clear();
-        self.memory_usage.store(0, Ordering::Relaxed);
-        self.memory_tracker.reset();
     }
 
     /// All non-expired string keys in the sharded map (for persistence).

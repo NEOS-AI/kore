@@ -371,19 +371,21 @@ Also tracked in `docs/roadmap.md`.
 - [ ] **`[P2]`** **Code review (BU):** HNSW `ef_construction` not round-tripped in AOF rewrite
   - *Found*: rewrite emits `HNSW M <n>` only; load hardcodes `ef_construction: 200` (command path also hardcodes 200 / unused `mut`)
   - *Fix*: when EF becomes configurable, encode/parse `EF_CONSTRUCTION` and store on `VectorAlgorithm::HNSW`
-- [ ] **`[P2]`** **Code review (BU nit):** VECTOR/NUMERIC AOF rewrite round-trip test; `has_search_state` can avoid double list locks
+- [x] **`[P2]`** **Code review (BU nit):** VECTOR/NUMERIC AOF rewrite round-trip test; `has_search_state` can avoid double list locks
+  - *Done (Batch BX, partial)*: VECTOR/NUMERIC rewrite round-trip in `tests/bu_aof_ft_rewrite_test.rs`; `has_search_state` double-list lock still open
 - [x] **`[P2]`** **Code review (BV):** AOF load is not transactional on FT failure
   - *Found*: mid-file FT.CREATE/ALIAS error returns `Err` after earlier commands already applied (BV tests assert first CREATE remains); `load_at_startup` propagates `?` so process should not serve, but in-memory DBs stay partially filled if a caller ignores the error
-  - *Done (Batch BW)*: on any `load_into_databases` / `load_into_cache` error, flush all DBs / the cache (including search indices+aliases via `Cache::flush`); all-or-nothing load (`tests/bw_aof_load_atomic_test.rs`)
+  - *Done (Batch BW)*: on any `load_into_databases` / `load_into_cache` error, full-wipe target DBs; *Batch BX* routes that path through `flush_all_including_search()` (not live FLUSHDB). Tests: `tests/bw_aof_load_atomic_test.rs`
 - [x] **`[P2]`** **Code review (BV nit):** map search OOM strings to `Error::OutOfMemory`; add DROPINDEX/ALIASDEL-missing apply tests (stricter than DEL no-op — intentional Redis-Search-style fail)
   - *Done (Batch BW)*: `map_ft_mutator_error` maps `"OOM"` substrings → `Error::OutOfMemory`; DROPINDEX/ALIASDEL missing apply tests in `tests/bv_aof_ft_load_errors_test.rs`
-- [ ] **`[P2]`** **Code review (BW):** FLUSHDB/FLUSHALL now drop FT indices (via `Cache::flush` → `search_index_manager.clear`)
+- [x] **`[P2]`** **Code review (BW):** FLUSHDB/FLUSHALL now drop FT indices (via `Cache::flush` → `search_index_manager.clear`)
   - *Found*: BW cleared search on flush so failed AOF load is fully empty; this also changes live `FLUSHDB`/`FLUSHALL` — RediSearch typically keeps index definitions after FLUSHDB (docs gone, schema remains)
-  - *Fix*: either document as intentional Kore behavior, or clear search only on AOF load failure (separate path from FLUSHDB) / keep empty schema on FLUSHDB
+  - *Done (Batch BX)*: decouple paths — `Cache::flush()` / `Databases::flush_all()` clear keyspace + `SearchIndexManager::clear_documents()` (schema + aliases kept); AOF load `Err` uses `flush_all_including_search()` / `SearchIndexManager::clear()` (full wipe). Tests: `tests/bx_flushdb_keeps_ft_schema_test.rs`
 - [ ] **`[P2]`** **Code review (BW):** failed AOF load flush wipes pre-existing data if target was non-empty
   - *Found*: `flush_all`/`flush` on load `Err` is correct for empty startup DBs, but a mid-load failure on a non-empty target would destroy prior keys/indices too
   - *Fix*: load into scratch Databases and swap on success (true transactional load); or document load APIs as empty-target-only
-- [ ] **`[P2]`** **Code review (BW nit):** `map_ft_mutator_error` uses `msg.contains("OOM")` (substring); prefer exact/prefix match or typed errors from search layer
+- [x] **`[P2]`** **Code review (BW nit):** `map_ft_mutator_error` uses `msg.contains("OOM")` (substring); prefer exact/prefix match or typed errors from search layer
+  - *Done (Batch BX)*: match `starts_with("OOM:")` / `starts_with("OOM ")` / exact `"OOM"` (search layer emits `"OOM: …"`)
 
 ### Pub/Sub
 
@@ -429,12 +431,12 @@ Prioritized for next letter batch(es). BW closed all-or-nothing AOF load; remain
 | P2 | Shared FT.CREATE parser (cmd + AOF load) | open |
 | P2 | HNSW `ef_construction` AOF round-trip | open |
 | P2 | AOF load all-or-nothing on FT failure (BV review) | done (BW) |
-| P2 | FLUSHDB vs FT schema (BW: flush clears indices) | open |
+| P2 | FLUSHDB vs FT schema (BW: flush clears indices) | done (BX) |
 | P2 | Scratch-load swap if AOF load targets non-empty DB | open |
 | P2 | `get_index` atomic resolve; min-replicas FT test | open |
-| P2 | VECTOR/NUMERIC rewrite tests; `has_search_state` lock nit | open |
+| P2 | VECTOR/NUMERIC rewrite tests; `has_search_state` lock nit | done (BX partial: VECTOR/NUMERIC rewrite test; lock nit still open) |
 | P2 | OOM→OutOfMemory map; DROPINDEX/ALIASDEL missing tests | done (BW) |
-| P2 | `map_ft_mutator_error` OOM match hygiene | open |
+| P2 | `map_ft_mutator_error` OOM match hygiene | done (BX) |
 | P2 | Lua SELECT DB side-effect test | done (BT) |
 
 ---

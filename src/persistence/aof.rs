@@ -1330,7 +1330,9 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
 
 /// Map FT mutator string errors to typed `Error` (OOM-ish → OutOfMemory).
 fn map_ft_mutator_error(msg: String) -> Error {
-    if msg.contains("OOM") {
+    // Search layer emits `"OOM: …"` (see account_search_index_write); match that
+    // prefix rather than any substring containing the letters OOM.
+    if msg.starts_with("OOM:") || msg.starts_with("OOM ") || msg == "OOM" {
         Error::OutOfMemory
     } else {
         Error::InvalidArgument(msg)
@@ -1339,8 +1341,8 @@ fn map_ft_mutator_error(msg: String) -> Error {
 
 /// Replay AOF into a single cache. SELECT is ignored (all commands hit this cache).
 ///
-/// On any load error, the cache is flushed so partial apply does not leave a
-/// half-filled live dataset (all-or-nothing load semantics).
+/// On any load error, the cache is fully wiped (keys + FT schema/aliases) so
+/// partial apply does not leave a half-filled live dataset (all-or-nothing).
 pub fn load_into_cache(cache: &Arc<Cache>, path: &Path) -> Result<usize> {
     let result = load_file_with(path, |argv| {
         let cmd = String::from_utf8_lossy(&argv[0]).to_uppercase();
@@ -1350,15 +1352,16 @@ pub fn load_into_cache(cache: &Arc<Cache>, path: &Path) -> Result<usize> {
         apply_command_to_cache(cache, &argv)
     });
     if result.is_err() {
-        cache.flush();
+        // Full wipe including FT definitions — not live FLUSHDB semantics.
+        cache.flush_all_including_search();
     }
     result
 }
 
 /// Replay AOF into multi-DB keyspaces. Handles SELECT and FLUSHALL across DBs.
 ///
-/// On any load error, every database is flushed so partial apply does not leave
-/// a half-filled live dataset (all-or-nothing load semantics).
+/// On any load error, every database is fully wiped (keys + FT schema/aliases)
+/// so partial apply does not leave a half-filled live dataset (all-or-nothing).
 pub fn load_into_databases(databases: &Databases, path: &Path) -> Result<usize> {
     let mut current = 0usize;
     let result = load_file_with(path, |argv| {
@@ -1377,6 +1380,8 @@ pub fn load_into_databases(databases: &Databases, path: &Path) -> Result<usize> 
                 Ok(())
             }
             "FLUSHALL" => {
+                // Live FLUSHALL during AOF replay: keys/docs only, keep schema
+                // if any had been created earlier in the file (matches runtime).
                 databases.flush_all();
                 Ok(())
             }
@@ -1389,7 +1394,8 @@ pub fn load_into_databases(databases: &Databases, path: &Path) -> Result<usize> 
         }
     });
     if result.is_err() {
-        databases.flush_all();
+        // Full wipe including FT definitions — not live FLUSHALL semantics.
+        databases.flush_all_including_search();
     }
     result
 }

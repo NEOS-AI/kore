@@ -332,3 +332,78 @@ fn aof_rewrite_index_only_db() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// NUMERIC + VECTOR field types round-trip through AOF rewrite/load.
+#[test]
+fn aof_rewrite_numeric_and_vector_fields() {
+    let dir = tmp_dir("ft-num-vec");
+    let path = dir.join("appendonly.aof");
+    let databases = make_databases();
+    let mut h = make_handler(databases.clone(), &dir);
+
+    assert_eq!(
+        handle(
+            &mut h,
+            cmd(&[
+                "FT.CREATE",
+                "mixed",
+                "PREFIX",
+                "1",
+                "item:",
+                "SCHEMA",
+                "price",
+                "NUMERIC",
+                "SORTABLE",
+                "emb",
+                "VECTOR",
+                "FLAT",
+                "TYPE",
+                "FLOAT32",
+                "DIM",
+                "3",
+                "DISTANCE_METRIC",
+                "COSINE",
+            ]),
+        ),
+        RespValue::ok()
+    );
+
+    aof::rewrite_databases(&databases, &path).unwrap();
+    let text = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+    assert!(
+        text.contains("NUMERIC") && text.contains("VECTOR") && text.contains("FLAT"),
+        "rewrite must emit NUMERIC + VECTOR; got:\n{text}"
+    );
+    assert!(
+        text.contains("DIM") && text.contains("COSINE"),
+        "rewrite must emit vector DIM + metric; got:\n{text}"
+    );
+
+    let loaded = make_databases();
+    aof::load_into_databases(&loaded, &path).expect("load numeric/vector schema");
+    let cache = loaded.get(0).unwrap();
+    let def = cache
+        .list_search_index_definitions()
+        .into_iter()
+        .find(|d| d.name == "mixed")
+        .expect("mixed index restored");
+    assert_eq!(def.fields.len(), 2);
+    assert!(matches!(
+        def.fields[0].field_type,
+        kore::FieldType::Numeric { sortable: true }
+    ));
+    match &def.fields[1].field_type {
+        kore::FieldType::Vector {
+            algorithm,
+            dimensions,
+            distance_metric,
+        } => {
+            assert_eq!(*dimensions, 3);
+            assert!(matches!(algorithm, kore::VectorAlgorithm::Flat));
+            assert!(matches!(distance_metric, kore::DistanceMetric::Cosine));
+        }
+        other => panic!("expected Vector field, got {:?}", other),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

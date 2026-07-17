@@ -369,6 +369,19 @@ impl SearchIndex {
         }
     }
 
+    /// Drop all indexed documents while keeping the `IndexDefinition` (schema).
+    ///
+    /// Used by FLUSHDB/FLUSHALL so search no longer returns deleted keys but
+    /// FT.CREATE schema (and manager-level aliases) survive, matching RediSearch.
+    pub fn clear_documents(&mut self) {
+        self.text_indices.clear();
+        self.numeric_indices.clear();
+        self.tag_indices.clear();
+        self.vector_indices.clear();
+        self.documents.clear();
+        self.document_data.clear();
+    }
+
     /// Get text index for a field
     pub fn get_text_index(&self, field: &str) -> Option<&InvertedIndex> {
         self.text_indices.get(field)
@@ -464,13 +477,25 @@ impl SearchIndexManager {
         }
     }
 
-    /// Drop every index and alias (used by FLUSHDB / FLUSHALL / failed AOF load).
+    /// Drop every index and alias (full wipe — AOF load failure / hard reset).
+    ///
+    /// Not used by live FLUSHDB/FLUSHALL (those keep schema via `clear_documents`).
     pub fn clear(&self) {
         // Lock order: aliases then indices (matches create/drop/alias_*).
         let mut aliases = self.aliases.write();
         let mut indices = self.indices.write();
         aliases.clear();
         indices.clear();
+    }
+
+    /// Clear documents from every index while keeping definitions and aliases.
+    ///
+    /// Used by FLUSHDB/FLUSHALL (RediSearch-style: keys/docs gone, schema remains).
+    pub fn clear_documents(&self) {
+        let indices = self.indices.read();
+        for idx in indices.values() {
+            idx.write().clear_documents();
+        }
     }
 
     /// Resolve `name` if it is an alias; otherwise return `name` unchanged.
@@ -808,5 +833,48 @@ mod tests {
         manager.drop_index("idx2").unwrap();
         assert!(manager.get_index("a2").is_none());
         assert!(manager.alias_del("a2").is_err());
+    }
+
+    #[test]
+    fn clear_documents_keeps_schema_and_aliases() {
+        let manager = SearchIndexManager::new();
+        let definition = IndexDefinition::new(
+            "idx".to_string(),
+            vec!["doc:".to_string()],
+            vec![FieldDefinition {
+                name: "title".to_string(),
+                field_type: FieldType::Text {
+                    weight: 1.0,
+                    sortable: false,
+                },
+            }],
+        );
+        manager.create_index(definition).unwrap();
+        manager.alias_add("blog", "idx").unwrap();
+
+        {
+            let idx = manager.get_index("idx").unwrap();
+            let mut guard = idx.write();
+            let mut fields = HashMap::new();
+            fields.insert("title".to_string(), DocumentField::Text("hello".into()));
+            guard.index_document(Bytes::from("doc:1"), fields);
+            assert_eq!(guard.size(), 1);
+        }
+
+        manager.clear_documents();
+
+        assert_eq!(manager.list_indices(), vec!["idx".to_string()]);
+        assert_eq!(
+            manager.list_aliases(),
+            vec![("blog".to_string(), "idx".to_string())]
+        );
+        let idx = manager.get_index("idx").unwrap();
+        assert_eq!(idx.read().size(), 0);
+        assert_eq!(idx.read().definition.name, "idx");
+
+        // Full clear drops schema + aliases.
+        manager.clear();
+        assert!(manager.list_indices().is_empty());
+        assert!(manager.list_aliases().is_empty());
     }
 }
