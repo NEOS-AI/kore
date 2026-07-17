@@ -11,14 +11,18 @@
 //!
 //! Layout (version 3):
 //!   magic + version
-//! Layout (version 4):
-//!   same as v3 plus trailing typed-expires section per DB body
-//!   (key + expire_unix_ms for non-string keys with TTL)
 //!   n_databases: u64
 //!   for each non-empty DB:
 //!     db_index: u32
 //!     single-DB body: strings, zsets, geos, hashes, lists, sets, streams
 //!   footer: 0xFF u8
+//!
+//! Layout (version 4):
+//!   same as v3 plus trailing typed-expires section per DB body
+//!   (key + expire_unix_ms for non-string keys with TTL)
+//!
+//! Layout (version 5):
+//!   same as v4 plus trailing search section per DB body (indices + aliases)
 //!
 //! Stream section (version >= 3):
 //!   n_streams: u64
@@ -30,16 +34,33 @@
 //!       n_pending, for each: id, consumer, delivery_time_ms:u64, delivery_count:u64
 //!       n_consumers, for each: name, seen_time_ms:u64, pending:u64
 //!
+//! Search section (version >= 5):
+//!   n_indices: u64
+//!   for each index:
+//!     name (bytes), n_prefixes, prefixes*, n_fields,
+//!     for each field: name, type tag, type-specific params
+//!       TEXT (1): weight f64, sortable u8
+//!       NUMERIC (2): sortable u8
+//!       TAG (3): separator bytes, sortable u8
+//!       VECTOR (4): algo u8 (0=FLAT,1=HNSW), m u64 (if HNSW),
+//!                   ef_construction u64, dimensions u64, distance u8 (0=Cosine,1=L2,2=IP)
+//!   n_aliases: u64
+//!   for each alias: alias name, real index name
+//!
 //! Strings/keys/members are length-prefixed with u32 LE + raw bytes.
 
 use crate::cache::Cache;
 use crate::databases::Databases;
 use crate::entry::StoreOptions;
 use crate::error::{Error, Result};
+use crate::search_index::{
+    DistanceMetric, DocumentField, FieldDefinition, FieldType, IndexDefinition, VectorAlgorithm,
+};
 use crate::stream_type::{
     ConsumerSnapshot, GroupSnapshot, PendingEntrySnapshot, StreamId, StreamStateSnapshot,
 };
 use bytes::Bytes;
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -47,11 +68,27 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAGIC: &[u8; 6] = b"KORDB\0";
-const VERSION: u32 = 4;
+const VERSION: u32 = 5;
 const VERSION_V1: u32 = 1;
 const VERSION_V2: u32 = 2;
 const VERSION_V3: u32 = 3;
+const VERSION_V4: u32 = 4;
 const FOOTER: u8 = 0xFF;
+
+// Field type tags in the RDB search section.
+const FT_TAG_TEXT: u8 = 1;
+const FT_TAG_NUMERIC: u8 = 2;
+const FT_TAG_TAG: u8 = 3;
+const FT_TAG_VECTOR: u8 = 4;
+
+// Vector algorithm tags.
+const VEC_ALGO_FLAT: u8 = 0;
+const VEC_ALGO_HNSW: u8 = 1;
+
+// Distance metric tags.
+const DIST_COSINE: u8 = 0;
+const DIST_L2: u8 = 1;
+const DIST_IP: u8 = 2;
 
 fn now_unix_ms() -> i64 {
     SystemTime::now()
@@ -135,6 +172,133 @@ fn read_stream_id<R: Read>(r: &mut R) -> Result<StreamId> {
     Ok(StreamId::new(ms, seq))
 }
 
+fn write_u8<W: Write>(w: &mut W, v: u8) -> Result<()> {
+    w.write_all(&[v])?;
+    Ok(())
+}
+
+fn read_u8<R: Read>(r: &mut R) -> Result<u8> {
+    let mut b = [0u8; 1];
+    r.read_exact(&mut b)?;
+    Ok(b[0])
+}
+
+fn write_field_type<W: Write>(w: &mut W, ft: &FieldType) -> Result<()> {
+    match ft {
+        FieldType::Text { weight, sortable } => {
+            write_u8(w, FT_TAG_TEXT)?;
+            write_f64(w, *weight)?;
+            write_u8(w, u8::from(*sortable))?;
+        }
+        FieldType::Numeric { sortable } => {
+            write_u8(w, FT_TAG_NUMERIC)?;
+            write_u8(w, u8::from(*sortable))?;
+        }
+        FieldType::Tag {
+            separator,
+            sortable,
+        } => {
+            write_u8(w, FT_TAG_TAG)?;
+            write_bytes(w, separator.as_bytes())?;
+            write_u8(w, u8::from(*sortable))?;
+        }
+        FieldType::Vector {
+            algorithm,
+            dimensions,
+            distance_metric,
+        } => {
+            write_u8(w, FT_TAG_VECTOR)?;
+            match algorithm {
+                VectorAlgorithm::Flat => {
+                    write_u8(w, VEC_ALGO_FLAT)?;
+                }
+                VectorAlgorithm::HNSW {
+                    m,
+                    ef_construction,
+                } => {
+                    write_u8(w, VEC_ALGO_HNSW)?;
+                    write_u64(w, *m as u64)?;
+                    write_u64(w, *ef_construction as u64)?;
+                }
+            }
+            write_u64(w, *dimensions as u64)?;
+            let dist = match distance_metric {
+                DistanceMetric::Cosine => DIST_COSINE,
+                DistanceMetric::L2 => DIST_L2,
+                DistanceMetric::IP => DIST_IP,
+            };
+            write_u8(w, dist)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_field_type<R: Read>(r: &mut R) -> Result<FieldType> {
+    let tag = read_u8(r)?;
+    match tag {
+        FT_TAG_TEXT => {
+            let weight = read_f64(r)?;
+            let sortable = read_u8(r)? != 0;
+            Ok(FieldType::Text { weight, sortable })
+        }
+        FT_TAG_NUMERIC => {
+            let sortable = read_u8(r)? != 0;
+            Ok(FieldType::Numeric { sortable })
+        }
+        FT_TAG_TAG => {
+            let separator = String::from_utf8(read_bytes(r)?)
+                .map_err(|e| Error::ParseError(format!("invalid TAG separator: {}", e)))?;
+            let sortable = read_u8(r)? != 0;
+            Ok(FieldType::Tag {
+                separator,
+                sortable,
+            })
+        }
+        FT_TAG_VECTOR => {
+            let algo_tag = read_u8(r)?;
+            let algorithm = match algo_tag {
+                VEC_ALGO_FLAT => VectorAlgorithm::Flat,
+                VEC_ALGO_HNSW => {
+                    let m = read_u64(r)? as usize;
+                    let ef_construction = read_u64(r)? as usize;
+                    VectorAlgorithm::HNSW {
+                        m,
+                        ef_construction,
+                    }
+                }
+                other => {
+                    return Err(Error::ParseError(format!(
+                        "unknown vector algorithm tag {}",
+                        other
+                    )));
+                }
+            };
+            let dimensions = read_u64(r)? as usize;
+            let dist_tag = read_u8(r)?;
+            let distance_metric = match dist_tag {
+                DIST_COSINE => DistanceMetric::Cosine,
+                DIST_L2 => DistanceMetric::L2,
+                DIST_IP => DistanceMetric::IP,
+                other => {
+                    return Err(Error::ParseError(format!(
+                        "unknown distance metric tag {}",
+                        other
+                    )));
+                }
+            };
+            Ok(FieldType::Vector {
+                algorithm,
+                dimensions,
+                distance_metric,
+            })
+        }
+        other => Err(Error::ParseError(format!(
+            "unknown search field type tag {}",
+            other
+        ))),
+    }
+}
+
 /// Snapshot of one string entry for RDB.
 pub struct StringRecord {
     pub key: Bytes,
@@ -191,6 +355,10 @@ pub struct DbSnapshot {
     pub streams: Vec<StreamRecord>,
     /// Non-string key expiries: (key, absolute Unix epoch ms). RDB v4+.
     pub typed_expires: Vec<(Bytes, i64)>,
+    /// Search index definitions (schema only). RDB v5+.
+    pub search_indices: Vec<IndexDefinition>,
+    /// Search aliases: (alias, real_index). RDB v5+.
+    pub search_aliases: Vec<(String, String)>,
 }
 
 /// Multi-database snapshot (RDB v3).
@@ -251,6 +419,8 @@ impl DbSnapshot {
             .map(|(key, state)| StreamRecord { key, state })
             .collect();
         let typed_expires = cache.export_typed_expires_unix_ms();
+        let search_indices = cache.list_search_index_definitions();
+        let search_aliases = cache.list_search_aliases();
 
         Ok(Self {
             strings,
@@ -261,6 +431,8 @@ impl DbSnapshot {
             sets,
             streams,
             typed_expires,
+            search_indices,
+            search_aliases,
         })
     }
 
@@ -272,6 +444,8 @@ impl DbSnapshot {
             && self.lists.is_empty()
             && self.sets.is_empty()
             && self.streams.is_empty()
+            && self.search_indices.is_empty()
+            && self.search_aliases.is_empty()
     }
 
     /// Encode a single-DB body (no magic/version/footer). Always includes v2+v3 sections.
@@ -374,6 +548,26 @@ impl DbSnapshot {
         for (key, exp) in &self.typed_expires {
             write_bytes(w, key)?;
             write_i64(w, *exp)?;
+        }
+
+        // Version 5+: search indices + aliases
+        write_u64(w, self.search_indices.len() as u64)?;
+        for def in &self.search_indices {
+            write_bytes(w, def.name.as_bytes())?;
+            write_u64(w, def.prefix.len() as u64)?;
+            for p in &def.prefix {
+                write_bytes(w, p.as_bytes())?;
+            }
+            write_u64(w, def.fields.len() as u64)?;
+            for field in &def.fields {
+                write_bytes(w, field.name.as_bytes())?;
+                write_field_type(w, &field.field_type)?;
+            }
+        }
+        write_u64(w, self.search_aliases.len() as u64)?;
+        for (alias, index) in &self.search_aliases {
+            write_bytes(w, alias.as_bytes())?;
+            write_bytes(w, index.as_bytes())?;
         }
 
         Ok(())
@@ -538,13 +732,56 @@ impl DbSnapshot {
         }
 
         let mut typed_expires = Vec::new();
-        if version >= VERSION {
+        if version >= VERSION_V4 {
             let n = read_u64(r)? as usize;
             typed_expires.reserve(n);
             for _ in 0..n {
                 let key = Bytes::from(read_bytes(r)?);
                 let exp = read_i64(r)?;
                 typed_expires.push((key, exp));
+            }
+        }
+
+        let mut search_indices = Vec::new();
+        let mut search_aliases = Vec::new();
+        if version >= VERSION {
+            let n_indices = read_u64(r)? as usize;
+            search_indices.reserve(n_indices);
+            for _ in 0..n_indices {
+                let name = String::from_utf8(read_bytes(r)?)
+                    .map_err(|e| Error::ParseError(format!("invalid index name: {}", e)))?;
+                let n_prefixes = read_u64(r)? as usize;
+                let mut prefixes = Vec::with_capacity(n_prefixes);
+                for _ in 0..n_prefixes {
+                    let p = String::from_utf8(read_bytes(r)?).map_err(|e| {
+                        Error::ParseError(format!("invalid index prefix: {}", e))
+                    })?;
+                    prefixes.push(p);
+                }
+                let n_fields = read_u64(r)? as usize;
+                let mut fields = Vec::with_capacity(n_fields);
+                for _ in 0..n_fields {
+                    let fname = String::from_utf8(read_bytes(r)?).map_err(|e| {
+                        Error::ParseError(format!("invalid field name: {}", e))
+                    })?;
+                    let field_type = read_field_type(r)?;
+                    fields.push(FieldDefinition {
+                        name: fname,
+                        field_type,
+                    });
+                }
+                search_indices.push(IndexDefinition::new(name, prefixes, fields));
+            }
+
+            let n_aliases = read_u64(r)? as usize;
+            search_aliases.reserve(n_aliases);
+            for _ in 0..n_aliases {
+                let alias = String::from_utf8(read_bytes(r)?)
+                    .map_err(|e| Error::ParseError(format!("invalid alias name: {}", e)))?;
+                let index = String::from_utf8(read_bytes(r)?).map_err(|e| {
+                    Error::ParseError(format!("invalid alias target: {}", e))
+                })?;
+                search_aliases.push((alias, index));
             }
         }
 
@@ -557,6 +794,8 @@ impl DbSnapshot {
             sets,
             streams,
             typed_expires,
+            search_indices,
+            search_aliases,
         })
     }
 
@@ -593,14 +832,26 @@ impl DbSnapshot {
                 sets: Vec::new(),
                 streams: Vec::new(),
                 typed_expires: Vec::new(),
+                search_indices: Vec::new(),
+                search_aliases: Vec::new(),
             })
         }
     }
 
     /// Load snapshot into cache (does not flush first — caller decides).
+    ///
+    /// Search indices are created **before** key types so hash load can
+    /// auto-index documents (same order idea as AOF: schema before HSET).
     pub fn load_into(&self, cache: &Cache) -> Result<usize> {
         let mut loaded = 0usize;
         let now = now_unix_ms();
+
+        // 1. Recreate search schema first.
+        for def in &self.search_indices {
+            cache
+                .create_search_index(def.clone())
+                .map_err(|e| Error::InvalidArgument(format!("RDB FT.CREATE: {}", e)))?;
+        }
 
         for s in &self.strings {
             if s.expire_unix_ms >= 0 && s.expire_unix_ms <= now {
@@ -638,11 +889,21 @@ impl DbSnapshot {
 
         for h in &self.hashes {
             let hash = cache.get_or_create_hash(&h.key)?;
-            let mut set = hash
-                .write();
-            for (f, v) in &h.fields {
-                set.hset(f.clone(), v.clone());
-            }
+            let index_fields = {
+                let mut set = hash.write();
+                for (f, v) in &h.fields {
+                    set.hset(f.clone(), v.clone());
+                }
+                // Snapshot for search auto-index (same as command-path / AOF HSET).
+                let mut index_fields = HashMap::new();
+                for (f, v) in set.hgetall() {
+                    let fname = String::from_utf8_lossy(&f).into_owned();
+                    let fval = String::from_utf8_lossy(&v).into_owned();
+                    index_fields.insert(fname, DocumentField::Text(fval));
+                }
+                index_fields
+            };
+            cache.auto_index_key(&h.key, index_fields);
             loaded += 1;
         }
 
@@ -675,6 +936,13 @@ impl DbSnapshot {
                 continue;
             }
             cache.set_typed_expire_unix_ms(key, *exp);
+        }
+
+        // 2. Aliases after keys (and after indices exist).
+        for (alias, index) in &self.search_aliases {
+            cache
+                .alias_add(alias, index)
+                .map_err(|e| Error::InvalidArgument(format!("RDB FT.ALIASADD: {}", e)))?;
         }
 
         Ok(loaded)
@@ -734,6 +1002,7 @@ impl MultiDbSnapshot {
             && version != VERSION_V1
             && version != VERSION_V2
             && version != VERSION_V3
+            && version != VERSION_V4
         {
             return Err(Error::ParseError(format!(
                 "unsupported RDB version {}",
@@ -923,6 +1192,8 @@ mod tests {
                 state: state.clone(),
             }],
             typed_expires: vec![],
+            search_indices: vec![],
+            search_aliases: vec![],
         };
         let multi = MultiDbSnapshot {
             databases: vec![(0, snap)],
@@ -930,7 +1201,7 @@ mod tests {
         let bytes = multi.encode().unwrap();
         assert!(bytes.starts_with(b"KORDB\0"));
         let version = u32::from_le_bytes(bytes[6..10].try_into().unwrap());
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
 
         let decoded = MultiDbSnapshot::decode(&bytes).unwrap();
         assert_eq!(decoded.databases.len(), 1);

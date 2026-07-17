@@ -361,7 +361,8 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P1]`** **Code review (BU):** AOF load must not silently drop FT mutator failures
   - *Found*: `apply_command_to_cache` FT.CREATE / FT.ALIAS* / FT.DROPINDEX use `let _ = …` and always `Ok(())` — create/alias errors (OOM, name conflict, bad def) leave hashes restored but search empty with no load error
   - *Done (Batch BV)*: propagate `create_search_index` / `drop_search_index` / `alias_*` as `Error::InvalidArgument`; non-truncated unparsable FT.CREATE → `ParseError` (truncated argv still skips like other AOF paths); `tests/bv_aof_ft_load_errors_test.rs`
-- [ ] **`[P2]`** Persist FT indices + aliases in RDB (AOF rewrite done in BU; RDB FT section still open)
+- [x] **`[P2]`** Persist FT indices + aliases in RDB (AOF rewrite done in BU; RDB FT section still open)
+  - *Done (Batch BY)*: RDB version 5 search section (index definitions + aliases) per DB body after typed-expires; `from_cache` / `is_empty` / `load_into` create schema first then auto-index hashes; v1–v4 still load. Tests: `tests/by_rdb_ft_section_test.rs`
 - [ ] **`[P2]`** ACL `@search` category for FT.* (fine-grained users; default `+@all` unaffected)
 - [ ] **`[P2]`** HNSW correctness/performance benchmarks vs FLAT
 - [ ] **`[P2]`** **Code review (BT nit):** optional single critical section for `get_index` resolve+lookup; min-replicas FT test
@@ -419,7 +420,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). BX closed FLUSHDB/FT schema decoupling; remaining P2: RDB FT (durability), shared parser, scratch-load.
+Prioritized for next letter batch(es). BY closed RDB FT section; remaining P2: shared parser, scratch-load, ACL `@search`.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -428,7 +429,7 @@ Prioritized for next letter batch(es). BX closed FLUSHDB/FT schema decoupling; r
 | P1 | Atomic create/alias namespace critical section | done (BT) |
 | P1 | AOF rewrite emits `FT.CREATE` + aliases (BT review) | done (BU) |
 | P1 | AOF load surfaces FT.CREATE / alias failures (BU review) | done (BV) |
-| P2 | FT RDB section | open |
+| P2 | FT RDB section | done (BY) |
 | P2 | ACL `@search` | open |
 | P2 | Shared FT.CREATE parser (cmd + AOF load) | open |
 | P2 | HNSW `ef_construction` AOF round-trip | open |

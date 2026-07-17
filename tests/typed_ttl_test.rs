@@ -245,9 +245,9 @@ fn rdb_roundtrip_preserves_typed_ttl() {
     );
 
     let bytes = rdb::save_to_bytes(&cache).unwrap();
-    // KORDB v4
+    // KORDB v5 (typed-expires since v4; search section since v5)
     let version = u32::from_le_bytes(bytes[6..10].try_into().unwrap());
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
 
     let cache2 = make_cache(16 * 1024 * 1024);
     rdb::load_bytes(&cache2, &bytes, true).unwrap();
