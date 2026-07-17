@@ -354,9 +354,13 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch BT)*: resolve `index` arg through alias map; store real name; DROPINDEX cleanup consistent
 - [x] **`[P1]`** **Code review (BS):** hold a single critical section for FT create/alias namespace checks (avoid TOCTOU between index and alias maps)
   - *Done (Batch BT)*: `create_index` / `alias_add` / `alias_update` hold aliases then indices locks for full check-and-insert (matches `drop_index`)
-- [ ] **`[P2]`** Persist FT indices + aliases (AOF now logs mutators; optional RDB section later)
+- [ ] **`[P1]`** **Code review (BT):** emit `FT.CREATE` + `FT.ALIASADD` during AOF rewrite
+  - *Found*: live AOF append logs FT mutators (BT), but `encode_snapshot_commands` / `BGREWRITEAOF` only dumps keyspace types — rewrite drops search schema/aliases while hashes remain
+  - *Fix*: serialize index definitions + aliases into rewrite stream; reload test after rewrite
+- [ ] **`[P2]`** Persist FT indices + aliases in RDB (AOF append OK; rewrite still open as P1 above)
 - [ ] **`[P2]`** ACL `@search` category for FT.* (fine-grained users; default `+@all` unaffected)
 - [ ] **`[P2]`** HNSW correctness/performance benchmarks vs FLAT
+- [ ] **`[P2]`** **Code review (BT nit):** optional single critical section for `get_index` resolve+lookup; min-replicas FT test
 
 ### Pub/Sub
 
@@ -386,17 +390,19 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
   - *Done (Batch BT)*: `bt_eval_select_persists_connection_db` — connection remains on selected DB after EVAL
 
-### Code review backlog (from scheduled review of Batch BS `55bbf70`)
+### Code review backlog
 
-Prioritized for next letter batch(es); full notes under scratch review files when present.
+Prioritized for next letter batch(es). BS review items closed in BT; BT review adds AOF rewrite gap.
 
 | Pri | Item | Status |
 |-----|------|--------|
 | P0 | `FT.*` mutators in `is_write_command` (AOF / repl / READONLY) | done (BT) |
 | P1 | Alias target resolve + real-name storage | done (BT) |
 | P1 | Atomic create/alias namespace critical section | done (BT) |
-| P2 | FT state durability (AOF/RDB) | open (AOF logs mutators; RDB section still open) |
+| P1 | AOF rewrite emits `FT.CREATE` + aliases (BT review) | open |
+| P2 | FT RDB section | open |
 | P2 | ACL `@search` | open |
+| P2 | `get_index` atomic resolve; min-replicas FT test | open |
 | P2 | Lua SELECT DB side-effect test | done (BT) |
 
 ---
