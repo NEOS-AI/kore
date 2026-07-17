@@ -1188,6 +1188,18 @@ impl CommandHandler {
                 }
                 Ok(RespValue::ok())
             }
+            "REWRITE" => {
+                // Kore is typically started with CLI flags (no redis.conf). Match Redis
+                // when no config file was loaded.
+                if args.len() != 1 {
+                    return Ok(RespValue::error(
+                        "ERR wrong number of arguments for 'config|rewrite' command",
+                    ));
+                }
+                Ok(RespValue::error(
+                    "ERR The server is running without a config file",
+                ))
+            }
             "HELP" => Ok(RespValue::Array(vec![
                 RespValue::BulkString(Some(Bytes::from_static(
                     b"CONFIG <subcommand> [<arg> ...]. Subcommands are:",
@@ -1200,6 +1212,9 @@ impl CommandHandler {
                 ))),
                 RespValue::BulkString(Some(Bytes::from_static(
                     b"RESETSTAT -- reset statistics reported by INFO",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"REWRITE -- rewrite the config file (requires a config file)",
                 ))),
                 RespValue::BulkString(Some(Bytes::from_static(
                     b"HELP -- print this help",

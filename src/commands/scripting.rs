@@ -107,6 +107,100 @@ impl CommandHandler {
         self.eval_script_body(&script, &args[1..], readonly, cmd)
     }
 
+    /// FUNCTION HELP | LIST | LOAD | DELETE | FLUSH | DUMP | RESTORE | STATS | KILL
+    ///
+    /// Redis Functions library is not implemented yet. LIST is empty; mutating
+    /// subcommands return clear errors so clients can detect the stub.
+    pub(super) fn handle_function(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'function' command",
+            ));
+        }
+        let sub = match args[0].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+            None => return Ok(RespValue::error("ERR syntax error")),
+        };
+        match sub.as_str() {
+            "LIST" => {
+                // Optional WITHCODE / LIBRARYNAME ignored; always empty.
+                Ok(RespValue::Array(vec![]))
+            }
+            "STATS" => {
+                // Minimal empty stats map (RESP2 flat array).
+                Ok(RespValue::Array(vec![
+                    RespValue::BulkString(Some(Bytes::from_static(b"running_script"))),
+                    RespValue::null(),
+                    RespValue::BulkString(Some(Bytes::from_static(b"engines"))),
+                    RespValue::Array(vec![]),
+                ]))
+            }
+            "LOAD" | "DELETE" | "FLUSH" | "DUMP" | "RESTORE" | "KILL" => {
+                Ok(RespValue::error(format!(
+                    "ERR FUNCTION {} is not supported yet (use EVAL/EVALSHA for scripts)",
+                    sub
+                )))
+            }
+            "HELP" => Ok(RespValue::Array(vec![
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"FUNCTION <subcommand> [<arg> ...]. Subcommands are:",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"LIST [LIBRARYNAME name] [WITHCODE] -- list loaded libraries (empty)",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"STATS -- function runtime stats",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"LOAD / DELETE / FLUSH / DUMP / RESTORE / KILL -- not supported yet",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"HELP -- print this help",
+                ))),
+            ])),
+            _ => Ok(RespValue::error(format!(
+                "ERR unknown subcommand '{}'. Try FUNCTION HELP.",
+                sub
+            ))),
+        }
+    }
+
+    /// FCALL function numkeys [key ...] [arg ...] — not supported (no libraries).
+    pub(super) fn handle_fcall(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.fcall_stub(args, "fcall")
+    }
+
+    /// FCALL_RO — read-only FCALL stub.
+    pub(super) fn handle_fcall_ro(&self, args: &[RespValue]) -> Result<RespValue> {
+        self.fcall_stub(args, "fcall_ro")
+    }
+
+    fn fcall_stub(&self, args: &[RespValue], cmd: &str) -> Result<RespValue> {
+        if args.len() < 2 {
+            return Ok(RespValue::error(format!(
+                "ERR wrong number of arguments for '{}' command",
+                cmd
+            )));
+        }
+        let name = match args[0].as_bulk_string() {
+            Some(b) => String::from_utf8_lossy(b).into_owned(),
+            None => return Ok(RespValue::error("ERR Function not found")),
+        };
+        // Validate numkeys shape so clients get arity-style errors when obvious.
+        match self.parse_integer(&args[1]) {
+            Ok(n) if n >= 0 => {}
+            _ => {
+                return Ok(RespValue::error(
+                    "ERR value is not an integer or out of range",
+                ));
+            }
+        }
+        Ok(RespValue::error(format!(
+            "ERR Function '{}' not found",
+            name
+        )))
+    }
+
     /// SCRIPT LOAD | EXISTS | FLUSH | KILL
     pub(super) fn handle_script(&mut self, args: &[RespValue]) -> Result<RespValue> {
         if args.is_empty() {

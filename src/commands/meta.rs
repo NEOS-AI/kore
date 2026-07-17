@@ -261,6 +261,16 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     CmdSpec { name: "evalsha", arity: -3, flags: &["noscript", "movablekeys"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "evalsha_ro", arity: -3, flags: &["readonly", "noscript", "movablekeys"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "script", arity: -2, flags: &["noscript"], first_key: 0, last_key: 0, step: 0 },
+    // Redis Functions (stub: LIST empty; LOAD/FCALL not implemented yet)
+    CmdSpec { name: "function", arity: -2, flags: &["noscript", "stale"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "fcall", arity: -3, flags: &["noscript", "movablekeys", "write"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "fcall_ro", arity: -3, flags: &["readonly", "noscript", "movablekeys"], first_key: 0, last_key: 0, step: 0 },
+    // RediSearch-compatible FT.* (wired; listed for COMMAND catalog)
+    CmdSpec { name: "ft.create", arity: -2, flags: &["write", "denyoom"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "ft.dropindex", arity: -2, flags: &["write"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "ft._list", arity: 1, flags: &["readonly", "random"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "ft.info", arity: 2, flags: &["readonly", "random"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "ft.search", arity: -3, flags: &["readonly"], first_key: 0, last_key: 0, step: 0 },
 ];
 
 fn bulk(s: impl Into<Bytes>) -> RespValue {
@@ -1144,10 +1154,18 @@ impl CommandHandler {
         match cmd_name.as_str() {
             "lmpop" | "zmpop" => return Ok(extract_numkeys_keys_for_getkeys(cmd_args, 0)),
             "blmpop" | "bzmpop" => return Ok(extract_numkeys_keys_for_getkeys(cmd_args, 1)),
-            "sintercard" => return Ok(extract_numkeys_keys_for_getkeys(cmd_args, 0)),
+            "sintercard" | "zunion" | "zinter" | "zdiff" | "zintercard" => {
+                return Ok(extract_numkeys_keys_for_getkeys(cmd_args, 0))
+            }
+            // dest + numkeys + keys…
+            "zunionstore" | "zinterstore" | "zdiffstore" => {
+                return Ok(extract_zstore_keys_for_getkeys(cmd_args))
+            }
             "xread" => return Ok(extract_xread_keys_for_getkeys(cmd_args, false)),
             "xreadgroup" => return Ok(extract_xread_keys_for_getkeys(cmd_args, true)),
             "memory" => return Ok(extract_memory_keys_for_getkeys(cmd_args)),
+            // FCALL / FCALL_RO: numkeys after function name
+            "fcall" | "fcall_ro" => return Ok(extract_fcall_keys_for_getkeys(cmd_args)),
             _ => {}
         }
 
@@ -1196,6 +1214,8 @@ fn command_matches_aclcat(spec: &CmdSpec, cat: &str) -> bool {
             has("scripting")
                 || spec.name.starts_with("eval")
                 || spec.name == "script"
+                || spec.name == "function"
+                || spec.name.starts_with("fcall")
         }
         "fast" => has("fast"),
         "slow" => !has("fast"),
@@ -1558,6 +1578,31 @@ fn extract_memory_keys_for_getkeys(args: &[RespValue]) -> Vec<Bytes> {
         .cloned()
         .into_iter()
         .collect()
+}
+
+/// ZUNIONSTORE/ZINTERSTORE/ZDIFFSTORE: destination, numkeys, key…
+fn extract_zstore_keys_for_getkeys(args: &[RespValue]) -> Vec<Bytes> {
+    if args.is_empty() {
+        return Vec::new();
+    }
+    let mut keys = Vec::new();
+    if let Some(dest) = args[0].as_bulk_string() {
+        keys.push(dest.clone());
+    }
+    if args.len() < 2 {
+        return keys;
+    }
+    keys.extend(extract_numkeys_keys_for_getkeys(&args[1..], 0));
+    keys
+}
+
+/// FCALL/FCALL_RO: function, numkeys, key…, arg…
+fn extract_fcall_keys_for_getkeys(args: &[RespValue]) -> Vec<Bytes> {
+    // args[0] = function name, args[1] = numkeys
+    if args.len() < 2 {
+        return Vec::new();
+    }
+    extract_numkeys_keys_for_getkeys(&args[1..], 0)
 }
 
 fn is_hello_keyword(b: &Bytes) -> bool {

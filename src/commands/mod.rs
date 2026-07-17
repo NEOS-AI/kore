@@ -887,12 +887,15 @@ impl CommandHandler {
             "SUNSUBSCRIBE" => self.handle_sunsubscribe(&args[1..]).await,
             "SPUBLISH" => self.handle_spublish(&args[1..]).await,
 
-            // Lua scripting
+            // Lua scripting / Redis Functions (FUNCTION is a stub; use EVAL for scripts)
             "EVAL" => self.handle_eval(&args[1..]),
             "EVAL_RO" => self.handle_eval_ro(&args[1..]),
             "EVALSHA" => self.handle_evalsha(&args[1..]),
             "EVALSHA_RO" => self.handle_evalsha_ro(&args[1..]),
             "SCRIPT" => self.handle_script(&args[1..]),
+            "FUNCTION" => self.handle_function(&args[1..]),
+            "FCALL" => self.handle_fcall(&args[1..]),
+            "FCALL_RO" => self.handle_fcall_ro(&args[1..]),
 
             _ => Ok(RespValue::error(format!("ERR unknown command '{}'", cmd_upper))),
         };
@@ -1390,6 +1393,9 @@ pub(super) fn is_write_command(cmd: &str) -> bool {
             // EVAL_RO / EVALSHA_RO are intentionally omitted (read-only).
             | "EVAL"
             | "EVALSHA"
+            // FCALL may mutate; FCALL_RO is read-only.
+            | "FCALL"
+            | "FUNCTION"
     )
 }
 
