@@ -452,7 +452,7 @@ impl Cache {
             .category_memory(MemoryCategory::Cache)
     }
 
-    /// Clear all entries (KV, sorted sets, geo, hash, list, set) and reset memory accounting
+    /// Clear all entries (KV, sorted sets, geo, hash, list, set, search) and reset memory accounting
     pub fn flush(&self) {
         self.map.clear();
         self.sorted_sets.clear();
@@ -462,6 +462,9 @@ impl Cache {
         self.sets.write().clear();
         self.streams.write().clear();
         self.typed_expires.write().clear();
+        // Search indices / aliases live outside the key maps; clear them so
+        // FLUSHDB/FLUSHALL and failed AOF load leave a fully empty DB.
+        self.search_index_manager.clear();
         self.memory_usage.store(0, Ordering::Relaxed);
         self.memory_tracker.reset();
     }

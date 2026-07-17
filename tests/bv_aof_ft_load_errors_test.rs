@@ -162,11 +162,11 @@ fn duplicate_ft_create_aof_load_returns_err() {
     let err = aof::load_into_databases(&loaded, &path).expect_err("load must fail on duplicate");
     assert_err_variant(err);
 
-    // First CREATE applied before the failing second — index may exist, but load is Err.
+    // All-or-nothing: partial apply is flushed so no leftover index remains.
     let cache = loaded.get(0).unwrap();
     assert!(
-        cache.list_search_indices().iter().any(|n| n == "idx"),
-        "first FT.CREATE should have applied before conflict"
+        cache.list_search_indices().is_empty(),
+        "failed load must flush partial FT.CREATE state"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -253,7 +253,34 @@ fn second_create_after_success_fails_load() {
     let err = aof::load_into_databases(&loaded, &path).expect_err("duplicate after rewrite");
     assert_err_variant(err);
 
+    // Partial rewrite payload must not remain after failed load.
+    let cache = loaded.get(0).unwrap();
+    assert!(
+        cache.list_search_indices().is_empty(),
+        "failed load must flush rewritten FT state"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// DROPINDEX for a missing index fails apply (stricter than DEL no-op).
+#[test]
+fn dropindex_missing_returns_err() {
+    let databases = make_databases();
+    let cache = databases.get(0).unwrap();
+    let err = aof::apply_command_to_cache(&cache, &argv(&["FT.DROPINDEX", "nope"]))
+        .expect_err("DROPINDEX missing must fail");
+    assert_err_variant(err);
+}
+
+/// ALIASDEL for a missing alias fails apply.
+#[test]
+fn aliasdel_missing_returns_err() {
+    let databases = make_databases();
+    let cache = databases.get(0).unwrap();
+    let err = aof::apply_command_to_cache(&cache, &argv(&["FT.ALIASDEL", "nope"]))
+        .expect_err("ALIASDEL missing must fail");
+    assert_err_variant(err);
 }
 
 /// Non-truncated but unparsable FT.CREATE (e.g. bad field type) fails load.

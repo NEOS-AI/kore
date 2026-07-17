@@ -464,6 +464,15 @@ impl SearchIndexManager {
         }
     }
 
+    /// Drop every index and alias (used by FLUSHDB / FLUSHALL / failed AOF load).
+    pub fn clear(&self) {
+        // Lock order: aliases then indices (matches create/drop/alias_*).
+        let mut aliases = self.aliases.write();
+        let mut indices = self.indices.write();
+        aliases.clear();
+        indices.clear();
+    }
+
     /// Resolve `name` if it is an alias; otherwise return `name` unchanged.
     pub fn resolve_name(&self, name: &str) -> String {
         let aliases = self.aliases.read();

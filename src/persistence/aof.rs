@@ -880,7 +880,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             match parse_ft_create_definition(argv) {
                 Some(def) => cache
                     .create_search_index(def)
-                    .map_err(Error::InvalidArgument)?,
+                    .map_err(map_ft_mutator_error)?,
                 None => {
                     return Err(Error::ParseError(
                         "invalid or incomplete FT.CREATE in AOF".into(),
@@ -894,7 +894,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
                 let name = String::from_utf8_lossy(&argv[1]);
                 cache
                     .drop_search_index(&name)
-                    .map_err(Error::InvalidArgument)?;
+                    .map_err(map_ft_mutator_error)?;
             }
             Ok(())
         }
@@ -904,14 +904,14 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
                 let index = String::from_utf8_lossy(&argv[2]);
                 cache
                     .alias_add(&alias, &index)
-                    .map_err(Error::InvalidArgument)?;
+                    .map_err(map_ft_mutator_error)?;
             }
             Ok(())
         }
         "FT.ALIASDEL" => {
             if argv.len() >= 2 {
                 let alias = String::from_utf8_lossy(&argv[1]);
-                cache.alias_del(&alias).map_err(Error::InvalidArgument)?;
+                cache.alias_del(&alias).map_err(map_ft_mutator_error)?;
             }
             Ok(())
         }
@@ -921,7 +921,7 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
                 let index = String::from_utf8_lossy(&argv[2]);
                 cache
                     .alias_update(&alias, &index)
-                    .map_err(Error::InvalidArgument)?;
+                    .map_err(map_ft_mutator_error)?;
             }
             Ok(())
         }
@@ -1328,21 +1328,40 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
     }
 }
 
+/// Map FT mutator string errors to typed `Error` (OOM-ish → OutOfMemory).
+fn map_ft_mutator_error(msg: String) -> Error {
+    if msg.contains("OOM") {
+        Error::OutOfMemory
+    } else {
+        Error::InvalidArgument(msg)
+    }
+}
+
 /// Replay AOF into a single cache. SELECT is ignored (all commands hit this cache).
+///
+/// On any load error, the cache is flushed so partial apply does not leave a
+/// half-filled live dataset (all-or-nothing load semantics).
 pub fn load_into_cache(cache: &Arc<Cache>, path: &Path) -> Result<usize> {
-    load_file_with(path, |argv| {
+    let result = load_file_with(path, |argv| {
         let cmd = String::from_utf8_lossy(&argv[0]).to_uppercase();
         if cmd == "SELECT" {
             return Ok(());
         }
         apply_command_to_cache(cache, &argv)
-    })
+    });
+    if result.is_err() {
+        cache.flush();
+    }
+    result
 }
 
 /// Replay AOF into multi-DB keyspaces. Handles SELECT and FLUSHALL across DBs.
+///
+/// On any load error, every database is flushed so partial apply does not leave
+/// a half-filled live dataset (all-or-nothing load semantics).
 pub fn load_into_databases(databases: &Databases, path: &Path) -> Result<usize> {
     let mut current = 0usize;
-    load_file_with(path, |argv| {
+    let result = load_file_with(path, |argv| {
         let cmd = String::from_utf8_lossy(&argv[0]).to_uppercase();
         match cmd.as_str() {
             "SELECT" => {
@@ -1368,5 +1387,9 @@ pub fn load_into_databases(databases: &Databases, path: &Path) -> Result<usize> 
                 apply_command_to_cache(&cache, &argv)
             }
         }
-    })
+    });
+    if result.is_err() {
+        databases.flush_all();
+    }
+    result
 }
