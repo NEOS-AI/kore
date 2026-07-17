@@ -1212,7 +1212,131 @@ impl CommandHandler {
                     _ => Ok(RespValue::error("ERR Unsupported CONFIG parameter")),
                 }
             }
+            "RESETSTAT" => {
+                if args.len() != 1 {
+                    return Ok(RespValue::error(
+                        "ERR wrong number of arguments for 'config|resetstat' command",
+                    ));
+                }
+                // Reset INFO-reported counters on every logical DB (shared Arc when multi-DB).
+                self.cache.stats.reset();
+                for db in self.databases.iter() {
+                    if !std::sync::Arc::ptr_eq(db, &self.cache) {
+                        db.stats.reset();
+                    }
+                }
+                Ok(RespValue::ok())
+            }
             _ => Ok(RespValue::error("ERR Unknown subcommand or wrong number of arguments")),
+        }
+    }
+
+    /// LATENCY HELP | LATEST | HISTORY | RESET | DOCTOR — latency monitoring (empty until events recorded).
+    pub(super) fn handle_latency(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'latency' command",
+            ));
+        }
+        let sub = match args[0].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+            None => return Ok(RespValue::error("ERR syntax error")),
+        };
+        match sub.as_str() {
+            "LATEST" => {
+                if args.len() != 1 {
+                    return Ok(RespValue::error(
+                        "ERR wrong number of arguments for 'latency|latest' command",
+                    ));
+                }
+                Ok(RespValue::Array(vec![]))
+            }
+            "HISTORY" => {
+                // LATENCY HISTORY <event> — no samples yet.
+                if args.len() != 2 {
+                    return Ok(RespValue::error(
+                        "ERR wrong number of arguments for 'latency|history' command",
+                    ));
+                }
+                Ok(RespValue::Array(vec![]))
+            }
+            "RESET" => {
+                // LATENCY RESET [event ...] — nothing to clear.
+                Ok(RespValue::Integer(0))
+            }
+            "DOCTOR" => {
+                if args.len() != 1 {
+                    return Ok(RespValue::error(
+                        "ERR wrong number of arguments for 'latency|doctor' command",
+                    ));
+                }
+                Ok(RespValue::BulkString(Some(Bytes::from_static(
+                    b"I'm sorry Dave, no latency spike to report. All systems nominal.",
+                ))))
+            }
+            "HELP" => Ok(RespValue::Array(vec![
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"LATENCY <subcommand> [<arg> ...]. Subcommands are:",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"LATEST -- latest latency spike per event",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"HISTORY <event> -- latency time-series for event",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"RESET [event ...] -- reset latency data",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"DOCTOR -- human-readable latency analysis",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(b"HELP -- print this help"))),
+            ])),
+            _ => Ok(RespValue::error(format!(
+                "ERR unknown subcommand '{}'. Try LATENCY HELP.",
+                sub
+            ))),
+        }
+    }
+
+    /// MODULE LIST | HELP — module subsystem (no loadable modules yet).
+    pub(super) fn handle_module(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'module' command",
+            ));
+        }
+        let sub = match args[0].as_bulk_string() {
+            Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+            None => return Ok(RespValue::error("ERR syntax error")),
+        };
+        match sub.as_str() {
+            "LIST" => {
+                if args.len() != 1 {
+                    return Ok(RespValue::error(
+                        "ERR wrong number of arguments for 'module|list' command",
+                    ));
+                }
+                // No modules loaded.
+                Ok(RespValue::Array(vec![]))
+            }
+            "HELP" => Ok(RespValue::Array(vec![
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"MODULE <subcommand> [<arg> ...]. Subcommands are:",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"LIST -- list all loaded modules",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(b"HELP -- print this help"))),
+            ])),
+            "LOAD" | "UNLOAD" | "LOADEX" => Ok(RespValue::error(format!(
+                "ERR MODULE {} is not supported",
+                sub
+            ))),
+            _ => Ok(RespValue::error(format!(
+                "ERR unknown subcommand '{}'. Try MODULE HELP.",
+                sub
+            ))),
         }
     }
 }

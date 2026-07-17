@@ -168,6 +168,6 @@ impl Stats {
         self.bytes_sent.store(0, Ordering::Relaxed);
         self.bytes_received.store(0, Ordering::Relaxed);
         self.total_connections.store(0, Ordering::Relaxed);
-        self.active_connections.store(0, Ordering::Relaxed);
+        // Keep active_connections — it reflects live sockets, not a cumulative counter.
     }
 }

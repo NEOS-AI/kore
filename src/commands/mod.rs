@@ -585,6 +585,8 @@ impl CommandHandler {
             "MEMORY" => self.handle_memory(&args[1..]),
             "OBJECT" => self.handle_object(&args[1..]),
             "SLOWLOG" => self.handle_slowlog(&args[1..]),
+            "LATENCY" => self.handle_latency(&args[1..]),
+            "MODULE" => self.handle_module(&args[1..]),
 
             // Persistence
             "SAVE" => self.handle_save(&args[1..]),

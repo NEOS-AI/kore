@@ -877,12 +877,25 @@ impl RedisStream {
 
     /// XREADGROUP: read new messages (`>`) or reclaim from history starting after `id`.
     /// Returns entries and updates PEL / last_delivered_id.
+    /// When `noack` is true, new (`>`) messages skip the PEL (still advance last_delivered_id).
     pub fn xreadgroup(
         &mut self,
         group_name: &Bytes,
         consumer_name: &Bytes,
         id_spec: &str,
         count: Option<usize>,
+    ) -> Result<Vec<StreamEntry>, String> {
+        self.xreadgroup_opts(group_name, consumer_name, id_spec, count, false)
+    }
+
+    /// XREADGROUP with optional NOACK.
+    pub fn xreadgroup_opts(
+        &mut self,
+        group_name: &Bytes,
+        consumer_name: &Bytes,
+        id_spec: &str,
+        count: Option<usize>,
+        noack: bool,
     ) -> Result<Vec<StreamEntry>, String> {
         if !self.groups.contains_key(group_name) {
             return Err("NOGROUP No such key '' or consumer group".into());
@@ -957,6 +970,10 @@ impl RedisStream {
         if id_spec == ">" {
             for entry in &entries {
                 group.last_delivered_id = entry.id;
+                if noack {
+                    // NOACK: deliver without adding to the PEL.
+                    continue;
+                }
                 let pe = group.pending.entry(entry.id).or_insert_with(|| PendingEntry {
                     id: entry.id,
                     consumer: consumer_name.clone(),
@@ -972,12 +989,14 @@ impl RedisStream {
                 pe.delivery_count += 1;
                 pe.delivery_time_ms = now;
             }
-            if let Some(c) = group.consumers.get_mut(consumer_name) {
-                c.pending = group
-                    .pending
-                    .values()
-                    .filter(|p| &p.consumer == consumer_name)
-                    .count();
+            if !noack {
+                if let Some(c) = group.consumers.get_mut(consumer_name) {
+                    c.pending = group
+                        .pending
+                        .values()
+                        .filter(|p| &p.consumer == consumer_name)
+                        .count();
+                }
             }
         } else {
             for entry in &entries {

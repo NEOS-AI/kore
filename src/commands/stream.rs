@@ -950,9 +950,11 @@ impl CommandHandler {
         }
     }
 
-    /// XREADGROUP GROUP group consumer [COUNT count] [BLOCK ms] STREAMS key [key ...] id [id ...]
+    /// XREADGROUP GROUP group consumer [COUNT count] [BLOCK ms] [NOACK]
+    /// STREAMS key [key ...] id [id ...]
     ///
     /// BLOCK waits for new messages when reading with `>` and nothing is available.
+    /// NOACK skips PEL insertion for newly delivered (`>`) messages.
     pub(super) async fn handle_xreadgroup(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.len() < 6 {
             return Ok(RespValue::error(
@@ -981,6 +983,7 @@ impl CommandHandler {
 
         let mut count: Option<usize> = None;
         let mut block_ms: Option<u64> = None;
+        let mut noack = false;
         while i < args.len() {
             let opt = match args[i].as_bulk_string() {
                 Some(s) => String::from_utf8_lossy(s).to_uppercase(),
@@ -1026,6 +1029,10 @@ impl CommandHandler {
                     block_ms = Some(ms);
                     i += 1;
                 }
+                "NOACK" => {
+                    noack = true;
+                    i += 1;
+                }
                 "STREAMS" => {
                     i += 1;
                     break;
@@ -1064,7 +1071,7 @@ impl CommandHandler {
         }
 
         // Immediate try
-        match self.xreadgroup_once(&group, &consumer, &keys, &id_specs, count)? {
+        match self.xreadgroup_once(&group, &consumer, &keys, &id_specs, count, noack)? {
             XReadGroupOutcome::Data(resp) | XReadGroupOutcome::Error(resp) => return Ok(resp),
             XReadGroupOutcome::Empty => {}
         }
@@ -1087,7 +1094,7 @@ impl CommandHandler {
         let (waiter_id, notify) = self.cache.stream_blockers.register(&keys);
 
         let result = loop {
-            match self.xreadgroup_once(&group, &consumer, &keys, &id_specs, count)? {
+            match self.xreadgroup_once(&group, &consumer, &keys, &id_specs, count, noack)? {
                 XReadGroupOutcome::Data(resp) | XReadGroupOutcome::Error(resp) => break Ok(resp),
                 XReadGroupOutcome::Empty => {}
             }
@@ -1119,6 +1126,7 @@ impl CommandHandler {
         keys: &[Bytes],
         id_specs: &[String],
         count: Option<usize>,
+        noack: bool,
     ) -> Result<XReadGroupOutcome> {
         let mut result: Vec<RespValue> = Vec::new();
         for (key, id_s) in keys.iter().zip(id_specs.iter()) {
@@ -1144,7 +1152,7 @@ impl CommandHandler {
                 }
             };
             let mut s = stream.write();
-            let entries = match s.xreadgroup(group, consumer, id_s, count) {
+            let entries = match s.xreadgroup_opts(group, consumer, id_s, count, noack) {
                 Ok(e) => e,
                 Err(e) => {
                     if e.starts_with("NOGROUP") {

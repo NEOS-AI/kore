@@ -95,6 +95,8 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     CmdSpec { name: "memory", arity: -2, flags: &["readonly", "random"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "object", arity: -2, flags: &["readonly", "random"], first_key: 2, last_key: 2, step: 1 },
     CmdSpec { name: "slowlog", arity: -2, flags: &["admin", "random", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "latency", arity: -2, flags: &["admin", "noscript", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },
+    CmdSpec { name: "module", arity: -2, flags: &["admin", "noscript", "loading", "stale"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "save", arity: 1, flags: &["admin", "noscript"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "bgsave", arity: -1, flags: &["admin", "noscript"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "lastsave", arity: 1, flags: &["loading", "stale", "fast", "admin"], first_key: 0, last_key: 0, step: 0 },
