@@ -235,3 +235,73 @@ fn test_server_handler_info_with_fair_queue_redlock() {
     assert!(body.contains("fair_queue_enabled:1"), "got: {}", body);
     assert!(body.contains("fair_queue_total_enqueued:"), "got: {}", body);
 }
+
+#[test]
+fn test_from_config_deadlock_off_by_default() {
+    let config = enabled_config(3, 200);
+    let redlock = Redlock::from_config(&config, Some(local_backends(3)))
+        .unwrap()
+        .expect("redlock");
+    assert!(
+        redlock.deadlock_detector().is_none(),
+        "port=0 + detection off must leave no detector"
+    );
+}
+
+#[test]
+fn test_from_config_enable_deadlock_detection_flag() {
+    let mut config = enabled_config(3, 200);
+    config.enable_deadlock_detection = true;
+    config.deadlock_max_wait_ms = 15_000;
+    config.deadlock_auto_resolve = true;
+    config.deadlock_victim_strategy = "oldest".to_string();
+    config.validate().unwrap();
+
+    let redlock = Redlock::from_config(&config, Some(local_backends(3)))
+        .unwrap()
+        .expect("redlock");
+    let det = redlock
+        .deadlock_detector()
+        .expect("enable_deadlock_detection must attach detector");
+    assert_eq!(det.max_wait_time_ms(), 15_000);
+    assert!(det.auto_resolve());
+    assert_eq!(
+        det.victim_strategy(),
+        kore::VictimSelectionStrategy::Oldest
+    );
+}
+
+#[test]
+fn test_from_config_ui_port_auto_attaches_detector() {
+    let mut config = enabled_config(3, 200);
+    config.deadlock_ui_port = 9101;
+    config.deadlock_max_wait_ms = 20_000;
+    config.deadlock_victim_strategy = "fewest-locks".to_string();
+    // Explicit enable flag off — UI port alone still attaches (back-compat).
+    assert!(!config.enable_deadlock_detection);
+    config.validate().unwrap();
+
+    let redlock = Redlock::from_config(&config, Some(local_backends(3)))
+        .unwrap()
+        .expect("redlock");
+    let det = redlock
+        .deadlock_detector()
+        .expect("deadlock_ui_port must auto-attach detector");
+    assert_eq!(det.max_wait_time_ms(), 20_000);
+    assert!(!det.auto_resolve());
+    assert_eq!(
+        det.victim_strategy(),
+        kore::VictimSelectionStrategy::FewestLocks
+    );
+}
+
+#[test]
+fn test_from_config_ui_port_zero_with_detection_off_no_detector() {
+    let mut config = enabled_config(3, 200);
+    config.deadlock_ui_port = 0;
+    config.enable_deadlock_detection = false;
+    let redlock = Redlock::from_config(&config, Some(local_backends(3)))
+        .unwrap()
+        .expect("redlock");
+    assert!(redlock.deadlock_detector().is_none());
+}

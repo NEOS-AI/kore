@@ -58,6 +58,14 @@ pub struct DeadlockUiSnapshot {
     pub held: Vec<(String, String, u64, u64)>, // resource, client, ttl_ms, held_for_ms
     pub waits: Vec<(String, String, String, u64)>, // waiter, holder, resource, wait_elapsed_ms
     pub orphan_waits: Vec<(String, String, u64)>, // waiter, resource, wait_elapsed_ms
+    /// Detector max-wait (ms); 0 when disabled.
+    pub max_wait_time_ms: u64,
+    /// Whether auto-resolve is enabled on the attached detector.
+    pub auto_resolve: bool,
+    /// Victim strategy name (`youngest` / `oldest` / `fewest-locks`); empty when disabled.
+    pub victim_strategy: String,
+    /// Whether this snapshot ran expired-lock cleanup (default UI path does).
+    pub cleanup_on_collect: bool,
 }
 
 impl DeadlockUiSnapshot {
@@ -74,13 +82,30 @@ impl DeadlockUiSnapshot {
             held: Vec::new(),
             waits: Vec::new(),
             orphan_waits: Vec::new(),
+            max_wait_time_ms: 0,
+            auto_resolve: false,
+            victim_strategy: String::new(),
+            cleanup_on_collect: false,
         }
     }
 
-    /// Collect from a live detector (detect + export + stats).
+    /// Collect from a live detector via a single critical section.
+    ///
+    /// Uses [`DeadlockDetector::collect_consistent_view`] with `cleanup = true`
+    /// so cycle, stats, and graph rows cannot diverge under concurrent
+    /// acquire/release. **Note:** cleanup mutates the detector (same as
+    /// `detect_deadlock`) — UI polls are not pure reads.
     pub fn from_detector(detector: &DeadlockDetector) -> Self {
-        let status = detector.detect_deadlock();
-        let (deadlock, cycle, resources) = match status {
+        Self::from_detector_with_cleanup(detector, true)
+    }
+
+    /// Collect with an explicit cleanup flag.
+    ///
+    /// - `cleanup = true`: purge expired holds/waits then snapshot (UI default).
+    /// - `cleanup = false`: pure read of the current graph (may include expired edges).
+    pub fn from_detector_with_cleanup(detector: &DeadlockDetector, cleanup: bool) -> Self {
+        let view = detector.collect_consistent_view(cleanup);
+        let (deadlock, cycle, resources) = match view.status {
             DeadlockStatus::Deadlock { cycle, resources } => {
                 let cycle: Vec<String> = cycle
                     .iter()
@@ -90,31 +115,36 @@ impl DeadlockUiSnapshot {
             }
             DeadlockStatus::NoDeadlock => (false, Vec::new(), Vec::new()),
         };
-        let stats = detector.get_stats();
-        let snap = detector.export_snapshot();
         Self {
             enabled: true,
             deadlock,
             cycle,
             resources,
-            held_locks_count: stats.held_locks_count,
-            waiting_clients_count: stats.waiting_clients_count,
-            wait_graph_edges: stats.wait_graph_edges,
-            held: snap
+            held_locks_count: view.stats.held_locks_count,
+            waiting_clients_count: view.stats.waiting_clients_count,
+            wait_graph_edges: view.stats.wait_graph_edges,
+            held: view
+                .snapshot
                 .held
                 .into_iter()
                 .map(|h| (h.resource, h.client_id, h.ttl_ms, h.held_for_ms))
                 .collect(),
-            waits: snap
+            waits: view
+                .snapshot
                 .waits
                 .into_iter()
                 .map(|w| (w.waiter, w.holder, w.resource, w.wait_elapsed_ms))
                 .collect(),
-            orphan_waits: snap
+            orphan_waits: view
+                .snapshot
                 .orphan_waits
                 .into_iter()
                 .map(|o| (o.waiter, o.resource, o.wait_elapsed_ms))
                 .collect(),
+            max_wait_time_ms: detector.max_wait_time_ms(),
+            auto_resolve: detector.auto_resolve(),
+            victim_strategy: detector.victim_strategy().as_str().to_string(),
+            cleanup_on_collect: cleanup,
         }
     }
 }
@@ -164,6 +194,24 @@ pub fn render_json(snap: &DeadlockUiSnapshot) -> String {
     out.push_str(&format!(
         "    \"wait_graph_edges\": {}\n",
         snap.wait_graph_edges
+    ));
+    out.push_str("  },\n");
+    out.push_str("  \"config\": {\n");
+    out.push_str(&format!(
+        "    \"max_wait_time_ms\": {},\n",
+        snap.max_wait_time_ms
+    ));
+    out.push_str(&format!(
+        "    \"auto_resolve\": {},\n",
+        snap.auto_resolve
+    ));
+    out.push_str(&format!(
+        "    \"victim_strategy\": \"{}\",\n",
+        json_escape(&snap.victim_strategy)
+    ));
+    out.push_str(&format!(
+        "    \"cleanup_on_collect\": {}\n",
+        snap.cleanup_on_collect
     ));
     out.push_str("  },\n");
 
@@ -585,6 +633,33 @@ mod tests {
         let j = render_json(&snap);
         assert!(j.contains("res\\\"x"), "escaped quote missing: {}", j);
         assert!(j.contains("c\\\\1"), "escaped backslash missing: {}", j);
+    }
+
+    #[test]
+    fn json_surfaces_detector_config() {
+        let det = DeadlockDetector::new_with_strategy(
+            12_000,
+            true,
+            crate::deadlock::VictimSelectionStrategy::Oldest,
+        );
+        let snap = DeadlockUiSnapshot::from_detector(&det);
+        assert_eq!(snap.max_wait_time_ms, 12_000);
+        assert!(snap.auto_resolve);
+        assert_eq!(snap.victim_strategy, "oldest");
+        assert!(snap.cleanup_on_collect);
+        let j = render_json(&snap);
+        assert!(j.contains("\"max_wait_time_ms\": 12000"), "json={}", j);
+        assert!(j.contains("\"auto_resolve\": true"), "json={}", j);
+        assert!(j.contains("\"victim_strategy\": \"oldest\""), "json={}", j);
+        assert!(j.contains("\"cleanup_on_collect\": true"), "json={}", j);
+    }
+
+    #[test]
+    fn pure_read_collect_skips_cleanup_flag() {
+        let det = DeadlockDetector::new(30_000, false);
+        let snap = DeadlockUiSnapshot::from_detector_with_cleanup(&det, false);
+        assert!(snap.enabled);
+        assert!(!snap.cleanup_on_collect);
     }
 
     #[tokio::test(flavor = "multi_thread")]

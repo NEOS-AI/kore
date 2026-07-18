@@ -144,6 +144,45 @@ pub enum VictimSelectionStrategy {
     FewestLocks,
 }
 
+impl VictimSelectionStrategy {
+    /// Stable CLI / JSON name (`youngest`, `oldest`, `fewest-locks`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Youngest => "youngest",
+            Self::Oldest => "oldest",
+            Self::FewestLocks => "fewest-locks",
+        }
+    }
+}
+
+impl std::str::FromStr for VictimSelectionStrategy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "youngest" => Ok(Self::Youngest),
+            "oldest" => Ok(Self::Oldest),
+            "fewest-locks" | "fewest_locks" | "fewestlocks" => Ok(Self::FewestLocks),
+            other => Err(format!(
+                "unknown victim strategy '{}'; expected youngest|oldest|fewest-locks",
+                other
+            )),
+        }
+    }
+}
+
+/// Consistent detect + stats + export collected under one critical section.
+///
+/// Produced by [`DeadlockDetector::collect_consistent_view`]. Cycle, stats, and
+/// graph fields all reflect the same point-in-time graph (no TOCTOU between
+/// detect and export).
+#[derive(Debug, Clone)]
+pub struct ConsistentDeadlockView {
+    pub status: DeadlockStatus,
+    pub stats: DeadlockStats,
+    pub snapshot: DeadlockGraphSnapshot,
+}
+
 /// Wait-for graph edge
 #[derive(Debug, Clone)]
 struct WaitEdge {
@@ -219,7 +258,12 @@ impl DeadlockDetector {
     pub fn auto_resolve(&self) -> bool {
         self.auto_resolve
     }
-    
+
+    /// Maximum wait time (ms) used for expired-wait cleanup and long-wait checks.
+    pub fn max_wait_time_ms(&self) -> u64 {
+        self.max_wait_time_ms
+    }
+
     /// Record a lock acquisition.
     ///
     /// Single write critical section (lock order: `held_locks` →
@@ -357,37 +401,82 @@ impl DeadlockDetector {
         self.wait_graph.write().retain(|edge| edge.waiter != *client_id);
     }
     
-    /// Detect deadlocks using cycle detection in wait-for graph
+    /// Detect deadlocks using cycle detection in wait-for graph.
+    ///
+    /// Runs [`Self::cleanup_expired_locks`] first (mutates the graph), then
+    /// cycle-detects under a wait-graph read lock. For a single consistent
+    /// detect + stats + export (e.g. UI polls), prefer
+    /// [`Self::collect_consistent_view`].
     pub fn detect_deadlock(&self) -> DeadlockStatus {
         // Clean up expired locks first
         self.cleanup_expired_locks();
-        
-        // Build adjacency list for wait-for graph
+
         let graph = self.wait_graph.read();
+        Self::detect_from_graph(&graph)
+    }
+
+    /// Collect detect status, stats, and export under **one** critical section.
+    ///
+    /// Lock order: `held_locks` → `waiting_for` → `wait_graph`.
+    ///
+    /// - `cleanup = true` (UI default): purge expired holds/waits under write
+    ///   locks, then detect + export while still holding — same cleanup side
+    ///   effect as [`Self::detect_deadlock`], but cycle/stats/graph cannot
+    ///   diverge under concurrent acquire/release.
+    /// - `cleanup = false`: pure read of the current maps (no mutation).
+    ///   Expired edges may still appear until a later cleanup detect.
+    pub fn collect_consistent_view(&self, cleanup: bool) -> ConsistentDeadlockView {
+        if cleanup {
+            let mut held = self.held_locks.write();
+            let mut waiting = self.waiting_for.write();
+            let mut graph = self.wait_graph.write();
+            Self::cleanup_expired_into(
+                &mut held,
+                &mut waiting,
+                &mut graph,
+                self.max_wait_time_ms,
+            );
+            ConsistentDeadlockView {
+                status: Self::detect_from_graph(&graph),
+                stats: Self::stats_from_maps(&held, &waiting, &graph),
+                snapshot: Self::export_from_maps(&held, &waiting, &graph),
+            }
+        } else {
+            let held = self.held_locks.read();
+            let waiting = self.waiting_for.read();
+            let graph = self.wait_graph.read();
+            ConsistentDeadlockView {
+                status: Self::detect_from_graph(&graph),
+                stats: Self::stats_from_maps(&held, &waiting, &graph),
+                snapshot: Self::export_from_maps(&held, &waiting, &graph),
+            }
+        }
+    }
+
+    /// Cycle detection over an already-locked wait-graph slice.
+    fn detect_from_graph(graph: &[WaitEdge]) -> DeadlockStatus {
         let mut adjacency: HashMap<Bytes, Vec<(Bytes, String)>> = HashMap::new();
-        
+
         for edge in graph.iter() {
             adjacency
                 .entry(edge.waiter.clone())
                 .or_insert_with(Vec::new)
                 .push((edge.holder.clone(), edge.resource.clone()));
         }
-        
-        // Detect cycles using DFS
+
         let all_clients: HashSet<Bytes> = adjacency.keys().cloned().collect();
-        
+
         for start_client in all_clients.iter() {
-            if let Some((cycle, resources)) = self.find_cycle_dfs(start_client, &adjacency) {
+            if let Some((cycle, resources)) = Self::find_cycle_dfs(start_client, &adjacency) {
                 return DeadlockStatus::Deadlock { cycle, resources };
             }
         }
-        
+
         DeadlockStatus::NoDeadlock
     }
-    
+
     /// Find cycle using depth-first search
     fn find_cycle_dfs(
-        &self,
         start: &Bytes,
         adjacency: &HashMap<Bytes, Vec<(Bytes, String)>>,
     ) -> Option<(Vec<Bytes>, Vec<String>)> {
@@ -395,8 +484,8 @@ impl DeadlockDetector {
         let mut rec_stack = HashSet::new();
         let mut path = Vec::new();
         let mut resource_path = Vec::new();
-        
-        if self.dfs_visit(
+
+        if Self::dfs_visit(
             start,
             adjacency,
             &mut visited,
@@ -411,13 +500,12 @@ impl DeadlockDetector {
                 return Some((cycle, resources));
             }
         }
-        
+
         None
     }
-    
+
     /// DFS visit helper
     fn dfs_visit(
-        &self,
         node: &Bytes,
         adjacency: &HashMap<Bytes, Vec<(Bytes, String)>>,
         visited: &mut HashSet<Bytes>,
@@ -428,12 +516,13 @@ impl DeadlockDetector {
         visited.insert(node.clone());
         rec_stack.insert(node.clone());
         path.push(node.clone());
-        
+
         if let Some(neighbors) = adjacency.get(node) {
             for (neighbor, resource) in neighbors {
                 if !visited.contains(neighbor) {
                     resource_path.push(resource.clone());
-                    if self.dfs_visit(neighbor, adjacency, visited, rec_stack, path, resource_path) {
+                    if Self::dfs_visit(neighbor, adjacency, visited, rec_stack, path, resource_path)
+                    {
                         return true;
                     }
                     resource_path.pop();
@@ -444,12 +533,12 @@ impl DeadlockDetector {
                 }
             }
         }
-        
+
         rec_stack.remove(node);
         path.pop();
         false
     }
-    
+
     /// Clean up expired locks and long waits.
     ///
     /// Expired held locks also drop matching wait-graph edges and
@@ -461,7 +550,21 @@ impl DeadlockDetector {
         let mut held = self.held_locks.write();
         let mut waiting = self.waiting_for.write();
         let mut graph = self.wait_graph.write();
+        Self::cleanup_expired_into(
+            &mut held,
+            &mut waiting,
+            &mut graph,
+            self.max_wait_time_ms,
+        );
+    }
 
+    /// In-place expired cleanup under already-held write locks.
+    fn cleanup_expired_into(
+        held: &mut HashMap<String, LockInfo>,
+        waiting: &mut HashMap<Bytes, Vec<LockInfo>>,
+        graph: &mut Vec<WaitEdge>,
+        max_wait_time_ms: u64,
+    ) {
         let mut expired_resources: HashSet<String> = HashSet::new();
         held.retain(|resource, info| {
             if info.is_expired() {
@@ -472,10 +575,9 @@ impl DeadlockDetector {
             }
         });
 
-        let max_wait = Duration::from_millis(self.max_wait_time_ms);
+        let max_wait = Duration::from_millis(max_wait_time_ms);
         graph.retain(|edge| {
-            !expired_resources.contains(&edge.resource)
-                && edge.timestamp.elapsed() < max_wait
+            !expired_resources.contains(&edge.resource) && edge.timestamp.elapsed() < max_wait
         });
 
         waiting.retain(|_, wait_list| {
@@ -485,28 +587,85 @@ impl DeadlockDetector {
             !wait_list.is_empty()
         });
     }
-    
+
+    fn stats_from_maps(
+        held: &HashMap<String, LockInfo>,
+        waiting: &HashMap<Bytes, Vec<LockInfo>>,
+        graph: &[WaitEdge],
+    ) -> DeadlockStats {
+        DeadlockStats {
+            held_locks_count: held.len(),
+            waiting_clients_count: waiting.len(),
+            wait_graph_edges: graph.len(),
+        }
+    }
+
+    fn export_from_maps(
+        held: &HashMap<String, LockInfo>,
+        waiting: &HashMap<Bytes, Vec<LockInfo>>,
+        graph: &[WaitEdge],
+    ) -> DeadlockGraphSnapshot {
+        let held_snaps: Vec<HeldLockSnapshot> = held
+            .values()
+            .map(|info| HeldLockSnapshot {
+                resource: info.resource.clone(),
+                client_id: client_id_to_string(&info.client_id),
+                ttl_ms: info.ttl_ms,
+                held_for_ms: info.timestamp.elapsed().as_millis() as u64,
+            })
+            .collect();
+
+        let wait_snaps: Vec<WaitEdgeSnapshot> = graph
+            .iter()
+            .map(|edge| WaitEdgeSnapshot {
+                waiter: client_id_to_string(&edge.waiter),
+                holder: client_id_to_string(&edge.holder),
+                resource: edge.resource.clone(),
+                wait_elapsed_ms: edge.timestamp.elapsed().as_millis() as u64,
+            })
+            .collect();
+
+        // Orphan waits: in waiting_for but no corresponding wait-graph edge.
+        let mut orphan_waits: Vec<OrphanWaitSnapshot> = Vec::new();
+        for (waiter, wait_list) in waiting.iter() {
+            for info in wait_list {
+                let has_edge = graph
+                    .iter()
+                    .any(|e| e.waiter == *waiter && e.resource == info.resource);
+                if !has_edge {
+                    orphan_waits.push(OrphanWaitSnapshot {
+                        waiter: client_id_to_string(waiter),
+                        resource: info.resource.clone(),
+                        wait_elapsed_ms: info.timestamp.elapsed().as_millis() as u64,
+                    });
+                }
+            }
+        }
+
+        DeadlockGraphSnapshot {
+            held: held_snaps,
+            waits: wait_snaps,
+            orphan_waits,
+            source_id: None,
+        }
+    }
+
     /// Get all currently held locks
     pub fn get_held_locks(&self) -> Vec<LockInfo> {
         self.held_locks.read().values().cloned().collect()
     }
-    
+
     /// Get all waiting clients
     pub fn get_waiting_clients(&self) -> HashMap<Bytes, Vec<LockInfo>> {
         self.waiting_for.read().clone()
     }
-    
+
     /// Get deadlock statistics
     pub fn get_stats(&self) -> DeadlockStats {
-        let held_count = self.held_locks.read().len();
-        let waiting_count = self.waiting_for.read().len();
-        let wait_edges = self.wait_graph.read().len();
-        
-        DeadlockStats {
-            held_locks_count: held_count,
-            waiting_clients_count: waiting_count,
-            wait_graph_edges: wait_edges,
-        }
+        let held = self.held_locks.read();
+        let waiting = self.waiting_for.read();
+        let graph = self.wait_graph.read();
+        Self::stats_from_maps(&held, &waiting, &graph)
     }
     
     /// Resolve deadlock by selecting a victim according to the configured strategy.
@@ -672,54 +831,15 @@ impl DeadlockDetector {
     ///
     /// Waits that have no wait-graph edge yet (holder unknown locally) are
     /// exported as [`OrphanWaitSnapshot`] so peers can re-link them.
+    ///
+    /// Acquires all three maps under one critical section (lock order:
+    /// `held_locks` → `waiting_for` → `wait_graph`). For detect + export
+    /// together, use [`Self::collect_consistent_view`].
     pub fn export_snapshot(&self) -> DeadlockGraphSnapshot {
         let held = self.held_locks.read();
         let waiting = self.waiting_for.read();
         let graph = self.wait_graph.read();
-
-        let held_snaps: Vec<HeldLockSnapshot> = held
-            .values()
-            .map(|info| HeldLockSnapshot {
-                resource: info.resource.clone(),
-                client_id: client_id_to_string(&info.client_id),
-                ttl_ms: info.ttl_ms,
-                held_for_ms: info.timestamp.elapsed().as_millis() as u64,
-            })
-            .collect();
-
-        let wait_snaps: Vec<WaitEdgeSnapshot> = graph
-            .iter()
-            .map(|edge| WaitEdgeSnapshot {
-                waiter: client_id_to_string(&edge.waiter),
-                holder: client_id_to_string(&edge.holder),
-                resource: edge.resource.clone(),
-                wait_elapsed_ms: edge.timestamp.elapsed().as_millis() as u64,
-            })
-            .collect();
-
-        // Orphan waits: in waiting_for but no corresponding wait-graph edge.
-        let mut orphan_waits: Vec<OrphanWaitSnapshot> = Vec::new();
-        for (waiter, wait_list) in waiting.iter() {
-            for info in wait_list {
-                let has_edge = graph
-                    .iter()
-                    .any(|e| e.waiter == *waiter && e.resource == info.resource);
-                if !has_edge {
-                    orphan_waits.push(OrphanWaitSnapshot {
-                        waiter: client_id_to_string(waiter),
-                        resource: info.resource.clone(),
-                        wait_elapsed_ms: info.timestamp.elapsed().as_millis() as u64,
-                    });
-                }
-            }
-        }
-
-        DeadlockGraphSnapshot {
-            held: held_snaps,
-            waits: wait_snaps,
-            orphan_waits,
-            source_id: None,
-        }
+        Self::export_from_maps(&held, &waiting, &graph)
     }
 
     /// Merge a remote process's wait-for graph into this detector.
@@ -2074,5 +2194,72 @@ mod tests {
             0,
             "edges naming victim as holder must be pruned"
         );
+    }
+
+    #[test]
+    fn test_victim_strategy_from_str() {
+        assert_eq!(
+            "youngest".parse::<VictimSelectionStrategy>().unwrap(),
+            VictimSelectionStrategy::Youngest
+        );
+        assert_eq!(
+            "oldest".parse::<VictimSelectionStrategy>().unwrap(),
+            VictimSelectionStrategy::Oldest
+        );
+        assert_eq!(
+            "fewest-locks".parse::<VictimSelectionStrategy>().unwrap(),
+            VictimSelectionStrategy::FewestLocks
+        );
+        assert_eq!(
+            "fewest_locks".parse::<VictimSelectionStrategy>().unwrap(),
+            VictimSelectionStrategy::FewestLocks
+        );
+        assert!("nope".parse::<VictimSelectionStrategy>().is_err());
+        assert_eq!(VictimSelectionStrategy::FewestLocks.as_str(), "fewest-locks");
+    }
+
+    /// collect_consistent_view: cycle, stats, and export agree under one hold.
+    #[test]
+    fn test_collect_consistent_view_matches_cycle_and_export() {
+        let detector = DeadlockDetector::new(30_000, false);
+        let c1 = Bytes::from("cv-c1");
+        let c2 = Bytes::from("cv-c2");
+        detector.record_lock_acquired("cv-a".into(), c1.clone(), 10_000);
+        detector.record_lock_acquired("cv-b".into(), c2.clone(), 10_000);
+        detector.record_lock_wait("cv-b".into(), c1.clone(), 10_000);
+        detector.record_lock_wait("cv-a".into(), c2.clone(), 10_000);
+
+        let view = detector.collect_consistent_view(true);
+        match &view.status {
+            DeadlockStatus::Deadlock { cycle, resources } => {
+                assert!(cycle.contains(&c1) && cycle.contains(&c2));
+                assert!(resources.iter().any(|r| r == "cv-a"));
+                assert!(resources.iter().any(|r| r == "cv-b"));
+            }
+            DeadlockStatus::NoDeadlock => panic!("expected deadlock"),
+        }
+        assert_eq!(view.stats.held_locks_count, 2);
+        assert_eq!(view.stats.wait_graph_edges, 2);
+        assert_eq!(view.snapshot.held.len(), 2);
+        assert_eq!(view.snapshot.waits.len(), 2);
+        // Pure-read path also sees the cycle (no cleanup needed for fresh locks).
+        let pure = detector.collect_consistent_view(false);
+        assert!(matches!(pure.status, DeadlockStatus::Deadlock { .. }));
+        assert_eq!(pure.stats.held_locks_count, view.stats.held_locks_count);
+    }
+
+    /// cleanup=true drops expired holds so view stats match post-cleanup graph.
+    #[test]
+    fn test_collect_consistent_view_cleanup_drops_expired() {
+        let detector = DeadlockDetector::new(30_000, false);
+        let c = Bytes::from("exp-c");
+        detector.record_lock_acquired("exp-res".into(), c, 1); // 1ms TTL
+        std::thread::sleep(Duration::from_millis(5));
+        let view = detector.collect_consistent_view(true);
+        assert_eq!(view.stats.held_locks_count, 0);
+        assert!(view.snapshot.held.is_empty());
+        // After cleanup above the maps are empty for pure-read too.
+        let pure = detector.collect_consistent_view(false);
+        assert_eq!(pure.stats.held_locks_count, 0);
     }
 }

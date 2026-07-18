@@ -157,12 +157,26 @@ impl Redlock {
                 config.fair_queue_max_size, config.fair_queue_cleanup_ms
             );
         }
-        // Auto-enable deadlock detection when the monitoring Web UI is requested so
-        // the UI has a live detector. Default: max_wait 30s, auto_resolve off.
-        if config.deadlock_ui_port != 0 {
-            redlock = redlock.with_deadlock_detection(30_000, false);
+        // Deadlock detection: explicit `--enable-deadlock-detection`, or
+        // auto-attach when UI port is set so the dashboard has a live graph
+        // (back-compat). Params come from dedicated CLI flags (not hardcoded).
+        let enable_detection =
+            config.enable_deadlock_detection || config.deadlock_ui_port != 0;
+        if enable_detection {
+            let strategy = config
+                .deadlock_victim_strategy
+                .parse::<VictimSelectionStrategy>()
+                .unwrap_or(VictimSelectionStrategy::Youngest);
+            redlock = redlock.with_deadlock_detection_strategy(
+                config.deadlock_max_wait_ms,
+                config.deadlock_auto_resolve,
+                strategy,
+            );
             info!(
-                "Deadlock detection enabled for Web UI on 127.0.0.1:{}",
+                "Deadlock detection enabled: max_wait_ms={} auto_resolve={} strategy={} ui_port={}",
+                config.deadlock_max_wait_ms,
+                config.deadlock_auto_resolve,
+                strategy.as_str(),
                 config.deadlock_ui_port
             );
         }

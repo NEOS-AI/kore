@@ -374,15 +374,12 @@ Also tracked in `docs/roadmap.md`.
     - *Done (Batch DE)*: on acquire, rewrite/drop edges for that resource and re-link `waiting_for` (mirror merge steps 2+5); tests `test_record_lock_acquired_rewrites_holders_and_relinks_waits`, `test_release_then_acquire_relinks_waiters`.
   - [x] **`[P2]`** Web UI monitoring
     - *Done (Batch DF, MVP)*: `--deadlock-ui-port` (default 0=off) serves hand-rolled HTML (`/`, `/deadlock`) + JSON (`/api/deadlock`, `/deadlock.json`) on `127.0.0.1` only; shares Redlock detector (auto-enabled when UI port set + redlock on); disabled state when no detector; unit/HTTP tests with planted cycle; docs.
-  - [ ] **`[P2]`** **Code review (DF post-ship):** UI snapshot not atomic; detect side-effects on poll
-    - *Found*: `DeadlockUiSnapshot::from_detector` calls `detect_deadlock()` (which runs `cleanup_expired_locks`), then `get_stats()`, then `export_snapshot()` under **separate** lock acquisitions. Concurrent acquire/release can yield cycle≠held/waits mismatch; docs claim “read-only” but each poll mutates via cleanup.
-    - *Next*: single critical-section collect (or export-then-detect on one consistent graph copy); document cleanup-on-poll; optional pure read path for UI.
-  - [ ] **`[P2]`** **Code review (DF post-ship):** no CLI for deadlock params; UI hardcodes detector
-    - *Found*: `Redlock::from_config` only enables detection when `deadlock_ui_port != 0`, with fixed `max_wait=30_000`, `auto_resolve=false`. No `--enable-deadlock-detection` / strategy / auto-resolve flags; cannot run detector without UI, or UI+auto-resolve, without code changes.
-    - *Next*: explicit CLI flags (or CONFIG) for enable / max-wait / auto-resolve / strategy; UI port only binds HTTP; surface params in JSON.
-  - [ ] **`[P3]`** **Code review (DF post-ship):** no `from_config` wiring test for UI auto-enable
-    - *Found*: unit tests cover server + planted cycle + disabled `None` detector, but nothing asserts `Redlock::from_config` with `--deadlock-ui-port` attaches a detector (or that port=0 leaves detection off).
-    - *Next*: integration test in `redlock_wiring_test` (or similar) for UI-port → detector present / absent.
+  - [x] **`[P2]`** **Code review (DF post-ship):** UI snapshot not atomic; detect side-effects on poll
+    - *Done (Batch DG)*: `DeadlockDetector::collect_consistent_view(cleanup)` — single critical section (held → waiting → graph); optional pure-read (`cleanup=false`); UI uses cleanup=true; docs honest about cleanup-on-poll; JSON `config.cleanup_on_collect`.
+  - [x] **`[P2]`** **Code review (DF post-ship):** no CLI for deadlock params; UI hardcodes detector
+    - *Done (Batch DG)*: `--enable-deadlock-detection`, `--deadlock-max-wait-ms`, `--deadlock-auto-resolve`, `--deadlock-victim-strategy`; UI port still auto-attaches for back-compat but params come from flags; JSON surfaces `config.{max_wait_time_ms,auto_resolve,victim_strategy}`.
+  - [x] **`[P3]`** **Code review (DF post-ship):** no `from_config` wiring test for UI auto-enable
+    - *Done (Batch DG)*: `tests/redlock_wiring_test.rs` — off-by-default, enable flag + params, UI-port auto-attach, port=0+off → no detector.
   - [ ] **`[P3]`** **Code review (DF post-ship):** JS poll only updates status badge
     - *Found*: 5s `fetch('/api/deadlock')` rewrites `.badge` class/text only; held/wait tables rely on full meta-refresh. If meta-refresh is blocked, tables go stale while badge updates.
     - *Next*: repaint tables from JSON or drop dual refresh paths; document meta-refresh dependency.
@@ -617,7 +614,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batches CZ–DE shipped** (victim strategies; async/monitor; Redlock auto-resolve; cross-process snapshot; Lock Drop safety + merge re-link; atomic release + no self-waits + local acquire re-link). **Open next:** Web UI; standing tests-for-phase P0; optional larger-N HNSW recall.
+Prioritized for next letter batch(es). **Batches CZ–DG shipped** (victim strategies; async/monitor; Redlock auto-resolve; cross-process snapshot; Lock Drop safety + merge re-link; atomic release + no self-waits + local acquire re-link; Web UI + atomic snapshot/CLI params). **Open next:** standing tests-for-phase P0; deferred DF P3 (JS full repaint; HTTP MVP gaps); optional larger-N HNSW recall.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -684,6 +681,12 @@ Prioritized for next letter batch(es). **Batches CZ–DE shipped** (victim strat
 | P1 | DD post-ship: atomic record_lock_released + holder-scoped edge prune | done (DE) |
 | P1 | DD post-ship: merge holder rewrite must not create self-waits | done (DE) |
 | P2 | DD post-ship: record_lock_acquired rewrites holders + re-links waits | done (DE) |
+| P2 | DF Web UI monitoring MVP | done (DF) |
+| P2 | DF post-ship: atomic UI snapshot + cleanup-on-poll docs | done (DG) |
+| P2 | DF post-ship: deadlock CLI params (enable/max-wait/auto-resolve/strategy) | done (DG) |
+| P3 | DF post-ship: from_config UI/detection wiring tests | done (DG) |
+| P3 | DF post-ship: JS poll only updates badge | open |
+| P3 | DF post-ship: HTTP MVP gaps shared with metrics | open |
 | P2 | CP post-ship: LOADING allowlist PSYNC/SYNC mid-install visibility | done (CR) |
 | P2 | CC post-ship: typed export skip expired keys (no revive without TTL) | done (CD) |
 | P2 | CC nit: unify start_background_sweep create paths | done (CD) |

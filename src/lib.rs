@@ -64,8 +64,8 @@ pub use stream_type::{
 pub use geospatial::{GeoSet, GeoPoint, DistanceUnit};
 pub use redlock::{LocalCacheBackend, Lock, LockBackend, Redlock, RespBackend};
 pub use deadlock::{
-    DeadlockDetector, DeadlockGraphSnapshot, DeadlockStatus, HeldLockSnapshot, LockInfo,
-    OrphanWaitSnapshot, VictimSelectionStrategy, WaitEdgeSnapshot,
+    ConsistentDeadlockView, DeadlockDetector, DeadlockGraphSnapshot, DeadlockStatus,
+    HeldLockSnapshot, LockInfo, OrphanWaitSnapshot, VictimSelectionStrategy, WaitEdgeSnapshot,
 };
 pub use deadlock_ui::{
     render_html as render_deadlock_html, render_json as render_deadlock_json,

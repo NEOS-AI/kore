@@ -128,8 +128,32 @@ pub struct Config {
 
     /// Deadlock monitoring Web UI HTTP port bound to 127.0.0.1 (0 = disabled).
     /// Serves HTML at `/` and JSON at `/api/deadlock`. Localhost-only; no auth.
+    /// Binds HTTP only — does not by itself configure detector params (see
+    /// `--enable-deadlock-detection` / `--deadlock-max-wait-ms` / etc.). When
+    /// non-zero and Redlock is on, a detector is still auto-attached for a live
+    /// graph (back-compat) using the deadlock-* param flags.
     #[arg(long, default_value = "0")]
     pub deadlock_ui_port: u16,
+
+    /// Enable Redlock deadlock detection (wait-for graph) independent of the UI.
+    /// Also auto-enabled when `--deadlock-ui-port` is non-zero (so the UI has a
+    /// live detector). Requires `--enable-redlock`.
+    #[arg(long, default_value = "false")]
+    pub enable_deadlock_detection: bool,
+
+    /// Max wait time in ms for deadlock wait-edge cleanup / long-wait checks
+    /// (default: 30000). Applied when detection is enabled.
+    #[arg(long, default_value = "30000")]
+    pub deadlock_max_wait_ms: u64,
+
+    /// Automatically resolve deadlocks by releasing a victim's locks (default: false).
+    #[arg(long, default_value = "false")]
+    pub deadlock_auto_resolve: bool,
+
+    /// Victim selection strategy when auto-resolving: `youngest` (default),
+    /// `oldest`, or `fewest-locks`.
+    #[arg(long, default_value = "youngest", value_parser = ["youngest", "oldest", "fewest-locks"])]
+    pub deadlock_victim_strategy: String,
 
     /// Enable TLS for client connections (default: false).
     #[arg(long, default_value = "false")]
@@ -189,6 +213,10 @@ impl Default for Config {
             databases: 16,
             metrics_port: 0,
             deadlock_ui_port: 0,
+            enable_deadlock_detection: false,
+            deadlock_max_wait_ms: 30_000,
+            deadlock_auto_resolve: false,
+            deadlock_victim_strategy: "youngest".to_string(),
             tls: false,
             tls_cert: String::new(),
             tls_key: String::new(),
@@ -347,6 +375,34 @@ impl Config {
             }
         }
 
+        // Deadlock detection needs Redlock (UI may still bind without it).
+        let deadlock_requested =
+            self.enable_deadlock_detection || self.deadlock_ui_port != 0;
+        if deadlock_requested && !self.enable_redlock {
+            // Soft: UI can start disabled; only fail when detection was
+            // explicitly requested without Redlock.
+            if self.enable_deadlock_detection {
+                return Err(Error::ConfigError(
+                    "enable_deadlock_detection requires enable_redlock".to_string(),
+                ));
+            }
+        }
+        if deadlock_requested && self.deadlock_max_wait_ms == 0 {
+            return Err(Error::ConfigError(
+                "deadlock_max_wait_ms cannot be 0".to_string(),
+            ));
+        }
+        // clap value_parser already restricts strategy; re-check for Default/mutate paths.
+        if !matches!(
+            self.deadlock_victim_strategy.as_str(),
+            "youngest" | "oldest" | "fewest-locks"
+        ) {
+            return Err(Error::ConfigError(format!(
+                "deadlock_victim_strategy must be youngest|oldest|fewest-locks, got {}",
+                self.deadlock_victim_strategy
+            )));
+        }
+
         // Validate TLS configuration
         if self.tls {
             if self.tls_cert.is_empty() {
@@ -469,6 +525,10 @@ mod tests {
     fn deadlock_ui_port_defaults_to_zero() {
         let c = Config::try_parse_from(["kore"]).expect("default parse");
         assert_eq!(c.deadlock_ui_port, 0);
+        assert!(!c.enable_deadlock_detection);
+        assert_eq!(c.deadlock_max_wait_ms, 30_000);
+        assert!(!c.deadlock_auto_resolve);
+        assert_eq!(c.deadlock_victim_strategy, "youngest");
     }
 
     #[test]
@@ -476,6 +536,42 @@ mod tests {
         let c = Config::try_parse_from(["kore", "--deadlock-ui-port", "9101"])
             .expect("deadlock-ui-port parse");
         assert_eq!(c.deadlock_ui_port, 9101);
+    }
+
+    #[test]
+    fn deadlock_detection_flags_parse() {
+        let c = Config::try_parse_from([
+            "kore",
+            "--enable-deadlock-detection",
+            "--deadlock-max-wait-ms",
+            "15000",
+            "--deadlock-auto-resolve",
+            "--deadlock-victim-strategy",
+            "fewest-locks",
+        ])
+        .expect("deadlock flags parse");
+        assert!(c.enable_deadlock_detection);
+        assert_eq!(c.deadlock_max_wait_ms, 15_000);
+        assert!(c.deadlock_auto_resolve);
+        assert_eq!(c.deadlock_victim_strategy, "fewest-locks");
+    }
+
+    #[test]
+    fn deadlock_victim_strategy_rejects_unknown() {
+        let err = Config::try_parse_from(["kore", "--deadlock-victim-strategy", "random"]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn enable_deadlock_detection_requires_redlock() {
+        let mut c = Config::default();
+        c.enable_deadlock_detection = true;
+        let err = c.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("enable_deadlock_detection"),
+            "got: {}",
+            err
+        );
     }
 }
 
