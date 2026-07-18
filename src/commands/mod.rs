@@ -578,6 +578,12 @@ impl CommandHandler {
             return Ok(RespValue::error("NOAUTH Authentication required"));
         }
 
+        // Multi-DB keyspace replace in progress (AOF/RDB commit): Redis-style
+        // LOADING for most commands so clients do not observe torn multi-DB state.
+        if let Some(loading) = self.loading_denied(cmd_upper) {
+            return Ok(loading);
+        }
+
         // ACL: command + key permission checks (after auth)
         if let Some(deny) = self.check_acl_permission(cmd_upper, &args[1..]) {
             return Ok(deny);
@@ -1010,6 +1016,25 @@ impl CommandHandler {
         }
 
         result
+    }
+
+    /// Redis-style `-LOADING` while multi-DB keyspace replace is in progress.
+    ///
+    /// Allows auth/handshake/info/replication control so clients and replicas
+    /// can still probe the server. Data-plane commands are rejected so they
+    /// do not observe a mid-install multi-DB tear.
+    fn loading_denied(&self, cmd_upper: &str) -> Option<RespValue> {
+        if !self.databases.load_in_progress() {
+            return None;
+        }
+        match cmd_upper {
+            // Connection / discovery / replication control during load.
+            "AUTH" | "HELLO" | "PING" | "ECHO" | "QUIT" | "RESET" | "INFO" | "COMMAND"
+            | "ROLE" | "REPLCONF" | "PSYNC" | "SYNC" | "CLIENT" | "CONFIG" | "MODULE" => None,
+            _ => Some(RespValue::error(
+                "LOADING Redis is loading the dataset in memory",
+            )),
+        }
     }
 
     /// Check ACL command + key + channel permissions for the authenticated user.

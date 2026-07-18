@@ -1017,16 +1017,19 @@ impl CommandHandler {
 
     /// Redis-compatible `# Persistence` section.
     fn persistence_info_section(&self) -> String {
-        let (loading, rdb_changes, rdb_last_save, aof_enabled) =
-            match self.persistence.as_ref() {
-                Some(p) => (
-                    0u64,
-                    p.dirty_changes(),
-                    p.last_save_unix(),
-                    if p.appendonly() { 1 } else { 0 },
-                ),
-                None => (0, 0, 0, 0),
-            };
+        let loading = if self.databases().load_in_progress() {
+            1u64
+        } else {
+            0
+        };
+        let (rdb_changes, rdb_last_save, aof_enabled) = match self.persistence.as_ref() {
+            Some(p) => (
+                p.dirty_changes(),
+                p.last_save_unix(),
+                if p.appendonly() { 1 } else { 0 },
+            ),
+            None => (0, 0, 0),
+        };
         format!(
             "loading:{}\r\n\
              async_loading:0\r\n\

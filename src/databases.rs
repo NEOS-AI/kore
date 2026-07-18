@@ -133,6 +133,34 @@ impl Databases {
         self.load_in_progress.load(Ordering::Acquire)
     }
 
+    /// Run `f` while [`load_in_progress`] is forced true (tests / probes).
+    ///
+    /// Restores the previous flag on drop (panic-safe). Does **not** bump
+    /// [`load_generation`] (unlike a real replace).
+    pub fn with_load_in_progress_flag<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let prev = self.load_in_progress.load(Ordering::Acquire);
+        self.load_in_progress.store(true, Ordering::Release);
+        struct Restore<'a> {
+            dbs: &'a Databases,
+            prev: bool,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.dbs
+                    .load_in_progress
+                    .store(self.prev, Ordering::Release);
+            }
+        }
+        let _g = Restore {
+            dbs: self,
+            prev,
+        };
+        f()
+    }
+
     /// Move full keyspace state of every DB from `other` into `self`.
     ///
     /// **Exclusive access required** (see [`Cache::replace_keyspace_from`]).

@@ -439,7 +439,8 @@ Also tracked in `docs/roadmap.md`.
   - *Partial (Batch CC)*: whole replace loop under multi-DB autosweep pause.
   - *Partial (Batch CF)*: staged drain of all sources before any target install; multi-DB tests.
   - *Partial (Batch CH)*: multi-DB AOF/RDB commit **no longer pre-flushes** all DBs before install — mid-install panic leaves remaining DBs with **pre-load** data (not empty). Single-DB `load_bytes` still pre-flushes for peak memory.
-  - *Partial (Batch CJ)*: `Databases::load_generation` / `load_in_progress` around `replace_keyspaces_from` (start+end bumps; drop-safe). Docs note ~2× peak dual-residency and exclusive-access requirement. True cross-DB atomic publish for concurrent readers still open (server-wide reader barrier). Tests: `tests/cj_load_gen_and_memory_test.rs`.
+  - *Partial (Batch CJ)*: `Databases::load_generation` / `load_in_progress` around `replace_keyspaces_from` (start+end bumps; drop-safe). Docs note ~2× peak dual-residency and exclusive-access requirement. Tests: `tests/cj_load_gen_and_memory_test.rs`.
+  - *Done (Batch CK, reader gate)*: command path returns Redis-style `-LOADING` while `load_in_progress` (data-plane denied; PING/INFO/auth/repl control allowed); `INFO persistence` `loading:0|1` reflects the flag. True lock-step atomic publish of all DBs still open. Tests: `tests/ck_loading_gate_test.rs`.
 - [x] **`[P1]`** **Code review (CC post-ship):** WATCH bump not atomic with keyspace install (race window)
   - *Found*: `replace_keyspace_from` installs scratch `watch_gens` (usually empty) and releases the lock, then later bumps `pre_watch_keys`. Between those steps `watch_generation` can `or_insert(0)` so a client that WATCHed at gen 0 sees clean EXEC against new/empty data. On `flush=true` the clean window spans flush (which does not touch watch_gens) through end of replace.
   - *Done (Batch CD)*: under one `watch_gens` lock, install `other_watch` and bump all `pre_watch_keys`; AOF/RDB `flush=true` commit calls `touch_all_watch_keys` before flush. Tests: `tests/cd_watch_atomic_and_typed_export_test.rs`.
@@ -459,7 +460,8 @@ Also tracked in `docs/roadmap.md`.
   - *Partial (Batch CC)*: seed non-mutation + autosweep restore + sequential WATCH + flush=true replace covered in `cc_load_*`.
   - *Partial (Batch CF)*: multi-DB RDB/AOF fail preserve both DBs + flush=true success updates both DBs (`cf_multidb_*`).
   - *Partial (Batch CG)*: FT.SEARCH after schema-equal name-clash merge + divergent prefix / alias retarget fail cases.
-  - *Partial (Batch CJ)*: post-swap `string_memory_usage` match; multi-DB `flush=false` merge preserves other DB; empty-AOF success replaces non-empty target; load_generation bumps. Still open: typed TTL after swap; pubsub non-clobber; peak-memory budget; concurrent WATCH race.
+  - *Partial (Batch CJ)*: post-swap `string_memory_usage` match; multi-DB `flush=false` merge preserves other DB; empty-AOF success replaces non-empty target; load_generation bumps.
+  - *Partial (Batch CK)*: typed TTL survives RDB snapshot replace; LOADING gate tests. Still open: pubsub non-clobber unit; peak-memory budget; concurrent WATCH race under load.
 - [ ] **`[P2]`** **Code review (CB):** `drain_all` / `replace_all` not fully failure-atomic across shards
   - *Partial (Batch CB)*: pre-`reserve(self.len())` on `ShardedHashMap`/`ShardedKeyMap` `drain_all`; docs note exclusive access. Mid-panic after partial shard drain still drops drained entries; install-half `replace_all` after target drain is the more dangerous path on the live DB (true OOM-abort policy remains open).
 - [x] **`[P2]`** **Code review (CB nit):** `install_keyspace_counts` not closed over `KEYSPACE_CATEGORIES`
@@ -494,7 +496,8 @@ Also tracked in `docs/roadmap.md`.
   - *Done*: in-tree smoke fuzz unit tests (random + structured); `fuzz/` crate with `resp_parse` + `command_dispatch` targets (`cargo +nightly fuzz run …` when cargo-fuzz installed).
 - [x] **`[P1]`** **Concurrency / loom or stress** jobs for shard RMW paths
   - *Done*: `tests/concurrency_stress_test.rs` — concurrent INCR, INCR/DECR net-zero, SET NX single winner, multi-key multi-shard, mixed RMW+reads, hash field RMW under `parking_lot`
-- [ ] **`[P2]`** Align version strings in docs/`INFO` examples with `Cargo.toml` (currently 0.6.0)
+- [x] **`[P2]`** Align version strings in docs/`INFO` examples with `Cargo.toml` (currently 0.6.0)
+  - *Done (Batch CK)*: README `kore_version` examples updated to 0.6.0.
 - [ ] **`[P2]`** Consistent locking and error handling guidelines in contributor docs
 - [ ] **`[P2]`** Keep `docs/roadmap.md` in sync with this file (or make this the single source of truth)
 - [x] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
@@ -502,7 +505,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batch CJ shipped** (multi-DB `load_generation` / `load_in_progress`; post-swap memory + empty-AOF + multi-DB merge tests). **Open:** true multi-DB atomic reader barrier (P1 partial); HNSW benches; min-replicas FT; remaining CB expand / drain failure-atomic.
+Prioritized for next letter batch(es). **Batch CK shipped** (LOADING gate + INFO loading during multi-DB replace; typed-TTL RDB test; README version 0.6.0). **Open:** true multi-DB atomic install (P1 residual); HNSW benches; min-replicas FT; remaining CB expand / drain failure-atomic.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -518,7 +521,7 @@ Prioritized for next letter batch(es). **Batch CJ shipped** (multi-DB `load_gene
 | P1 | RDB load `flush=true` must wipe FT schema (BY×BX clash) | done (BZ) |
 | P1 | CB: full keyspace swap under quiesce (typed maps, expires, watch) | done (CB) |
 | P1 | CB: `Cache.memory_usage` + tracker paired install (no double-account) | done (CB) |
-| P1 | CB post-ship: multi-DB replace atomic / server-wide quiesce | partial (CJ load_gen; true reader barrier open) |
+| P1 | CB post-ship: multi-DB replace atomic / server-wide quiesce | partial (CK LOADING gate; atomic install open) |
 | P1 | CF post-ship: FT merge compare schema on name clash (not name-only skip) | done (CG) |
 | P1 | CF post-ship: FT alias merge compare targets on clash | done (CG) |
 | P1 | CB post-ship: bump `watch_gens` on keyspace replace | done (CC+CD) |

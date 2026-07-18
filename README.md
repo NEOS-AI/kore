@@ -466,7 +466,7 @@ OK
 
 127.0.0.1:6379> INFO
 # Server
-kore_version:0.1.0
+kore_version:0.6.0
 
 # Stats
 ...
@@ -485,7 +485,7 @@ OK
 
 127.0.0.1:6379> INFO
 # Server
-kore_version:0.1.0
+kore_version:0.6.0
 
 # Stats
 total_commands_processed:7
