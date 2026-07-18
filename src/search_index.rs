@@ -1444,8 +1444,27 @@ mod tests {
             ))
             .unwrap();
         assert!(manager.has_any_state());
-        manager.drop_index("idx").unwrap();
+        manager.alias_add("blog", "idx").unwrap();
+        assert!(manager.has_any_state());
+        manager.drop_index("idx").unwrap(); // drops alias targets too
         assert!(!manager.has_any_state());
+
+        // Alias-only is impossible (alias requires an index); empty after drop.
+        manager
+            .create_index(IndexDefinition::new(
+                "i2".to_string(),
+                vec![],
+                vec![FieldDefinition {
+                    name: "t".to_string(),
+                    field_type: FieldType::Text {
+                        weight: 1.0,
+                        sortable: false,
+                    },
+                }],
+            ))
+            .unwrap();
+        manager.alias_add("a", "i2").unwrap();
+        assert!(manager.has_any_state());
     }
 
     #[test]

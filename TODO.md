@@ -388,6 +388,9 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch CE)*: `tests/ce_acl_search_hnsw_test.rs` — FT.CREATE HNSW M+EF_CONSTRUCTION, RDB save/load preserves both
 - [x] **`[P2]`** **Code review (BY nit):** RDB FT mutator errors always `Error::InvalidArgument` — align with AOF `map_ft_mutator_error` (OOM → `OutOfMemory`) if search layer can return OOM on create
   - *Done (Batch CH)*: RDB `load_into` CREATE/ALIASADD use shared `aof::map_ft_mutator_error` (OOM prefix → `OutOfMemory`).
+- [x] **`[P0]`** **Code review (CH post-ship):** RDB OOM mapping broken by pre-prefixing error strings
+  - *Found*: `map_ft_mutator_error(format!("RDB FT.CREATE: {}", e))` — helper only matches `starts_with("OOM:")` / `"OOM "` / exact `"OOM"`. Prefixed messages never map to `OutOfMemory` (stay `InvalidArgument`). AOF correctly passes raw search strings.
+  - *Done (Batch CI)*: `map_rdb_ft_mutator_error` maps raw message first, then prefixes only `InvalidArgument`. Unit tests in `aof::ft_error_map_tests` (including pre-prefixed regression guard).
 - [x] **`[P2]`** ACL `@search` category for FT.* (fine-grained users; default `+@all` unaffected)
   - *Done (Batch CE)*: `@search` in `category_names` / `category_commands`; FT read/write also under `@read`/`@write`; `+@all` expands via `all_known_commands`. Tests: `tests/ce_acl_search_hnsw_test.rs`
 - [ ] **`[P2]`** HNSW correctness/performance benchmarks vs FLAT
@@ -436,6 +439,7 @@ Also tracked in `docs/roadmap.md`.
   - *Partial (Batch CC)*: whole replace loop under multi-DB autosweep pause.
   - *Partial (Batch CF)*: staged drain of all sources before any target install; multi-DB tests.
   - *Partial (Batch CH)*: multi-DB AOF/RDB commit **no longer pre-flushes** all DBs before install — mid-install panic leaves remaining DBs with **pre-load** data (not empty). Single-DB `load_bytes` still pre-flushes for peak memory. True cross-DB atomic publish to concurrent readers still open (server-wide load barrier / epoch).
+  - *CH post-ship*: no-pre-flush reopens ~2× dual-residency peak on FULLRESYNC (`load_databases_bytes(..., true)`); document peak cost; optional free-old strategies that do not empty-before-stage.
 - [x] **`[P1]`** **Code review (CC post-ship):** WATCH bump not atomic with keyspace install (race window)
   - *Found*: `replace_keyspace_from` installs scratch `watch_gens` (usually empty) and releases the lock, then later bumps `pre_watch_keys`. Between those steps `watch_generation` can `or_insert(0)` so a client that WATCHed at gen 0 sees clean EXEC against new/empty data. On `flush=true` the clean window spans flush (which does not touch watch_gens) through end of replace.
   - *Done (Batch CD)*: under one `watch_gens` lock, install `other_watch` and bump all `pre_watch_keys`; AOF/RDB `flush=true` commit calls `touch_all_watch_keys` before flush. Tests: `tests/cd_watch_atomic_and_typed_export_test.rs`.
@@ -497,7 +501,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batch CH shipped** (multi-DB no pre-flush on commit; RDB FT OOM map via shared helper; `has_any_state`; `get_index` dual-lock; clear_documents MemoryTracker docs). **Open:** true multi-DB atomic publish (P1 partial); HNSW benches; min-replicas FT test; CB expand-tests / drain failure-atomic leftovers.
+Prioritized for next letter batch(es). **Batch CI shipped** (RDB OOM map-then-prefix; AOF multi-DB rustdoc; has_any_state alias coverage). **Open:** multi-DB true atomic publish + FULLRESYNC peak ~2× (P1 partial); HNSW benches; min-replicas FT; CB expand-tests / drain failure-atomic.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -505,6 +509,7 @@ Prioritized for next letter batch(es). **Batch CH shipped** (multi-DB no pre-flu
 | P0 | CB post-ship: quiesce target sweep during `replace_keyspace_from` | done (CC) |
 | P0 | CB second-pass: flush=true peak memory ~2× (independent trackers) | done (CC) |
 | P0 | CB second-pass: flush=false seed mutates live target (`load` touch/expire) | done (CC) |
+| P0 | CH post-ship: RDB map_ft_mutator_error after prefix breaks OOM match | done (CI) |
 | P1 | Alias target resolve + real-name storage | done (BT) |
 | P1 | Atomic create/alias namespace critical section | done (BT) |
 | P1 | AOF rewrite emits `FT.CREATE` + aliases (BT review) | done (BU) |
@@ -538,7 +543,7 @@ Prioritized for next letter batch(es). **Batch CH shipped** (multi-DB no pre-flu
 | P2 | `get_index` atomic resolve; min-replicas FT test | partial (CH get_index; min-replicas open) |
 | P2 | VECTOR/NUMERIC rewrite tests | done (BX) |
 | P2 | HNSW RDB round-trip test | done (CE) |
-| P2 | RDB FT OOM → OutOfMemory map | done (CH) |
+| P2 | RDB FT OOM → OutOfMemory map | done (CH+CI) |
 | P2 | BZ mid-fail test: tighten InvalidArgument assert | done (CF) |
 | P2 | raw load_into non-transactional (wrappers are safe) | done (CF docs) |
 | P2 | `has_search_state` double-list lock nit | done (CH) |

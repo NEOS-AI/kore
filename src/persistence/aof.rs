@@ -1143,6 +1143,9 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
 ///
 /// Shared by AOF apply and RDB `load_into` so OOM strings from the search
 /// layer surface as [`Error::OutOfMemory`] consistently.
+///
+/// **Call with the raw search-layer message** (e.g. `"OOM: …"`). Do not
+/// pre-prefix with `"RDB FT.CREATE: "` — that breaks the OOM prefix match.
 pub(crate) fn map_ft_mutator_error(msg: String) -> Error {
     // Search layer emits `"OOM: …"` (see account_search_index_write); match that
     // prefix rather than any substring containing the letters OOM.
@@ -1150,6 +1153,74 @@ pub(crate) fn map_ft_mutator_error(msg: String) -> Error {
         Error::OutOfMemory
     } else {
         Error::InvalidArgument(msg)
+    }
+}
+
+/// Map an FT mutator error, then prefix non-OOM messages for RDB context.
+///
+/// Ensures `"OOM: …"` still becomes [`Error::OutOfMemory`] while other
+/// messages become `InvalidArgument("RDB FT.CREATE: …")` etc.
+pub(crate) fn map_rdb_ft_mutator_error(context: &str, msg: String) -> Error {
+    match map_ft_mutator_error(msg) {
+        Error::OutOfMemory => Error::OutOfMemory,
+        Error::InvalidArgument(m) => Error::InvalidArgument(format!("{context}: {m}")),
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod ft_error_map_tests {
+    use super::*;
+
+    #[test]
+    fn map_ft_mutator_error_oom_prefix() {
+        assert!(matches!(
+            map_ft_mutator_error("OOM: cannot allocate search index memory".into()),
+            Error::OutOfMemory
+        ));
+        assert!(matches!(map_ft_mutator_error("OOM".into()), Error::OutOfMemory));
+        assert!(matches!(
+            map_ft_mutator_error("OOM overflow".into()),
+            Error::OutOfMemory
+        ));
+    }
+
+    #[test]
+    fn map_ft_mutator_error_non_oom() {
+        match map_ft_mutator_error("Index 'x' already exists".into()) {
+            Error::InvalidArgument(m) => assert!(m.contains("already exists")),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_rdb_ft_maps_oom_before_prefix() {
+        // Pre-prefixing would break starts_with("OOM:") — this helper must not.
+        assert!(matches!(
+            map_rdb_ft_mutator_error("RDB FT.CREATE", "OOM: cannot allocate".into()),
+            Error::OutOfMemory
+        ));
+        match map_rdb_ft_mutator_error("RDB FT.CREATE", "already exists".into()) {
+            Error::InvalidArgument(m) => {
+                assert!(m.starts_with("RDB FT.CREATE:"), "{m}");
+                assert!(m.contains("already exists"));
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        assert!(matches!(
+            map_rdb_ft_mutator_error("RDB FT.ALIASADD", "OOM: x".into()),
+            Error::OutOfMemory
+        ));
+    }
+
+    #[test]
+    fn pre_prefixed_oom_would_not_match_raw_helper() {
+        // Documents the CH post-ship bug: never call map_ft_mutator_error on
+        // already-prefixed strings.
+        match map_ft_mutator_error("RDB FT.CREATE: OOM: cannot allocate".into()) {
+            Error::InvalidArgument(m) => assert!(m.starts_with("RDB FT.CREATE:")),
+            other => panic!("pre-prefixed OOM must NOT map as OutOfMemory, got {other:?}"),
+        }
     }
 }
 
@@ -1188,10 +1259,12 @@ pub fn load_into_cache(cache: &Arc<Cache>, path: &Path) -> Result<usize> {
 /// Replay AOF into multi-DB keyspaces. Handles SELECT and FLUSHALL across DBs.
 ///
 /// **Scratch-load (transactional):** replay targets an empty multi-DB scratch
-/// collection. On `Ok`, autosweep is paused on all DBs, targets are flushed
-/// (AOF is a full snapshot replace), then each DB is swapped via
-/// [`Databases::replace_keyspaces_from`]. On `Err`, `databases` is left
-/// completely untouched. Requires exclusive access for the commit swap.
+/// collection. On `Ok`, autosweep is paused on all DBs, WATCH gens are
+/// bumped, then each DB is swapped via [`Databases::replace_keyspaces_from`]
+/// (full keyspace + FT replace per DB — **no** multi-DB pre-flush; mid-install
+/// panic leaves remaining DBs with pre-load data). Peak dual-residency during
+/// stage is ~old multi-DB + scratch. On `Err`, `databases` is left completely
+/// untouched. Requires exclusive access for the commit swap.
 pub fn load_into_databases(databases: &Databases, path: &Path) -> Result<usize> {
     let scratch = databases.empty_like();
     let mut current = 0usize;

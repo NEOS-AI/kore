@@ -900,7 +900,7 @@ impl DbSnapshot {
             cache
                 .create_search_index(def.clone())
                 .map_err(|e| {
-                    crate::persistence::aof::map_ft_mutator_error(format!("RDB FT.CREATE: {}", e))
+                    crate::persistence::aof::map_rdb_ft_mutator_error("RDB FT.CREATE", e)
                 })?;
         }
 
@@ -1013,7 +1013,7 @@ impl DbSnapshot {
             cache
                 .alias_add(alias, index)
                 .map_err(|e| {
-                    crate::persistence::aof::map_ft_mutator_error(format!("RDB FT.ALIASADD: {}", e))
+                    crate::persistence::aof::map_rdb_ft_mutator_error("RDB FT.ALIASADD", e)
                 })?;
         }
 
