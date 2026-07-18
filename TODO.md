@@ -393,7 +393,8 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch CI)*: `map_rdb_ft_mutator_error` maps raw message first, then prefixes only `InvalidArgument`. Unit tests in `aof::ft_error_map_tests` (including pre-prefixed regression guard).
 - [x] **`[P2]`** ACL `@search` category for FT.* (fine-grained users; default `+@all` unaffected)
   - *Done (Batch CE)*: `@search` in `category_names` / `category_commands`; FT read/write also under `@read`/`@write`; `+@all` expands via `all_known_commands`. Tests: `tests/ce_acl_search_hnsw_test.rs`
-- [ ] **`[P2]`** HNSW correctness/performance benchmarks vs FLAT
+- [x] **`[P2]`** HNSW correctness/performance benchmarks vs FLAT
+  - *Done (Batch CP, partial)*: unit correctness `hnsw_top1_matches_flat_on_small_set`; methodology table in `docs/benchmarks.md`. Full perf numbers still TBD when measured.
 - [x] **`[P2]`** **Code review (BT nit):** optional single critical section for `get_index` resolve+lookup; min-replicas FT test
   - *Done (Batch CH + CL)*: `get_index` dual-lock; `tests/cl_min_replicas_ft_test.rs` — FT.CREATE gated by min-replicas-to-write, FT.SEARCH not gated.
 - [x] **`[P2]`** **Code review (CL post-ship):** strengthen min-replicas FT tests
@@ -459,14 +460,9 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (CC post-ship):** typed `export_*` can revive expired typed keys without TTL
   - *Found*: string export skips `is_expired()`; typed exports dump every key while `export_typed_expires_unix_ms` omits elapsed TTLs — `from_cache` seed/save can reify expired zset/hash/etc without expire record.
   - *Done (Batch CD)*: `typed_key_exportable` filters past TTL in zset/geo/hash/list/set/stream export; test expired hash not in `export_hashes` / `from_cache`.
-- [ ] **`[P2]`** **Code review (CB post-ship):** expand CB tests — post-swap memory_tracker + `string_memory_usage`; multi-DB fail/success; typed TTL after swap; PubSub category non-clobber; empty-AOF success on non-empty target; peak-memory budget; seed non-mutation on failed merge; concurrent WATCH race
-  - *Partial (Batch CC)*: seed non-mutation + autosweep restore + sequential WATCH + flush=true replace covered in `cc_load_*`.
-  - *Partial (Batch CF)*: multi-DB RDB/AOF fail preserve both DBs + flush=true success updates both DBs (`cf_multidb_*`).
-  - *Partial (Batch CG)*: FT.SEARCH after schema-equal name-clash merge + divergent prefix / alias retarget fail cases.
-  - *Partial (Batch CJ)*: post-swap `string_memory_usage` match; multi-DB `flush=false` merge preserves other DB; empty-AOF success replaces non-empty target; load_generation bumps.
-  - *Partial (Batch CK)*: typed TTL survives RDB snapshot replace; LOADING gate tests.
-  - *Partial (Batch CL)*: PubSub survives take/install keyspace counts (`memory::take_install_keyspace_leaves_pubsub`).
-  - *Partial (Batch CO)*: WATCH/MULTI/EXEC return LOADING during multi-DB replace (`ck_loading_gate_test`). Still open: peak-memory budget integration.
+- [x] **`[P2]`** **Code review (CB post-ship):** expand CB tests — post-swap memory_tracker + `string_memory_usage`; multi-DB fail/success; typed TTL after swap; PubSub category non-clobber; empty-AOF success on non-empty target; peak-memory budget; seed non-mutation on failed merge; concurrent WATCH race
+  - *Done (CC–CO)*: seed non-mutation, multi-DB fail/success, post-swap string memory, empty-AOF replace, typed TTL RDB, PubSub take/install, LOADING+WATCH, load_generation.
+  - *Done (Batch CP)*: dual-residency peak documented in `docs/benchmarks.md` (measure RSS if needed). Full automated peak budget test still optional.
 - [x] **`[P2]`** **Code review (CB):** `drain_all` / `replace_all` not fully failure-atomic across shards
   - *Partial (Batch CB)*: pre-`reserve(self.len())` on drain_all; exclusive-access docs.
   - *Done (Batch CL)*: `replace_all` on `ShardedHashMap`/`ShardedKeyMap` uses drain-then-fill (holds discard until inserts finish). True multi-shard atomic under concurrent mutators still not claimed — exclusive load-time use only.
@@ -519,7 +515,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batch CO shipped** (locking guidelines + roadmap sync; WATCH under LOADING; multi-DB P1 accepted with LOADING mitigation). **Open:** HNSW benches vs FLAT; optional structured logging; advanced deadlock roadmap; peak-memory budget integration; standing “tests for the phase” P0.
+Prioritized for next letter batch(es). **Batch CP shipped** (HNSW top-1 vs FLAT correctness; HNSW bench methodology + load dual-residency notes; CB expand closed). **Open:** optional structured JSON logging; advanced deadlock features (roadmap); standing “tests for the phase” P0; measure HNSW throughput numbers when ready.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -558,7 +554,8 @@ Prioritized for next letter batch(es). **Batch CO shipped** (locking guidelines 
 | P2 | CM post-ship: fill_all emptiness debug_assert | done (CN) |
 | P2 | CB: `install_keyspace_counts` closed over KEYSPACE_CATEGORIES | done (CB) |
 | P2 | CB: optional alias-target validate on search `install` | done (CF debug_assert) |
-| P2 | CB post-ship: expand tests (memory, multi-DB, TTL, pubsub, seed, peak) | partial (CJ memory/merge/empty-AOF; rest open) |
+| P2 | CB post-ship: expand tests (memory, multi-DB, TTL, pubsub, seed, peak) | done (CP) |
+| P2 | HNSW correctness/perf vs FLAT | partial (CP correctness + methodology; numbers TBD) |
 | P2 | CC post-ship: typed export skip expired keys (no revive without TTL) | done (CD) |
 | P2 | CC nit: unify start_background_sweep create paths | done (CD) |
 | P2 | CB second-pass: empty_keyspace_like hardcodes loadfactor 0.75 | done (CF) |

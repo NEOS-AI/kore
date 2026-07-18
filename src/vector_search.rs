@@ -394,4 +394,39 @@ mod tests {
         // The closest should be doc1
         assert_eq!(results[0].doc_id, Bytes::from("doc1"));
     }
+
+    /// Small fixed set: HNSW top-1 should match FLAT exact top-1 (correctness
+    /// check; not a throughput benchmark — see `docs/benchmarks.md`).
+    #[test]
+    fn hnsw_top1_matches_flat_on_small_set() {
+        let vectors: Vec<(&str, Vec<f32>)> = vec![
+            ("a", vec![1.0, 0.0, 0.0, 0.0]),
+            ("b", vec![0.0, 1.0, 0.0, 0.0]),
+            ("c", vec![0.0, 0.0, 1.0, 0.0]),
+            ("d", vec![0.7, 0.7, 0.0, 0.0]),
+            ("e", vec![0.9, 0.1, 0.0, 0.0]),
+            ("f", vec![0.1, 0.9, 0.0, 0.0]),
+            ("g", vec![0.0, 0.0, 0.9, 0.1]),
+            ("h", vec![0.5, 0.5, 0.5, 0.5]),
+        ];
+        let query = [1.0f32, 0.05, 0.0, 0.0];
+
+        let mut flat = FlatVectorIndex::new(DistanceMetric::Cosine);
+        let mut hnsw = HNSWIndex::new(8, 64, DistanceMetric::Cosine);
+        for (id, v) in &vectors {
+            flat.add(Bytes::from(*id), v.clone());
+            hnsw.add(Bytes::from(*id), v.clone());
+        }
+
+        let flat_top = flat.search(&query, 1);
+        let hnsw_top = hnsw.search(&query, 1);
+        assert_eq!(flat_top.len(), 1);
+        assert_eq!(hnsw_top.len(), 1);
+        assert_eq!(
+            flat_top[0].doc_id, hnsw_top[0].doc_id,
+            "HNSW top-1 should match FLAT exact top-1 on tiny set (flat={:?} hnsw={:?})",
+            flat_top[0].doc_id,
+            hnsw_top[0].doc_id
+        );
+    }
 }

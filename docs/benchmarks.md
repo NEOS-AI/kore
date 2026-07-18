@@ -123,6 +123,36 @@ Fill after measurement. Until then, leave cells as `TBD`.
 
 If `redis-benchmark` reports p50/p99, record them in a second table with the same workload labels.
 
+## Vector search (HNSW vs FLAT) — methodology
+
+Generic `redis-benchmark` does not cover RediSearch vectors. For Kore-internal
+comparison:
+
+1. Build with `cargo test --release` (correctness) or a dedicated bench binary
+   when added.
+2. Use the same vectors/query for FLAT (exact) and HNSW (`M`, `ef_construction`).
+3. Report: dataset size (N, dim), recall@k vs FLAT ground truth, and wall time
+   for build + query (median of ≥3 runs).
+4. In-tree correctness gate: unit test
+   `vector_search::tests::hnsw_top1_matches_flat_on_small_set` (tiny N only).
+
+| Field | Value |
+|-------|--------|
+| Date | TBD |
+| N / dim | TBD |
+| HNSW M / ef | TBD |
+| Recall@10 vs FLAT | TBD |
+| Query p50 (ms) FLAT / HNSW | TBD |
+
+## Load dual-residency peak (scratch-load)
+
+AOF/RDB public load builds a full scratch keyspace then swaps. Peak process
+RSS can approach ~2× used memory during stage (old multi-DB + scratch).
+Mitigations already in tree: single-DB `load_bytes` pre-flush on success;
+multi-DB avoids pre-flush for panic safety and uses `-LOADING` for clients.
+Measure with `INFO memory` / OS RSS around `load_databases_bytes(..., true)`
+if you need numbers for capacity planning.
+
 ## What not to compare
 
 - Cluster hash slots / multi-node until Kore cluster exists
