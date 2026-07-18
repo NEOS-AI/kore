@@ -220,38 +220,99 @@ impl DeadlockDetector {
         self.auto_resolve
     }
     
-    /// Record a lock acquisition
+    /// Record a lock acquisition.
+    ///
+    /// Single write critical section (lock order: `held_locks` →
+    /// `waiting_for` → `wait_graph`), mirroring merge steps 2+5 for the
+    /// pure local path:
+    /// 1. Insert/overwrite the held entry for `resource`
+    /// 2. Drop the acquirer from `waiting_for` for this resource
+    /// 3. Rewrite existing wait edges for `resource` so `holder == client_id`
+    ///    (drop if `waiter == client_id` — no self-waits; dedupe)
+    /// 4. Re-link any remaining `waiting_for` entries for `resource` to
+    ///    edge `waiter → client_id` (skip self)
     pub fn record_lock_acquired(&self, resource: String, client_id: Bytes, ttl_ms: u64) {
         let lock_info = LockInfo::new(resource.clone(), client_id.clone(), ttl_ms);
-        
-        // Add to held locks
-        self.held_locks.write().insert(resource.clone(), lock_info);
-        
-        // Remove from waiting list
+
+        // Lock order matches `release_client_locks` / `merge_snapshot`.
+        let mut held = self.held_locks.write();
         let mut waiting = self.waiting_for.write();
+        let mut graph = self.wait_graph.write();
+
+        held.insert(resource.clone(), lock_info);
+
+        // Acquirer is no longer waiting for this resource.
         if let Some(wait_list) = waiting.get_mut(&client_id) {
             wait_list.retain(|info| info.resource != resource);
             if wait_list.is_empty() {
                 waiting.remove(&client_id);
             }
         }
-        
-        // Clean up wait graph
-        self.wait_graph.write().retain(|edge| {
-            edge.waiter != client_id || edge.resource != resource
-        });
+
+        // Rewrite edges for this resource: holder = acquirer; drop self-waits;
+        // dedupe by (waiter, resource, holder).
+        let old_edges = std::mem::take(&mut *graph);
+        let mut seen: HashSet<(Bytes, String, Bytes)> = HashSet::with_capacity(old_edges.len());
+        for mut edge in old_edges {
+            if edge.resource == resource {
+                if edge.waiter == client_id {
+                    // Acquirer was waiting, or rewrite would be a self-wait.
+                    continue;
+                }
+                edge.holder = client_id.clone();
+            }
+            let key = (
+                edge.waiter.clone(),
+                edge.resource.clone(),
+                edge.holder.clone(),
+            );
+            if seen.insert(key) {
+                graph.push(edge);
+            }
+        }
+
+        // Re-link waiters still listed for this resource (orphan waits / post-unlock).
+        for (waiter, wait_list) in waiting.iter() {
+            if *waiter == client_id {
+                continue;
+            }
+            for info in wait_list {
+                if info.resource != resource {
+                    continue;
+                }
+                let key = (waiter.clone(), resource.clone(), client_id.clone());
+                if !seen.insert(key) {
+                    continue;
+                }
+                graph.push(WaitEdge {
+                    waiter: waiter.clone(),
+                    holder: client_id.clone(),
+                    resource: resource.clone(),
+                    timestamp: info.timestamp,
+                });
+            }
+        }
     }
-    
+
     /// Record a lock release by `client_id` for `resource`.
     ///
-    /// Only removes the held-lock entry (and matching wait edges) when the
-    /// **current** graph holder is `client_id`. This is safe after forced
-    /// unlock / auto-resolve: if another client has already re-acquired the
-    /// resource, Drop of the old [`crate::redlock::Lock`] must not erase the
-    /// new holder's graph entry. Backends stay correct via token compare
-    /// (`release_if_equal`); the graph needs the same ownership check.
+    /// Only removes the held-lock entry when the **current** graph holder is
+    /// `client_id`. This is safe after forced unlock / auto-resolve: if another
+    /// client has already re-acquired the resource, Drop of the old
+    /// [`crate::redlock::Lock`] must not erase the new holder's graph entry.
+    /// Backends stay correct via token compare (`release_if_equal`); the graph
+    /// needs the same ownership check.
+    ///
+    /// Held-lock removal and wait-graph prune run in **one** critical section
+    /// (lock order: `held_locks` → `wait_graph`) so a concurrent re-acquire +
+    /// wait cannot install edges that a delayed prune then wipes. Prune is
+    /// **holder-scoped**: only edges with `edge.resource == resource` **and**
+    /// `edge.holder == client_id` are removed — not every edge for the resource.
     pub fn record_lock_released(&self, resource: &str, client_id: &Bytes) {
+        // Lock order: held_locks → wait_graph (subset of release_client_locks).
         let mut held = self.held_locks.write();
+        let mut graph = self.wait_graph.write();
+
         let removed = match held.get(resource) {
             Some(info) if info.client_id == *client_id => {
                 held.remove(resource);
@@ -259,13 +320,11 @@ impl DeadlockDetector {
             }
             _ => false,
         };
-        drop(held);
 
         if removed {
-            // Clean up wait graph edges for this resource only if we still owned it
-            self.wait_graph
-                .write()
-                .retain(|edge| edge.resource != resource);
+            graph.retain(|edge| {
+                !(edge.resource == resource && edge.holder == *client_id)
+            });
         }
     }
     
@@ -672,6 +731,9 @@ impl DeadlockDetector {
     ///   `timestamp = Instant::now()` so transit lag does not extend holds.
     /// - **Edge holder reconcile**: after holds merge, edges whose holder
     ///   disagrees with `held[resource]` are rewritten to the current holder.
+    ///   If rewrite would make `holder == waiter`, the edge is **dropped**
+    ///   (no self-wait / single-node false cycles). Graph is then deduped by
+    ///   `(waiter, resource, holder)`.
     /// - **Wait edges**: union by `(waiter, resource, holder)` — duplicates
     ///   (including a second merge of the same snapshot) are ignored.
     /// - **Local wait re-link**: local `waiting_for` entries whose resource is
@@ -720,10 +782,27 @@ impl DeadlockDetector {
         }
 
         // 2. Reconcile existing edges with post-merge held holders.
-        for edge in graph.iter_mut() {
-            if let Some(holder_info) = held.get(&edge.resource) {
-                if edge.holder != holder_info.client_id {
-                    edge.holder = holder_info.client_id.clone();
+        //    Drop self-waits (holder == waiter after rewrite); dedupe.
+        {
+            let old_edges = std::mem::take(&mut *graph);
+            let mut seen: HashSet<(Bytes, String, Bytes)> =
+                HashSet::with_capacity(old_edges.len());
+            for mut edge in old_edges {
+                if let Some(holder_info) = held.get(&edge.resource) {
+                    if edge.holder != holder_info.client_id {
+                        edge.holder = holder_info.client_id.clone();
+                    }
+                }
+                if edge.holder == edge.waiter {
+                    continue;
+                }
+                let key = (
+                    edge.waiter.clone(),
+                    edge.resource.clone(),
+                    edge.holder.clone(),
+                );
+                if seen.insert(key) {
+                    graph.push(edge);
                 }
             }
         }
@@ -1694,28 +1773,30 @@ mod tests {
         }
     }
 
-    /// Stale edge holder is rewritten to match post-merge held.
+    /// Local acquire rewrites edge holders; merge reconcile still covers
+    /// remote edges that arrive with a stale holder name.
     #[test]
     fn test_merge_rewrites_stale_edge_holder() {
         let local = DeadlockDetector::new(5000, false);
 
-        let old_holder = Bytes::from("old-holder");
         let new_holder = Bytes::from("new-holder");
-        let waiter = Bytes::from("waiter");
         let resource = "rewritten".to_string();
 
-        // old_holder holds; waiter gets an edge naming old_holder
-        local.record_lock_acquired(resource.clone(), old_holder, 10_000);
-        local.record_lock_wait(resource.clone(), waiter.clone(), 10_000);
-        assert_eq!(local.get_stats().wait_graph_edges, 1);
+        // Local holds with current owner; remote wait still names old-holder.
+        local.record_lock_acquired(resource.clone(), new_holder, 10_000);
 
-        // Overwrite held entry to new_holder without updating the wait edge
-        // (record_lock_acquired only drops edges where the acquirer is waiter).
-        local.record_lock_acquired(resource, new_holder, 10_000);
-        assert_eq!(local.get_stats().wait_graph_edges, 1);
-
-        // Merge (even empty) reconciles edge holders against held
-        local.merge_snapshot(&DeadlockGraphSnapshot::default());
+        let remote = DeadlockGraphSnapshot {
+            held: vec![],
+            waits: vec![WaitEdgeSnapshot {
+                waiter: "waiter".to_string(),
+                holder: "old-holder".to_string(),
+                resource: resource.clone(),
+                wait_elapsed_ms: 0,
+            }],
+            orphan_waits: vec![],
+            source_id: None,
+        };
+        local.merge_snapshot(&remote);
 
         let snap = local.export_snapshot();
         assert_eq!(snap.waits.len(), 1);
@@ -1723,6 +1804,196 @@ mod tests {
             snap.waits[0].holder, "new-holder",
             "stale edge holder must be rewritten to current held client"
         );
+        assert_eq!(snap.waits[0].waiter, "waiter");
+    }
+
+    /// Atomic release + holder-scoped prune: delayed unlock of an old owner
+    /// must not wipe wait edges installed for a concurrent re-acquirer.
+    #[test]
+    fn test_record_lock_released_holder_scoped_preserves_reacquire_edges() {
+        let detector = DeadlockDetector::new(5000, false);
+        let victim = Bytes::from("victim");
+        let new_holder = Bytes::from("new-holder");
+        let waiter = Bytes::from("waiter");
+        let resource = "shared".to_string();
+
+        // Victim held, then force-unlocked (auto-resolve style).
+        detector.record_lock_acquired(resource.clone(), victim.clone(), 10_000);
+        detector.release_client_locks(&victim);
+
+        // Concurrent re-acquire + wait (production race after force-unlock).
+        detector.record_lock_acquired(resource.clone(), new_holder.clone(), 10_000);
+        detector.record_lock_wait(resource.clone(), waiter.clone(), 10_000);
+        assert_eq!(detector.get_stats().wait_graph_edges, 1);
+        assert_eq!(detector.get_held_locks().len(), 1);
+
+        // Delayed Drop/unlock of the victim must not erase the new graph.
+        detector.record_lock_released(&resource, &victim);
+        assert_eq!(
+            detector.get_held_locks().len(),
+            1,
+            "new holder must remain after victim release"
+        );
+        assert_eq!(
+            detector.get_stats().wait_graph_edges,
+            1,
+            "waiter→new_holder edge must survive victim record_lock_released"
+        );
+        let snap = detector.export_snapshot();
+        assert_eq!(snap.waits[0].holder, "new-holder");
+        assert_eq!(snap.waits[0].waiter, "waiter");
+        assert_eq!(snap.held[0].client_id, "new-holder");
+    }
+
+    /// Owner unlock prunes only edges with holder == unlocking client for
+    /// that resource (not every edge for the resource under concurrent views).
+    #[test]
+    fn test_record_lock_released_prunes_only_own_holder_edges() {
+        let detector = DeadlockDetector::new(5000, false);
+        let owner = Bytes::from("owner");
+        let waiter = Bytes::from("waiter");
+        let resource = "r-owner".to_string();
+
+        detector.record_lock_acquired(resource.clone(), owner.clone(), 10_000);
+        detector.record_lock_wait(resource.clone(), waiter.clone(), 10_000);
+        assert_eq!(detector.get_stats().wait_graph_edges, 1);
+
+        // Plant a second edge for the same resource via merge that still names
+        // a different holder *before* reconcile would rewrite — use a second
+        // resource wait that we keep, plus release owner and check waiter
+        // waiting_for survives for re-link on next acquire.
+        detector.record_lock_released(&resource, &owner);
+        assert_eq!(
+            detector.get_stats().wait_graph_edges,
+            0,
+            "edges with holder==owner for resource must be pruned"
+        );
+        assert!(
+            detector.get_waiting_clients().contains_key(&waiter),
+            "waiting_for entry should remain so a later acquire can re-link"
+        );
+        assert_eq!(detector.get_held_locks().len(), 0);
+    }
+
+    /// Merge holder rewrite must not create self-wait edges (false single-node cycles).
+    #[test]
+    fn test_merge_holder_rewrite_drops_self_wait() {
+        let local = DeadlockDetector::new(5000, false);
+
+        // Import wait c1→c2 for R while unheld.
+        let wait_snap = DeadlockGraphSnapshot {
+            held: vec![],
+            waits: vec![WaitEdgeSnapshot {
+                waiter: "c1".to_string(),
+                holder: "c2".to_string(),
+                resource: "R".to_string(),
+                wait_elapsed_ms: 0,
+            }],
+            orphan_waits: vec![],
+            source_id: None,
+        };
+        local.merge_snapshot(&wait_snap);
+        assert_eq!(local.get_stats().wait_graph_edges, 1);
+
+        // Merge hold of R by c1 → rewrite would make holder==waiter → drop edge.
+        let hold_snap = DeadlockGraphSnapshot {
+            held: vec![HeldLockSnapshot {
+                resource: "R".to_string(),
+                client_id: "c1".to_string(),
+                ttl_ms: 10_000,
+                held_for_ms: 0,
+            }],
+            waits: vec![],
+            orphan_waits: vec![],
+            source_id: None,
+        };
+        local.merge_snapshot(&hold_snap);
+
+        assert_eq!(
+            local.get_stats().wait_graph_edges,
+            0,
+            "self-wait edge after holder rewrite must be dropped"
+        );
+        match local.detect_deadlock() {
+            DeadlockStatus::NoDeadlock => {}
+            DeadlockStatus::Deadlock { cycle, resources } => {
+                panic!(
+                    "self-wait must not create a single-node deadlock; cycle={:?} resources={:?}",
+                    cycle, resources
+                );
+            }
+        }
+        let held = local.get_held_locks();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].client_id, Bytes::from("c1"));
+    }
+
+    /// Local acquire rewrites stale holders and re-links orphan waits.
+    #[test]
+    fn test_record_lock_acquired_rewrites_holders_and_relinks_waits() {
+        let detector = DeadlockDetector::new(5000, false);
+        let c = Bytes::from("C");
+        let d = Bytes::from("D");
+        let waiter = Bytes::from("waiter");
+        let resource = "R".to_string();
+
+        // Waiter waits on R with no holder yet → orphan (no edge).
+        detector.record_lock_wait(resource.clone(), waiter.clone(), 10_000);
+        assert_eq!(detector.get_stats().wait_graph_edges, 0);
+        assert!(detector.get_waiting_clients().contains_key(&waiter));
+
+        // Acquire by C creates waiter→C edge.
+        detector.record_lock_acquired(resource.clone(), c.clone(), 10_000);
+        assert_eq!(
+            detector.get_stats().wait_graph_edges,
+            1,
+            "acquire must re-link waiting_for to current holder"
+        );
+        let snap = detector.export_snapshot();
+        assert_eq!(snap.waits[0].waiter, "waiter");
+        assert_eq!(snap.waits[0].holder, "C");
+
+        // Re-acquire by D rewrites holder on existing edge.
+        detector.record_lock_acquired(resource.clone(), d.clone(), 10_000);
+        assert_eq!(detector.get_stats().wait_graph_edges, 1);
+        let snap = detector.export_snapshot();
+        assert_eq!(
+            snap.waits[0].holder, "D",
+            "re-acquire must rewrite edge.holder to new owner"
+        );
+        assert_eq!(snap.waits[0].waiter, "waiter");
+        assert_eq!(snap.held[0].client_id, "D");
+    }
+
+    /// Release then re-acquire re-links remaining waiters (local path, no merge).
+    #[test]
+    fn test_release_then_acquire_relinks_waiters() {
+        let detector = DeadlockDetector::new(5000, false);
+        let old = Bytes::from("old");
+        let new_holder = Bytes::from("new");
+        let waiter = Bytes::from("waiter");
+        let resource = "R".to_string();
+
+        detector.record_lock_acquired(resource.clone(), old.clone(), 10_000);
+        detector.record_lock_wait(resource.clone(), waiter.clone(), 10_000);
+        assert_eq!(detector.get_stats().wait_graph_edges, 1);
+
+        detector.record_lock_released(&resource, &old);
+        assert_eq!(
+            detector.get_stats().wait_graph_edges,
+            0,
+            "owner release prunes holder-scoped edges"
+        );
+        assert!(detector.get_waiting_clients().contains_key(&waiter));
+
+        detector.record_lock_acquired(resource, new_holder, 10_000);
+        assert_eq!(
+            detector.get_stats().wait_graph_edges,
+            1,
+            "new acquire must re-link remaining waiters without merge"
+        );
+        let snap = detector.export_snapshot();
+        assert_eq!(snap.waits[0].holder, "new");
         assert_eq!(snap.waits[0].waiter, "waiter");
     }
 

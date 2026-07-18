@@ -360,10 +360,18 @@ Also tracked in `docs/roadmap.md`.
     - *Done (Batch DB)*: single write section retain-by-client; waiting_for + edge prune for victim and released resources; `cleanup_expired` drops edges/waiting for expired holds; monitor logs resolve-None; unit tests TOCTOU re-acquire / prune / expired.
   - [x] **`[P1]`** **Code review (DB post-ship):** disarm victim `Lock` after auto-resolve backend unlock
     - *Done (Batch DD)*: conditional `record_lock_released(resource, client_id)` — only remove if current holder’s `client_id` matches; Redlock `unlock`/`Drop` pass `lock.val`. Regression: resolve → re-acquire → drop victim → new holder still in `get_held_locks()`.
+    - *Residual (DD post-ship → DE)*: `record_lock_released` race — fixed in Batch DE (atomic held+graph; holder-scoped prune).
   - [x] **`[P1]`** **Code review (DC post-ship):** merge re-links local waits to imported holds
     - *Done (Batch DD)*: after merging holds, scan `waiting_for` and create edges; export `OrphanWaitSnapshot` for holder-less waits; realistic half-cycle test without pre-planted peer holds.
   - [x] **`[P2]`** **Code review (DC post-ship):** reconcile wait-edge holders + remaining TTL on import
     - *Done (Batch DD)*: rewrite edges where holder ≠ held[resource]; import remaining TTL (`ttl_ms.saturating_sub(held_for_ms)`, `timestamp = now`); zero remaining skips import; `release_client_locks` drops `edge.holder == client_id`.
+    - *Residual (DD post-ship → DE)*: self-wait on merge rewrite + local acquire re-link — fixed in Batch DE.
+  - [x] **`[P1]`** **Code review (DD post-ship):** atomic `record_lock_released` + holder-scoped edge prune
+    - *Done (Batch DE)*: single critical section (`held_locks` → `wait_graph`); prune only `edge.resource == resource && edge.holder == client_id`; regression `test_record_lock_released_holder_scoped_preserves_reacquire_edges`.
+  - [x] **`[P1]`** **Code review (DD post-ship):** merge holder rewrite must not create self-waits
+    - *Done (Batch DE)*: step 2 drops edge if rewrite yields `holder == waiter`; dedupe by `(waiter, resource, holder)`; unit test `test_merge_holder_rewrite_drops_self_wait`.
+  - [x] **`[P2]`** **Code review (DD post-ship):** `record_lock_acquired` rewrites holders + re-links waits
+    - *Done (Batch DE)*: on acquire, rewrite/drop edges for that resource and re-link `waiting_for` (mirror merge steps 2+5); tests `test_record_lock_acquired_rewrites_holders_and_relinks_waits`, `test_release_then_acquire_relinks_waiters`.
   - [ ] **`[P2]`** Web UI monitoring
 
 ### Search & vectors
@@ -593,7 +601,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batches CZ–DD shipped** (victim strategies; async/monitor; Redlock auto-resolve; cross-process snapshot MVP; Lock Drop safety + merge re-link + remaining TTL). **Open next:** Web UI; standing tests-for-phase P0; optional larger-N HNSW recall.
+Prioritized for next letter batch(es). **Batches CZ–DE shipped** (victim strategies; async/monitor; Redlock auto-resolve; cross-process snapshot; Lock Drop safety + merge re-link; atomic release + no self-waits + local acquire re-link). **Open next:** Web UI; standing tests-for-phase P0; optional larger-N HNSW recall.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -654,9 +662,12 @@ Prioritized for next letter batch(es). **Batches CZ–DD shipped** (victim strat
 | P2 | CZ/DA post-ship: Redlock auto-resolve + strategy + backend unlock | done (DB + DD Lock Drop) |
 | P2 | DA post-ship: release_client_locks TOCTOU + wait cleanup | done (DB) |
 | P2 | DC cross-process snapshot merge MVP | done (DC + DD re-link/TTL) |
-| P1 | DB post-ship: disarm victim Lock after auto-resolve | done (DD) |
+| P1 | DB post-ship: disarm victim Lock after auto-resolve | done (DD; release race residual) |
 | P1 | DC post-ship: merge re-links local waits to imported holds | done (DD) |
-| P2 | DC post-ship: reconcile edge holders + remaining TTL on import | done (DD) |
+| P2 | DC post-ship: reconcile edge holders + remaining TTL on import | done (DD; self-wait residual) |
+| P1 | DD post-ship: atomic record_lock_released + holder-scoped edge prune | done (DE) |
+| P1 | DD post-ship: merge holder rewrite must not create self-waits | done (DE) |
+| P2 | DD post-ship: record_lock_acquired rewrites holders + re-links waits | done (DE) |
 | P2 | CP post-ship: LOADING allowlist PSYNC/SYNC mid-install visibility | done (CR) |
 | P2 | CC post-ship: typed export skip expired keys (no revive without TTL) | done (CD) |
 | P2 | CC nit: unify start_background_sweep create paths | done (CD) |

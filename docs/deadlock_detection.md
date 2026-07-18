@@ -138,7 +138,10 @@ When `auto_resolve` is **true**, a deadlock found during `lock` /
 
 The victim may still own a live `Lock` RAII handle. On Drop, `unlock` uses
 `record_lock_released(resource, client_id)` which **only** clears the graph
-entry when that client is still the tracked holder. If a waiter re-acquired
+entry when that client is still the tracked holder. Held removal and wait-graph
+prune run in **one** critical section and prune is **holder-scoped**
+(`edge.holder == client_id` for that resource), so a concurrent re-acquire +
+wait cannot lose edges to a delayed all-resource wipe. If a waiter re-acquired
 after force-unlock, the new holder's graph entry is preserved (backends were
 already safe via `release_if_equal`).
 
@@ -621,15 +624,23 @@ so a full edge is exported instead of an orphan; both paths work after merge.
    TTL (`ttl_ms - held_for_ms`); zero remaining skips import.
 2. **Edge holder reconcile**: after holds merge, any local edge whose
    `holder` ≠ `held[resource].client_id` is rewritten to the current holder.
+   If rewrite would make `holder == waiter`, the edge is **dropped** (no
+   self-wait / single-node false cycle). Graph is then deduped by
+   `(waiter, resource, holder)`.
 3. **Wait edges — union + dedupe**: edges are keyed by
    `(waiter, resource, holder)`. Merging the same snapshot twice does not
-   duplicate edges. Remote edge holders are also aligned to post-merge held.
+   duplicate edges. Remote edge holders are also aligned to post-merge held
+   (self-waits skipped).
 4. **Local wait re-link**: local `waiting_for` entries whose resource is now
-   in `held` get a wait-graph edge if missing.
+   in `held` get a wait-graph edge if missing (skip self).
 5. **Orphan waits**: remote `orphan_waits` become edges when the resource is
    held (local or just imported); otherwise they stay as `waiting_for` only.
 6. After merge, `detect_deadlock()` / auto-resolve / monitors use the combined
    graph like any other local state.
+
+**Local acquire path** (`record_lock_acquired`) mirrors steps 2+5 without a
+merge: it rewrites edge holders for the resource to the acquirer (drops
+self-waits), and re-links any `waiting_for` entries for that resource.
 
 ### How to use from two processes
 
@@ -747,4 +758,5 @@ Available tests:
 - `test_redlock_auto_resolve_false_fail_fast`: `DeadlockDetected`, backends unchanged
 - `test_redlock_spawn_monitor_unlocks_backends`: `spawn_deadlock_monitor` backend + graph
 - Unit tests in `src/deadlock.rs`: cross-process merge (pre-planted + realistic re-link),
-  remaining-TTL import, stale edge holder rewrite, conditional `record_lock_released`
+  remaining-TTL import, stale edge holder rewrite, conditional `record_lock_released`,
+  holder-scoped release prune, merge self-wait drop, local acquire re-link/rewrite
