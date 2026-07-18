@@ -149,9 +149,13 @@ impl PartialOrd for MaxCand {
 /// reachable from `entry_point` at insert time; existing-id `add` rewires
 /// (remove + re-insert).
 ///
-/// **Batch CT:** on hard-delete, former neighbors of the removed id are reconnected
-/// (closest-peer heuristic + degree prune) so a cut-vertex remove does not permanently
-/// partition the layer. Force-keep remains insert-time only (not a global invariant).
+/// **Batch CT/CU:** on hard-delete, former neighbors are snapshotted as an
+/// **undirected** adjacency (outgoing ∪ reverse scan), then reconnected with a
+/// spanning structure among survivors (full clique when degree fits, else a
+/// nearest-neighbor path) and force-keep of those tree/clique edges on both
+/// endpoints. Fixes bidirectional 2-chains, asymmetric incoming-only links, and
+/// multi-way stars under degree caps. Not a global non-partition guarantee under
+/// arbitrary later hub churn. Force-keep on insert remains insert-time only.
 /// This is approximate ANN, not a full RedisSearch HNSW port.
 #[derive(Debug)]
 pub struct HNSWIndex {
@@ -239,16 +243,16 @@ impl HNSWIndex {
             self.layers[layer].add_edge(neighbor.clone(), doc_id.clone());
             // Cap degree on the existing neighbor; force-keep reverse edge to the
             // new node so it remains reachable from entry via outgoing walks.
-            self.prune_neighbors_keeping(neighbor, layer, max_m, Some(&doc_id));
+            self.prune_neighbors_keeping(neighbor, layer, max_m, std::slice::from_ref(&doc_id));
         }
-        self.prune_neighbors_keeping(&doc_id, layer, max_m, None);
+        self.prune_neighbors_keeping(&doc_id, layer, max_m, &[]);
     }
 
     /// Remove a vector and fully unlink it from the HNSW graph.
     ///
     /// Strips reverse edges, removes the node from every layer map, reconnects
     /// former neighbors so a bridge/cut-vertex delete does not permanently
-    /// partition the layer (Batch CT), and reassigns `entry_point` when needed
+    /// partition the layer (Batch CT/CU), and reassigns `entry_point` when needed
     /// (prefer a remaining node that still has edges).
     pub fn remove(&mut self, doc_id: &Bytes) {
         if !self.vectors.contains_key(doc_id) {
@@ -262,16 +266,32 @@ impl HNSWIndex {
             return;
         }
 
-        // Snapshot former neighbors per layer before unlink (for bridge repair).
+        // Undirected former-neighbor snapshot per layer (Batch CU):
+        // outgoing neighbors of deleted ∪ nodes that list deleted as a neighbor.
+        // Outgoing-only missed asymmetric predecessors and left them unrepaired.
         let former_by_layer: Vec<Vec<Bytes>> = self
             .layers
             .iter()
             .map(|layer| {
-                layer
-                    .get_neighbors(doc_id)
-                    .into_iter()
-                    .filter(|n| n != doc_id && self.vectors.contains_key(n))
-                    .collect()
+                let mut seen: HashSet<Bytes> = HashSet::new();
+                let mut former: Vec<Bytes> = Vec::new();
+                for n in layer.get_neighbors(doc_id) {
+                    if n != *doc_id && self.vectors.contains_key(&n) && seen.insert(n.clone()) {
+                        former.push(n);
+                    }
+                }
+                for (id, neighs) in &layer.neighbors {
+                    if id == doc_id {
+                        continue;
+                    }
+                    if !neighs.iter().any(|n| n == doc_id) {
+                        continue;
+                    }
+                    if self.vectors.contains_key(id) && seen.insert(id.clone()) {
+                        former.push(id.clone());
+                    }
+                }
+                former
             })
             .collect();
 
@@ -293,10 +313,13 @@ impl HNSWIndex {
     /// After unlinking a deleted id, reconnect its former neighbors so they are
     /// not left isolated from each other when the deleted node was a cut vertex.
     ///
-    /// Heuristic (Batch CT): among survivors still in `vectors`, add bidirectional
-    /// edges from each node to its closest other former neighbors (up to
-    /// `max_edges(layer)`), then prune with `prune_neighbors_keeping`, force-keeping
-    /// the nearest peer so at least one bridge edge survives the degree cap.
+    /// Heuristic (Batch CU): build a **spanning** structure among survivors still
+    /// in `vectors` — full bidirectional clique when `n-1 ≤ max_edges(layer)`,
+    /// otherwise a nearest-neighbor path (degree ≤ 2). Force-keep those spanning
+    /// edges on **both** endpoints when pruning so multi-way hubs stay directed-
+    /// reachable from an entry-adjacent survivor even under degree saturation.
+    /// Extra closest-peer edges may be added for density but only spanning edges
+    /// are force-kept.
     fn bridge_reconnect_neighbors(&mut self, former: &[Bytes], layer: usize) {
         // Dedup while preserving first-seen order.
         let mut seen: HashSet<Bytes> = HashSet::new();
@@ -312,35 +335,99 @@ impl HNSWIndex {
         }
 
         let max_m = self.max_edges(layer);
+        let n = survivors.len();
 
-        for u in &survivors {
-            let Some(u_vec) = self.vectors.get(u).cloned() else {
-                continue;
-            };
+        // Spanning force-keep set per survivor (tree/clique neighbors).
+        let mut force_keep: HashMap<Bytes, Vec<Bytes>> = HashMap::new();
+        for s in &survivors {
+            force_keep.insert(s.clone(), Vec::new());
+        }
 
-            let mut peers: Vec<(Bytes, f32)> = survivors
-                .iter()
-                .filter(|v| *v != u)
-                .filter_map(|v| {
-                    self.vectors
-                        .get(v)
-                        .map(|vv| (v.clone(), self.compute_distance(&u_vec, vv)))
-                })
-                .collect();
-            peers.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-
-            let nearest = peers.first().map(|(id, _)| id.clone());
-            let connect_to = peers.len().min(max_m);
-
-            for (peer, _) in peers.into_iter().take(connect_to) {
-                if let Some(l) = self.layers.get_mut(layer) {
-                    l.add_edge(u.clone(), peer.clone());
-                    l.add_edge(peer, u.clone());
+        let push_keep = |fk: &mut HashMap<Bytes, Vec<Bytes>>, u: &Bytes, v: &Bytes| {
+            if let Some(list) = fk.get_mut(u) {
+                if !list.iter().any(|x| x == v) {
+                    list.push(v.clone());
                 }
             }
+        };
 
-            // Cap degree; force-keep nearest former peer so the bridge survives.
-            self.prune_neighbors_keeping(u, layer, max_m, nearest.as_ref());
+        // Full clique when every survivor can hold edges to all others under max_m.
+        if n - 1 <= max_m {
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let u = &survivors[i];
+                    let v = &survivors[j];
+                    if let Some(l) = self.layers.get_mut(layer) {
+                        l.add_edge(u.clone(), v.clone());
+                        l.add_edge(v.clone(), u.clone());
+                    }
+                    push_keep(&mut force_keep, u, v);
+                    push_keep(&mut force_keep, v, u);
+                }
+            }
+        } else {
+            // Nearest-neighbor path among survivors (max degree 2) so force-keep
+            // fits under small max_m; then add denser closest-peer edges as bonus.
+            let mut remaining: Vec<Bytes> = survivors.clone();
+            let mut path: Vec<Bytes> = Vec::with_capacity(n);
+            path.push(remaining.remove(0));
+            while !remaining.is_empty() {
+                let last = path.last().expect("path non-empty").clone();
+                let Some(last_vec) = self.vectors.get(&last).cloned() else {
+                    path.push(remaining.remove(0));
+                    continue;
+                };
+                let mut best_idx = 0usize;
+                let mut best_dist = f32::MAX;
+                for (idx, cand) in remaining.iter().enumerate() {
+                    if let Some(cv) = self.vectors.get(cand) {
+                        let d = self.compute_distance(&last_vec, cv);
+                        if d < best_dist {
+                            best_dist = d;
+                            best_idx = idx;
+                        }
+                    }
+                }
+                let next = remaining.remove(best_idx);
+                let prev = path.last().expect("path non-empty").clone();
+                if let Some(l) = self.layers.get_mut(layer) {
+                    l.add_edge(prev.clone(), next.clone());
+                    l.add_edge(next.clone(), prev.clone());
+                }
+                push_keep(&mut force_keep, &prev, &next);
+                push_keep(&mut force_keep, &next, &prev);
+                path.push(next);
+            }
+
+            // Bonus density: each survivor ↔ up to max_m closest other survivors.
+            for u in &survivors {
+                let Some(u_vec) = self.vectors.get(u).cloned() else {
+                    continue;
+                };
+                let mut peers: Vec<(Bytes, f32)> = survivors
+                    .iter()
+                    .filter(|v| *v != u)
+                    .filter_map(|v| {
+                        self.vectors
+                            .get(v)
+                            .map(|vv| (v.clone(), self.compute_distance(&u_vec, vv)))
+                    })
+                    .collect();
+                peers.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+                let connect_to = peers.len().min(max_m);
+                for (peer, _) in peers.into_iter().take(connect_to) {
+                    if let Some(l) = self.layers.get_mut(layer) {
+                        l.add_edge(u.clone(), peer.clone());
+                        l.add_edge(peer, u.clone());
+                    }
+                }
+            }
+        }
+
+        // Cap degree; force-keep spanning edges on both endpoints.
+        for u in &survivors {
+            let keep = force_keep.get(u).map(|v| v.as_slice()).unwrap_or(&[]);
+            self.prune_neighbors_keeping(u, layer, max_m, keep);
         }
     }
 
@@ -487,15 +574,16 @@ impl HNSWIndex {
 
     /// Keep at most `max_m` nearest neighbors of `node_id` (by distance to that node).
     ///
-    /// When `must_keep` is set, that neighbor is always retained (evicting the
-    /// furthest other edge if needed). Used so reverse edges `neighbor → new`
-    /// survive prune and the new node stays reachable from `entry_point`.
+    /// Every id in `must_keep` is retained when present in `vectors` (evicting the
+    /// furthest non-required edge if needed). Used so reverse edges `neighbor → new`
+    /// survive insert prune, and so bridge-repair spanning edges survive on both
+    /// endpoints (Batch CU multi-way).
     fn prune_neighbors_keeping(
         &mut self,
         node_id: &Bytes,
         layer: usize,
         max_m: usize,
-        must_keep: Option<&Bytes>,
+        must_keep: &[Bytes],
     ) {
         let Some(layer_ref) = self.layers.get(layer) else {
             return;
@@ -515,8 +603,8 @@ impl HNSWIndex {
             })
             .collect();
 
-        // Ensure must_keep is present even if it was somehow missing.
-        if let Some(keep) = must_keep {
+        // Ensure must_keep ids are present even if somehow missing from the list.
+        for keep in must_keep {
             if keep != node_id
                 && self.vectors.contains_key(keep)
                 && !scored.iter().any(|(id, _)| id == keep)
@@ -527,6 +615,13 @@ impl HNSWIndex {
                 }
             }
         }
+
+        let must: Vec<Bytes> = must_keep
+            .iter()
+            .filter(|k| *k != node_id && self.vectors.contains_key(*k))
+            .cloned()
+            .collect();
+        let is_must = |id: &Bytes| must.iter().any(|m| m == id);
 
         if scored.len() <= max_m {
             // Still rewrite if we had to re-add must_keep or clean self-loops.
@@ -548,17 +643,23 @@ impl HNSWIndex {
             .map(|(id, _)| id.clone())
             .collect();
 
-        if let Some(keep) = must_keep {
-            if keep != node_id
-                && self.vectors.contains_key(keep)
-                && !kept.iter().any(|id| id == keep)
-            {
-                // Force-keep: drop furthest of the current set, then push keep.
-                if kept.len() >= max_m {
-                    kept.pop();
-                }
-                kept.push(keep.clone());
+        // Force-keep each required neighbor, evicting furthest non-required first.
+        for keep in &must {
+            if kept.iter().any(|id| id == keep) {
+                continue;
             }
+            if kept.len() >= max_m {
+                if let Some(pos) = kept.iter().rposition(|id| !is_must(id)) {
+                    kept.remove(pos);
+                } else {
+                    // All slots are required; prefer must_keep over capacity.
+                    // Drop the last required slot only if we still need room.
+                    if kept.len() >= max_m {
+                        kept.pop();
+                    }
+                }
+            }
+            kept.push(keep.clone());
         }
 
         if let Some(layer_mut) = self.layers.get_mut(layer) {
@@ -1334,6 +1435,137 @@ mod tests {
                 results[0].doc_id, id,
                 "end {:?} must stay searchable after updating bridge node",
                 id
+            );
+        }
+    }
+
+    /// Batch CU: asymmetric edges — entry only points at the bridge; bridge↔leaf.
+    /// Outgoing-only snapshot of `b` would miss `a` and leave `c` unreachable.
+    #[test]
+    fn hnsw_bridge_remove_asymmetric_incoming_reconnects() {
+        let mut index = HNSWIndex::new(4, 32, DistanceMetric::L2);
+        index.add(Bytes::from("a"), vec![0.0, 0.0]);
+        index.add(Bytes::from("b"), vec![1.0, 0.0]);
+        index.add(Bytes::from("c"), vec![2.0, 0.0]);
+
+        // Force a→b only, b↔c. Entry a. (pre-CU: former={c}, no reconnect with a)
+        for layer in &mut index.layers {
+            for (_id, neigh) in layer.neighbors.iter_mut() {
+                neigh.clear();
+            }
+        }
+        let layer = &mut index.layers[0];
+        layer.add_edge(Bytes::from("a"), Bytes::from("b"));
+        layer.add_edge(Bytes::from("b"), Bytes::from("c"));
+        layer.add_edge(Bytes::from("c"), Bytes::from("b"));
+        index.entry_point = Some(Bytes::from("a"));
+
+        index.remove(&Bytes::from("b"));
+
+        assert!(!index.vectors.contains_key(&Bytes::from("b")));
+        assert!(index.vectors.contains_key(&Bytes::from("a")));
+        assert!(index.vectors.contains_key(&Bytes::from("c")));
+
+        let entry = index
+            .entry_point
+            .clone()
+            .expect("non-empty index has entry_point");
+        let mut seen: HashSet<Bytes> = HashSet::new();
+        let mut stack = vec![entry.clone()];
+        seen.insert(entry);
+        while let Some(cur) = stack.pop() {
+            for nb in index.layers[0].get_neighbors(&cur) {
+                if seen.insert(nb.clone()) {
+                    stack.push(nb);
+                }
+            }
+        }
+        assert!(
+            seen.contains(&Bytes::from("c")),
+            "after asymmetric bridge remove, c must be BFS-reachable from entry (visited {:?})",
+            seen
+        );
+
+        let results = index.search(&[2.0f32, 0.0], 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].doc_id,
+            Bytes::from("c"),
+            "leaf c must remain searchable after asymmetric bridge remove (got {:?})",
+            results[0].doc_id
+        );
+    }
+
+    /// Batch CU: multi-way star `a,c,d ↔ b` with degree-saturated leaves.
+    /// Single nearest-peer force-keep orphans `d` when mutual-NN is `a↔c` and
+    /// max_m is filled by closer decoys; spanning force-keep must keep a path.
+    #[test]
+    fn hnsw_bridge_remove_star_multiway_reconnects() {
+        // M=1 → layer-0 max_m=2 so two close decoys fully saturate each leaf.
+        let mut index = HNSWIndex::new(1, 8, DistanceMetric::L2);
+        // a and c mutual-nearest among survivors; d far — single nearest force-keep
+        // cannot span a–d without force-keeping the path edge on c.
+        index.add(Bytes::from("a"), vec![0.0, 0.0]);
+        index.add(Bytes::from("b"), vec![1.0, 0.0]);
+        index.add(Bytes::from("c"), vec![0.05, 0.0]);
+        index.add(Bytes::from("d"), vec![10.0, 0.0]);
+        // Decoys closer to each leaf than the far former peers.
+        index.add(Bytes::from("da1"), vec![0.0, 0.01]);
+        index.add(Bytes::from("da2"), vec![0.0, 0.02]);
+        index.add(Bytes::from("dc1"), vec![0.05, 0.01]);
+        index.add(Bytes::from("dc2"), vec![0.05, 0.02]);
+        index.add(Bytes::from("dd1"), vec![10.0, 0.01]);
+        index.add(Bytes::from("dd2"), vec![10.0, 0.02]);
+
+        // Force star a,c,d ↔ b; each of a,c,d also linked to its two decoys.
+        for layer in &mut index.layers {
+            for (_id, neigh) in layer.neighbors.iter_mut() {
+                neigh.clear();
+            }
+        }
+        let layer = &mut index.layers[0];
+        for leaf in ["a", "c", "d"] {
+            layer.add_edge(Bytes::from(leaf), Bytes::from("b"));
+            layer.add_edge(Bytes::from("b"), Bytes::from(leaf));
+        }
+        layer.add_edge(Bytes::from("a"), Bytes::from("da1"));
+        layer.add_edge(Bytes::from("a"), Bytes::from("da2"));
+        layer.add_edge(Bytes::from("da1"), Bytes::from("a"));
+        layer.add_edge(Bytes::from("da2"), Bytes::from("a"));
+        layer.add_edge(Bytes::from("c"), Bytes::from("dc1"));
+        layer.add_edge(Bytes::from("c"), Bytes::from("dc2"));
+        layer.add_edge(Bytes::from("dc1"), Bytes::from("c"));
+        layer.add_edge(Bytes::from("dc2"), Bytes::from("c"));
+        layer.add_edge(Bytes::from("d"), Bytes::from("dd1"));
+        layer.add_edge(Bytes::from("d"), Bytes::from("dd2"));
+        layer.add_edge(Bytes::from("dd1"), Bytes::from("d"));
+        layer.add_edge(Bytes::from("dd2"), Bytes::from("d"));
+        index.entry_point = Some(Bytes::from("a"));
+
+        index.remove(&Bytes::from("b"));
+
+        assert!(!index.vectors.contains_key(&Bytes::from("b")));
+
+        let entry = index
+            .entry_point
+            .clone()
+            .expect("non-empty index has entry_point");
+        let mut seen: HashSet<Bytes> = HashSet::new();
+        let mut stack = vec![entry.clone()];
+        seen.insert(entry);
+        while let Some(cur) = stack.pop() {
+            for nb in index.layers[0].get_neighbors(&cur) {
+                if seen.insert(nb.clone()) {
+                    stack.push(nb);
+                }
+            }
+        }
+        for id in [Bytes::from("a"), Bytes::from("c"), Bytes::from("d")] {
+            assert!(
+                seen.contains(&id),
+                "after multi-way star remove, {:?} must be BFS-reachable from entry (visited {:?})",
+                id,
+                seen
             );
         }
     }

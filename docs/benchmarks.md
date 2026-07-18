@@ -141,20 +141,24 @@ comparison:
    - `hnsw_insert_preserves_reachability_from_entry` (Batch CS; small M, BFS + self-search)
    - `hnsw_update_rewires_graph` (Batch CS; large vector move)
    - `hnsw_bridge_remove_keeps_survivors_reachable` / `hnsw_bridge_update_keeps_ends_reachable` (Batch CT)
+   - `hnsw_bridge_remove_asymmetric_incoming_reconnects` / `hnsw_bridge_remove_star_multiway_reconnects` (Batch CU)
    - `hnsw_m1_hub_churn_preserves_reachability` (Batch CT smoke)
 
-**Implementation note (Batch CQ + CS + CT):** `HNSWIndex::search` walks neighbor
+**Implementation note (Batch CQ + CS + CT + CU):** `HNSWIndex::search` walks neighbor
 edges (SEARCH-LAYER) with candidate list size `ef_search` (defaults to
 `ef_construction`). Insert still assigns all nodes to **layer 0** only
 (multi-layer assignment simplified). Layer-0 prune uses `M_max ≈ 2M` and
 force-keeps a reverse edge to each **new** node at insert time (mitigates
 immediate drop under degree caps; **not** a durable global reachability
 invariant — later hub prunes can still disconnect older leaves). `remove`
-unlinks reverse edges and **reconnects former neighbors** with a closest-peer
-heuristic + degree prune (Batch CT bridge repair) so hard-delete of a cut
-vertex does not permanently partition the layer. Existing-id `add` rewires via
-remove + re-insert (benefits from bridge repair). Approximate ANN; use FLAT
-for exact recall baselines. Brute-force over `vectors` remains only as a
+unlinks reverse edges and reconnects an **undirected** former-neighbor set
+(outgoing ∪ reverse scan) via a spanning structure — full clique when degree
+fits, else nearest-neighbor path — force-keeping those edges on both endpoints
+(Batch CU; extends CT 2-chain closest-peer). Covers asymmetric incoming-only
+links and multi-way stars under degree caps; still **not** a global
+non-partition guarantee under arbitrary later hub churn. Existing-id `add`
+rewires via remove + re-insert (inherits bridge repair). Approximate ANN; use
+FLAT for exact recall baselines. Brute-force over `vectors` remains only as a
 defensive fallback when the entry-point vector is missing.
 
 | Field | Value |

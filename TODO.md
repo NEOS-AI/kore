@@ -410,12 +410,19 @@ Also tracked in `docs/roadmap.md`.
   - *Residual (CS post-ship)*: update inherited hard-delete bridge partition — fixed by Batch CT reconnect on remove.
 - [x] **`[P2]`** **Code review (CS post-ship):** HNSW hard-delete can partition the graph (bridge remove/update)
   - *Found*: `remove` stripped edges to the deleted id but never reconnected former neighbors. Chain `a↔b↔c` with entry `a` after `remove(b)` left `c` in `vectors` but unreachable from search. Update-in-place is remove+reinsert, so updating a cut vertex could permanently orphan the other partition.
-  - *Done (Batch CT)*: `remove` snapshots former neighbors, unlinks, then `bridge_reconnect_neighbors` — bidirectional closest-peer edges among survivors up to `max_edges(layer)`, prune with force-keep nearest peer. Tests: `hnsw_bridge_remove_keeps_survivors_reachable`, `hnsw_bridge_update_keeps_ends_reachable`, optional `hnsw_m1_hub_churn_preserves_reachability`.
+  - *Done (Batch CT, bidirectional 2-chain)*: `remove` snapshots **outgoing** former neighbors, unlinks, then `bridge_reconnect_neighbors` — closest-peer bidirectional edges + force-keep nearest peer. Tests: `hnsw_bridge_remove_*`, `hnsw_bridge_update_*`; `hnsw_m1_hub_churn_*` is **smoke only**.
+  - *Residual (CT post-ship)*: outgoing-only snapshot + multi-way force-keep — fixed in Batch CU.
 - [x] **`[P2]`** **Code review (CS post-ship):** force-keep / docs over-claim global insert reachability
   - *Found*: force-keep only protects `neighbor → new` for the current insert; later `must_keep` prunes can `kept.pop()` older reverse edges. Docs saying inserts “stay reachable from entry” overstated durability.
-  - *Done (Batch CT, docs honesty)*: `docs/benchmarks.md` + module docs state insert-time only / not a durable global invariant. Optional `M=1` hub-churn smoke is a soft majority check, not a global guarantee. Stronger global reachability (if ever claimed) still needs soft-delete or periodic rebuild.
+  - *Done (Batch CT, docs honesty)*: insert-time only / not a durable global invariant. Hub-churn is soft majority smoke, not a global guarantee.
+- [x] **`[P2]`** **Code review (CT post-ship):** bridge repair snapshot is outgoing-only
+  - *Found*: former set is `get_neighbors(deleted)` only. Nodes with edges **into** the deleted id but not listed as out-neighbors are unlinked and never reconnected. Asymmetric prune can leave `entry→bridge`, `bridge→leaf` / `leaf→bridge` only; `remove(bridge)` then `survivors.len() < 2` and entry/leaf stay disconnected.
+  - *Done (Batch CU)*: undirected former snapshot (outgoing ∪ reverse scan). Test: `hnsw_bridge_remove_asymmetric_incoming_reconnects`.
+- [x] **`[P2]`** **Code review (CT post-ship):** multi-way / degree-saturated bridge reconnect incomplete
+  - *Found*: each survivor only force-keeps its **single** nearest former peer. With ≥3 former neighbors or leaves already at `max_m` with closer non-former edges, secondary former links can be pruned — directed search from entry may still miss a survivor. CT tests only cover the 2-neighbor mutual-NN chain.
+  - *Done (Batch CU)*: spanning reconnect (full clique when `n-1 ≤ max_m`, else nearest-neighbor path) with force-keep of spanning edges on **both** endpoints; `prune_neighbors_keeping` accepts multiple must-keeps. Test: `hnsw_bridge_remove_star_multiway_reconnects` (degree-saturated star). Not a global non-partition guarantee under later hub churn.
 - [ ] **`[P2]`** HNSW recall@k / throughput numbers vs FLAT
-  - *Partial*: methodology table in `docs/benchmarks.md`; graph search + CS/CT connectivity gated by unit tests. Full recall@k on larger N + measured throughput still TBD.
+  - *Partial*: methodology table in `docs/benchmarks.md`; graph search + bridge/asymmetric/multi-way tests gated. Full recall@k on larger N + measured throughput still TBD.
 - [x] **`[P2]`** **Code review (CP post-ship):** HNSW search does not use the graph
   - *Found*: `search` full-scanned `self.vectors`; `ef_search` unused; `add` could connect self as neighbor.
   - *Done (Batch CQ)*: graph SEARCH-LAYER + self-exclude on connect; discriminating edge-walk test.
@@ -542,7 +549,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batch CT shipped** (bridge reconnect on remove; CS post-ship partition residual closed; force-keep docs honesty). **Open next:** HNSW recall@k/throughput numbers; optional JSON logging; advanced deadlock; standing tests-for-phase P0. (Force-keep remains insert-time only — not a global invariant.)
+Prioritized for next letter batch(es). **Batch CU shipped** (undirected former snapshot + multi-way spanning bridge reconnect; CT post-ship residuals closed). Still not a global non-partition guarantee under arbitrary later hub churn. **Open next:** HNSW recall@k/throughput numbers; optional JSON logging; advanced deadlock; standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -585,10 +592,12 @@ Prioritized for next letter batch(es). **Batch CT shipped** (bridge reconnect on
 | P2 | HNSW graph search (ef_search; self-exclude; edge-walk tests) | done (CQ) |
 | P2 | CQ post-ship: HNSW remove unlinks graph + re-add clears neighbors | done (CS local hygiene) |
 | P2 | CQ post-ship: insert M-prune preserves reachability from entry | done (CS insert-time heuristic) |
-| P2 | CQ post-ship: update-in-place rewire or document | done (CS; CT closes bridge residual) |
-| P2 | CS post-ship: hard-delete bridge repair / soft-delete | done (CT reconnect heuristic) |
-| P2 | CS post-ship: force-keep not global reachability (docs + hub-churn tests) | done (CT docs honesty; residual: no global invariant) |
-| P2 | HNSW recall@k / throughput numbers vs FLAT | open (methodology + CQ/CS/CT correctness; numbers TBD) |
+| P2 | CQ post-ship: update-in-place rewire or document | done (CS; CT 2-chain) |
+| P2 | CS post-ship: hard-delete bridge repair / soft-delete | done (CT 2-chain heuristic) |
+| P2 | CS post-ship: force-keep not global reachability (docs + hub-churn tests) | done (CT docs honesty; hub-churn smoke) |
+| P2 | CT post-ship: undirected former-neighbor snapshot (incoming too) | done (CU) |
+| P2 | CT post-ship: multi-way / degree-saturated bridge reconnect | done (CU) |
+| P2 | HNSW recall@k / throughput numbers vs FLAT | open (methodology + CQ–CU; numbers TBD) |
 | P2 | CP post-ship: LOADING allowlist PSYNC/SYNC mid-install visibility | done (CR) |
 | P2 | CC post-ship: typed export skip expired keys (no revive without TTL) | done (CD) |
 | P2 | CC nit: unify start_background_sweep create paths | done (CD) |

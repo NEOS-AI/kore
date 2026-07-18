@@ -15,7 +15,8 @@ Tracked in detail in root `TODO.md`. High level:
 - [ ] True multi-DB atomic keyspace install under concurrent readers (residual; LOADING gate mitigates)
 - [x] HNSW graph-based ANN search (Batch CQ; layer-0 edges + `ef_search`; multi-layer insert still simplified)
 - [x] HNSW remove/unlink + insert-time force-keep + update rewire (Batch CS)
-- [x] HNSW hard-delete bridge repair — reconnect former neighbors on remove (Batch CT)
+- [x] HNSW hard-delete bridge repair — closest-peer reconnect (Batch CT; 2-chain)
+- [x] HNSW undirected former snapshot + multi-way spanning bridge reconnect (Batch CU)
 - [ ] HNSW recall@k / throughput numbers vs FLAT (methodology in `docs/benchmarks.md`)
 
 ## Plans
