@@ -1164,6 +1164,8 @@ pub fn load_into_cache(cache: &Arc<Cache>, path: &Path) -> Result<usize> {
     match result {
         Ok(n) => {
             cache.with_autosweep_paused(|| {
+                // Dirty WATCH before flush so no clean window while keyspace is empty.
+                cache.touch_all_watch_keys();
                 // Full replace: free target early to cut dual-residency peak.
                 cache.flush_all_including_search();
                 cache.replace_keyspace_from(&scratch);
@@ -1216,6 +1218,9 @@ pub fn load_into_databases(databases: &Databases, path: &Path) -> Result<usize> 
     match result {
         Ok(n) => {
             databases.with_autosweep_paused_all(|| {
+                for db in databases.iter() {
+                    db.touch_all_watch_keys();
+                }
                 databases.flush_all_including_search();
                 databases.replace_keyspaces_from(&scratch);
             });

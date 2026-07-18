@@ -82,12 +82,15 @@ impl Cache {
     }
 
     /// Export all geo sets for persistence: (key, [(member, lon, lat), ...]).
+    /// Skips keys whose typed TTL has already elapsed (no revive without TTL).
     pub fn export_geos(&self) -> Vec<(Bytes, Vec<(Bytes, f64, f64)>)> {
         let mut out = Vec::new();
         self.geo_sets.for_each(|key, geoset| {
-            { let set = geoset.read();
-                out.push((key.clone(), set.iter_members().collect()));
+            if !self.typed_key_exportable(key) {
+                return;
             }
+            let set = geoset.read();
+            out.push((key.clone(), set.iter_members().collect()));
         });
         out
     }

@@ -492,8 +492,9 @@ impl Cache {
     /// tracker take/install + `memory_usage` store (never per-key `account`
     /// after map replace).
     ///
-    /// Pre-swap WATCH keys on `self` are re-tracked and bumped after install so
-    /// live clients with WATCH fail EXEC (same idea as FLUSHDB).
+    /// Pre-swap WATCH keys on `self` are re-tracked and bumped **atomically**
+    /// with watch map install so live clients with WATCH fail EXEC (same idea
+    /// as FLUSHDB) without a clean-gen window.
     ///
     /// Leaves **unchanged** on `self`: pubsub, connection stats, list/stream
     /// blockers, maxmemory / eviction config, slowlog, acl_log.
@@ -504,7 +505,7 @@ impl Cache {
     /// scratch leaves `self` intact. Discard locals are dropped immediately
     /// after install to shorten the dual-residency window.
     pub fn replace_keyspace_from(&self, other: &Self) {
-        // Capture pre-swap WATCH keys before drain (for post-install bump).
+        // Capture pre-swap WATCH keys before drain (for atomic install+bump).
         let pre_watch_keys: Vec<Bytes> = self.watch_gens.lock().keys().cloned().collect();
 
         // 1. Drain scratch completely first (self still intact if this panics).
@@ -543,7 +544,16 @@ impl Cache {
         *self.sets.write() = other_sets;
         *self.streams.write() = other_streams;
         *self.typed_expires.write() = other_expires;
-        *self.watch_gens.lock() = other_watch;
+        // Install scratch watch map and bump pre-swap keys under one lock so
+        // `watch_generation` cannot observe a clean empty map mid-replace.
+        {
+            let mut gens = self.watch_gens.lock();
+            *gens = other_watch;
+            for k in pre_watch_keys {
+                let g = gens.entry(k).or_insert(0);
+                *g = g.wrapping_add(1);
+            }
+        }
         self.search_index_manager
             .install(other_indices, other_aliases);
         self.memory_tracker.install_keyspace_counts(&other_counts);
@@ -562,15 +572,6 @@ impl Cache {
         drop(discard_indices);
         drop(discard_aliases);
         let _ = discard_counts;
-
-        // Bump pre-swap WATCH gens so live EXEC aborts after dataset replace.
-        if !pre_watch_keys.is_empty() {
-            let mut gens = self.watch_gens.lock();
-            for k in pre_watch_keys {
-                let g = gens.entry(k).or_insert(0);
-                *g = g.wrapping_add(1);
-            }
-        }
     }
 
     /// Non-mutating export of non-expired string entries for RDB snapshot /

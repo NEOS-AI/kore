@@ -139,6 +139,17 @@ impl Cache {
         }
     }
 
+    /// Whether a typed key should be included in persistence export.
+    ///
+    /// Returns false when the key has a past `typed_expires` entry (would be
+    /// revived without TTL if exported). Keys with no expire record are live.
+    pub(super) fn typed_key_exportable(&self, key: &Bytes) -> bool {
+        match self.typed_expires.read().get(key) {
+            Some(exp) if *exp <= Instant::now() => false,
+            _ => true,
+        }
+    }
+
     /// Export typed expires as absolute Unix ms for persistence.
     pub fn export_typed_expires_unix_ms(&self) -> Vec<(Bytes, i64)> {
         let now_unix = SystemTime::now()

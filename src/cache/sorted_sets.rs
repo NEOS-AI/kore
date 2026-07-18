@@ -90,12 +90,15 @@ impl Cache {
     }
 
     /// Export all sorted sets for persistence: (key, [(member, score), ...]).
+    /// Skips keys whose typed TTL has already elapsed (no revive without TTL).
     pub fn export_zsets(&self) -> Vec<(Bytes, Vec<(Bytes, f64)>)> {
         let mut out = Vec::new();
         self.sorted_sets.for_each(|key, zset| {
-            { let set = zset.read();
-                out.push((key.clone(), set.iter_members().collect()));
+            if !self.typed_key_exportable(key) {
+                return;
             }
+            let set = zset.read();
+            out.push((key.clone(), set.iter_members().collect()));
         });
         out
     }

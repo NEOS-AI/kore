@@ -1150,6 +1150,8 @@ pub fn load_bytes(cache: &Cache, data: &[u8], flush: bool) -> Result<usize> {
                 // flush=true: drop live keyspace early so peak ≈ scratch only
                 // before install (Err path never reaches here).
                 if flush {
+                    // Dirty WATCH before flush so no clean window while empty.
+                    cache.touch_all_watch_keys();
                     cache.flush_all_including_search();
                 }
                 cache.replace_keyspace_from(&scratch);
@@ -1181,6 +1183,9 @@ pub fn load_databases_bytes(databases: &Databases, data: &[u8], flush: bool) -> 
         Ok(n) => {
             databases.with_autosweep_paused_all(|| {
                 if flush {
+                    for db in databases.iter() {
+                        db.touch_all_watch_keys();
+                    }
                     databases.flush_all_including_search();
                 }
                 databases.replace_keyspaces_from(&scratch);

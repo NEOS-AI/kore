@@ -76,10 +76,14 @@ impl Cache {
     }
 
     /// Export all lists: (key, [elements left-to-right]).
+    /// Skips keys whose typed TTL has already elapsed (no revive without TTL).
     pub fn export_lists(&self) -> Vec<(Bytes, Vec<Bytes>)> {
         let lists = self.lists.read();
         let mut out = Vec::with_capacity(lists.len());
         for (key, l) in lists.iter() {
+            if !self.typed_key_exportable(key) {
+                continue;
+            }
             let list = l.read();
             out.push((key.clone(), list.iter_items().collect()));
         }

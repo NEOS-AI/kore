@@ -420,22 +420,33 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch CC)*: `Cache::export_strings` + `DbSnapshot::from_cache` non-mutating (skip expired, no touch/lazy-delete/stats); save + seed share the same path. Tests: failed merge keeps expired for sweep, live key, zero unexpected cmd_get/hits/evicted_expired.
 - [ ] **`[P1]`** **Code review (CB post-ship):** multi-DB `replace_keyspaces_from` is not atomic across DBs
   - *Found*: commits one DB at a time; concurrent readers (FULLRESYNC) can see DB0 new + DB1 old; panic mid-loop leaves partial multi-DB commit.
-  - *Second-pass*: confirmed.
-  - *Partial (Batch CC)*: whole replace loop runs under multi-DB autosweep pause; true cross-DB atomic install / global load lock still open.
+  - *Partial (Batch CC)*: whole replace loop under multi-DB autosweep pause; `flush=true` empties all DBs first then per-DB install — tear becomes DB0 new + DB1 empty (not old), still not atomic.
+  - *CC post-ship*: reconfirmed; true cross-DB atomic install / global load lock still open.
+- [x] **`[P1]`** **Code review (CC post-ship):** WATCH bump not atomic with keyspace install (race window)
+  - *Found*: `replace_keyspace_from` installs scratch `watch_gens` (usually empty) and releases the lock, then later bumps `pre_watch_keys`. Between those steps `watch_generation` can `or_insert(0)` so a client that WATCHed at gen 0 sees clean EXEC against new/empty data. On `flush=true` the clean window spans flush (which does not touch watch_gens) through end of replace.
+  - *Done (Batch CD)*: under one `watch_gens` lock, install `other_watch` and bump all `pre_watch_keys`; AOF/RDB `flush=true` commit calls `touch_all_watch_keys` before flush. Tests: `tests/cd_watch_atomic_and_typed_export_test.rs`.
 - [x] **`[P1]`** **Code review (CB post-ship):** keyspace replace does not bump `watch_gens` (unlike FLUSHDB `touch_all_watch_keys`)
   - *Found*: install uses scratch’s empty `watch_gens`; clients with WATCH gen `0` can still EXEC after full dataset replace. Harmless at exclusive startup; wrong if load runs with live WATCH holders.
-  - *Done (Batch CC)*: `replace_keyspace_from` collects pre-swap watch keys and bumps them after install. Test: EXEC null after load replace.
+  - *Done (Batch CC + CD)*: sequential bump in CC; atomic install+bump + pre-flush touch in CD.
 - [x] **`[P1]`** **Code review (CB second-pass):** scratch shares `Stats` Arc with target (`new_keyspace_sharing`)
   - *Found*: RDB/AOF apply on scratch increments shared `cmd_set`/`cmd_get`/OOM counters; failed loads never commit keyspace but permanently inflate INFO; success counts internal apply as client commands. PubSub category install itself is fine (KEYSPACE excludes PubSub).
   - *Done (Batch CC)*: `empty_keyspace_like` uses independent `Stats::new()`; multi-DB siblings still share stats.
-- [ ] **`[P2]`** **Code review (CB post-ship):** expand CB tests — post-swap memory_tracker + `string_memory_usage`; multi-DB fail/success; typed TTL after swap; PubSub category non-clobber; empty-AOF success on non-empty target; peak-memory budget; seed non-mutation on failed merge
-  - *Partial (Batch CC)*: seed non-mutation + autosweep restore + WATCH + flush=true replace covered in `cc_load_*`; remaining expansion open.
+- [x] **`[P1]`** **Code review (CC post-ship):** `with_autosweep_paused` does not stop an in-flight expire cycle
+  - *Found*: only stores `autosweep_enabled=false`; `background_sweep` re-checks at loop top — mid-cycle `active_expire_cycle` + accounting still runs during flush/replace on live FULLRESYNC. Startup path safe (no task until after load).
+  - *Done (Batch CD)*: `autosweep_cycle_lock` held for whole expire body; `with_autosweep_paused` disables flag then acquires the lock (waits for in-flight cycle) before running `f`.
+- [x] **`[P2]`** **Code review (CC post-ship):** typed `export_*` can revive expired typed keys without TTL
+  - *Found*: string export skips `is_expired()`; typed exports dump every key while `export_typed_expires_unix_ms` omits elapsed TTLs — `from_cache` seed/save can reify expired zset/hash/etc without expire record.
+  - *Done (Batch CD)*: `typed_key_exportable` filters past TTL in zset/geo/hash/list/set/stream export; test expired hash not in `export_hashes` / `from_cache`.
+- [ ] **`[P2]`** **Code review (CB post-ship):** expand CB tests — post-swap memory_tracker + `string_memory_usage`; multi-DB fail/success; typed TTL after swap; PubSub category non-clobber; empty-AOF success on non-empty target; peak-memory budget; seed non-mutation on failed merge; concurrent WATCH race
+  - *Partial (Batch CC)*: seed non-mutation + autosweep restore + sequential WATCH + flush=true replace covered in `cc_load_*`; remaining expansion open.
 - [ ] **`[P2]`** **Code review (CB):** `drain_all` / `replace_all` not fully failure-atomic across shards
   - *Partial (Batch CB)*: pre-`reserve(self.len())` on `ShardedHashMap`/`ShardedKeyMap` `drain_all`; docs note exclusive access. Mid-panic after partial shard drain still drops drained entries; install-half `replace_all` after target drain is the more dangerous path on the live DB (true OOM-abort policy remains open).
 - [x] **`[P2]`** **Code review (CB nit):** `install_keyspace_counts` not closed over `KEYSPACE_CATEGORIES`
   - *Done (Batch CB)*: install always writes fixed `KEYSPACE_CATEGORIES` slots (ignores fabricated category tags; PubSub cannot be clobbered).
 - [ ] **`[P2]`** **Code review (CB nit):** `SearchIndexManager::install` does not validate alias targets exist in indices (fine if only fed `take_all` output)
 - [ ] **`[P2]`** **Code review (CB second-pass nit):** `empty_keyspace_like` hardcodes `loadfactor: 0.75` (diverges from process create-time loadfactor; capacity churn only)
+- [x] **`[P2]`** **Code review (CC nit):** `new_with_sweep_loadfactor` still inlines `tokio::spawn(background_sweep)` instead of `start_background_sweep` (duplication / drift risk)
+  - *Done (Batch CD)*: both create paths call `start_background_sweep`.
 
 ### Pub/Sub
 
@@ -467,7 +478,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batch CC shipped** (load quiesce + non-mutating seed + flush=true peak recovery + WATCH bump + independent scratch Stats). **Next:** ACL `@search`; HNSW AOF/`ef_construction` + RDB round-trip tests; remaining CB/BZ nits (multi-DB atomic install, expand tests, loadfactor, raw `load_into`).
+Prioritized for next letter batch(es). **Batch CD shipped** (atomic WATCH install+bump, pre-flush touch, expire cycle lock for pause, typed export skips expired). **Next:** ACL `@search`; HNSW AOF/`ef_construction` + RDB round-trip; multi-DB atomic install (still partial); remaining BZ/CB nits.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -483,7 +494,9 @@ Prioritized for next letter batch(es). **Batch CC shipped** (load quiesce + non-
 | P1 | CB: full keyspace swap under quiesce (typed maps, expires, watch) | done (CB) |
 | P1 | CB: `Cache.memory_usage` + tracker paired install (no double-account) | done (CB) |
 | P1 | CB post-ship: multi-DB replace atomic / server-wide quiesce | partial (CC pause; install still per-DB) |
-| P1 | CB post-ship: bump `watch_gens` on keyspace replace | done (CC) |
+| P1 | CB post-ship: bump `watch_gens` on keyspace replace | done (CC+CD) |
+| P1 | CC post-ship: atomic WATCH bump with keyspace install | done (CD) |
+| P1 | CC post-ship: pause waits for in-flight expire cycle | done (CD) |
 | P1 | CB second-pass: scratch independent Stats (no INFO pollution) | done (CC) |
 | P2 | FT RDB section | done (BY) |
 | P2 | RDB load wipe-on-FT-failure (mirror AOF BW) | done (BZ) |
@@ -498,6 +511,8 @@ Prioritized for next letter batch(es). **Batch CC shipped** (load quiesce + non-
 | P2 | CB: `install_keyspace_counts` closed over KEYSPACE_CATEGORIES | done (CB) |
 | P2 | CB: optional alias-target validate on search `install` | open |
 | P2 | CB post-ship: expand tests (memory, multi-DB, TTL, pubsub, seed, peak) | partial (CC seed/quiesce/WATCH) |
+| P2 | CC post-ship: typed export skip expired keys (no revive without TTL) | done (CD) |
+| P2 | CC nit: unify start_background_sweep create paths | done (CD) |
 | P2 | CB second-pass: empty_keyspace_like hardcodes loadfactor 0.75 | open |
 | P2 | `get_index` atomic resolve; min-replicas FT test | open |
 | P2 | VECTOR/NUMERIC rewrite tests | done (BX) |

@@ -466,6 +466,13 @@ impl Cache {
                 continue;
             }
 
+            // Hold cycle lock for the whole body so `with_autosweep_paused` can
+            // wait and exclude concurrent expire during keyspace replace.
+            let _cycle = self.autosweep_cycle_lock.lock();
+            if !self.autosweep_enabled.load(Ordering::Relaxed) {
+                continue;
+            }
+
             let result = self.map.active_expire_cycle(
                 crate::hashmap::ACTIVE_EXPIRE_SAMPLES_PER_PASS,
                 crate::hashmap::ACTIVE_EXPIRE_MAX_PASSES,

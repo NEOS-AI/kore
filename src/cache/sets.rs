@@ -76,10 +76,14 @@ impl Cache {
     }
 
     /// Export all sets: (key, [members]).
+    /// Skips keys whose typed TTL has already elapsed (no revive without TTL).
     pub fn export_sets(&self) -> Vec<(Bytes, Vec<Bytes>)> {
         let sets = self.sets.read();
         let mut out = Vec::with_capacity(sets.len());
         for (key, s) in sets.iter() {
+            if !self.typed_key_exportable(key) {
+                continue;
+            }
             let set = s.read();
             out.push((key.clone(), set.iter_members().collect()));
         }

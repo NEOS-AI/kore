@@ -86,10 +86,14 @@ impl Cache {
     }
 
     /// Export all hashes: (key, [(field, value), ...]).
+    /// Skips keys whose typed TTL has already elapsed (no revive without TTL).
     pub fn export_hashes(&self) -> Vec<(Bytes, Vec<(Bytes, Bytes)>)> {
         let hashes = self.hashes.read();
         let mut out = Vec::with_capacity(hashes.len());
         for (key, h) in hashes.iter() {
+            if !self.typed_key_exportable(key) {
+                continue;
+            }
             let hash = h.read();
             out.push((key.clone(), hash.iter_fields().collect()));
         }

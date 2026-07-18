@@ -84,10 +84,14 @@ impl Cache {
     }
 
     /// Export all streams with full state (entries, last_generated_id, groups, PEL).
+    /// Skips keys whose typed TTL has already elapsed (no revive without TTL).
     pub fn export_streams(&self) -> Vec<(Bytes, StreamStateSnapshot)> {
         let streams = self.streams.read();
         let mut out = Vec::with_capacity(streams.len());
         for (key, s) in streams.iter() {
+            if !self.typed_key_exportable(key) {
+                continue;
+            }
             let stream = s.read();
             out.push((key.clone(), stream.export_state()));
         }

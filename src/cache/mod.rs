@@ -87,6 +87,9 @@ pub struct Cache {
     pub(super) eviction_policy: AtomicU8,
     /// Enable automatic sweeping
     pub(super) autosweep_enabled: AtomicBool,
+    /// Held for the duration of one background expire cycle so
+    /// [`Self::with_autosweep_paused`] can wait for in-flight work to finish.
+    pub(super) autosweep_cycle_lock: Mutex<()>,
     /// Number of samples for approximated LRU/LFU eviction (default: 5)
     pub(super) eviction_sample_size: AtomicUsize,
     /// Redis `lfu-log-factor` (default 10): higher slows counter growth.
@@ -153,18 +156,15 @@ impl Cache {
             evict_enabled: AtomicBool::new(true),
             eviction_policy: AtomicU8::new(EvictionPolicy::AllKeysLru as u8),
             autosweep_enabled: AtomicBool::new(true),
+            autosweep_cycle_lock: Mutex::new(()),
             eviction_sample_size: AtomicUsize::new(5), // Redis default
             lfu_log_factor: AtomicU8::new(crate::lfu::LFU_LOG_FACTOR_DEFAULT),
             lfu_decay_time: AtomicU8::new(crate::lfu::LFU_DECAY_TIME_DEFAULT),
             watch_gens: Mutex::new(HashMap::new()),
         });
 
-        // Start background sweep task if requested
         if start_sweep {
-            let cache_clone = cache.clone();
-            tokio::spawn(async move {
-                cache_clone.background_sweep().await;
-            });
+            cache.start_background_sweep();
         }
 
         cache
@@ -242,6 +242,7 @@ impl Cache {
                     .autosweep_enabled
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
+            autosweep_cycle_lock: Mutex::new(()),
             eviction_sample_size: AtomicUsize::new(
                 shared
                     .eviction_sample_size
@@ -300,16 +301,17 @@ impl Cache {
         });
     }
 
-    /// Current autosweep flag (background expire may still finish an in-flight
-    /// cycle after this flips to false).
+    /// Current autosweep flag.
     pub fn autosweep_enabled(&self) -> bool {
         self.autosweep_enabled
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Run `f` with autosweep disabled on this cache; restore previous flag
-    /// even if `f` panics. Used around keyspace replace commit so expire cannot
-    /// race map/counter install.
+    /// Run `f` with autosweep disabled and no in-flight expire cycle running.
+    ///
+    /// Disables the flag, waits to acquire [`Self::autosweep_cycle_lock`] (held
+    /// for the whole background expire body), runs `f`, then restores the
+    /// previous flag even if `f` panics. Used around keyspace replace commit.
     pub fn with_autosweep_paused<F, R>(&self, f: F) -> R
     where
         F: FnOnce() -> R,
@@ -325,10 +327,13 @@ impl Cache {
                 self.cache.set_autosweep(self.prev);
             }
         }
-        let _guard = Restore {
+        let _restore = Restore {
             cache: self,
             prev,
         };
+        // Wait for any in-flight expire cycle to finish; hold lock so a new
+        // cycle cannot start while `f` runs.
+        let _cycle = self.autosweep_cycle_lock.lock();
         f()
     }
 
