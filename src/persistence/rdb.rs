@@ -853,22 +853,49 @@ impl DbSnapshot {
     /// Search indices are created **before** key types so hash load can
     /// auto-index documents (same order idea as AOF: schema before HSET).
     ///
-    /// **Merge name clash:** if an index name from this snapshot already
-    /// exists on `cache` (typical `flush=false` merge into a seeded scratch),
-    /// create is **skipped** and the existing definition is kept so seed
-    /// documents stay indexed. Aliases that already exist are likewise
-    /// skipped. Unknown-target alias errors still fail the load.
+    /// **Merge name clash (indices):** if an index name from this snapshot
+    /// already exists on `cache` (typical `flush=false` merge into a seeded
+    /// scratch), compare **logical schema** via
+    /// [`IndexDefinition::schema_eq`] (`name` / `prefix` / `fields`; ignore
+    /// `created_at`):
+    /// - **Equal** → skip create (idempotent; seed definition kept). Hashes
+    ///   from the RDB still load and `auto_index_key` against the seed schema
+    ///   (only keys matching the seed PREFIX are indexed — same as live).
+    /// - **Unequal** → `Err(InvalidArgument)` describing the clash. Do **not**
+    ///   silently keep the seed while loading RDB keys that would not match
+    ///   the intended RDB schema.
+    ///
+    /// **Merge name clash (aliases):** if an alias already exists, compare
+    /// resolved real-index targets:
+    /// - **Equal** → skip (idempotent).
+    /// - **Unequal** → `Err(InvalidArgument)` retarget clash (seed mapping kept
+    ///   only because the public wrappers roll back the scratch on `Err`).
+    ///
+    /// Unknown-target alias errors still fail the load.
     pub fn load_into(&self, cache: &Cache) -> Result<usize> {
         let mut loaded = 0usize;
         let now = now_unix_ms();
 
-        // 1. Recreate search schema first (skip names already present on merge).
-        let existing_indices: std::collections::HashSet<String> =
-            cache.list_search_indices().into_iter().collect();
+        // 1. Recreate search schema first. On merge name clash, require schema
+        // equality (skip) rather than silently discarding a divergent RDB def.
+        let existing_defs: HashMap<String, IndexDefinition> = cache
+            .list_search_index_definitions()
+            .into_iter()
+            .map(|d| (d.name.clone(), d))
+            .collect();
         for def in &self.search_indices {
-            if existing_indices.contains(&def.name) {
-                // Merge: keep seed index definition + its documents.
-                continue;
+            if let Some(existing) = existing_defs.get(&def.name) {
+                if existing.schema_eq(def) {
+                    // Idempotent merge: keep seed definition + its documents.
+                    continue;
+                }
+                let detail = existing
+                    .schema_diff_summary(def)
+                    .unwrap_or_else(|| "schema differs".into());
+                return Err(Error::InvalidArgument(format!(
+                    "RDB FT.CREATE: index '{}' already exists with a different schema ({})",
+                    def.name, detail
+                )));
             }
             cache
                 .create_search_index(def.clone())
@@ -961,15 +988,25 @@ impl DbSnapshot {
         }
 
         // 2. Aliases after keys (and after indices exist).
-        // Skip aliases already present (merge keeps seed mapping).
-        let existing_aliases: std::collections::HashSet<String> = cache
-            .list_search_aliases()
-            .into_iter()
-            .map(|(a, _)| a)
-            .collect();
+        // On merge alias clash, require equal resolved targets (skip) rather
+        // than silently keeping a divergent seed mapping.
+        let existing_aliases: HashMap<String, String> =
+            cache.list_search_aliases().into_iter().collect();
         for (alias, index) in &self.search_aliases {
-            if existing_aliases.contains(alias) {
-                continue;
+            if let Some(existing_target) = existing_aliases.get(alias) {
+                // Stored alias targets are always real index names. Resolve the
+                // RDB target the same way alias_add would (alias→alias one hop).
+                let resolved_rdb = existing_aliases
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| index.clone());
+                if existing_target == &resolved_rdb {
+                    continue;
+                }
+                return Err(Error::InvalidArgument(format!(
+                    "RDB FT.ALIASADD: alias '{}' already points to '{}' (RDB targets '{}')",
+                    alias, existing_target, resolved_rdb
+                )));
             }
             cache
                 .alias_add(alias, index)
@@ -1179,9 +1216,11 @@ pub fn load_databases(databases: &Databases, path: &Path, flush: bool) -> Result
 /// - `flush = false` (**merge**): scratch is seeded with a non-mutating deep
 ///   copy of the current keyspace, then the RDB is merged into that copy
 ///   before swap — failure preserves the live target with no touch/lazy-expire
-///   side effects from seeding. FT indices/aliases whose names already exist
-///   on the seed are **kept** (RDB create/alias skipped for those names); new
-///   names from the RDB are added.
+///   side effects from seeding. FT indices whose names already exist on the
+///   seed are kept only when the RDB definition is **schema-equal**
+///   ([`IndexDefinition::schema_eq`]); divergent schemas fail the load.
+///   Aliases whose names already exist are kept only when the resolved target
+///   matches; retarget clashes fail. New FT names from the RDB are added.
 pub fn load_bytes(cache: &Cache, data: &[u8], flush: bool) -> Result<usize> {
     let snap = MultiDbSnapshot::decode(data)?;
     let scratch = cache.empty_keyspace_like();
@@ -1223,7 +1262,8 @@ pub fn load_bytes(cache: &Cache, data: &[u8], flush: bool) -> Result<usize> {
 ///   flushes all target DBs (including FT) then replaces (peak-memory recovery
 ///   for FULLRESYNC).
 /// - `flush = false` (**merge**): scratch seeded from non-mutating multi-DB
-///   snapshot, then merged (existing FT names kept; new names from RDB added).
+///   snapshot, then merged (existing FT names kept only when schema/target
+///   equal; clash otherwise fails — see [`DbSnapshot::load_into`]).
 pub fn load_databases_bytes(databases: &Databases, data: &[u8], flush: bool) -> Result<usize> {
     let snap = MultiDbSnapshot::decode(data)?;
     let scratch = databases.empty_like();

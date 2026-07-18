@@ -204,8 +204,12 @@ fn multi_db_rdb_flush_success_updates_both_dbs() {
     );
 }
 
-/// flush=false merge: same FT index name on seed does not fail; seed key kept,
-/// RDB keys added; existing index definition retained.
+/// flush=false merge: same FT index name with **equal schema** skips create;
+/// seed key kept, RDB keys added; existing definition retained. Same-target
+/// alias is skipped; new names from RDB are added.
+///
+/// Divergent schema / alias retarget clash cases live in
+/// `tests/cg_ft_merge_schema_test.rs` (Batch CG).
 #[test]
 fn rdb_flush_false_ft_name_clash_merges() {
     let loaded = make_databases();
@@ -217,22 +221,24 @@ fn rdb_flush_false_ft_name_clash_merges() {
             Default::default(),
         )
         .unwrap();
+    let idx_fields = vec![FieldDefinition {
+        name: "title".to_string(),
+        field_type: FieldType::Text {
+            weight: 1.0,
+            sortable: false,
+        },
+    }];
     cache
         .create_search_index(IndexDefinition::new(
             "idx".to_string(),
             vec!["doc:".to_string()],
-            vec![FieldDefinition {
-                name: "title".to_string(),
-                field_type: FieldType::Text {
-                    weight: 1.0,
-                    sortable: false,
-                },
-            }],
+            idx_fields.clone(),
         ))
         .unwrap();
     cache.alias_add("blog", "idx").unwrap();
 
-    // RDB carries same index name + a new key + a new index name.
+    // RDB carries same index name with **identical** schema + a new key + a
+    // new index name. Equal schema → skip create (idempotent merge).
     let mut body = empty_snap();
     body.strings.push(StringRecord {
         key: Bytes::from("from-rdb"),
@@ -242,14 +248,8 @@ fn rdb_flush_false_ft_name_clash_merges() {
     });
     body.search_indices.push(IndexDefinition::new(
         "idx".to_string(),
-        vec!["other:".to_string()], // different prefix — must be skipped on clash
-        vec![FieldDefinition {
-            name: "title".to_string(),
-            field_type: FieldType::Text {
-                weight: 1.0,
-                sortable: false,
-            },
-        }],
+        vec!["doc:".to_string()], // same prefix as seed — schema-equal skip
+        idx_fields,
     ));
     body.search_indices.push(IndexDefinition::new(
         "idx2".to_string(),
@@ -262,7 +262,7 @@ fn rdb_flush_false_ft_name_clash_merges() {
             },
         }],
     ));
-    // Same alias name as seed — skip; new alias should apply.
+    // Same alias → same target: skip; new alias should apply.
     body.search_aliases
         .push(("blog".to_string(), "idx".to_string()));
     body.search_aliases
@@ -274,7 +274,7 @@ fn rdb_flush_false_ft_name_clash_merges() {
     let bytes = Bytes::from(snap.encode().unwrap());
 
     let n = rdb::load_databases_bytes(&loaded, &bytes, false)
-        .expect("merge with FT name clash must succeed");
+        .expect("merge with schema-equal FT name clash must succeed");
     assert!(n >= 1);
 
     assert_eq!(
@@ -297,13 +297,13 @@ fn rdb_flush_false_ft_name_clash_merges() {
         indices.iter().any(|n| n == "idx2"),
         "new RDB index added; got {indices:?}"
     );
-    // Seed definition kept (prefix doc:), not RDB's other:
+    // Seed definition kept (prefix doc:).
     let defs = cache.list_search_index_definitions();
     let idx_def = defs.iter().find(|d| d.name == "idx").expect("idx def");
     assert_eq!(
         idx_def.prefix,
         vec!["doc:".to_string()],
-        "seed index definition wins on name clash"
+        "seed index definition kept on schema-equal name clash"
     );
 
     let aliases = cache.list_search_aliases();

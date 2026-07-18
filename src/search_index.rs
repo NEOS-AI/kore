@@ -81,6 +81,44 @@ impl IndexDefinition {
         }
     }
 
+    /// Compare **logical schema** only: `name`, `prefix`, and `fields`
+    /// (each field's name + type). Ignores `created_at` so two independently
+    /// created definitions with the same FT.CREATE shape are equal.
+    ///
+    /// Used by RDB merge (`DbSnapshot::load_into`) to decide whether a name
+    /// clash is an idempotent skip (schemas equal) or a hard error (diverge).
+    pub fn schema_eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.prefix == other.prefix
+            && self.fields == other.fields
+    }
+
+    /// Human-readable summary of logical schema differences (for merge errors).
+    ///
+    /// Returns `None` when [`schema_eq`] is true.
+    pub fn schema_diff_summary(&self, other: &Self) -> Option<String> {
+        if self.schema_eq(other) {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if self.name != other.name {
+            parts.push(format!("name ('{}' vs '{}')", self.name, other.name));
+        }
+        if self.prefix != other.prefix {
+            parts.push(format!(
+                "prefix ({:?} vs {:?})",
+                self.prefix, other.prefix
+            ));
+        }
+        if self.fields != other.fields {
+            parts.push(format!(
+                "fields ({:?} vs {:?})",
+                self.fields, other.fields
+            ));
+        }
+        Some(parts.join(", "))
+    }
+
     /// Parse an `FT.CREATE` argument list into an index definition.
     ///
     /// `argv` is the full command argv with the command name at `[0]`:
@@ -1043,6 +1081,74 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<Bytes> {
         parts.iter().map(|p| b(p)).collect()
+    }
+
+    #[test]
+    fn schema_eq_ignores_created_at() {
+        let fields = vec![FieldDefinition {
+            name: "title".into(),
+            field_type: FieldType::Text {
+                weight: 1.0,
+                sortable: false,
+            },
+        }];
+        let a = IndexDefinition {
+            name: "idx".into(),
+            prefix: vec!["doc:".into()],
+            fields: fields.clone(),
+            created_at: 1,
+        };
+        let b = IndexDefinition {
+            name: "idx".into(),
+            prefix: vec!["doc:".into()],
+            fields,
+            created_at: 999,
+        };
+        assert!(a.schema_eq(&b));
+        assert!(b.schema_eq(&a));
+        assert!(a.schema_diff_summary(&b).is_none());
+    }
+
+    #[test]
+    fn schema_eq_detects_prefix_and_field_diff() {
+        let text = FieldDefinition {
+            name: "title".into(),
+            field_type: FieldType::Text {
+                weight: 1.0,
+                sortable: false,
+            },
+        };
+        let base = IndexDefinition {
+            name: "idx".into(),
+            prefix: vec!["doc:".into()],
+            fields: vec![text.clone()],
+            created_at: 1,
+        };
+        let other_prefix = IndexDefinition {
+            name: "idx".into(),
+            prefix: vec!["other:".into()],
+            fields: vec![text.clone()],
+            created_at: 1,
+        };
+        assert!(!base.schema_eq(&other_prefix));
+        let sum = base.schema_diff_summary(&other_prefix).unwrap();
+        assert!(sum.contains("prefix"), "got {sum}");
+
+        let other_field = IndexDefinition {
+            name: "idx".into(),
+            prefix: vec!["doc:".into()],
+            fields: vec![FieldDefinition {
+                name: "body".into(),
+                field_type: FieldType::Text {
+                    weight: 1.0,
+                    sortable: false,
+                },
+            }],
+            created_at: 1,
+        };
+        assert!(!base.schema_eq(&other_field));
+        let sum = base.schema_diff_summary(&other_field).unwrap();
+        assert!(sum.contains("fields"), "got {sum}");
     }
 
     #[test]

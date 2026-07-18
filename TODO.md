@@ -371,9 +371,16 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch BZ)*: on RDB load `Err` after decode (mutate started), `flush_all_including_search` (mirror AOF BW/BX). Tests: `tests/bz_rdb_load_wipes_ft_schema_test.rs`. Scratch-load swap for non-empty targets remains open (shared with BW item).
 - [x] **`[P2]`** **Code review (BZ):** RDB `flush=false` still merges into FT schema — name clash risk on merge
   - *Found*: BZ only full-wipes schema when `flush=true`. A `flush=false` load into a DB that already has the same index name still fails at `create_search_index` (now on scratch; target preserved on Err after CB). Startup / FULLRESYNC use `flush=true` and are fine.
-  - *Done (Batch CF)*: on merge, `DbSnapshot::load_into` **skips** FT.CREATE / ALIASADD when the name already exists (seed definition wins; RDB docs still auto-index into existing index). Public wrappers document snapshot-replace (`flush=true`) vs merge (`flush=false`). Test: `tests/cf_multidb_replace_and_merge_test.rs`.
+  - *Done (Batch CF)*: on merge, `DbSnapshot::load_into` **skips** FT.CREATE / ALIASADD when the name already exists (seed definition wins). Public wrappers document snapshot-replace vs merge. Test: `tests/cf_multidb_replace_and_merge_test.rs`.
+- [x] **`[P1]`** **Code review (CF post-ship):** FT merge skip is name-only — divergent RDB schema silently discarded
+  - *Found*: `load_into` builds `existing_indices` by name and `continue`s with no definition check. Seed wins even when RDB has different `prefix` / fields; RDB hashes still load but `auto_index_key` follows **seed** prefixes only — silent search data loss while load returns `Ok`. Docs claiming “RDB docs still auto-index into existing index” are wrong when definitions diverge.
+  - *Done (Batch CG)*: `IndexDefinition::schema_eq` (name/prefix/fields; ignore `created_at`); `load_into` schema-equal → skip, unequal → `Err(InvalidArgument)`. Tests: `tests/cg_ft_merge_schema_test.rs`; CF equal-schema success path updated.
+- [x] **`[P1]`** **Code review (CF post-ship):** FT alias merge skip is name-only — retarget clash keeps seed mapping silently
+  - *Found*: if seed has `blog → idx` and RDB has `blog → other_idx`, seed mapping is kept with no error; alias queries hit the wrong index after successful merge.
+  - *Done (Batch CG)*: on alias name clash, compare resolved targets; equal → skip; unequal → `Err(InvalidArgument)`. Retarget + equal-target tests in `cg_ft_merge_schema_test.rs`.
 - [x] **`[P2]`** **Code review (BZ nit):** `rdb_load_mid_ft_failure_wipes_partial_state` accepts almost any `InvalidArgument` message (`!msg.is_empty()`); tighten to `RDB FT.ALIASADD` / unknown index
   - *Done (Batch CF)*: assert message mentions alias / unknown index / missing (prints actual msg on fail).
+  - *CF post-ship nit*: still accepts bare `"missing"`; prefer `alias` + `unknown index` or exact `RDB FT.ALIASADD` prefix.
 - [x] **`[P2]`** **Code review (BZ nit):** raw `DbSnapshot::load_into` / `MultiDbSnapshot::load_into_*` still leave partial state on `Err` if called directly
   - *Found*: production paths use `load_bytes` / `load_databases_bytes` / AOF `load_into_*` wrappers (scratch-load after CB). Direct `load_into` remains non-transactional.
   - *Done (Batch CF)*: rustdoc on raw `load_into` / `load_into_*` marks them non-transactional; public wrappers documented as the supported transactional/scratch-load APIs.
@@ -424,6 +431,7 @@ Also tracked in `docs/roadmap.md`.
   - *Found*: commits one DB at a time; concurrent readers (FULLRESYNC) can see DB0 new + DB1 old; panic mid-loop leaves partial multi-DB commit.
   - *Partial (Batch CC)*: whole replace loop under multi-DB autosweep pause; `flush=true` empties all DBs first then per-DB install — tear becomes DB0 new + DB1 empty (not old), still not atomic.
   - *Partial (Batch CF)*: documented concurrent-reader intermediate-DB visibility + exclusive-access requirement; staged drain of **all** source DBs before any target install (panic while preparing later DBs leaves all targets intact; mid-install panic still partial). Multi-DB fail/success load tests in `tests/cf_multidb_replace_and_merge_test.rs`. True cross-DB atomic publish to concurrent readers still open (server-wide load barrier).
+  - *CF post-ship*: reconfirmed — install still per-DB; after `flush=true`, mid-install panic loses uninstalled DBs (targets already wiped). Optional: delay flush until after successful stage (peak-memory tradeoff).
 - [x] **`[P1]`** **Code review (CC post-ship):** WATCH bump not atomic with keyspace install (race window)
   - *Found*: `replace_keyspace_from` installs scratch `watch_gens` (usually empty) and releases the lock, then later bumps `pre_watch_keys`. Between those steps `watch_generation` can `or_insert(0)` so a client that WATCHed at gen 0 sees clean EXEC against new/empty data. On `flush=true` the clean window spans flush (which does not touch watch_gens) through end of replace.
   - *Done (Batch CD)*: under one `watch_gens` lock, install `other_watch` and bump all `pre_watch_keys`; AOF/RDB `flush=true` commit calls `touch_all_watch_keys` before flush. Tests: `tests/cd_watch_atomic_and_typed_export_test.rs`.
@@ -442,12 +450,14 @@ Also tracked in `docs/roadmap.md`.
 - [ ] **`[P2]`** **Code review (CB post-ship):** expand CB tests — post-swap memory_tracker + `string_memory_usage`; multi-DB fail/success; typed TTL after swap; PubSub category non-clobber; empty-AOF success on non-empty target; peak-memory budget; seed non-mutation on failed merge; concurrent WATCH race
   - *Partial (Batch CC)*: seed non-mutation + autosweep restore + sequential WATCH + flush=true replace covered in `cc_load_*`.
   - *Partial (Batch CF)*: multi-DB RDB/AOF fail preserve both DBs + flush=true success updates both DBs (`cf_multidb_*`); remaining expansion open.
+  - *Partial (Batch CG)*: FT.SEARCH after schema-equal name-clash merge + divergent prefix / alias retarget fail cases in `cg_ft_merge_schema_test.rs`. Still open: multi-DB `flush=false` merge; loadfactor preserved on scratch; peak-memory / pubsub / concurrent WATCH expansion.
 - [ ] **`[P2]`** **Code review (CB):** `drain_all` / `replace_all` not fully failure-atomic across shards
   - *Partial (Batch CB)*: pre-`reserve(self.len())` on `ShardedHashMap`/`ShardedKeyMap` `drain_all`; docs note exclusive access. Mid-panic after partial shard drain still drops drained entries; install-half `replace_all` after target drain is the more dangerous path on the live DB (true OOM-abort policy remains open).
 - [x] **`[P2]`** **Code review (CB nit):** `install_keyspace_counts` not closed over `KEYSPACE_CATEGORIES`
   - *Done (Batch CB)*: install always writes fixed `KEYSPACE_CATEGORIES` slots (ignores fabricated category tags; PubSub cannot be clobbered).
 - [x] **`[P2]`** **Code review (CB nit):** `SearchIndexManager::install` does not validate alias targets exist in indices (fine if only fed `take_all` output)
   - *Done (Batch CF)*: `debug_assert!` that every alias target exists in the indices map.
+  - *CF post-ship nit*: validate only in debug; release still accepts dangling aliases if non-`take_all` callers mis-pair maps.
 - [x] **`[P2]`** **Code review (CB second-pass nit):** `empty_keyspace_like` hardcodes `loadfactor: 0.75` (diverges from process create-time loadfactor; capacity churn only)
   - *Done (Batch CF)*: `Cache` stores create-time `loadfactor`; `empty_keyspace_like` / keyspace sharing pass it through.
 - [x] **`[P2]`** **Code review (CC nit):** `new_with_sweep_loadfactor` still inlines `tokio::spawn(background_sweep)` instead of `start_background_sweep` (duplication / drift risk)
@@ -483,7 +493,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batch CF shipped** (multi-DB staged replace + docs; BZ nits; FT merge name-clash skip; loadfactor on Cache; install debug_assert; `cf_*` multi-DB tests). **Next:** remaining open P2s (RDB FT OOM map; `has_search_state` double-list; `clear_documents`+tracker; `get_index` atomic resolve / min-replicas FT; CB expand-tests leftovers; true cross-DB atomic publish still P1 partial).
+Prioritized for next letter batch(es). **Batch CG shipped** (FT merge schema_eq + alias target compare; CF equal-schema success path). **Open:** multi-DB true atomic publish (P1); remaining P2s (HNSW benches, RDB OOM map, test expansion, nits).
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -499,13 +509,15 @@ Prioritized for next letter batch(es). **Batch CF shipped** (multi-DB staged rep
 | P1 | CB: full keyspace swap under quiesce (typed maps, expires, watch) | done (CB) |
 | P1 | CB: `Cache.memory_usage` + tracker paired install (no double-account) | done (CB) |
 | P1 | CB post-ship: multi-DB replace atomic / server-wide quiesce | partial (CF stage+docs; true atomic open) |
+| P1 | CF post-ship: FT merge compare schema on name clash (not name-only skip) | done (CG) |
+| P1 | CF post-ship: FT alias merge compare targets on clash | done (CG) |
 | P1 | CB post-ship: bump `watch_gens` on keyspace replace | done (CC+CD) |
 | P1 | CC post-ship: atomic WATCH bump with keyspace install | done (CD) |
 | P1 | CC post-ship: pause waits for in-flight expire cycle | done (CD) |
 | P1 | CB second-pass: scratch independent Stats (no INFO pollution) | done (CC) |
 | P2 | FT RDB section | done (BY) |
 | P2 | RDB load wipe-on-FT-failure (mirror AOF BW) | done (BZ) |
-| P2 | RDB `flush=false` FT merge / name-clash semantics | done (CF skip existing) |
+| P2 | RDB `flush=false` FT merge / name-clash semantics | done (CF name-skip; CG schema/target compare) |
 | P2 | ACL `@search` | done (CE) |
 | P2 | Shared FT.CREATE parser (cmd + AOF load) | done (CA) |
 | P2 | HNSW `ef_construction` AOF round-trip | done (CE) |
