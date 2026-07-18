@@ -397,10 +397,13 @@ impl ShardedHashMap {
 
     /// Replace contents with `entries` (rehashes into this map's shards).
     ///
-    /// **Exclusive access**: destructive clear-then-fill; not failure-atomic
-    /// under concurrent traffic. Prefer drain-then-replace for commit paths.
+    /// **Exclusive access**: not safe under concurrent mutators. Drains prior
+    /// entries into a local discard held until the new inserts finish, so a
+    /// panic mid-fill still drops the old payload only after unwind (same
+    /// process-OOM policy as clear-then-fill, but keeps one consistent drain
+    /// path with [`drain_all`]).
     pub fn replace_all(&self, entries: Vec<(Bytes, SharedEntry)>) {
-        self.clear();
+        let _discard = self.drain_all();
         for (k, v) in entries {
             self.insert(k, v);
         }
@@ -651,8 +654,9 @@ impl<V: Clone> ShardedKeyMap<V> {
     /// Replace contents with `entries` (rehashes into this map's shards).
     ///
     /// **Exclusive access**: destructive clear-then-fill.
+    /// **Exclusive access**: drain-then-fill (see [`ShardedHashMap::replace_all`]).
     pub fn replace_all(&self, entries: Vec<(Bytes, V)>) {
-        self.clear();
+        let _discard = self.drain_all();
         for (k, v) in entries {
             self.insert(k, v);
         }

@@ -389,6 +389,42 @@ mod tests {
     }
 
     #[test]
+    fn take_install_keyspace_leaves_pubsub() {
+        let tracker = MemoryTracker::new(1024 * 1024, 1024);
+        tracker.account(500, MemoryCategory::Cache);
+        tracker.account(200, MemoryCategory::Search);
+        tracker.account(4096, MemoryCategory::PubSub);
+
+        let taken = tracker.take_keyspace_counts();
+        assert_eq!(tracker.category_memory(MemoryCategory::Cache), 0);
+        assert_eq!(tracker.category_memory(MemoryCategory::Search), 0);
+        assert_eq!(
+            tracker.category_memory(MemoryCategory::PubSub),
+            4096,
+            "PubSub must not be taken with keyspace counts"
+        );
+
+        // Install scratch-like totals without touching PubSub.
+        let mut scratch = taken;
+        for (cat, v) in scratch.iter_mut() {
+            if *cat == MemoryCategory::Cache {
+                *v = 100;
+            }
+            if *cat == MemoryCategory::Search {
+                *v = 50;
+            }
+        }
+        tracker.install_keyspace_counts(&scratch);
+        assert_eq!(tracker.category_memory(MemoryCategory::Cache), 100);
+        assert_eq!(tracker.category_memory(MemoryCategory::Search), 50);
+        assert_eq!(
+            tracker.category_memory(MemoryCategory::PubSub),
+            4096,
+            "PubSub must survive keyspace install"
+        );
+    }
+
+    #[test]
     fn with_alloc_overhead_grows_and_aligns() {
         assert_eq!(with_alloc_overhead(0), 0);
         let n = with_alloc_overhead(100);

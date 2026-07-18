@@ -395,7 +395,7 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch CE)*: `@search` in `category_names` / `category_commands`; FT read/write also under `@read`/`@write`; `+@all` expands via `all_known_commands`. Tests: `tests/ce_acl_search_hnsw_test.rs`
 - [ ] **`[P2]`** HNSW correctness/performance benchmarks vs FLAT
 - [x] **`[P2]`** **Code review (BT nit):** optional single critical section for `get_index` resolve+lookup; min-replicas FT test
-  - *Done (Batch CH, partial)*: `get_index` holds aliases then indices for resolve+lookup. Min-replicas FT test still open.
+  - *Done (Batch CH + CL)*: `get_index` dual-lock; `tests/cl_min_replicas_ft_test.rs` — FT.CREATE gated by min-replicas-to-write, FT.SEARCH not gated.
 - [x] **`[P2]`** **Code review (BU):** share one FT.CREATE parser between command path and AOF load
   - *Found*: `parse_ft_create_definition` in `aof.rs` duplicates `handle_ft_create` in `commands/search.rs` — schema options can drift (already two HNSW option loops)
   - *Done (Batch CA)*: shared `IndexDefinition::from_ft_create_argv` / `from_ft_create_args` in `search_index.rs`; command path + AOF load both call it (single `ef_construction` default 200). Tests: unit in `search_index`, `tests/ca_shared_ft_create_parser_test.rs`
@@ -461,9 +461,11 @@ Also tracked in `docs/roadmap.md`.
   - *Partial (Batch CF)*: multi-DB RDB/AOF fail preserve both DBs + flush=true success updates both DBs (`cf_multidb_*`).
   - *Partial (Batch CG)*: FT.SEARCH after schema-equal name-clash merge + divergent prefix / alias retarget fail cases.
   - *Partial (Batch CJ)*: post-swap `string_memory_usage` match; multi-DB `flush=false` merge preserves other DB; empty-AOF success replaces non-empty target; load_generation bumps.
-  - *Partial (Batch CK)*: typed TTL survives RDB snapshot replace; LOADING gate tests. Still open: pubsub non-clobber unit; peak-memory budget; concurrent WATCH race under load.
-- [ ] **`[P2]`** **Code review (CB):** `drain_all` / `replace_all` not fully failure-atomic across shards
-  - *Partial (Batch CB)*: pre-`reserve(self.len())` on `ShardedHashMap`/`ShardedKeyMap` `drain_all`; docs note exclusive access. Mid-panic after partial shard drain still drops drained entries; install-half `replace_all` after target drain is the more dangerous path on the live DB (true OOM-abort policy remains open).
+  - *Partial (Batch CK)*: typed TTL survives RDB snapshot replace; LOADING gate tests.
+  - *Partial (Batch CL)*: PubSub survives take/install keyspace counts (`memory::take_install_keyspace_leaves_pubsub`). Still open: peak-memory budget integration; concurrent WATCH race under load.
+- [x] **`[P2]`** **Code review (CB):** `drain_all` / `replace_all` not fully failure-atomic across shards
+  - *Partial (Batch CB)*: pre-`reserve(self.len())` on drain_all; exclusive-access docs.
+  - *Done (Batch CL)*: `replace_all` on `ShardedHashMap`/`ShardedKeyMap` uses drain-then-fill (holds discard until inserts finish). True multi-shard atomic under concurrent mutators still not claimed — exclusive load-time use only.
 - [x] **`[P2]`** **Code review (CB nit):** `install_keyspace_counts` not closed over `KEYSPACE_CATEGORIES`
   - *Done (Batch CB)*: install always writes fixed `KEYSPACE_CATEGORIES` slots (ignores fabricated category tags; PubSub cannot be clobbered).
 - [x] **`[P2]`** **Code review (CB nit):** `SearchIndexManager::install` does not validate alias targets exist in indices (fine if only fed `take_all` output)
@@ -505,7 +507,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batch CK shipped** (LOADING gate + INFO loading during multi-DB replace; typed-TTL RDB test; README version 0.6.0). **Open:** true multi-DB atomic install (P1 residual); HNSW benches; min-replicas FT; remaining CB expand / drain failure-atomic.
+Prioritized for next letter batch(es). **Batch CL shipped** (min-replicas FT.CREATE gate test; PubSub take/install unit test; drain-then-fill `replace_all`). **Open:** true multi-DB atomic install residual (P1); HNSW benches; peak-memory / concurrent WATCH expand; eng-quality P2s.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -537,14 +539,14 @@ Prioritized for next letter batch(es). **Batch CK shipped** (LOADING gate + INFO
 | P2 | AOF load all-or-nothing on FT failure (BV review) | done (BW) |
 | P2 | FLUSHDB vs FT schema (BW: flush clears indices) | done (BX) |
 | P2 | Scratch-load swap if AOF/RDB load targets non-empty DB | done (CB) |
-| P2 | CB: `drain_all`/`replace_all` failure-atomic | partial (reserve done) |
+| P2 | CB: `drain_all`/`replace_all` failure-atomic | done (CL drain-then-fill; exclusive-only) |
 | P2 | CB: `install_keyspace_counts` closed over KEYSPACE_CATEGORIES | done (CB) |
 | P2 | CB: optional alias-target validate on search `install` | done (CF debug_assert) |
 | P2 | CB post-ship: expand tests (memory, multi-DB, TTL, pubsub, seed, peak) | partial (CJ memory/merge/empty-AOF; rest open) |
 | P2 | CC post-ship: typed export skip expired keys (no revive without TTL) | done (CD) |
 | P2 | CC nit: unify start_background_sweep create paths | done (CD) |
 | P2 | CB second-pass: empty_keyspace_like hardcodes loadfactor 0.75 | done (CF) |
-| P2 | `get_index` atomic resolve; min-replicas FT test | partial (CH get_index; min-replicas open) |
+| P2 | `get_index` atomic resolve; min-replicas FT test | done (CH+CL) |
 | P2 | VECTOR/NUMERIC rewrite tests | done (BX) |
 | P2 | HNSW RDB round-trip test | done (CE) |
 | P2 | RDB FT OOM → OutOfMemory map | done (CH+CI) |
