@@ -165,14 +165,14 @@ fn test_deadlock_release_breaks_cycle() {
     // Create deadlock situation
     detector.record_lock_acquired("resource-a".to_string(), client1.clone(), 10000);
     detector.record_lock_acquired("resource-b".to_string(), client2.clone(), 10000);
-    detector.record_lock_wait("resource-b".to_string(), client1, 10000);
+    detector.record_lock_wait("resource-b".to_string(), client1.clone(), 10000);
     detector.record_lock_wait("resource-a".to_string(), client2.clone(), 10000);
     
     // Verify deadlock exists
     assert!(matches!(detector.detect_deadlock(), DeadlockStatus::Deadlock { .. }));
     
-    // Release one lock
-    detector.record_lock_released("resource-a");
+    // Release one lock (owner must match current holder)
+    detector.record_lock_released("resource-a", &client1);
     
     // Deadlock should be resolved
     assert!(matches!(detector.detect_deadlock(), DeadlockStatus::NoDeadlock));
@@ -417,6 +417,71 @@ fn test_redlock_auto_resolve_youngest_releases_backend() {
     // client2 may fail (lost B, still cannot get A) — either is fine as long as
     // backends/graph stayed consistent and client1 progressed.
     let _ = result_c2;
+}
+
+/// After auto-resolve force-unlocks the victim and a waiter re-acquires, Drop of
+/// the victim's live `Lock` must not erase the new holder's graph entry.
+#[test]
+fn test_victim_lock_drop_preserves_new_holder_graph() {
+    let caches = three_local_caches();
+    let redlock = Redlock::new(caches.clone())
+        .unwrap()
+        .with_deadlock_detection_strategy(
+            5000,
+            true,
+            VictimSelectionStrategy::Youngest,
+        );
+
+    let client1 = Bytes::from("drop-c1");
+    let client2 = Bytes::from("drop-c2");
+
+    let _lock_a = redlock
+        .lock("resource-a", client1.clone(), 30_000)
+        .expect("client1 acquires A");
+    thread::sleep(Duration::from_millis(10));
+    // Victim (Youngest) holds B; keep the Lock so Drop runs after re-acquire
+    let lock_b_victim = redlock
+        .lock("resource-b", client2.clone(), 30_000)
+        .expect("client2 acquires B");
+
+    let redlock_t = redlock.clone();
+    let c1 = client1.clone();
+    let handle = thread::spawn(move || redlock_t.lock("resource-b", c1, 8_000));
+    thread::sleep(Duration::from_millis(80));
+
+    // Close cycle → Youngest (client2) force-unlocked on backends + graph
+    let _ = redlock.lock("resource-a", client2.clone(), 8_000);
+
+    let new_lock_b = handle
+        .join()
+        .expect("client1 thread")
+        .expect("client1 should re-acquire B after auto-resolve");
+
+    let detector = redlock.deadlock_detector().expect("detector");
+    assert!(
+        detector
+            .get_held_locks()
+            .iter()
+            .any(|l| l.resource == "resource-b" && l.client_id == client1),
+        "new holder must be tracked before victim Drop"
+    );
+
+    // Drop victim RAII Lock — previously wiped the new holder's graph entry
+    drop(lock_b_victim);
+
+    assert!(
+        detector
+            .get_held_locks()
+            .iter()
+            .any(|l| l.resource == "resource-b" && l.client_id == client1),
+        "new holder must remain in get_held_locks() after victim Lock Drop"
+    );
+    assert!(
+        backend_holds(&caches, "resource-b", &client1),
+        "backend token for B must still be client1"
+    );
+
+    drop(new_lock_b);
 }
 
 /// auto_resolve=false keeps fail-fast DeadlockDetected; victim backends unchanged.

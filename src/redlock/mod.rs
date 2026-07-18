@@ -596,9 +596,10 @@ impl Redlock {
         let all_instances: Vec<usize> = (0..self.instances.len()).collect();
         self.unlock_instances(&key, &lock.val, &all_instances);
 
-        // Record lock release
+        // Record lock release only if this lock's client still owns the graph entry
+        // (safe after auto-resolve force-unlock + waiter re-acquire).
         if let Some(ref detector) = self.deadlock_detector {
-            detector.record_lock_released(&lock.resource);
+            detector.record_lock_released(&lock.resource, &lock.val);
         }
 
         Ok(())

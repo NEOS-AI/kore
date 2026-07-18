@@ -51,6 +51,21 @@ pub struct WaitEdgeSnapshot {
     pub wait_elapsed_ms: u64,
 }
 
+/// Wait recorded locally without a known holder (no wait-graph edge yet).
+///
+/// Peers that hold the resource can create a real edge on
+/// [`DeadlockDetector::merge_snapshot`]. Enables realistic half-cycle
+/// detection without pre-planting peer holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrphanWaitSnapshot {
+    /// Client waiting for the resource
+    pub waiter: String,
+    /// Resource being waited for
+    pub resource: String,
+    /// Milliseconds elapsed since the wait started (export-time relative)
+    pub wait_elapsed_ms: u64,
+}
+
 /// Portable wait-for graph snapshot for cross-process deadlock detection.
 ///
 /// Exchange these between processes that share Redlock resources (over any
@@ -62,6 +77,9 @@ pub struct DeadlockGraphSnapshot {
     pub held: Vec<HeldLockSnapshot>,
     /// Wait-for edges known to the source process
     pub waits: Vec<WaitEdgeSnapshot>,
+    /// Local waits without a known holder (no edge yet). Peers re-link on merge.
+    #[serde(default)]
+    pub orphan_waits: Vec<OrphanWaitSnapshot>,
     /// Optional identifier of the exporting process (for logging / debugging)
     pub source_id: Option<String>,
 }
@@ -224,12 +242,31 @@ impl DeadlockDetector {
         });
     }
     
-    /// Record a lock release
-    pub fn record_lock_released(&self, resource: &str) {
-        self.held_locks.write().remove(resource);
-        
-        // Clean up wait graph edges for this resource
-        self.wait_graph.write().retain(|edge| edge.resource != resource);
+    /// Record a lock release by `client_id` for `resource`.
+    ///
+    /// Only removes the held-lock entry (and matching wait edges) when the
+    /// **current** graph holder is `client_id`. This is safe after forced
+    /// unlock / auto-resolve: if another client has already re-acquired the
+    /// resource, Drop of the old [`crate::redlock::Lock`] must not erase the
+    /// new holder's graph entry. Backends stay correct via token compare
+    /// (`release_if_equal`); the graph needs the same ownership check.
+    pub fn record_lock_released(&self, resource: &str, client_id: &Bytes) {
+        let mut held = self.held_locks.write();
+        let removed = match held.get(resource) {
+            Some(info) if info.client_id == *client_id => {
+                held.remove(resource);
+                true
+            }
+            _ => false,
+        };
+        drop(held);
+
+        if removed {
+            // Clean up wait graph edges for this resource only if we still owned it
+            self.wait_graph
+                .write()
+                .retain(|edge| edge.resource != resource);
+        }
     }
     
     /// Record a client waiting for a lock
@@ -532,9 +569,12 @@ impl DeadlockDetector {
         let released_set: HashSet<&str> =
             released.iter().map(String::as_str).collect();
 
-        // Drop edges for released resources and any wait edges from the victim.
+        // Drop edges for released resources, waits from the victim, and any
+        // edges that still name the victim as holder (stale after force-unlock).
         graph.retain(|edge| {
-            edge.waiter != *client_id && !released_set.contains(edge.resource.as_str())
+            edge.waiter != *client_id
+                && edge.holder != *client_id
+                && !released_set.contains(edge.resource.as_str())
         });
 
         // Victim no longer waits; other waiters drop entries for released resources.
@@ -570,8 +610,12 @@ impl DeadlockDetector {
     /// Timestamps are converted to relative durations (`held_for_ms` /
     /// `wait_elapsed_ms`) because [`Instant`] is not serializable.
     /// `source_id` is left as `None`; callers may set it after export.
+    ///
+    /// Waits that have no wait-graph edge yet (holder unknown locally) are
+    /// exported as [`OrphanWaitSnapshot`] so peers can re-link them.
     pub fn export_snapshot(&self) -> DeadlockGraphSnapshot {
         let held = self.held_locks.read();
+        let waiting = self.waiting_for.read();
         let graph = self.wait_graph.read();
 
         let held_snaps: Vec<HeldLockSnapshot> = held
@@ -594,69 +638,140 @@ impl DeadlockDetector {
             })
             .collect();
 
+        // Orphan waits: in waiting_for but no corresponding wait-graph edge.
+        let mut orphan_waits: Vec<OrphanWaitSnapshot> = Vec::new();
+        for (waiter, wait_list) in waiting.iter() {
+            for info in wait_list {
+                let has_edge = graph
+                    .iter()
+                    .any(|e| e.waiter == *waiter && e.resource == info.resource);
+                if !has_edge {
+                    orphan_waits.push(OrphanWaitSnapshot {
+                        waiter: client_id_to_string(waiter),
+                        resource: info.resource.clone(),
+                        wait_elapsed_ms: info.timestamp.elapsed().as_millis() as u64,
+                    });
+                }
+            }
+        }
+
         DeadlockGraphSnapshot {
             held: held_snaps,
             waits: wait_snaps,
+            orphan_waits,
             source_id: None,
         }
     }
 
     /// Merge a remote process's wait-for graph into this detector.
     ///
-    /// Merge rules (MVP):
+    /// Merge rules:
     /// - **Held locks**: local ownership wins. A remote hold is inserted only
-    ///   when the resource is not already held locally.
+    ///   when the resource is not already held locally. Imported TTL is the
+    ///   **remaining** life (`ttl_ms.saturating_sub(held_for_ms)`) with
+    ///   `timestamp = Instant::now()` so transit lag does not extend holds.
+    /// - **Edge holder reconcile**: after holds merge, edges whose holder
+    ///   disagrees with `held[resource]` are rewritten to the current holder.
     /// - **Wait edges**: union by `(waiter, resource, holder)` — duplicates
     ///   (including a second merge of the same snapshot) are ignored.
+    /// - **Local wait re-link**: local `waiting_for` entries whose resource is
+    ///   now held get a wait-graph edge if missing.
+    /// - **Orphan waits**: remote orphan waits are linked when the resource
+    ///   is held locally (or was just imported).
     /// - Remote `waiting_for` entries are synthesised from new wait edges so
     ///   stats stay consistent.
     ///
     /// After a mutual export/merge, [`Self::detect_deadlock`] can find cycles
     /// that span multiple processes (e.g. P1 holds A waits B; P2 holds B
-    /// waits A).
+    /// waits A) **without** pre-planting peer holds.
     ///
     /// # Limitations
     /// - No automatic transport — callers exchange snapshots themselves.
     /// - Not consensus: stale remote holds may linger until TTL cleanup.
-    /// - Relative timestamps are approximate (`Instant` reconstructed from
-    ///   elapsed ms at export time).
+    /// - Relative timestamps are approximate (remaining TTL at export time).
     pub fn merge_snapshot(&self, remote: &DeadlockGraphSnapshot) {
         let mut held = self.held_locks.write();
         let mut waiting = self.waiting_for.write();
         let mut graph = self.wait_graph.write();
 
         // 1. Merge held locks — local wins on conflict.
+        //    Use remaining TTL so transit lag does not extend remote holds.
         for remote_hold in &remote.held {
             if held.contains_key(&remote_hold.resource) {
                 continue;
             }
+            let remaining_ttl = remote_hold
+                .ttl_ms
+                .saturating_sub(remote_hold.held_for_ms);
+            if remaining_ttl == 0 {
+                // Already expired at export — do not revive.
+                continue;
+            }
             let client_id = client_id_from_string(&remote_hold.client_id);
-            let held_for = Duration::from_millis(remote_hold.held_for_ms);
-            // Reconstruct an Instant approximately held_for ago.
-            let timestamp = Instant::now()
-                .checked_sub(held_for)
-                .unwrap_or_else(Instant::now);
             held.insert(
                 remote_hold.resource.clone(),
                 LockInfo {
                     resource: remote_hold.resource.clone(),
                     client_id,
-                    timestamp,
-                    ttl_ms: remote_hold.ttl_ms,
+                    timestamp: Instant::now(),
+                    ttl_ms: remaining_ttl,
                 },
             );
         }
 
-        // 2. Union wait edges (dedupe waiter + resource + holder).
+        // 2. Reconcile existing edges with post-merge held holders.
+        for edge in graph.iter_mut() {
+            if let Some(holder_info) = held.get(&edge.resource) {
+                if edge.holder != holder_info.client_id {
+                    edge.holder = holder_info.client_id.clone();
+                }
+            }
+        }
+
+        // Helper: ensure waiting_for has an entry for (waiter, resource).
+        let ensure_waiting =
+            |waiting: &mut HashMap<Bytes, Vec<LockInfo>>,
+             waiter: &Bytes,
+             resource: &str,
+             timestamp: Instant,
+             max_wait_ms: u64| {
+                let already = waiting
+                    .get(waiter)
+                    .map(|list| list.iter().any(|i| i.resource == resource))
+                    .unwrap_or(false);
+                if !already {
+                    waiting
+                        .entry(waiter.clone())
+                        .or_insert_with(Vec::new)
+                        .push(LockInfo {
+                            resource: resource.to_string(),
+                            client_id: waiter.clone(),
+                            timestamp,
+                            ttl_ms: max_wait_ms,
+                        });
+                }
+            };
+
+        // Helper: push edge if not already present (waiter + resource + holder).
+        let edge_exists = |graph: &[WaitEdge], waiter: &Bytes, holder: &Bytes, resource: &str| {
+            graph.iter().any(|e| {
+                e.waiter == *waiter && e.holder == *holder && e.resource == resource
+            })
+        };
+
+        // 3. Union wait edges (dedupe waiter + resource + holder).
+        //    Rewrite holder to match post-merge held when known.
         for remote_edge in &remote.waits {
             let waiter = client_id_from_string(&remote_edge.waiter);
-            let holder = client_id_from_string(&remote_edge.holder);
-            let is_dup = graph.iter().any(|e| {
-                e.waiter == waiter
-                    && e.holder == holder
-                    && e.resource == remote_edge.resource
-            });
-            if is_dup {
+            let mut holder = client_id_from_string(&remote_edge.holder);
+            if let Some(holder_info) = held.get(&remote_edge.resource) {
+                holder = holder_info.client_id.clone();
+            }
+            // Skip self-wait edges
+            if holder == waiter {
+                continue;
+            }
+            if edge_exists(&graph, &waiter, &holder, &remote_edge.resource) {
                 continue;
             }
 
@@ -665,23 +780,13 @@ impl DeadlockDetector {
                 .checked_sub(wait_elapsed)
                 .unwrap_or_else(Instant::now);
 
-            // Keep waiting_for in sync for stats / long-wait reporting.
-            let already_waiting = waiting
-                .get(&waiter)
-                .map(|list| list.iter().any(|i| i.resource == remote_edge.resource))
-                .unwrap_or(false);
-            if !already_waiting {
-                waiting
-                    .entry(waiter.clone())
-                    .or_insert_with(Vec::new)
-                    .push(LockInfo {
-                        resource: remote_edge.resource.clone(),
-                        client_id: waiter.clone(),
-                        timestamp,
-                        // Use remaining max-wait budget as a soft TTL for the wait entry.
-                        ttl_ms: self.max_wait_time_ms,
-                    });
-            }
+            ensure_waiting(
+                &mut waiting,
+                &waiter,
+                &remote_edge.resource,
+                timestamp,
+                self.max_wait_time_ms,
+            );
 
             graph.push(WaitEdge {
                 waiter,
@@ -690,6 +795,82 @@ impl DeadlockDetector {
                 timestamp,
             });
         }
+
+        // 4. Link remote orphan waits when we know the holder.
+        for orphan in &remote.orphan_waits {
+            let waiter = client_id_from_string(&orphan.waiter);
+            let Some(holder_info) = held.get(&orphan.resource) else {
+                // Still no holder known — keep as local waiting_for only.
+                let wait_elapsed = Duration::from_millis(orphan.wait_elapsed_ms);
+                let timestamp = Instant::now()
+                    .checked_sub(wait_elapsed)
+                    .unwrap_or_else(Instant::now);
+                ensure_waiting(
+                    &mut waiting,
+                    &waiter,
+                    &orphan.resource,
+                    timestamp,
+                    self.max_wait_time_ms,
+                );
+                continue;
+            };
+            let holder = holder_info.client_id.clone();
+            if holder == waiter {
+                continue;
+            }
+            if edge_exists(&graph, &waiter, &holder, &orphan.resource) {
+                continue;
+            }
+
+            let wait_elapsed = Duration::from_millis(orphan.wait_elapsed_ms);
+            let timestamp = Instant::now()
+                .checked_sub(wait_elapsed)
+                .unwrap_or_else(Instant::now);
+
+            ensure_waiting(
+                &mut waiting,
+                &waiter,
+                &orphan.resource,
+                timestamp,
+                self.max_wait_time_ms,
+            );
+
+            graph.push(WaitEdge {
+                waiter,
+                holder,
+                resource: orphan.resource.clone(),
+                timestamp,
+            });
+        }
+
+        // 5. Re-link local waiting_for entries to (possibly newly imported) holds.
+        let mut relink: Vec<WaitEdge> = Vec::new();
+        for (waiter, wait_list) in waiting.iter() {
+            for info in wait_list {
+                let Some(holder_info) = held.get(&info.resource) else {
+                    continue;
+                };
+                if holder_info.client_id == *waiter {
+                    continue;
+                }
+                if edge_exists(&graph, waiter, &holder_info.client_id, &info.resource)
+                    || relink.iter().any(|e| {
+                        e.waiter == *waiter
+                            && e.holder == holder_info.client_id
+                            && e.resource == info.resource
+                    })
+                {
+                    continue;
+                }
+                relink.push(WaitEdge {
+                    waiter: waiter.clone(),
+                    holder: holder_info.client_id.clone(),
+                    resource: info.resource.clone(),
+                    timestamp: info.timestamp,
+                });
+            }
+        }
+        graph.extend(relink);
     }
 
     // ── Async API ──────────────────────────────────────────────────────────
@@ -891,7 +1072,32 @@ mod tests {
         detector.record_lock_acquired(resource1.clone(), client1.clone(), 10000);
         assert_eq!(detector.get_held_locks().len(), 1);
         
-        detector.record_lock_released(&resource1);
+        detector.record_lock_released(&resource1, &client1);
+        assert_eq!(detector.get_held_locks().len(), 0);
+    }
+
+    /// Conditional release: only the current holder can clear the graph entry.
+    #[test]
+    fn test_record_lock_released_only_if_owner() {
+        let detector = DeadlockDetector::new(5000, false);
+        let victim = Bytes::from("victim");
+        let new_holder = Bytes::from("new-holder");
+        let resource = "shared".to_string();
+
+        detector.record_lock_acquired(resource.clone(), victim.clone(), 10_000);
+        // Force-unlock style cleanup (as release_client_locks does)
+        detector.release_client_locks(&victim);
+        // Waiter re-acquires
+        detector.record_lock_acquired(resource.clone(), new_holder.clone(), 10_000);
+
+        // Old owner's release must not wipe the new holder
+        detector.record_lock_released(&resource, &victim);
+        let held = detector.get_held_locks();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].client_id, new_holder);
+
+        // Real owner can still release
+        detector.record_lock_released(&resource, &new_holder);
         assert_eq!(detector.get_held_locks().len(), 0);
     }
 
@@ -1243,7 +1449,7 @@ mod tests {
         let _ = handle.await;
     }
 
-    // ── Cross-process snapshot merge (Batch DC) ────────────────────────────
+    // ── Cross-process snapshot merge (Batch DC / DD) ───────────────────────
 
     /// Plant a half-cycle on each detector:
     /// - det1: c1 holds A, c2 holds B (peer knowledge), c1 waits for B
@@ -1267,6 +1473,34 @@ mod tests {
         det2.record_lock_acquired(b, c2.clone(), 10_000);
         det2.record_lock_acquired(a, c1.clone(), 10_000);
         det2.record_lock_wait("xp-resource-a".to_string(), c2.clone(), 10_000);
+
+        (c1, c2)
+    }
+
+    /// Realistic half-cycles: only local hold + local wait (no pre-planted
+    /// peer holds). Edges are created on merge via re-link + orphan waits.
+    fn plant_realistic_half_cycles_no_peer_holds(
+        det1: &DeadlockDetector,
+        det2: &DeadlockDetector,
+    ) -> (Bytes, Bytes) {
+        let c1 = Bytes::from("real-c1");
+        let c2 = Bytes::from("real-c2");
+        let a = "real-resource-a".to_string();
+        let b = "real-resource-b".to_string();
+
+        // Process 1: holds A, waits for B (holder unknown → orphan wait)
+        det1.record_lock_acquired(a.clone(), c1.clone(), 10_000);
+        det1.record_lock_wait(b.clone(), c1.clone(), 10_000);
+        assert_eq!(
+            det1.get_stats().wait_graph_edges,
+            0,
+            "no edge without local holder knowledge"
+        );
+
+        // Process 2: holds B, waits for A (holder unknown → orphan wait)
+        det2.record_lock_acquired(b, c2.clone(), 10_000);
+        det2.record_lock_wait(a, c2.clone(), 10_000);
+        assert_eq!(det2.get_stats().wait_graph_edges, 0);
 
         (c1, c2)
     }
@@ -1402,10 +1636,172 @@ mod tests {
         assert_eq!(snap.waits[0].waiter, "rt-c1");
         assert_eq!(snap.waits[0].holder, "rt-c2");
         assert_eq!(snap.waits[0].resource, "rt-b");
+        assert!(snap.orphan_waits.is_empty(), "edged wait is not an orphan");
         assert_eq!(snap.source_id.as_deref(), Some("proc-test"));
 
         // All held resources present
         let resources: HashSet<&str> = snap.held.iter().map(|h| h.resource.as_str()).collect();
         assert!(resources.contains("rt-a") && resources.contains("rt-b"));
+    }
+
+    /// Realistic AB-BA: no pre-planted peer holds. Mutual merge re-links
+    /// local waits + orphan waits → full cycle detected.
+    #[test]
+    fn test_merge_relinks_local_waits_detects_realistic_half_cycle() {
+        let det1 = DeadlockDetector::new(5000, false);
+        let det2 = DeadlockDetector::new(5000, false);
+        let (c1, c2) = plant_realistic_half_cycles_no_peer_holds(&det1, &det2);
+
+        // Exports carry orphan waits, not edges
+        let snap1 = det1.export_snapshot();
+        let snap2 = det2.export_snapshot();
+        assert_eq!(snap1.waits.len(), 0);
+        assert_eq!(snap1.orphan_waits.len(), 1);
+        assert_eq!(snap1.orphan_waits[0].resource, "real-resource-b");
+        assert_eq!(snap2.waits.len(), 0);
+        assert_eq!(snap2.orphan_waits.len(), 1);
+
+        assert!(matches!(det1.detect_deadlock(), DeadlockStatus::NoDeadlock));
+        assert!(matches!(det2.detect_deadlock(), DeadlockStatus::NoDeadlock));
+
+        det1.merge_snapshot(&snap2);
+        det2.merge_snapshot(&snap1);
+
+        match det1.detect_deadlock() {
+            DeadlockStatus::Deadlock { cycle, resources } => {
+                assert!(
+                    cycle.contains(&c1) && cycle.contains(&c2),
+                    "cycle should involve both clients: {:?}",
+                    cycle
+                );
+                assert!(
+                    resources.iter().any(|r| r.contains("real-resource")),
+                    "resources: {:?}",
+                    resources
+                );
+            }
+            DeadlockStatus::NoDeadlock => {
+                panic!("det1 should detect cycle after realistic merge re-link")
+            }
+        }
+        match det2.detect_deadlock() {
+            DeadlockStatus::Deadlock { cycle, .. } => {
+                assert!(cycle.contains(&c1) && cycle.contains(&c2));
+            }
+            DeadlockStatus::NoDeadlock => {
+                panic!("det2 should detect cycle after realistic merge re-link")
+            }
+        }
+    }
+
+    /// Stale edge holder is rewritten to match post-merge held.
+    #[test]
+    fn test_merge_rewrites_stale_edge_holder() {
+        let local = DeadlockDetector::new(5000, false);
+
+        let old_holder = Bytes::from("old-holder");
+        let new_holder = Bytes::from("new-holder");
+        let waiter = Bytes::from("waiter");
+        let resource = "rewritten".to_string();
+
+        // old_holder holds; waiter gets an edge naming old_holder
+        local.record_lock_acquired(resource.clone(), old_holder, 10_000);
+        local.record_lock_wait(resource.clone(), waiter.clone(), 10_000);
+        assert_eq!(local.get_stats().wait_graph_edges, 1);
+
+        // Overwrite held entry to new_holder without updating the wait edge
+        // (record_lock_acquired only drops edges where the acquirer is waiter).
+        local.record_lock_acquired(resource, new_holder, 10_000);
+        assert_eq!(local.get_stats().wait_graph_edges, 1);
+
+        // Merge (even empty) reconciles edge holders against held
+        local.merge_snapshot(&DeadlockGraphSnapshot::default());
+
+        let snap = local.export_snapshot();
+        assert_eq!(snap.waits.len(), 1);
+        assert_eq!(
+            snap.waits[0].holder, "new-holder",
+            "stale edge holder must be rewritten to current held client"
+        );
+        assert_eq!(snap.waits[0].waiter, "waiter");
+    }
+
+    /// Imported holds use remaining TTL, not original + transit lag.
+    #[test]
+    fn test_merge_imports_remaining_ttl() {
+        let local = DeadlockDetector::new(5000, false);
+
+        // Remote hold: original TTL 10s, already held for 7s → remaining 3s
+        let snap = DeadlockGraphSnapshot {
+            held: vec![HeldLockSnapshot {
+                resource: "ttl-res".to_string(),
+                client_id: "remote-c".to_string(),
+                ttl_ms: 10_000,
+                held_for_ms: 7_000,
+            }],
+            waits: vec![],
+            orphan_waits: vec![],
+            source_id: None,
+        };
+
+        local.merge_snapshot(&snap);
+        let held = local.get_held_locks();
+        assert_eq!(held.len(), 1);
+        assert_eq!(
+            held[0].ttl_ms, 3_000,
+            "imported ttl_ms must be remaining (= ttl - held_for), not original"
+        );
+        // Fresh timestamp: remaining_ttl_ms should be close to 3000
+        let remaining = held[0].remaining_ttl_ms();
+        assert!(
+            remaining <= 3_000 && remaining > 2_500,
+            "remaining_ttl_ms should be ~3000 right after import, got {}",
+            remaining
+        );
+
+        // Fully expired remote hold is not imported
+        let expired = DeadlockGraphSnapshot {
+            held: vec![HeldLockSnapshot {
+                resource: "expired-res".to_string(),
+                client_id: "remote-c".to_string(),
+                ttl_ms: 1_000,
+                held_for_ms: 1_500,
+            }],
+            waits: vec![],
+            orphan_waits: vec![],
+            source_id: None,
+        };
+        local.merge_snapshot(&expired);
+        assert!(
+            !local
+                .get_held_locks()
+                .iter()
+                .any(|l| l.resource == "expired-res"),
+            "zero remaining TTL must not revive a hold"
+        );
+    }
+
+    /// release_client_locks also drops edges where the victim is the holder.
+    #[test]
+    fn test_release_client_locks_drops_edges_where_holder() {
+        let detector = DeadlockDetector::new(5000, true);
+        let holder = Bytes::from("holder-c");
+        let waiter = Bytes::from("waiter-c");
+
+        detector.record_lock_acquired("r-held".to_string(), holder.clone(), 10_000);
+        detector.record_lock_wait("r-held".to_string(), waiter.clone(), 10_000);
+        assert_eq!(detector.get_stats().wait_graph_edges, 1);
+
+        // Manually plant a stale edge where holder is victim but resource
+        // is not in released set — release_client_locks should still drop it
+        // via edge.holder == client_id. (The normal path also drops via
+        // released_set; the holder clause covers stale edges.)
+        let released = detector.release_client_locks(&holder);
+        assert!(released.contains(&"r-held".to_string()));
+        assert_eq!(
+            detector.get_stats().wait_graph_edges,
+            0,
+            "edges naming victim as holder must be pruned"
+        );
     }
 }

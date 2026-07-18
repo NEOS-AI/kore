@@ -132,8 +132,15 @@ When `auto_resolve` is **true**, a deadlock found during `lock` /
 2. **Unlocks the victim's held resources on all Redlock backends**
    (token = client id / `val` — Redlock uses the same value for both)
 3. Atomically cleans the wait-for graph (`release_client_locks`: held locks,
-   wait edges, and waiting entries for the victim and for released resources)
+   wait edges where the victim is waiter **or** holder, and waiting entries
+   for the victim and for released resources)
 4. Continues the acquisition loop so a non-victim waiter can proceed
+
+The victim may still own a live `Lock` RAII handle. On Drop, `unlock` uses
+`record_lock_released(resource, client_id)` which **only** clears the graph
+entry when that client is still the tracked holder. If a waiter re-acquired
+after force-unlock, the new holder's graph entry is preserved (backends were
+already safe via `release_if_equal`).
 
 When `auto_resolve` is **false**, Redlock **fail-fasts** with
 `Error::DeadlockDetected` (no backend unlock, no graph resolve). Callers
@@ -550,11 +557,15 @@ or cluster gossip. You transport snapshots over whatever bus you already have
 |------|------|
 | `HeldLockSnapshot` | resource, client_id (UTF-8 lossy), `ttl_ms`, `held_for_ms` |
 | `WaitEdgeSnapshot` | waiter, holder, resource, `wait_elapsed_ms` |
-| `DeadlockGraphSnapshot` | `held`, `waits`, optional `source_id` |
+| `OrphanWaitSnapshot` | waiter, resource, `wait_elapsed_ms` (no known holder yet) |
+| `DeadlockGraphSnapshot` | `held`, `waits`, `orphan_waits`, optional `source_id` |
 
-`Instant` is not serializable; relative durations are stored and reconstructed
-approximately on import. Types implement `serde::Serialize` /
-`Deserialize` for JSON or any other serde format.
+`Instant` is not serializable; relative durations are stored on export.
+On import, held locks use **remaining TTL** =
+`ttl_ms.saturating_sub(held_for_ms)` with `timestamp = Instant::now()` so
+transit lag does not extend remote holds. Types implement `serde::Serialize` /
+`Deserialize` for JSON or any other serde format. Older snapshots without
+`orphan_waits` deserialize with an empty list (`#[serde(default)]`).
 
 ### API
 
@@ -562,22 +573,20 @@ approximately on import. Types implement `serde::Serialize` /
 use kore::{DeadlockDetector, DeadlockGraphSnapshot, DeadlockStatus};
 use bytes::Bytes;
 
-// --- Process 1 (holds A, waits for B held by client-2) ---
+// Realistic half-cycles: only local hold + local wait (no pre-planted peer holds).
+// --- Process 1 (holds A, waits for B) ---
 let det1 = DeadlockDetector::new(30_000, false);
 let c1 = Bytes::from("client-1");
 let c2 = Bytes::from("client-2");
 det1.record_lock_acquired("resource-a".into(), c1.clone(), 10_000);
-// Optional: record peer hold learned via GET / admin channel
-det1.record_lock_acquired("resource-b".into(), c2.clone(), 10_000);
-det1.record_lock_wait("resource-b".into(), c1.clone(), 10_000);
+det1.record_lock_wait("resource-b".into(), c1.clone(), 10_000); // orphan wait
 
-// --- Process 2 (holds B, waits for A held by client-1) ---
+// --- Process 2 (holds B, waits for A) ---
 let det2 = DeadlockDetector::new(30_000, false);
 det2.record_lock_acquired("resource-b".into(), c2.clone(), 10_000);
-det2.record_lock_acquired("resource-a".into(), c1.clone(), 10_000);
-det2.record_lock_wait("resource-a".into(), c2.clone(), 10_000);
+det2.record_lock_wait("resource-a".into(), c2.clone(), 10_000); // orphan wait
 
-// Neither process alone sees a full cycle yet.
+// Neither process alone has edges or a cycle yet.
 assert!(matches!(det1.detect_deadlock(), DeadlockStatus::NoDeadlock));
 assert!(matches!(det2.detect_deadlock(), DeadlockStatus::NoDeadlock));
 
@@ -586,13 +595,14 @@ let mut snap1 = det1.export_snapshot();
 snap1.source_id = Some("proc-1".into());
 let mut snap2 = det2.export_snapshot();
 snap2.source_id = Some("proc-2".into());
+// snap*.orphan_waits carry the holder-less waits; snap*.held carry peer holds.
 
 // ... send snap1 to process 2, snap2 to process 1 ...
 
 det1.merge_snapshot(&snap2);
 det2.merge_snapshot(&snap1);
 
-// Multi-process cycle is now visible:
+// Multi-process cycle is now visible (re-link + orphan import):
 match det1.detect_deadlock() {
     DeadlockStatus::Deadlock { cycle, resources } => {
         println!("cross-process deadlock: {:?} on {:?}", cycle, resources);
@@ -601,20 +611,30 @@ match det1.detect_deadlock() {
 }
 ```
 
+You may still pre-plant peer holds (e.g. from GET) before `record_lock_wait`
+so a full edge is exported instead of an orphan; both paths work after merge.
+
 ### Merge rules
 
 1. **Held locks — local wins**: if both claim the same resource, the local
-   hold is kept; the remote claim is ignored.
-2. **Wait edges — union + dedupe**: edges are keyed by
+   hold is kept; the remote claim is ignored. Imported holds use **remaining**
+   TTL (`ttl_ms - held_for_ms`); zero remaining skips import.
+2. **Edge holder reconcile**: after holds merge, any local edge whose
+   `holder` ≠ `held[resource].client_id` is rewritten to the current holder.
+3. **Wait edges — union + dedupe**: edges are keyed by
    `(waiter, resource, holder)`. Merging the same snapshot twice does not
-   duplicate edges.
-3. After merge, `detect_deadlock()` / auto-resolve / monitors use the combined
+   duplicate edges. Remote edge holders are also aligned to post-merge held.
+4. **Local wait re-link**: local `waiting_for` entries whose resource is now
+   in `held` get a wait-graph edge if missing.
+5. **Orphan waits**: remote `orphan_waits` become edges when the resource is
+   held (local or just imported); otherwise they stay as `waiting_for` only.
+6. After merge, `detect_deadlock()` / auto-resolve / monitors use the combined
    graph like any other local state.
 
 ### How to use from two processes
 
 1. Each process records local acquires and waits as usual (Redlock path or
-   standalone `record_*` APIs).
+   standalone `record_*` APIs). Peer holds need not be pre-planted.
 2. Periodically (or on long wait) call `export_snapshot()`.
 3. Publish the snapshot (JSON via serde, or any format) to peers that share
    the same lock namespace.
@@ -630,8 +650,8 @@ match det1.detect_deadlock() {
 |------------|--------|
 | **No transport** | Kore does not ship gossip, HTTP, or Redis pub/sub for snapshots. |
 | **Not consensus** | Last-writer is not used for holds; local always wins. Stale remote holds can linger until TTL cleanup. |
-| **Timestamp approximation** | `held_for_ms` / `wait_elapsed_ms` reconstruct `Instant`s relative to import time — not wall-clock synchronized. |
-| **Partial views** | A wait edge needs a known holder. If process A waits for a lock held only in process B and never learns the holder, export has no edge until a peer snapshot (or local GET) supplies it. Recording peer holds when known (as in the example) closes that gap. |
+| **Remaining TTL** | Import uses remaining life at export time; clock skew between processes is not corrected. |
+| **Partial views** | Orphan waits export holder-less waits; one mutual merge re-links when peers export their holds. Without any exchange, cycles stay invisible. |
 | **No Web UI** | Visualization remains open (see roadmap). |
 | **Client id encoding** | Export uses UTF-8 lossy strings; binary tokens with invalid UTF-8 are mangled on the wire. |
 
@@ -723,7 +743,8 @@ Available tests:
 - `test_async_detect_planted_cycle`: Async detect + Redlock `check_deadlock_async`
 - `test_background_monitor_auto_resolves`: `spawn_monitor` clears cycle with auto_resolve
 - `test_redlock_auto_resolve_youngest_releases_backend`: two-client cycle; Youngest victim backend key gone
+- `test_victim_lock_drop_preserves_new_holder_graph`: auto-resolve → re-acquire → drop victim `Lock` keeps new holder in graph
 - `test_redlock_auto_resolve_false_fail_fast`: `DeadlockDetected`, backends unchanged
 - `test_redlock_spawn_monitor_unlocks_backends`: `spawn_deadlock_monitor` backend + graph
-- Unit tests in `src/deadlock.rs`: `test_cross_process_cycle_detected_after_snapshot_merge`,
-  `test_merge_local_held_not_overwritten_by_remote`, `test_merge_wait_edges_deduped_on_double_merge`
+- Unit tests in `src/deadlock.rs`: cross-process merge (pre-planted + realistic re-link),
+  remaining-TTL import, stale edge holder rewrite, conditional `record_lock_released`

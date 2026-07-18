@@ -346,6 +346,7 @@ Also tracked in `docs/roadmap.md`.
 - [ ] **`[P2]`** Deadlock detection advanced (from roadmap)
   - [x] **`[P2]`** Cross-process detection
     - *Done (Batch DC, MVP)*: `HeldLockSnapshot` / `WaitEdgeSnapshot` / `DeadlockGraphSnapshot` (serde); `export_snapshot` / `merge_snapshot` (local held wins, wait edges union+dedupe); multi-process half-cycle tests; docs “Cross-process (snapshot merge)”. No transport/Web UI.
+    - *Done (Batch DD)*: merge re-links local `waiting_for` + imports `OrphanWaitSnapshot`; edge holder reconcile; remaining-TTL import (`ttl_ms - held_for_ms`, `timestamp = now`).
   - [x] **`[P2]`** Async support
     - *Done (Batch DA, standalone surface)*: `detect_deadlock_async` / `resolve_deadlock_async` / `get_stats_async` / `check_long_waits_async` (thin Tokio wrappers over short sync critical sections); `release_client_locks`; `DeadlockDetector::spawn_monitor` (abort `JoinHandle`, auto-resolve + tracing); `Redlock::check_deadlock_async` / `get_deadlock_stats_async`; unit + integration tests; docs
     - *Done (Batch DB)*: `Redlock::deadlock_detector()` / `spawn_deadlock_monitor` (backend unlock + graph); residual async is still sync-on-poll under contention.
@@ -354,8 +355,15 @@ Also tracked in `docs/roadmap.md`.
     - *Done (Batch DB)*: Redlock lock path honors `auto_resolve` + strategy — backend unlock then atomic graph cleanup; fail-fast when auto_resolve=false.
   - [x] **`[P2]`** **Code review (CZ/DA post-ship):** wire auto-resolve + strategy through Redlock backend unlock
     - *Done (Batch DB)*: on detect + auto_resolve, `resolve_deadlock` → unlock victim resources on backends (`val` = client id token) → `release_client_locks`; E2E tests (Youngest backend release, fail-fast, Redlock monitor).
+    - *Done (Batch DD)*: `record_lock_released(resource, client_id)` only clears graph when current holder matches (safe after force-unlock + re-acquire); `release_client_locks` also drops edges with `edge.holder == client_id`; E2E `test_victim_lock_drop_preserves_new_holder_graph`.
   - [x] **`[P2]`** **Code review (DA post-ship):** `release_client_locks` TOCTOU + incomplete wait cleanup
     - *Done (Batch DB)*: single write section retain-by-client; waiting_for + edge prune for victim and released resources; `cleanup_expired` drops edges/waiting for expired holds; monitor logs resolve-None; unit tests TOCTOU re-acquire / prune / expired.
+  - [x] **`[P1]`** **Code review (DB post-ship):** disarm victim `Lock` after auto-resolve backend unlock
+    - *Done (Batch DD)*: conditional `record_lock_released(resource, client_id)` — only remove if current holder’s `client_id` matches; Redlock `unlock`/`Drop` pass `lock.val`. Regression: resolve → re-acquire → drop victim → new holder still in `get_held_locks()`.
+  - [x] **`[P1]`** **Code review (DC post-ship):** merge re-links local waits to imported holds
+    - *Done (Batch DD)*: after merging holds, scan `waiting_for` and create edges; export `OrphanWaitSnapshot` for holder-less waits; realistic half-cycle test without pre-planted peer holds.
+  - [x] **`[P2]`** **Code review (DC post-ship):** reconcile wait-edge holders + remaining TTL on import
+    - *Done (Batch DD)*: rewrite edges where holder ≠ held[resource]; import remaining TTL (`ttl_ms.saturating_sub(held_for_ms)`, `timestamp = now`); zero remaining skips import; `release_client_locks` drops `edge.holder == client_id`.
   - [ ] **`[P2]`** Web UI monitoring
 
 ### Search & vectors
@@ -585,7 +593,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batches CZ+DA+DB shipped** (victim strategies; async/monitor; Redlock auto-resolve + safe release). **Open next:** cross-process detection; Web UI; standing tests-for-phase P0; optional larger-N HNSW recall.
+Prioritized for next letter batch(es). **Batches CZ–DD shipped** (victim strategies; async/monitor; Redlock auto-resolve; cross-process snapshot MVP; Lock Drop safety + merge re-link + remaining TTL). **Open next:** Web UI; standing tests-for-phase P0; optional larger-N HNSW recall.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -643,8 +651,12 @@ Prioritized for next letter batch(es). **Batches CZ+DA+DB shipped** (victim stra
 | P3 | CX post-ship: EnvFilter / JSON smoke / boot-only docs | done (CY; smoke/EnvFilter residual) |
 | P2 | CZ victim strategies (Youngest/Oldest/FewestLocks) | done (CZ + DB Redlock wiring) |
 | P2 | DA async API + spawn_monitor | done (DA + DB Redlock monitor/accessor) |
-| P2 | CZ/DA post-ship: Redlock auto-resolve + strategy + backend unlock | done (DB) |
+| P2 | CZ/DA post-ship: Redlock auto-resolve + strategy + backend unlock | done (DB + DD Lock Drop) |
 | P2 | DA post-ship: release_client_locks TOCTOU + wait cleanup | done (DB) |
+| P2 | DC cross-process snapshot merge MVP | done (DC + DD re-link/TTL) |
+| P1 | DB post-ship: disarm victim Lock after auto-resolve | done (DD) |
+| P1 | DC post-ship: merge re-links local waits to imported holds | done (DD) |
+| P2 | DC post-ship: reconcile edge holders + remaining TTL on import | done (DD) |
 | P2 | CP post-ship: LOADING allowlist PSYNC/SYNC mid-install visibility | done (CR) |
 | P2 | CC post-ship: typed export skip expired keys (no revive without TTL) | done (CD) |
 | P2 | CC nit: unify start_background_sweep create paths | done (CD) |
