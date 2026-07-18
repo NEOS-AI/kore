@@ -157,6 +157,15 @@ impl Redlock {
                 config.fair_queue_max_size, config.fair_queue_cleanup_ms
             );
         }
+        // Auto-enable deadlock detection when the monitoring Web UI is requested so
+        // the UI has a live detector. Default: max_wait 30s, auto_resolve off.
+        if config.deadlock_ui_port != 0 {
+            redlock = redlock.with_deadlock_detection(30_000, false);
+            info!(
+                "Deadlock detection enabled for Web UI on 127.0.0.1:{}",
+                config.deadlock_ui_port
+            );
+        }
         Ok(Some(Arc::new(redlock)))
     }
 

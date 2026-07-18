@@ -343,7 +343,7 @@ Also tracked in `docs/roadmap.md`.
   - *Done (MVP + Batch Y)*: `Redlock::from_config` + `Server::with_redlock`; INFO fields; `LockBackend` trait with **remote RESP** backends (`SET NX PX` / GET+DEL / PEXPIRE) for `--redlock-instances`; injectable local `Cache` backends for tests.
 - [x] **`[P1]`** Fair lock queueing: production hardening, metrics, docs
   - *Done*: atomic `try_acquire` under write lock; `dequeue_client` front-safe pop; retry cleanup uses `max_attempts`; Drop stops cleanup thread; CLI `--enable-fair-queue` / max-size / cleanup-ms; INFO `# FairQueue` section; docs
-- [ ] **`[P2]`** Deadlock detection advanced (from roadmap)
+- [x] **`[P2]`** Deadlock detection advanced (from roadmap)
   - [x] **`[P2]`** Cross-process detection
     - *Done (Batch DC, MVP)*: `HeldLockSnapshot` / `WaitEdgeSnapshot` / `DeadlockGraphSnapshot` (serde); `export_snapshot` / `merge_snapshot` (local held wins, wait edges union+dedupe); multi-process half-cycle tests; docs “Cross-process (snapshot merge)”. No transport/Web UI.
     - *Done (Batch DD)*: merge re-links local `waiting_for` + imports `OrphanWaitSnapshot`; edge holder reconcile; remaining-TTL import (`ttl_ms - held_for_ms`, `timestamp = now`).
@@ -372,7 +372,8 @@ Also tracked in `docs/roadmap.md`.
     - *Done (Batch DE)*: step 2 drops edge if rewrite yields `holder == waiter`; dedupe by `(waiter, resource, holder)`; unit test `test_merge_holder_rewrite_drops_self_wait`.
   - [x] **`[P2]`** **Code review (DD post-ship):** `record_lock_acquired` rewrites holders + re-links waits
     - *Done (Batch DE)*: on acquire, rewrite/drop edges for that resource and re-link `waiting_for` (mirror merge steps 2+5); tests `test_record_lock_acquired_rewrites_holders_and_relinks_waits`, `test_release_then_acquire_relinks_waiters`.
-  - [ ] **`[P2]`** Web UI monitoring
+  - [x] **`[P2]`** Web UI monitoring
+    - *Done (Batch DF, MVP)*: `--deadlock-ui-port` (default 0=off) serves hand-rolled HTML (`/`, `/deadlock`) + JSON (`/api/deadlock`, `/deadlock.json`) on `127.0.0.1` only; shares Redlock detector (auto-enabled when UI port set + redlock on); disabled state when no detector; unit/HTTP tests with planted cycle; docs.
 
 ### Search & vectors
 

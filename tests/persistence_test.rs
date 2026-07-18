@@ -285,6 +285,7 @@ async fn test_config_set_save_updates_rules() {
             maxmemory_policy: "allkeys-lru".to_string(),
         databases: 16,
         metrics_port: 0,
+        deadlock_ui_port: 0,
         tls: false,
         tls_cert: String::new(),
         tls_key: String::new(),

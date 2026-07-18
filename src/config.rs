@@ -126,6 +126,11 @@ pub struct Config {
     #[arg(long, default_value = "0")]
     pub metrics_port: u16,
 
+    /// Deadlock monitoring Web UI HTTP port bound to 127.0.0.1 (0 = disabled).
+    /// Serves HTML at `/` and JSON at `/api/deadlock`. Localhost-only; no auth.
+    #[arg(long, default_value = "0")]
+    pub deadlock_ui_port: u16,
+
     /// Enable TLS for client connections (default: false).
     #[arg(long, default_value = "false")]
     pub tls: bool,
@@ -183,6 +188,7 @@ impl Default for Config {
             save: "900,1 300,10 60,10000".to_string(),
             databases: 16,
             metrics_port: 0,
+            deadlock_ui_port: 0,
             tls: false,
             tls_cert: String::new(),
             tls_key: String::new(),
@@ -457,6 +463,19 @@ mod tests {
     fn log_format_rejects_unknown() {
         let err = Config::try_parse_from(["kore", "--log-format", "xml"]);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn deadlock_ui_port_defaults_to_zero() {
+        let c = Config::try_parse_from(["kore"]).expect("default parse");
+        assert_eq!(c.deadlock_ui_port, 0);
+    }
+
+    #[test]
+    fn deadlock_ui_port_flag() {
+        let c = Config::try_parse_from(["kore", "--deadlock-ui-port", "9101"])
+            .expect("deadlock-ui-port parse");
+        assert_eq!(c.deadlock_ui_port, 9101);
     }
 }
 

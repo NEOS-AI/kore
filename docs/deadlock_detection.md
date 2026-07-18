@@ -24,6 +24,7 @@ Client 2: Holds Lock B, Waits for Lock A
 - **Configurable**: Adjustable timeouts and auto-resolution
 - **Async API**: Tokio-friendly wrappers + optional background monitor
 - **Cross-process snapshots**: Export/merge wait-for graphs across processes (no built-in transport)
+- **Web UI monitoring**: Optional localhost HTML dashboard + JSON API for live wait-for graph
 
 ## How It Works
 
@@ -663,8 +664,83 @@ self-waits), and re-links any `waiting_for` entries for that resource.
 | **Not consensus** | Last-writer is not used for holds; local always wins. Stale remote holds can linger until TTL cleanup. |
 | **Remaining TTL** | Import uses remaining life at export time; clock skew between processes is not corrected. |
 | **Partial views** | Orphan waits export holder-less waits; one mutual merge re-links when peers export their holds. Without any exchange, cycles stay invisible. |
-| **No Web UI** | Visualization remains open (see roadmap). |
 | **Client id encoding** | Export uses UTF-8 lossy strings; binary tokens with invalid UTF-8 are mangled on the wire. |
+
+## Web UI monitoring
+
+Kore ships an optional **localhost-only** deadlock dashboard (hand-rolled HTTP,
+same style as `--metrics-port` — no extra HTTP crates).
+
+### Enable
+
+```bash
+# With Redlock: detector is auto-enabled when the UI port is set
+kore --enable-redlock --redlock-instances host1:6379,host2:6379,host3:6379 \
+     --deadlock-ui-port 9101
+
+# Open in a browser (loopback only)
+open http://127.0.0.1:9101/
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--deadlock-ui-port` | `0` (off) | Bind `127.0.0.1:<port>` for the UI. |
+
+When `--deadlock-ui-port` is non-zero **and** Redlock is enabled,
+`Redlock::from_config` attaches a detector (`max_wait_time_ms=30000`,
+`auto_resolve=false`) so the UI has a live graph. If Redlock is disabled,
+the UI still starts but reports `status: "disabled"`.
+
+### Endpoints
+
+| Method / path | Response |
+|---------------|----------|
+| `GET /` or `GET /deadlock` | Self-contained HTML dashboard (meta-refresh 5s + light JS poll) |
+| `GET /api/deadlock` or `GET /deadlock.json` | JSON snapshot of held locks, wait edges, orphan waits, cycle, stats |
+
+Example JSON shape:
+
+```json
+{
+  "enabled": true,
+  "status": "ok",
+  "cycle": [],
+  "resources": [],
+  "stats": {
+    "held_locks_count": 0,
+    "waiting_clients_count": 0,
+    "wait_graph_edges": 0
+  },
+  "held": [],
+  "waits": [],
+  "orphan_waits": []
+}
+```
+
+`status` is one of `ok`, `deadlock`, or `disabled`. On deadlock, `cycle` lists
+client ids and `resources` the involved lock names.
+
+### Security
+
+- **Bind address is always `127.0.0.1`** — not configurable in MVP.
+- **No authentication** — treat as a local admin tool; do not port-forward or
+  reverse-proxy to untrusted networks without adding auth yourself.
+- Read-only surface: the UI does not resolve deadlocks or mutate the graph.
+
+### Programmatic use
+
+```rust
+use kore::{run_deadlock_ui_server, DeadlockDetector};
+use std::sync::Arc;
+use tokio::sync::watch;
+
+let detector = Arc::new(DeadlockDetector::new(30_000, false));
+let (tx, rx) = watch::channel(false);
+tokio::spawn(async move {
+    run_deadlock_ui_server(9101, Some(detector), rx).await.unwrap();
+});
+// later: let _ = tx.send(true);
+```
 
 ## Limitations
 
@@ -679,6 +755,8 @@ self-waits), and re-links any `waiting_for` entries for that resource.
    than the detector client id are not supported for backend release.
 6. **Standalone monitor is graph-only**: `DeadlockDetector::spawn_monitor` does not
    touch Redlock backends — use `Redlock::spawn_deadlock_monitor` for backend unlock.
+7. **Web UI is localhost-only, no auth**: Suitable for local ops; not a multi-tenant
+   admin console.
 
 ## Example: Complete Deadlock-Safe Application
 
@@ -760,3 +838,7 @@ Available tests:
 - Unit tests in `src/deadlock.rs`: cross-process merge (pre-planted + realistic re-link),
   remaining-TTL import, stale edge holder rewrite, conditional `record_lock_released`,
   holder-scoped release prune, merge self-wait drop, local acquire re-link/rewrite
+- Unit/integration tests in `src/deadlock_ui.rs`:
+  - `json_disabled_state` / `json_and_html_show_planted_cycle` / `json_escape_quotes`
+  - `http_ui_and_json_endpoints` — HTTP 200 on `/`, `/deadlock`, `/api/deadlock`,
+    `/deadlock.json`; planted cycle visible; disabled detector honest

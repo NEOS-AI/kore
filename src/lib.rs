@@ -28,6 +28,7 @@ pub mod query_engine;
 pub mod vector_search;
 pub mod persistence;
 pub mod metrics;
+pub mod deadlock_ui;
 pub mod scripting;
 pub mod slowlog;
 pub mod acl_log;
@@ -65,6 +66,10 @@ pub use redlock::{LocalCacheBackend, Lock, LockBackend, Redlock, RespBackend};
 pub use deadlock::{
     DeadlockDetector, DeadlockGraphSnapshot, DeadlockStatus, HeldLockSnapshot, LockInfo,
     OrphanWaitSnapshot, VictimSelectionStrategy, WaitEdgeSnapshot,
+};
+pub use deadlock_ui::{
+    render_html as render_deadlock_html, render_json as render_deadlock_json,
+    run_deadlock_ui_server, DeadlockUiSnapshot,
 };
 pub use fair_queue::{FairQueue, QueuedClient, FairQueueStats};
 pub use pubsub::{

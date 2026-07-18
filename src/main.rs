@@ -264,6 +264,31 @@ fn main() -> anyhow::Result<()> {
             info!("Redlock disabled");
         }
 
+        // Optional deadlock monitoring Web UI (127.0.0.1 only, no auth).
+        // Shares Redlock's detector when present; otherwise serves a disabled view.
+        if config.deadlock_ui_port != 0 {
+            let detector = redlock.as_ref().and_then(|rl| rl.deadlock_detector());
+            let shutdown_rx_ui = shutdown_rx.clone();
+            let ui_port = config.deadlock_ui_port;
+            tokio::spawn(async move {
+                if let Err(e) =
+                    kore::deadlock_ui::run_deadlock_ui_server(ui_port, detector, shutdown_rx_ui)
+                        .await
+                {
+                    warn!("Deadlock UI server exited: {}", e);
+                }
+            });
+            info!(
+                "Deadlock UI enabled on http://127.0.0.1:{}/ (JSON /api/deadlock){}",
+                config.deadlock_ui_port,
+                if redlock.is_some() {
+                    ""
+                } else {
+                    " — no Redlock detector; UI will show disabled state"
+                }
+            );
+        }
+
         // Create and run server until shutdown signal
         let config = Arc::new(config);
         let server = Server::with_databases_and_persistence(databases, config, persistence)
