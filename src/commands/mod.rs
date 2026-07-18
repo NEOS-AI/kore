@@ -1020,17 +1020,20 @@ impl CommandHandler {
 
     /// Redis-style `-LOADING` while multi-DB keyspace replace is in progress.
     ///
-    /// Allows auth/handshake/info/replication control so clients and replicas
-    /// can still probe the server. Data-plane commands are rejected so they
-    /// do not observe a mid-install multi-DB tear.
+    /// Allows connection/discovery/repl handshake that does not snapshot the
+    /// keyspace so clients and replicas can still probe the server. Data-plane
+    /// commands and full-sync (`SYNC`/`PSYNC`) are rejected so they do not
+    /// observe a mid-install multi-DB tear (e.g. strings filled, typed maps
+    /// empty). `CONFIG` stays allowed (ops/live params only; no keyspace read).
     fn loading_denied(&self, cmd_upper: &str) -> Option<RespValue> {
         if !self.databases.load_in_progress() {
             return None;
         }
         match cmd_upper {
-            // Connection / discovery / replication control during load.
+            // Connection / discovery / repl handshake (no keyspace snapshot).
             "AUTH" | "HELLO" | "PING" | "ECHO" | "QUIT" | "RESET" | "INFO" | "COMMAND"
-            | "ROLE" | "REPLCONF" | "PSYNC" | "SYNC" | "CLIENT" | "CONFIG" | "MODULE" => None,
+            | "ROLE" | "REPLCONF" | "CLIENT" | "CONFIG" | "MODULE" => None,
+            // SYNC/PSYNC intentionally denied: full resync snapshots live maps.
             _ => Some(RespValue::error(
                 "LOADING Redis is loading the dataset in memory",
             )),

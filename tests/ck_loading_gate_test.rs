@@ -120,6 +120,62 @@ fn set_denied_while_load_in_progress_ping_and_info_allowed() {
 }
 
 #[test]
+fn sync_and_psync_denied_while_load_in_progress() {
+    // Batch CR: fullresync must not snapshot mid-install torn keyspace maps.
+    let dbs = Databases::create(4, 8, 1024 * 1024 * 50, 500 * 1024 * 1024, false, 0.75);
+    let mut h = make_handler(dbs.clone());
+
+    dbs.with_load_in_progress_flag(|| {
+        let sync = handle(&mut h, cmd(&["SYNC"]));
+        assert!(
+            is_loading(&sync),
+            "SYNC should LOADING during multi-DB replace, got {:?}",
+            sync
+        );
+
+        let psync = handle(&mut h, cmd(&["PSYNC", "?", "-1"]));
+        assert!(
+            is_loading(&psync),
+            "PSYNC should LOADING during multi-DB replace, got {:?}",
+            psync
+        );
+
+        // Repl handshake / discovery still allowed (no keyspace snapshot).
+        let ping = handle(&mut h, cmd(&["PING"]));
+        assert!(
+            matches!(ping, RespValue::SimpleString(ref s) if s.as_ref() == b"PONG"),
+            "PING allowed during load, got {:?}",
+            ping
+        );
+
+        let info = handle(&mut h, cmd(&["INFO", "replication"]));
+        assert!(
+            matches!(info, RespValue::BulkString(Some(_))),
+            "INFO allowed during load, got {:?}",
+            info
+        );
+
+        let role = handle(&mut h, cmd(&["ROLE"]));
+        assert!(
+            matches!(role, RespValue::Array(_)),
+            "ROLE allowed during load, got {:?}",
+            role
+        );
+
+        let replconf = handle(&mut h, cmd(&["REPLCONF", "listening-port", "6380"]));
+        assert!(
+            matches!(replconf, RespValue::SimpleString(ref s) if s.as_ref() == b"OK"),
+            "REPLCONF allowed during load, got {:?}",
+            replconf
+        );
+
+        // Data plane still gated (regression).
+        let set = handle(&mut h, cmd(&["SET", "k", "v"]));
+        assert!(is_loading(&set), "SET should LOADING, got {:?}", set);
+    });
+}
+
+#[test]
 fn watch_and_exec_denied_while_load_in_progress() {
     let dbs = Databases::create(4, 8, 1024 * 1024 * 50, 500 * 1024 * 1024, false, 0.75);
     let mut h = make_handler(dbs.clone());

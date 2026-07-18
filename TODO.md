@@ -451,9 +451,9 @@ Also tracked in `docs/roadmap.md`.
   - *Found*: commits one DB at a time; concurrent readers (FULLRESYNC) can see DB0 new + DB1 old; panic mid-loop leaves partial multi-DB commit.
   - *Mitigated (CC–CK)*: staged drain; no multi-DB pre-flush; `load_generation` / `load_in_progress`; Redis-style **`-LOADING`** for data-plane commands during replace; INFO `loading:`.
   - *Accepted residual*: true lock-step atomic install of all DBs in one publish (no mid-loop torn maps even for privileged paths) remains a future design if needed. Documented in `docs/locking.md` + roadmap.
-- [ ] **`[P2]`** **Code review (CP post-ship):** LOADING allowlist still runs `PSYNC`/`SYNC`/`CONFIG` during replace
-  - *Found*: `loading_reply_if_busy` allows `INFO`/`ROLE`/`REPLCONF`/`PSYNC`/`SYNC`/`CLIENT`/`CONFIG`/`MODULE` (and auth/admin probes). Full sync snapshots live multi-DB maps and can observe mid-`install_keyspace_payload` torn state (strings filled, typed maps empty, counters not yet installed). Data plane is correctly gated.
-  - *Next*: document allowlist exceptions in `docs/locking.md`; decide whether to return `-LOADING` for `SYNC`/`PSYNC` (or serialize fullsync behind the replace barrier) if replica safety during live load matters.
+- [x] **`[P2]`** **Code review (CP post-ship):** LOADING allowlist still runs `PSYNC`/`SYNC`/`CONFIG` during replace
+  - *Found*: `loading_denied` allowed `INFO`/`ROLE`/`REPLCONF`/`PSYNC`/`SYNC`/`CLIENT`/`CONFIG`/`MODULE` (and auth/admin probes). Full sync snapshots live multi-DB maps and can observe mid-`install_keyspace_payload` torn state (strings filled, typed maps empty, counters not yet installed). Data plane is correctly gated.
+  - *Done (Batch CR)*: deny `SYNC`/`PSYNC` during `load_in_progress` (`-LOADING`); keep allowlist for connection/discovery/repl handshake (`AUTH`/`HELLO`/`PING`/`ECHO`/`QUIT`/`RESET`/`INFO`/`COMMAND`/`ROLE`/`REPLCONF`/`CLIENT`/`CONFIG`/`MODULE`). `CONFIG` left allowed (ops/live params; no keyspace snapshot). Docs: `docs/locking.md` Keyspace replace. Tests: `tests/ck_loading_gate_test.rs`.
 - [x] **`[P1]`** **Code review (CC post-ship):** WATCH bump not atomic with keyspace install (race window)
   - *Found*: `replace_keyspace_from` installs scratch `watch_gens` (usually empty) and releases the lock, then later bumps `pre_watch_keys`. Between those steps `watch_generation` can `or_insert(0)` so a client that WATCHed at gen 0 sees clean EXEC against new/empty data. On `flush=true` the clean window spans flush (which does not touch watch_gens) through end of replace.
   - *Done (Batch CD)*: under one `watch_gens` lock, install `other_watch` and bump all `pre_watch_keys`; AOF/RDB `flush=true` commit calls `touch_all_watch_keys` before flush. Tests: `tests/cd_watch_atomic_and_typed_export_test.rs`.
@@ -524,7 +524,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batch CQ shipped** (graph-based HNSW SEARCH-LAYER + self-exclude on connect; discriminating edge-walk tests; CP methodology kept). **Open:** HNSW recall@k / throughput numbers; LOADING allowlist docs/policy (PSYNC/SYNC mid-install); optional structured JSON logging; advanced deadlock features (roadmap); standing “tests for the phase” P0; optional peak-RSS automation.
+Prioritized for next letter batch(es). **Batch CR shipped** (deny `SYNC`/`PSYNC` during LOADING replace; allowlist documented; CQ HNSW graph search kept). **Open:** HNSW recall@k / throughput numbers; optional structured JSON logging; advanced deadlock features (roadmap); standing “tests for the phase” P0; optional peak-RSS automation.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -566,7 +566,7 @@ Prioritized for next letter batch(es). **Batch CQ shipped** (graph-based HNSW SE
 | P2 | CB post-ship: expand tests (memory, multi-DB, TTL, pubsub, seed, peak) | done (CP) |
 | P2 | HNSW graph search (ef_search; self-exclude; edge-walk tests) | done (CQ) |
 | P2 | HNSW recall@k / throughput numbers vs FLAT | open (methodology + CQ correctness; numbers TBD) |
-| P2 | CP post-ship: LOADING allowlist PSYNC/SYNC mid-install visibility | open |
+| P2 | CP post-ship: LOADING allowlist PSYNC/SYNC mid-install visibility | done (CR) |
 | P2 | CC post-ship: typed export skip expired keys (no revive without TTL) | done (CD) |
 | P2 | CC nit: unify start_background_sweep create paths | done (CD) |
 | P2 | CB second-pass: empty_keyspace_like hardcodes loadfactor 0.75 | done (CF) |
