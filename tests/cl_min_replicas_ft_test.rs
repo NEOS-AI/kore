@@ -117,7 +117,7 @@ fn min_replicas_blocks_ft_mutators_not_search() {
         search0
     );
 
-    // Mutators blocked
+    // Mutators blocked with 0 good replicas (including ALIASADD before CREATE exists)
     let create = handle(
         &mut h,
         cmd(&[
@@ -135,8 +135,14 @@ fn min_replicas_blocks_ft_mutators_not_search() {
         err_contains(&create, "NOREPLICAS"),
         "FT.CREATE must respect min-replicas-to-write"
     );
+    let alias_add0 = handle(&mut h, cmd(&["FT.ALIASADD", "blog", "idx"]));
+    assert!(
+        err_contains(&alias_add0, "NOREPLICAS"),
+        "FT.ALIASADD must respect min-replicas-to-write (0 replicas), got {:?}",
+        alias_add0
+    );
 
-    // Register a replica → FT.CREATE allowed
+    // Register a replica → FT.CREATE + ALIASADD allowed
     let _feed = mgr.replication.register_replica();
     assert!(is_ok(&handle(
         &mut h,

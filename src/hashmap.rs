@@ -412,6 +412,10 @@ impl ShardedHashMap {
     /// Used after an external [`drain_all`] so install paths do not double-drain.
     /// **Exclusive access** required; caller owns emptiness invariant.
     pub fn fill_all(&self, entries: Vec<(Bytes, SharedEntry)>) {
+        debug_assert!(
+            self.is_empty(),
+            "fill_all requires an empty map (caller must drain first)"
+        );
         for (k, v) in entries {
             self.insert(k, v);
         }
@@ -669,6 +673,10 @@ impl<V: Clone> ShardedKeyMap<V> {
 
     /// Insert into an already-empty map (no drain). See [`ShardedHashMap::fill_all`].
     pub fn fill_all(&self, entries: Vec<(Bytes, V)>) {
+        debug_assert!(
+            self.is_empty(),
+            "fill_all requires an empty map (caller must drain first)"
+        );
         for (k, v) in entries {
             self.insert(k, v);
         }
