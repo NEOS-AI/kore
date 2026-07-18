@@ -128,12 +128,17 @@ If `redis-benchmark` reports p50/p99, record them in a second table with the sam
 Generic `redis-benchmark` does not cover RediSearch vectors. For Kore-internal
 comparison:
 
-1. Build with `cargo test --release` (correctness) or a dedicated bench binary
-   when added.
+1. Build with `cargo test --release` (correctness + micro timing) or a dedicated
+   bench binary when added. Prefer **release** for throughput ratios; debug is
+   fine for recall gates only.
 2. Use the same vectors/query for FLAT (exact) and HNSW (`M`, `ef_construction`).
 3. Report: dataset size (N, dim), recall@k vs FLAT ground truth, and wall time
-   for build + query (median of ≥3 runs).
-4. In-tree correctness gates (unit tests in `src/vector_search.rs`):
+   for the query set (build excluded). CI does **not** gate on absolute ms.
+4. In-tree gates (unit tests in `src/vector_search.rs`):
+   - `hnsw_recall_at_k_vs_flat_and_throughput` (**Batch CV**): N=300 unit vectors,
+     dim=16, Cosine, Q=40 queries, fixed `StdRng` seed `0xC0FFEE42`; HNSW
+     M=16 / ef=100; asserts mean recall@1 ≥ 0.90 and recall@10 ≥ 0.80; prints
+     FLAT vs HNSW wall time (`eprintln!`, see `--nocapture`)
    - `hnsw_top1_matches_flat_on_small_set` (tiny N; graph search should still match FLAT)
    - `hnsw_search_follows_edges_not_full_scan` (fails if search ignores edges)
    - `hnsw_add_excludes_self_from_neighbors`
@@ -144,7 +149,7 @@ comparison:
    - `hnsw_bridge_remove_asymmetric_incoming_reconnects` / `hnsw_bridge_remove_star_multiway_reconnects` (Batch CU)
    - `hnsw_m1_hub_churn_preserves_reachability` (Batch CT smoke)
 
-**Implementation note (Batch CQ + CS + CT + CU):** `HNSWIndex::search` walks neighbor
+**Implementation note (Batch CQ + CS + CT + CU + CV):** `HNSWIndex::search` walks neighbor
 edges (SEARCH-LAYER) with candidate list size `ef_search` (defaults to
 `ef_construction`). Insert still assigns all nodes to **layer 0** only
 (multi-layer assignment simplified). Layer-0 prune uses `M_max ≈ 2M` and
@@ -161,13 +166,32 @@ rewires via remove + re-insert (inherits bridge repair). Approximate ANN; use
 FLAT for exact recall baselines. Brute-force over `vectors` remains only as a
 defensive fallback when the entry-point vector is missing.
 
+### Indicative micro-results (Batch CV)
+
+**Disclaimer:** single-host, indicative only — not a cross-machine claim and not
+a CI gate. Absolute ms vary with CPU; use **relative** FLAT/HNSW ratios and
+recall@k. Re-run:
+
+```bash
+cargo test --release --lib hnsw_recall_at_k_vs_flat_and_throughput -- --nocapture
+```
+
 | Field | Value |
 |-------|--------|
-| Date | TBD |
-| N / dim | TBD |
-| HNSW M / ef | TBD |
-| Recall@10 vs FLAT | TBD |
-| Query p50 (ms) FLAT / HNSW | TBD |
+| Date | 2026-07-18 |
+| Host | single-host dev (Apple Silicon / macOS); release profile |
+| N / dim / metric | 300 / 16 / Cosine (unit vectors) |
+| Queries | Q=40 random unit queries; seed `0xC0FFEE42` |
+| HNSW M / ef | 16 / 100 (`ef_search` = `ef_construction`) |
+| mean recall@1 vs FLAT | **1.00** (gate ≥ 0.90) |
+| mean recall@10 vs FLAT | **1.00** (gate ≥ 0.80) |
+| Query set wall (k=10) FLAT / HNSW | ~0.80 ms / ~4.1 ms (HNSW ≈ **0.20×** FLAT) |
+
+**Interpretation:** at this small N, brute-force FLAT is cheaper than graph
+walk (HNSW overhead dominates). The test is a **recall correctness + relative
+timing** smoke, not a claim that HNSW wins at N=300. Expect HNSW to pull ahead
+only as N grows (not covered by the unit-test budget). Re-print live numbers
+from the unit test output on any host.
 
 ## Load dual-residency peak (scratch-load)
 

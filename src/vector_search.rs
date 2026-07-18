@@ -1620,4 +1620,128 @@ mod tests {
             seen.len()
         );
     }
+
+    /// Batch CV: moderate-N recall@k of HNSW vs FLAT ground truth + indicative
+    /// search throughput (wall time over the query set).
+    ///
+    /// Methodology (also in `docs/benchmarks.md`):
+    /// - N=300 random **unit** vectors, dim=16, Cosine; deterministic `StdRng` seed.
+    /// - HNSW: M=16, ef_construction=ef_search=100 (reasonable defaults).
+    /// - Q=40 independent random unit queries (same seed stream after corpus).
+    /// - recall@k = |HNSW top-k ∩ FLAT top-k| / k, averaged over queries.
+    ///
+    /// Thresholds (pass a correct graph ANN; fail random/empty search):
+    /// - mean recall@1  ≥ 0.90
+    /// - mean recall@10 ≥ 0.80
+    ///
+    /// Throughput: total wall time for all Q searches (FLAT vs HNSW), printed via
+    /// `eprintln!` (visible with `cargo test -- --nocapture`). Not a CI gate.
+    #[test]
+    fn hnsw_recall_at_k_vs_flat_and_throughput() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        use std::time::Instant;
+
+        const N: usize = 300;
+        const DIM: usize = 16;
+        const Q: usize = 40;
+        const M: usize = 16;
+        const EF: usize = 100;
+        const SEED: u64 = 0xC0_FF_EE_42; // fixed — do not change without re-checking thresholds
+
+        // Thresholds: high enough that a broken/random search fails, low enough
+        // that a correct layer-0 HNSW with these params is stable across hosts.
+        const MIN_RECALL_AT_1: f64 = 0.90;
+        const MIN_RECALL_AT_10: f64 = 0.80;
+
+        fn random_unit(rng: &mut StdRng, dim: usize) -> Vec<f32> {
+            let mut v: Vec<f32> = (0..dim).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect();
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 1e-12 {
+                for x in &mut v {
+                    *x /= norm;
+                }
+            } else {
+                v[0] = 1.0;
+            }
+            v
+        }
+
+        /// Standard recall@k = |approx ∩ exact| / k using the top-k id sets.
+        fn recall_at_k(
+            flat: &[VectorSearchResult],
+            hnsw: &[VectorSearchResult],
+            k: usize,
+        ) -> f64 {
+            let truth: HashSet<&Bytes> = flat.iter().take(k).map(|r| &r.doc_id).collect();
+            let hits = hnsw
+                .iter()
+                .take(k)
+                .filter(|r| truth.contains(&r.doc_id))
+                .count();
+            hits as f64 / k as f64
+        }
+
+        let mut rng = StdRng::seed_from_u64(SEED);
+        let corpus: Vec<(Bytes, Vec<f32>)> = (0..N)
+            .map(|i| (Bytes::from(format!("v{i}")), random_unit(&mut rng, DIM)))
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..Q).map(|_| random_unit(&mut rng, DIM)).collect();
+
+        let mut flat = FlatVectorIndex::new(DistanceMetric::Cosine);
+        let mut hnsw = HNSWIndex::new(M, EF, DistanceMetric::Cosine);
+        for (id, v) in &corpus {
+            flat.add(id.clone(), v.clone());
+            hnsw.add(id.clone(), v.clone());
+        }
+        assert_eq!(flat.len(), N);
+        assert_eq!(hnsw.len(), N);
+
+        // One search pass at k=10 per index; recall@1 uses the top-1 of that list.
+        // Wall times cover only the Q searches (build excluded).
+        let t_flat = Instant::now();
+        let flat_top10: Vec<Vec<VectorSearchResult>> =
+            queries.iter().map(|q| flat.search(q, 10)).collect();
+        let flat_ms = t_flat.elapsed().as_secs_f64() * 1000.0;
+
+        let t_hnsw = Instant::now();
+        let hnsw_top10: Vec<Vec<VectorSearchResult>> =
+            queries.iter().map(|q| hnsw.search(q, 10)).collect();
+        let hnsw_ms = t_hnsw.elapsed().as_secs_f64() * 1000.0;
+
+        let mut sum_r1 = 0.0f64;
+        let mut sum_r10 = 0.0f64;
+        for i in 0..Q {
+            let f = &flat_top10[i];
+            let h = &hnsw_top10[i];
+            assert_eq!(f.len(), 10, "FLAT must return k=10 for query {i}");
+            assert_eq!(h.len(), 10, "HNSW must return k=10 for query {i}");
+            sum_r1 += recall_at_k(f, h, 1);
+            sum_r10 += recall_at_k(f, h, 10);
+        }
+
+        let mean_r1 = sum_r1 / Q as f64;
+        let mean_r10 = sum_r10 / Q as f64;
+        let speedup = if hnsw_ms > 0.0 {
+            flat_ms / hnsw_ms
+        } else {
+            f64::INFINITY
+        };
+
+        eprintln!(
+            "hnsw_recall_at_k_vs_flat_and_throughput: N={N} dim={DIM} Q={Q} M={M} ef={EF} \
+             mean_recall@1={mean_r1:.3} mean_recall@10={mean_r10:.3} \
+             flat_search_k10={flat_ms:.3}ms hnsw_search_k10={hnsw_ms:.3}ms speedup≈{speedup:.2}× \
+             (indicative single-host; not a CI gate)"
+        );
+
+        assert!(
+            mean_r1 >= MIN_RECALL_AT_1,
+            "mean recall@1 {mean_r1:.3} < {MIN_RECALL_AT_1} (N={N} dim={DIM} Q={Q} M={M} ef={EF})"
+        );
+        assert!(
+            mean_r10 >= MIN_RECALL_AT_10,
+            "mean recall@10 {mean_r10:.3} < {MIN_RECALL_AT_10} (N={N} dim={DIM} Q={Q} M={M} ef={EF})"
+        );
+    }
 }

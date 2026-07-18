@@ -421,8 +421,8 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (CT post-ship):** multi-way / degree-saturated bridge reconnect incomplete
   - *Found*: each survivor only force-keeps its **single** nearest former peer. With ≥3 former neighbors or leaves already at `max_m` with closer non-former edges, secondary former links can be pruned — directed search from entry may still miss a survivor. CT tests only cover the 2-neighbor mutual-NN chain.
   - *Done (Batch CU)*: spanning reconnect (full clique when `n-1 ≤ max_m`, else nearest-neighbor path) with force-keep of spanning edges on **both** endpoints; `prune_neighbors_keeping` accepts multiple must-keeps. Test: `hnsw_bridge_remove_star_multiway_reconnects` (degree-saturated star). Not a global non-partition guarantee under later hub churn.
-- [ ] **`[P2]`** HNSW recall@k / throughput numbers vs FLAT
-  - *Partial*: methodology table in `docs/benchmarks.md`; graph search + bridge/asymmetric/multi-way tests gated. Full recall@k on larger N + measured throughput still TBD.
+- [x] **`[P2]`** HNSW recall@k / throughput numbers vs FLAT
+  - *Done (Batch CV)*: `hnsw_recall_at_k_vs_flat_and_throughput` in `src/vector_search.rs` — N=300 dim=16 Cosine, Q=40, fixed seed; mean recall@1 ≥ 0.90 / recall@10 ≥ 0.80 vs FLAT; `eprintln!` FLAT vs HNSW search wall time. Indicative numbers + methodology in `docs/benchmarks.md` (at N=300 FLAT still cheaper; recall perfect on seed).
 - [x] **`[P2]`** **Code review (CP post-ship):** HNSW search does not use the graph
   - *Found*: `search` full-scanned `self.vectors`; `ef_search` unused; `add` could connect self as neighbor.
   - *Done (Batch CQ)*: graph SEARCH-LAYER + self-exclude on connect; discriminating edge-walk test.
@@ -549,7 +549,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batch CU shipped** (undirected former snapshot + multi-way spanning bridge reconnect; CT post-ship residuals closed). Still not a global non-partition guarantee under arbitrary later hub churn. **Open next:** HNSW recall@k/throughput numbers; optional JSON logging; advanced deadlock; standing tests-for-phase P0.
+Prioritized for next letter batch(es). **Batch CV shipped** (HNSW recall@k unit gate + indicative throughput vs FLAT in `docs/benchmarks.md`). **Open next:** optional JSON logging; advanced deadlock; standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -597,7 +597,7 @@ Prioritized for next letter batch(es). **Batch CU shipped** (undirected former s
 | P2 | CS post-ship: force-keep not global reachability (docs + hub-churn tests) | done (CT docs honesty; hub-churn smoke) |
 | P2 | CT post-ship: undirected former-neighbor snapshot (incoming too) | done (CU) |
 | P2 | CT post-ship: multi-way / degree-saturated bridge reconnect | done (CU) |
-| P2 | HNSW recall@k / throughput numbers vs FLAT | open (methodology + CQ–CU; numbers TBD) |
+| P2 | HNSW recall@k / throughput numbers vs FLAT | done (CV; unit gate + indicative table) |
 | P2 | CP post-ship: LOADING allowlist PSYNC/SYNC mid-install visibility | done (CR) |
 | P2 | CC post-ship: typed export skip expired keys (no revive without TTL) | done (CD) |
 | P2 | CC nit: unify start_background_sweep create paths | done (CD) |
