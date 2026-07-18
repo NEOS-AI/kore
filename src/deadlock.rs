@@ -53,6 +53,22 @@ pub enum DeadlockStatus {
     },
 }
 
+/// Strategy for selecting which client in a deadlock cycle is the victim.
+///
+/// Used when auto-resolve is enabled. Default is [`VictimSelectionStrategy::Youngest`]
+/// for backward compatibility (abort the most recent acquirer to minimize wasted work).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VictimSelectionStrategy {
+    /// Most recent lock acquirer in the cycle (default).
+    #[default]
+    Youngest,
+    /// Earliest lock acquirer in the cycle.
+    Oldest,
+    /// Client in the cycle holding the fewest locks.
+    /// Ties break toward the youngest acquirer (most recent max timestamp).
+    FewestLocks,
+}
+
 /// Wait-for graph edge
 #[derive(Debug, Clone)]
 struct WaitEdge {
@@ -82,18 +98,46 @@ pub struct DeadlockDetector {
     
     /// Enable automatic deadlock resolution
     auto_resolve: bool,
+
+    /// Victim selection strategy used when auto-resolving
+    victim_strategy: VictimSelectionStrategy,
 }
 
 impl DeadlockDetector {
-    /// Create a new deadlock detector
+    /// Create a new deadlock detector with the default [`VictimSelectionStrategy::Youngest`].
     pub fn new(max_wait_time_ms: u64, auto_resolve: bool) -> Self {
+        Self::new_with_strategy(
+            max_wait_time_ms,
+            auto_resolve,
+            VictimSelectionStrategy::Youngest,
+        )
+    }
+
+    /// Create a new deadlock detector with an explicit victim selection strategy.
+    pub fn new_with_strategy(
+        max_wait_time_ms: u64,
+        auto_resolve: bool,
+        victim_strategy: VictimSelectionStrategy,
+    ) -> Self {
         Self {
             held_locks: Arc::new(RwLock::new(HashMap::new())),
             waiting_for: Arc::new(RwLock::new(HashMap::new())),
             wait_graph: Arc::new(RwLock::new(Vec::new())),
             max_wait_time_ms,
             auto_resolve,
+            victim_strategy,
         }
+    }
+
+    /// Builder-style: set the victim selection strategy.
+    pub fn with_victim_strategy(mut self, strategy: VictimSelectionStrategy) -> Self {
+        self.victim_strategy = strategy;
+        self
+    }
+
+    /// Current victim selection strategy.
+    pub fn victim_strategy(&self) -> VictimSelectionStrategy {
+        self.victim_strategy
     }
     
     /// Record a lock acquisition
@@ -290,28 +334,70 @@ impl DeadlockDetector {
         }
     }
     
-    /// Resolve deadlock by selecting a victim
+    /// Resolve deadlock by selecting a victim according to the configured strategy.
+    ///
+    /// Returns `None` when the cycle is empty, auto-resolve is disabled, or no
+    /// cycle member currently holds a tracked lock.
     pub fn resolve_deadlock(&self, cycle: &[Bytes]) -> Option<Bytes> {
         if cycle.is_empty() || !self.auto_resolve {
             return None;
         }
-        
-        // Select victim: youngest lock holder (most recent acquirer)
-        // This is a simple heuristic; more sophisticated strategies can be implemented
+
         let held = self.held_locks.read();
-        
-        let victim = cycle
-            .iter()
-            .filter_map(|client| {
-                // Find newest lock held by this client
-                held.values()
-                    .find(|info| info.client_id == *client)
-                    .map(|info| (client.clone(), info.timestamp))
-            })
-            .max_by_key(|(_, timestamp)| *timestamp)
-            .map(|(client, _)| client);
-        
-        victim
+
+        // Per cycle client: (lock_count, earliest_ts, latest_ts)
+        let mut candidates: Vec<(Bytes, usize, Instant, Instant)> = Vec::new();
+        for client in cycle {
+            let mut count = 0usize;
+            let mut earliest: Option<Instant> = None;
+            let mut latest: Option<Instant> = None;
+            for info in held.values() {
+                if info.client_id == *client {
+                    count += 1;
+                    earliest = Some(match earliest {
+                        Some(t) if t <= info.timestamp => t,
+                        _ => info.timestamp,
+                    });
+                    latest = Some(match latest {
+                        Some(t) if t >= info.timestamp => t,
+                        _ => info.timestamp,
+                    });
+                }
+            }
+            if count > 0 {
+                candidates.push((
+                    client.clone(),
+                    count,
+                    earliest.expect("count > 0 implies earliest"),
+                    latest.expect("count > 0 implies latest"),
+                ));
+            }
+        }
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        match self.victim_strategy {
+            VictimSelectionStrategy::Youngest => candidates
+                .into_iter()
+                .max_by_key(|(_, _, _, latest)| *latest)
+                .map(|(client, _, _, _)| client),
+            VictimSelectionStrategy::Oldest => candidates
+                .into_iter()
+                .min_by_key(|(_, _, earliest, _)| *earliest)
+                .map(|(client, _, _, _)| client),
+            VictimSelectionStrategy::FewestLocks => {
+                // Fewest held locks; ties break toward youngest (max latest timestamp).
+                candidates
+                    .into_iter()
+                    .min_by(|a, b| {
+                        a.1.cmp(&b.1)
+                            .then_with(|| b.3.cmp(&a.3)) // reverse: larger latest wins
+                    })
+                    .map(|(client, _, _, _)| client)
+            }
+        }
     }
     
     /// Check for long-running waits (potential deadlock candidates)
@@ -448,5 +534,115 @@ mod tests {
         
         detector.record_lock_released(&resource1);
         assert_eq!(detector.get_held_locks().len(), 0);
+    }
+
+    /// Two-client cycle: client1 acquires first (older), client2 second (younger).
+    fn setup_two_client_cycle(detector: &DeadlockDetector) -> (Bytes, Bytes) {
+        let client1 = Bytes::from("client-1");
+        let client2 = Bytes::from("client-2");
+        let resource1 = "resource-1".to_string();
+        let resource2 = "resource-2".to_string();
+
+        detector.record_lock_acquired(resource1.clone(), client1.clone(), 10000);
+        std::thread::sleep(Duration::from_millis(5));
+        detector.record_lock_acquired(resource2.clone(), client2.clone(), 10000);
+
+        // Create wait-for cycle (not required for resolve_deadlock, but realistic)
+        detector.record_lock_wait(resource2.clone(), client1.clone(), 10000);
+        detector.record_lock_wait(resource1.clone(), client2.clone(), 10000);
+
+        (client1, client2)
+    }
+
+    #[test]
+    fn test_victim_youngest_picks_most_recent_acquirer() {
+        let detector = DeadlockDetector::new_with_strategy(
+            5000,
+            true,
+            VictimSelectionStrategy::Youngest,
+        );
+        let (client1, client2) = setup_two_client_cycle(&detector);
+        let cycle = vec![client1.clone(), client2.clone()];
+
+        let victim = detector
+            .resolve_deadlock(&cycle)
+            .expect("auto_resolve should pick a victim");
+        assert_eq!(
+            victim, client2,
+            "Youngest should pick the more recent acquirer (client2)"
+        );
+    }
+
+    #[test]
+    fn test_victim_oldest_picks_earliest_acquirer() {
+        let detector = DeadlockDetector::new_with_strategy(
+            5000,
+            true,
+            VictimSelectionStrategy::Oldest,
+        );
+        let (client1, client2) = setup_two_client_cycle(&detector);
+        let cycle = vec![client1.clone(), client2.clone()];
+
+        let victim = detector
+            .resolve_deadlock(&cycle)
+            .expect("auto_resolve should pick a victim");
+        assert_eq!(
+            victim, client1,
+            "Oldest should pick the earliest acquirer (client1)"
+        );
+    }
+
+    #[test]
+    fn test_victim_fewest_locks_picks_client_with_fewer_held() {
+        // client1 holds 2 locks; client2 holds 1 → FewestLocks picks client2
+        let detector = DeadlockDetector::new_with_strategy(
+            5000,
+            true,
+            VictimSelectionStrategy::FewestLocks,
+        );
+        let client1 = Bytes::from("client-1");
+        let client2 = Bytes::from("client-2");
+
+        detector.record_lock_acquired("resource-1".to_string(), client1.clone(), 10000);
+        detector.record_lock_acquired("resource-extra".to_string(), client1.clone(), 10000);
+        detector.record_lock_acquired("resource-2".to_string(), client2.clone(), 10000);
+
+        let cycle = vec![client1.clone(), client2.clone()];
+        let victim = detector
+            .resolve_deadlock(&cycle)
+            .expect("auto_resolve should pick a victim");
+        assert_eq!(
+            victim, client2,
+            "FewestLocks should pick client2 (1 lock vs 2)"
+        );
+    }
+
+    #[test]
+    fn test_victim_auto_resolve_false_returns_none() {
+        let detector = DeadlockDetector::new_with_strategy(
+            5000,
+            false,
+            VictimSelectionStrategy::Youngest,
+        );
+        let (client1, client2) = setup_two_client_cycle(&detector);
+        let cycle = vec![client1, client2];
+
+        assert!(
+            detector.resolve_deadlock(&cycle).is_none(),
+            "auto_resolve=false must not select a victim"
+        );
+    }
+
+    #[test]
+    fn test_default_strategy_is_youngest() {
+        let detector = DeadlockDetector::new(5000, true);
+        assert_eq!(
+            detector.victim_strategy(),
+            VictimSelectionStrategy::Youngest
+        );
+
+        let detector = DeadlockDetector::new(5000, true)
+            .with_victim_strategy(VictimSelectionStrategy::Oldest);
+        assert_eq!(detector.victim_strategy(), VictimSelectionStrategy::Oldest);
     }
 }

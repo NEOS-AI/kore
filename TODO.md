@@ -327,6 +327,7 @@ Also tracked in `docs/roadmap.md`.
   - *Residual (CX post-ship)*: boot-only (not `CONFIG SET`); no `RUST_LOG`/`EnvFilter`; no JSON emit smoke; default verbosity WARN hides `info!` startup lines; targets off for parity with text.
 - [x] **`[P3]`** **Code review (CX post-ship):** JSON logging ops polish
   - *Done (Batch CY)*: README documents boot-only + verbosity 0–3 → ERROR/WARN/INFO/DEBUG (default 1=WARN); `EnvFilter::try_from_default_env()` falls back to verbosity; JSON `with_target(true)`; unit smoke `json_log_line_is_parseable_object`.
+  - *Residual (CY post-ship)*: smoke uses string contains, not `serde_json` parse; does not exercise `with_env_filter`. `RUST_LOG` **replaces** `-v` (not a floor); empty/invalid env edge cases soft; default WARN still hides boot `info!`.
 - [x] **`[P1]`** Health / readiness beyond bare `PING` (memory, persistence lag)
   - *Done (MVP)*: `HEALTH` / `HEALTH PING` → OK/PONG; `HEALTH FULL` structured status (`ready`, `role`, memory, `master_link`, `rdb_last_save`, `aof`); replica not ready when master link down.
 
@@ -345,7 +346,8 @@ Also tracked in `docs/roadmap.md`.
 - [ ] **`[P2]`** Deadlock detection advanced (from roadmap)
   - [ ] **`[P2]`** Cross-process detection
   - [ ] **`[P2]`** Async support
-  - [ ] **`[P2]`** Custom victim selection strategies
+  - [x] **`[P2]`** Custom victim selection strategies
+    - *Done (Batch CZ)*: `VictimSelectionStrategy` {`Youngest` (default), `Oldest`, `FewestLocks`}; `DeadlockDetector::new_with_strategy` / `with_victim_strategy`; `Redlock::with_deadlock_detection_strategy`; unit tests for each strategy + `auto_resolve=false`
   - [ ] **`[P2]`** Web UI monitoring
 
 ### Search & vectors
@@ -441,9 +443,11 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P3]`** **Code review (CW post-ship):** path-branch test needs degree-saturating decoys
   - *Found*: empty neighbor lists after hub clear mean bonus closest-peer density reconnects the line without proving path force-keep under pressure.
   - *Done (Batch CY)*: `hnsw_bridge_remove_path_branch_reconnects` attaches 2 decoys/leaf closer than other survivors; BFS farthest leaf + `search` for `d` still pass.
+  - *Residual (CY post-ship)*: positive connectivity only — does not assert path edges present in adjacency after prune under decoy pressure.
 - [x] **`[P3]`** **Code review (CU post-ship):** undirected remove reverse-scan is O(N)
   - *Found*: every remove full-scans layer neighbors for reverse edges, then `unlink_node` scans again. Correct but costly as N grows.
   - *Done (Batch CY)*: `unlink_collecting_undirected_former` fuses undirected snapshot + strip + drop in one reverse pass (no full reverse adjacency index).
+  - *Residual (CY post-ship)*: still **O(E_layer)** once (not O(N)+deg); reverse index only if delete-heavy workloads need better asymptotics.
 - [ ] **`[P3]`** **Code review (CV post-ship):** tighten recall gate / larger-N throughput
   - *Found*: thresholds 0.90/0.80 leave headroom on easy N/M/ef; throughput is single-shot N=300 where HNSW loses to FLAT.
   - *Next*: raise gates or harder config; optional `#[ignore]`/`--release` larger-N bench; label table single-shot.
@@ -573,7 +577,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batch CY shipped** (fuse HNSW remove reverse-scan+unlink; path-branch degree decoys; JSON ops polish). **Open next:** advanced deadlock (all sub-items); standing tests-for-phase P0; optional larger-N HNSW recall; multi-layer must_keep residual.
+Prioritized for next letter batch(es). **Batch CZ shipped** (custom deadlock victim selection strategies: Youngest/Oldest/FewestLocks). **CY post-ship review residuals** remain (JSON smoke parse, RUST_LOG replaces -v, path adjacency asserts, O(E) complexity honesty). **Open next:** advanced deadlock remaining (cross-process, async, Web UI); standing tests-for-phase P0; optional larger-N HNSW recall; multi-layer must_keep residual.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -623,12 +627,12 @@ Prioritized for next letter batch(es). **Batch CY shipped** (fuse HNSW remove re
 | P2 | CT post-ship: multi-way / degree-saturated bridge reconnect | done (CU clique + CW path) |
 | P2 | CU post-ship: NN-path bridge reconnect unit test (n-1 > max_m) | done (CW; CY decoys) |
 | P2 | CU post-ship: prune must_keep never drops required edges | done (CW; multi-layer residual) |
-| P3 | CW post-ship: path-branch test degree-saturating decoys | done (CY) |
-| P3 | CU post-ship: fuse reverse-scan + unlink / reverse index | done (CY fuse; no reverse index) |
+| P3 | CW post-ship: path-branch test degree-saturating decoys | done (CY; adjacency-assert residual) |
+| P3 | CU post-ship: fuse reverse-scan + unlink / reverse index | done (CY one O(E) pass; no reverse index) |
 | P2 | HNSW recall@k / throughput numbers vs FLAT | done (CV unit gate + N=300 micro) |
 | P3 | CV post-ship: tighter recall / larger-N throughput bench | open |
 | P2 | Optional structured JSON logging | done (CX MVP) |
-| P3 | CX post-ship: EnvFilter / JSON smoke / boot-only docs | done (CY) |
+| P3 | CX post-ship: EnvFilter / JSON smoke / boot-only docs | done (CY; smoke/EnvFilter residual) |
 | P2 | CP post-ship: LOADING allowlist PSYNC/SYNC mid-install visibility | done (CR) |
 | P2 | CC post-ship: typed export skip expired keys (no revive without TTL) | done (CD) |
 | P2 | CC nit: unify start_background_sweep create paths | done (CD) |

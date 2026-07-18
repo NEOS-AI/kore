@@ -249,10 +249,24 @@ match redlock.lock("resource-b", client_id.clone(), 1000) {
 ### DeadlockDetector Parameters
 
 ```rust
+use kore::{DeadlockDetector, VictimSelectionStrategy};
+
+// Default strategy is Youngest (backward compatible)
 DeadlockDetector::new(
     max_wait_time_ms: u64,  // Max time to wait before flagging (default: 30000)
     auto_resolve: bool       // Automatically resolve deadlocks (default: false)
-)
+);
+
+// Explicit strategy
+DeadlockDetector::new_with_strategy(
+    30000,
+    true,
+    VictimSelectionStrategy::Oldest,
+);
+
+// Builder-style override
+DeadlockDetector::new(30000, true)
+    .with_victim_strategy(VictimSelectionStrategy::FewestLocks);
 ```
 
 - **max_wait_time_ms**: Maximum wait time before considering it a potential deadlock
@@ -262,15 +276,36 @@ DeadlockDetector::new(
 
 - **auto_resolve**: Automatic victim selection and lock release
   - `false`: Detection only, manual handling required
-  - `true`: Automatic resolution (picks youngest lock holder as victim)
+  - `true`: Automatic resolution using the configured strategy
 
-### Victim Selection Strategy
+### Victim Selection Strategies
 
-When auto-resolve is enabled, the detector selects a victim using:
-- **Youngest lock holder**: Client who most recently acquired a lock
-- Rationale: Minimize wasted work by aborting newer operations
+When auto-resolve is enabled, the detector selects a victim from the deadlock cycle
+using [`VictimSelectionStrategy`]:
 
-Custom strategies can be implemented by extending the detector.
+| Strategy | Behavior |
+|----------|----------|
+| **`Youngest`** (default) | Client whose most recent held-lock acquisition is newest. Minimizes wasted work by aborting newer operations. |
+| **`Oldest`** | Client whose earliest held-lock acquisition is oldest. Prefers aborting long-running holders. |
+| **`FewestLocks`** | Client holding the fewest locks in the cycle. Ties break toward **Youngest** (most recent max timestamp). |
+
+Via Redlock:
+
+```rust
+use kore::{Redlock, VictimSelectionStrategy};
+
+// Default Youngest
+let redlock = Redlock::new(instances)?
+    .with_deadlock_detection(30000, true);
+
+// Explicit strategy
+let redlock = Redlock::new(instances)?
+    .with_deadlock_detection_strategy(
+        30000,
+        true,
+        VictimSelectionStrategy::FewestLocks,
+    );
+```
 
 ## Performance Considerations
 

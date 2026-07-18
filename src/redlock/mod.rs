@@ -4,7 +4,7 @@ pub use backend::{LocalCacheBackend, LockBackend, RespBackend};
 
 use crate::cache::Cache;
 use crate::config::Config;
-use crate::deadlock::{DeadlockDetector, DeadlockStatus};
+use crate::deadlock::{DeadlockDetector, DeadlockStatus, VictimSelectionStrategy};
 use crate::error::{Error, Result};
 use crate::fair_queue::{FairQueue, QueuedClient};
 use bytes::Bytes;
@@ -185,13 +185,33 @@ impl Redlock {
         self.retry_delay_ms
     }
 
-    /// Enable deadlock detection
-    /// 
+    /// Enable deadlock detection with the default victim strategy ([`VictimSelectionStrategy::Youngest`]).
+    ///
     /// # Arguments
     /// * `max_wait_time_ms` - Maximum time to wait before flagging potential deadlock
     /// * `auto_resolve` - Automatically resolve deadlocks by releasing victim locks
     pub fn with_deadlock_detection(mut self, max_wait_time_ms: u64, auto_resolve: bool) -> Self {
         self.deadlock_detector = Some(Arc::new(DeadlockDetector::new(max_wait_time_ms, auto_resolve)));
+        self
+    }
+
+    /// Enable deadlock detection with an explicit victim selection strategy.
+    ///
+    /// # Arguments
+    /// * `max_wait_time_ms` - Maximum time to wait before flagging potential deadlock
+    /// * `auto_resolve` - Automatically resolve deadlocks by releasing victim locks
+    /// * `strategy` - How to pick a victim when auto-resolving
+    pub fn with_deadlock_detection_strategy(
+        mut self,
+        max_wait_time_ms: u64,
+        auto_resolve: bool,
+        strategy: VictimSelectionStrategy,
+    ) -> Self {
+        self.deadlock_detector = Some(Arc::new(DeadlockDetector::new_with_strategy(
+            max_wait_time_ms,
+            auto_resolve,
+            strategy,
+        )));
         self
     }
     
