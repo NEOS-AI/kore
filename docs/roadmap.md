@@ -13,7 +13,8 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] FT merge schema/alias equality on clash (CG); multi-DB LOADING gate (CK)
 - [x] Shared FT.CREATE parser; HNSW `EF_CONSTRUCTION` AOF/RDB; ACL `@search` (CA, CE)
 - [ ] True multi-DB atomic keyspace install under concurrent readers (residual; LOADING gate mitigates)
-- [ ] HNSW correctness/performance benchmarks vs FLAT
+- [x] HNSW graph-based ANN search (Batch CQ; layer-0 edges + `ef_search`; multi-layer insert still simplified)
+- [ ] HNSW recall@k / throughput numbers vs FLAT (methodology in `docs/benchmarks.md`)
 
 ## Plans
 

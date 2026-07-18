@@ -1,5 +1,6 @@
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use crate::search_index::DistanceMetric;
 
 /// Vector search result
@@ -28,16 +29,109 @@ impl HNSWLayer {
         self.neighbors.entry(node_id).or_insert_with(Vec::new);
     }
 
+    /// Add a directed edge, skipping self-loops and duplicates.
     fn add_edge(&mut self, from: Bytes, to: Bytes) {
-        self.neighbors.entry(from).or_insert_with(Vec::new).push(to);
+        if from == to {
+            return;
+        }
+        let edges = self.neighbors.entry(from).or_insert_with(Vec::new);
+        if !edges.iter().any(|n| n == &to) {
+            edges.push(to);
+        }
     }
 
     fn get_neighbors(&self, node_id: &Bytes) -> Vec<Bytes> {
         self.neighbors.get(node_id).cloned().unwrap_or_default()
     }
+
+    fn set_neighbors(&mut self, node_id: Bytes, neighbors: Vec<Bytes>) {
+        self.neighbors.insert(node_id, neighbors);
+    }
 }
 
-/// HNSW (Hierarchical Navigable Small World) index for approximate nearest neighbor search
+fn cmp_f32(a: f32, b: f32) -> Ordering {
+    a.partial_cmp(&b).unwrap_or(Ordering::Equal)
+}
+
+/// Min-heap candidate (BinaryHeap is max-heap, so Ord is reversed by distance).
+#[derive(Clone)]
+struct MinCand {
+    distance: f32,
+    id: Bytes,
+}
+
+impl MinCand {
+    fn new(distance: f32, id: Bytes) -> Self {
+        Self { distance, id }
+    }
+
+    fn dist(&self) -> f32 {
+        self.distance
+    }
+}
+
+impl PartialEq for MinCand {
+    fn eq(&self, other: &Self) -> bool {
+        self.distance == other.distance && self.id == other.id
+    }
+}
+impl Eq for MinCand {}
+
+impl Ord for MinCand {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse: smaller distance pops first
+        cmp_f32(other.distance, self.distance).then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+impl PartialOrd for MinCand {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Max-heap candidate for the dynamic nearest set W (furthest on top).
+#[derive(Clone)]
+struct MaxCand {
+    distance: f32,
+    id: Bytes,
+}
+
+impl MaxCand {
+    fn new(distance: f32, id: Bytes) -> Self {
+        Self { distance, id }
+    }
+
+    fn dist(&self) -> f32 {
+        self.distance
+    }
+}
+
+impl PartialEq for MaxCand {
+    fn eq(&self, other: &Self) -> bool {
+        self.distance == other.distance && self.id == other.id
+    }
+}
+impl Eq for MaxCand {}
+
+impl Ord for MaxCand {
+    fn cmp(&self, other: &Self) -> Ordering {
+        cmp_f32(self.distance, other.distance).then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+impl PartialOrd for MaxCand {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// HNSW (Hierarchical Navigable Small World) index for approximate nearest neighbor search.
+///
+/// **Batch CQ:** query search walks neighbor edges (SEARCH-LAYER) with candidate list
+/// size `ef_search`. Insert still assigns all nodes to **layer 0** only (multi-layer
+/// assignment is simplified); edges on that layer are real and used at query time.
+/// This is approximate ANN, not a full RedisSearch HNSW port.
 #[derive(Debug)]
 pub struct HNSWIndex {
     /// Vectors stored in the index
@@ -61,96 +155,221 @@ impl HNSWIndex {
         Self {
             vectors: HashMap::new(),
             layers: vec![HNSWLayer::new()],
-            m,
-            ef_construction,
-            ef_search: ef_construction,
+            m: m.max(1),
+            ef_construction: ef_construction.max(1),
+            ef_search: ef_construction.max(1),
             distance_metric,
             entry_point: None,
         }
     }
 
-    /// Add a vector to the index
+    /// Add a vector to the index.
+    ///
+    /// Neighbors are selected via graph search **before** the vector is stored, so the
+    /// new node is never chosen as its own neighbor. Existing IDs only update the vector.
     pub fn add(&mut self, doc_id: Bytes, vector: Vec<f32>) {
-        // Store the vector
-        self.vectors.insert(doc_id.clone(), vector.clone());
+        // Update-in-place for existing documents (keep graph wiring).
+        if self.vectors.contains_key(&doc_id) {
+            self.vectors.insert(doc_id, vector);
+            return;
+        }
 
-        // Determine the layer for this node (simplified: all go to layer 0 for now)
-        // In a full implementation, we'd use exponential decay to assign layers
+        // Simplified multi-layer: all nodes live on layer 0.
         let layer = 0;
-
-        // Ensure we have enough layers
         while self.layers.len() <= layer {
             self.layers.push(HNSWLayer::new());
         }
 
-        // Add node to layer
-        self.layers[layer].add_node(doc_id.clone());
-
-        // If this is the first node, make it the entry point
+        // First node becomes the entry point; no edges yet.
         if self.entry_point.is_none() {
-            self.entry_point = Some(doc_id.clone());
+            self.layers[layer].add_node(doc_id.clone());
+            self.vectors.insert(doc_id.clone(), vector);
+            self.entry_point = Some(doc_id);
             return;
         }
 
-        // Find neighbors and connect
-        let neighbors = self.find_neighbors(&vector, self.m, layer);
-        for neighbor in neighbors {
+        // Find neighbors via graph walk *before* inserting self into `vectors`.
+        let entry = self
+            .entry_point
+            .clone()
+            .expect("entry_point set when index non-empty");
+        let ef = self.ef_construction.max(self.m);
+        let candidates = self.search_layer(&vector, &entry, ef, layer);
+        let neighbors = Self::select_top_m(candidates, self.m);
+
+        // Insert vector + node, then bidirectional edges (no self-loops).
+        self.vectors.insert(doc_id.clone(), vector);
+        self.layers[layer].add_node(doc_id.clone());
+
+        for neighbor in &neighbors {
+            debug_assert_ne!(neighbor, &doc_id, "neighbor selection must exclude self");
             self.layers[layer].add_edge(doc_id.clone(), neighbor.clone());
-            self.layers[layer].add_edge(neighbor, doc_id.clone());
+            self.layers[layer].add_edge(neighbor.clone(), doc_id.clone());
+            // Cap degree on the existing neighbor (simple M-prune, not full HNSW heuristic).
+            self.prune_neighbors(neighbor, layer, self.m);
         }
+        self.prune_neighbors(&doc_id, layer, self.m);
     }
 
     /// Remove a vector from the index
     pub fn remove(&mut self, doc_id: &Bytes) {
         self.vectors.remove(doc_id);
         // Note: In a full implementation, we'd also clean up the graph connections
+        if self.entry_point.as_ref() == Some(doc_id) {
+            self.entry_point = self.vectors.keys().next().cloned();
+        }
     }
 
-    /// Search for k nearest neighbors
+    /// Search for k nearest neighbors by walking the HNSW graph (layer 0).
+    ///
+    /// Uses `ef_search` (at least `k`) as the dynamic candidate list size. This is
+    /// approximate: only nodes reachable via edges from the entry point are considered.
+    /// Fallback: if the entry point is missing from `vectors`, brute-force the map
+    /// (should not happen after normal `add` paths).
     pub fn search(&self, query_vector: &[f32], k: usize) -> Vec<VectorSearchResult> {
-        if self.vectors.is_empty() || self.entry_point.is_none() {
+        if self.vectors.is_empty() || k == 0 {
+            return Vec::new();
+        }
+        let Some(entry) = self.entry_point.as_ref() else {
+            return Vec::new();
+        };
+
+        let ef = self.ef_search.max(k);
+        let layer = 0;
+        let candidates = self.search_layer(query_vector, entry, ef, layer);
+
+        candidates
+            .into_iter()
+            .take(k)
+            .filter_map(|(doc_id, distance)| {
+                self.vectors.get(&doc_id).map(|vector| VectorSearchResult {
+                    doc_id,
+                    score: self.distance_to_score(distance),
+                    vector: vector.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// SEARCH-LAYER (Malkov & Yashunin): greedy expansion of neighbors with ef bound.
+    ///
+    /// Returns up to `ef` nearest visited nodes by distance (closest first).
+    /// Does **not** scan the full `vectors` map; only follows graph edges.
+    ///
+    /// If `entry` is absent from `vectors`, falls back to brute-force top-`ef`
+    /// (defensive; normal indexes always keep entry in `vectors`).
+    fn search_layer(
+        &self,
+        query: &[f32],
+        entry: &Bytes,
+        ef: usize,
+        layer: usize,
+    ) -> Vec<(Bytes, f32)> {
+        if ef == 0 {
             return Vec::new();
         }
 
-        // For simplicity, we'll do a brute-force search on layer 0
-        // In a full HNSW implementation, we'd navigate the graph from top to bottom
-        let mut results: Vec<VectorSearchResult> = self.vectors
-            .iter()
-            .map(|(doc_id, vector)| {
-                let distance = self.compute_distance(query_vector, vector);
-                VectorSearchResult {
-                    doc_id: doc_id.clone(),
-                    score: self.distance_to_score(distance),
-                    vector: vector.clone(),
+        let Some(entry_vec) = self.vectors.get(entry) else {
+            return self.brute_force_top(query, ef);
+        };
+
+        let mut visited: HashSet<Bytes> = HashSet::new();
+        visited.insert(entry.clone());
+
+        let d0 = self.compute_distance(query, entry_vec);
+        let mut candidates: BinaryHeap<MinCand> = BinaryHeap::new();
+        let mut w: BinaryHeap<MaxCand> = BinaryHeap::new();
+        candidates.push(MinCand::new(d0, entry.clone()));
+        w.push(MaxCand::new(d0, entry.clone()));
+
+        while let Some(current) = candidates.pop() {
+            let furthest = w.peek().map(|c| c.dist()).unwrap_or(f32::MAX);
+            if current.dist() > furthest {
+                break;
+            }
+
+            let neighbors = self
+                .layers
+                .get(layer)
+                .map(|l| l.get_neighbors(&current.id))
+                .unwrap_or_default();
+
+            for neighbor in neighbors {
+                if !visited.insert(neighbor.clone()) {
+                    continue;
                 }
+                let Some(nvec) = self.vectors.get(&neighbor) else {
+                    continue;
+                };
+                let dist = self.compute_distance(query, nvec);
+                let furthest = w.peek().map(|c| c.dist()).unwrap_or(f32::MAX);
+                if dist < furthest || w.len() < ef {
+                    candidates.push(MinCand::new(dist, neighbor.clone()));
+                    w.push(MaxCand::new(dist, neighbor));
+                    if w.len() > ef {
+                        w.pop();
+                    }
+                }
+            }
+        }
+
+        let mut results: Vec<(Bytes, f32)> = w
+            .into_iter()
+            .map(|c| {
+                let dist = c.distance;
+                (c.id, dist)
             })
             .collect();
-
-        // Sort by score (higher is better)
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-
-        results.into_iter().take(k).collect()
+        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        results
     }
 
-    /// Find neighbors for a vector at a given layer
-    fn find_neighbors(&self, vector: &[f32], m: usize, layer: usize) -> Vec<Bytes> {
-        let mut candidates: Vec<(Bytes, f32)> = self.vectors
+    /// Defensive full scan used only when the entry point vector is missing.
+    fn brute_force_top(&self, query: &[f32], ef: usize) -> Vec<(Bytes, f32)> {
+        let mut candidates: Vec<(Bytes, f32)> = self
+            .vectors
             .iter()
-            .map(|(doc_id, doc_vector)| {
-                let distance = self.compute_distance(vector, doc_vector);
-                (doc_id.clone(), distance)
+            .map(|(id, v)| (id.clone(), self.compute_distance(query, v)))
+            .collect();
+        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        candidates.truncate(ef);
+        candidates
+    }
+
+    fn select_top_m(candidates: Vec<(Bytes, f32)>, m: usize) -> Vec<Bytes> {
+        candidates.into_iter().take(m).map(|(id, _)| id).collect()
+    }
+
+    /// Keep at most `max_m` nearest neighbors of `node_id` (by distance to that node).
+    fn prune_neighbors(&mut self, node_id: &Bytes, layer: usize, max_m: usize) {
+        let Some(layer_ref) = self.layers.get(layer) else {
+            return;
+        };
+        let neighbors = layer_ref.get_neighbors(node_id);
+        if neighbors.len() <= max_m {
+            return;
+        }
+        let Some(node_vec) = self.vectors.get(node_id).cloned() else {
+            return;
+        };
+
+        let mut scored: Vec<(Bytes, f32)> = neighbors
+            .into_iter()
+            .filter(|n| n != node_id)
+            .filter_map(|n| {
+                self.vectors
+                    .get(&n)
+                    .map(|v| (n, self.compute_distance(&node_vec, v)))
             })
             .collect();
-
-        // Sort by distance (lower is better for distance)
-        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Take top m neighbors
-        candidates
-            .into_iter()
-            .take(m)
-            .map(|(doc_id, _)| doc_id)
-            .collect()
+        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        // Dedup by id (keep first = closest)
+        let mut seen = HashSet::new();
+        scored.retain(|(id, _)| seen.insert(id.clone()));
+        let kept: Vec<Bytes> = scored.into_iter().take(max_m).map(|(id, _)| id).collect();
+        if let Some(layer_mut) = self.layers.get_mut(layer) {
+            layer_mut.set_neighbors(node_id.clone(), kept);
+        }
     }
 
     /// Compute distance between two vectors
@@ -236,7 +455,8 @@ impl FlatVectorIndex {
     }
 
     pub fn search(&self, query_vector: &[f32], k: usize) -> Vec<VectorSearchResult> {
-        let mut results: Vec<VectorSearchResult> = self.vectors
+        let mut results: Vec<VectorSearchResult> = self
+            .vectors
             .iter()
             .map(|(doc_id, vector)| {
                 let score = self.compute_similarity(query_vector, vector);
@@ -249,7 +469,7 @@ impl FlatVectorIndex {
             .collect();
 
         // Sort by score (higher is better)
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 
         results.into_iter().take(k).collect()
     }
@@ -396,7 +616,7 @@ mod tests {
     }
 
     /// Small fixed set: HNSW top-1 should match FLAT exact top-1 (correctness
-    /// check; not a throughput benchmark — see `docs/benchmarks.md`).
+    /// check under graph search; not a throughput benchmark — see `docs/benchmarks.md`).
     #[test]
     fn hnsw_top1_matches_flat_on_small_set() {
         let vectors: Vec<(&str, Vec<f32>)> = vec![
@@ -428,5 +648,116 @@ mod tests {
             flat_top[0].doc_id,
             hnsw_top[0].doc_id
         );
+    }
+
+    /// Inserts must never wire a node as its own neighbor (Batch CQ).
+    #[test]
+    fn hnsw_add_excludes_self_from_neighbors() {
+        let mut index = HNSWIndex::new(4, 32, DistanceMetric::L2);
+        for i in 0..12 {
+            index.add(Bytes::from(format!("d{i}")), vec![i as f32, 0.0]);
+        }
+        assert!(!index.layers.is_empty());
+        for (id, neighs) in &index.layers[0].neighbors {
+            assert!(
+                !neighs.iter().any(|n| n == id),
+                "self-loop on neighbor list for {:?}",
+                id
+            );
+        }
+    }
+
+    /// Crafted connectivity: an isolated closer vector must not win top-1 if search
+    /// only walks edges. Full-scan (pre-CQ) would return the isolated point.
+    #[test]
+    fn hnsw_search_follows_edges_not_full_scan() {
+        let mut index = HNSWIndex::new(8, 64, DistanceMetric::L2);
+        index.add(Bytes::from("entry"), vec![0.0, 0.0]);
+        index.add(Bytes::from("near"), vec![1.0, 0.0]);
+        index.add(Bytes::from("mid"), vec![10.0, 0.0]);
+        index.add(Bytes::from("far_isolated"), vec![0.1, 0.0]);
+
+        // Rebuild edges: entry -- mid -- near; leave far_isolated disconnected.
+        for layer in &mut index.layers {
+            for (_id, neigh) in layer.neighbors.iter_mut() {
+                neigh.clear();
+            }
+        }
+        let layer = &mut index.layers[0];
+        layer.add_edge(Bytes::from("entry"), Bytes::from("mid"));
+        layer.add_edge(Bytes::from("mid"), Bytes::from("entry"));
+        layer.add_edge(Bytes::from("mid"), Bytes::from("near"));
+        layer.add_edge(Bytes::from("near"), Bytes::from("mid"));
+        // far_isolated intentionally has no edges
+
+        index.entry_point = Some(Bytes::from("entry"));
+
+        // Query sits on far_isolated; FLAT would rank it #1.
+        let query = [0.1f32, 0.0];
+        let mut flat = FlatVectorIndex::new(DistanceMetric::L2);
+        for (id, v) in [
+            ("entry", vec![0.0, 0.0]),
+            ("near", vec![1.0, 0.0]),
+            ("mid", vec![10.0, 0.0]),
+            ("far_isolated", vec![0.1, 0.0]),
+        ] {
+            flat.add(Bytes::from(id), v);
+        }
+        let flat_top = flat.search(&query, 1);
+        assert_eq!(
+            flat_top[0].doc_id,
+            Bytes::from("far_isolated"),
+            "sanity: FLAT must prefer the isolated closer point"
+        );
+
+        let hnsw_top = index.search(&query, 1);
+        assert_eq!(hnsw_top.len(), 1);
+        assert_ne!(
+            hnsw_top[0].doc_id,
+            Bytes::from("far_isolated"),
+            "graph search must not return a disconnected node (would indicate full-scan)"
+        );
+        // Closest among reachable {entry, mid, near} to [0.1, 0] is entry.
+        assert_eq!(hnsw_top[0].doc_id, Bytes::from("entry"));
+
+        // Reachable set size via graph walk should be 3, not 4.
+        let layer_results = index.search_layer(&query, &Bytes::from("entry"), 16, 0);
+        let ids: HashSet<_> = layer_results.iter().map(|(id, _)| id.clone()).collect();
+        assert!(ids.contains(&Bytes::from("entry")));
+        assert!(ids.contains(&Bytes::from("mid")));
+        assert!(ids.contains(&Bytes::from("near")));
+        assert!(
+            !ids.contains(&Bytes::from("far_isolated")),
+            "search_layer must not visit disconnected nodes"
+        );
+        assert_eq!(ids.len(), 3);
+    }
+
+    /// Normal insert builds a connected layer-0 graph; top-1 still works with edges.
+    #[test]
+    fn hnsw_graph_has_edges_after_inserts() {
+        let mut index = HNSWIndex::new(4, 32, DistanceMetric::L2);
+        for i in 0..8 {
+            index.add(Bytes::from(format!("n{i}")), vec![i as f32, (i % 3) as f32]);
+        }
+        let total_edges: usize = index.layers[0]
+            .neighbors
+            .values()
+            .map(|v| v.len())
+            .sum();
+        assert!(
+            total_edges > 0,
+            "expected bidirectional edges after multi-node insert"
+        );
+        // Every non-entry node should have at least one neighbor after insert.
+        for (id, neighs) in &index.layers[0].neighbors {
+            if Some(id) != index.entry_point.as_ref() {
+                assert!(
+                    !neighs.is_empty(),
+                    "node {:?} should be connected",
+                    id
+                );
+            }
+        }
     }
 }

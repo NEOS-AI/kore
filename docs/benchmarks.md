@@ -133,8 +133,18 @@ comparison:
 2. Use the same vectors/query for FLAT (exact) and HNSW (`M`, `ef_construction`).
 3. Report: dataset size (N, dim), recall@k vs FLAT ground truth, and wall time
    for build + query (median of ≥3 runs).
-4. In-tree correctness gate: unit test
-   `vector_search::tests::hnsw_top1_matches_flat_on_small_set` (tiny N only).
+4. In-tree correctness gates (unit tests in `src/vector_search.rs`):
+   - `hnsw_top1_matches_flat_on_small_set` (tiny N; graph search should still match FLAT)
+   - `hnsw_search_follows_edges_not_full_scan` (fails if search ignores edges)
+   - `hnsw_add_excludes_self_from_neighbors`
+
+**Implementation note (Batch CQ):** `HNSWIndex::search` walks neighbor edges
+(SEARCH-LAYER) with candidate list size `ef_search` (defaults to
+`ef_construction`). Insert still assigns all nodes to **layer 0** only
+(multi-layer assignment simplified). This is approximate ANN and may not match
+full RedisSearch HNSW; use FLAT for exact recall baselines. Brute-force over
+`vectors` remains only as a defensive fallback when the entry-point vector is
+missing.
 
 | Field | Value |
 |-------|--------|

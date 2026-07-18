@@ -393,8 +393,14 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch CI)*: `map_rdb_ft_mutator_error` maps raw message first, then prefixes only `InvalidArgument`. Unit tests in `aof::ft_error_map_tests` (including pre-prefixed regression guard).
 - [x] **`[P2]`** ACL `@search` category for FT.* (fine-grained users; default `+@all` unaffected)
   - *Done (Batch CE)*: `@search` in `category_names` / `category_commands`; FT read/write also under `@read`/`@write`; `+@all` expands via `all_known_commands`. Tests: `tests/ce_acl_search_hnsw_test.rs`
-- [x] **`[P2]`** HNSW correctness/performance benchmarks vs FLAT
-  - *Done (Batch CP, partial)*: unit correctness `hnsw_top1_matches_flat_on_small_set`; methodology table in `docs/benchmarks.md`. Full perf numbers still TBD when measured.
+- [x] **`[P2]`** HNSW graph-based search (Batch CQ)
+  - *Done (Batch CQ)*: `HNSWIndex::search` walks layer-0 neighbor edges (SEARCH-LAYER) with `ef_search`; `add` selects neighbors **before** inserting the vector (no self-loops); simple M-prune on reverse edges. Multi-layer insert still simplified (all nodes on layer 0) — documented in code + `docs/benchmarks.md`.
+  - *Tests*: `hnsw_top1_matches_flat_on_small_set` (kept); `hnsw_search_follows_edges_not_full_scan` (fails under full-scan); `hnsw_add_excludes_self_from_neighbors`; `hnsw_graph_has_edges_after_inserts`.
+- [ ] **`[P2]`** HNSW recall@k / throughput numbers vs FLAT
+  - *Partial*: methodology table in `docs/benchmarks.md`; graph search correctness gated by unit tests (CQ). Full recall@k on larger N + measured throughput still TBD.
+- [x] **`[P2]`** **Code review (CP post-ship):** HNSW search does not use the graph
+  - *Found*: `search` full-scanned `self.vectors`; `ef_search` unused; `add` could connect self as neighbor.
+  - *Done (Batch CQ)*: graph SEARCH-LAYER + self-exclude on connect; discriminating edge-walk test.
 - [x] **`[P2]`** **Code review (BT nit):** optional single critical section for `get_index` resolve+lookup; min-replicas FT test
   - *Done (Batch CH + CL)*: `get_index` dual-lock; `tests/cl_min_replicas_ft_test.rs` — FT.CREATE gated by min-replicas-to-write, FT.SEARCH not gated.
 - [x] **`[P2]`** **Code review (CL post-ship):** strengthen min-replicas FT tests
@@ -445,6 +451,9 @@ Also tracked in `docs/roadmap.md`.
   - *Found*: commits one DB at a time; concurrent readers (FULLRESYNC) can see DB0 new + DB1 old; panic mid-loop leaves partial multi-DB commit.
   - *Mitigated (CC–CK)*: staged drain; no multi-DB pre-flush; `load_generation` / `load_in_progress`; Redis-style **`-LOADING`** for data-plane commands during replace; INFO `loading:`.
   - *Accepted residual*: true lock-step atomic install of all DBs in one publish (no mid-loop torn maps even for privileged paths) remains a future design if needed. Documented in `docs/locking.md` + roadmap.
+- [ ] **`[P2]`** **Code review (CP post-ship):** LOADING allowlist still runs `PSYNC`/`SYNC`/`CONFIG` during replace
+  - *Found*: `loading_reply_if_busy` allows `INFO`/`ROLE`/`REPLCONF`/`PSYNC`/`SYNC`/`CLIENT`/`CONFIG`/`MODULE` (and auth/admin probes). Full sync snapshots live multi-DB maps and can observe mid-`install_keyspace_payload` torn state (strings filled, typed maps empty, counters not yet installed). Data plane is correctly gated.
+  - *Next*: document allowlist exceptions in `docs/locking.md`; decide whether to return `-LOADING` for `SYNC`/`PSYNC` (or serialize fullsync behind the replace barrier) if replica safety during live load matters.
 - [x] **`[P1]`** **Code review (CC post-ship):** WATCH bump not atomic with keyspace install (race window)
   - *Found*: `replace_keyspace_from` installs scratch `watch_gens` (usually empty) and releases the lock, then later bumps `pre_watch_keys`. Between those steps `watch_generation` can `or_insert(0)` so a client that WATCHed at gen 0 sees clean EXEC against new/empty data. On `flush=true` the clean window spans flush (which does not touch watch_gens) through end of replace.
   - *Done (Batch CD)*: under one `watch_gens` lock, install `other_watch` and bump all `pre_watch_keys`; AOF/RDB `flush=true` commit calls `touch_all_watch_keys` before flush. Tests: `tests/cd_watch_atomic_and_typed_export_test.rs`.
@@ -515,7 +524,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batch CP shipped** (HNSW top-1 vs FLAT correctness; HNSW bench methodology + load dual-residency notes; CB expand closed). **Open:** optional structured JSON logging; advanced deadlock features (roadmap); standing “tests for the phase” P0; measure HNSW throughput numbers when ready.
+Prioritized for next letter batch(es). **Batch CQ shipped** (graph-based HNSW SEARCH-LAYER + self-exclude on connect; discriminating edge-walk tests; CP methodology kept). **Open:** HNSW recall@k / throughput numbers; LOADING allowlist docs/policy (PSYNC/SYNC mid-install); optional structured JSON logging; advanced deadlock features (roadmap); standing “tests for the phase” P0; optional peak-RSS automation.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -555,7 +564,9 @@ Prioritized for next letter batch(es). **Batch CP shipped** (HNSW top-1 vs FLAT 
 | P2 | CB: `install_keyspace_counts` closed over KEYSPACE_CATEGORIES | done (CB) |
 | P2 | CB: optional alias-target validate on search `install` | done (CF debug_assert) |
 | P2 | CB post-ship: expand tests (memory, multi-DB, TTL, pubsub, seed, peak) | done (CP) |
-| P2 | HNSW correctness/perf vs FLAT | partial (CP correctness + methodology; numbers TBD) |
+| P2 | HNSW graph search (ef_search; self-exclude; edge-walk tests) | done (CQ) |
+| P2 | HNSW recall@k / throughput numbers vs FLAT | open (methodology + CQ correctness; numbers TBD) |
+| P2 | CP post-ship: LOADING allowlist PSYNC/SYNC mid-install visibility | open |
 | P2 | CC post-ship: typed export skip expired keys (no revive without TTL) | done (CD) |
 | P2 | CC nit: unify start_background_sweep create paths | done (CD) |
 | P2 | CB second-pass: empty_keyspace_like hardcodes loadfactor 0.75 | done (CF) |
