@@ -398,15 +398,24 @@ Also tracked in `docs/roadmap.md`.
   - *Tests*: `hnsw_top1_matches_flat_on_small_set` (kept); `hnsw_search_follows_edges_not_full_scan` (fails under full-scan); `hnsw_add_excludes_self_from_neighbors`; `hnsw_graph_has_edges_after_inserts`.
 - [x] **`[P2]`** **Code review (CQ post-ship):** HNSW `remove` leaves stale graph edges
   - *Found*: `remove` deleted the vector (and may reassign `entry_point` via arbitrary `keys().next()`) but did **not** remove the node from the layer map, strip reverse edges, or repair bridges. Re-`add` of the same id used `or_insert` and could **revive stale neighbor lists**.
-  - *Done (Batch CS)*: `remove` unlinks reverse edges + drops layer entry; `add_node` always resets neighbor list; `pick_entry_point` prefers a remaining node with edges. Tests: `hnsw_remove_middle_unlinks_graph`, `hnsw_remove_entry_reassigns`, `hnsw_remove_readd_clears_stale_neighbors`.
+  - *Done (Batch CS, local hygiene)*: `remove` unlinks reverse edges + drops layer entry; `add_node` always resets neighbor list; `pick_entry_point` prefers a remaining node with edges. Tests: `hnsw_remove_middle_unlinks_graph`, `hnsw_remove_entry_reassigns`, `hnsw_remove_readd_clears_stale_neighbors`.
+  - *Residual (CS post-ship)*: hard unlink did **not** reconnect former neighbors — fixed in Batch CT bridge repair.
 - [x] **`[P2]`** **Code review (CQ post-ship):** M-prune can make new nodes unreachable from entry
   - *Found*: after bidirectional connect, prune rewrote only each neighbor’s **outgoing** list. With small `M`, reverse edges `neighbor → new` could all be dropped — search from entry never visited the new node.
-  - *Done (Batch CS)*: layer-0 `M_max ≈ 2M`; `prune_neighbors_keeping` force-keeps reverse edge to the new node. Test: `hnsw_insert_preserves_reachability_from_entry` (BFS + self-search).
+  - *Done (Batch CS, insert-time heuristic)*: layer-0 `M_max ≈ 2M`; `prune_neighbors_keeping` force-keeps reverse edge to the **new** node at that prune. Test: `hnsw_insert_preserves_reachability_from_entry`.
+  - *Residual (CS post-ship)*: force-keep is **not** a durable global invariant — later hub prunes can drop older reverse edges that were a leaf’s only path from entry. Docs softened (Batch CT); do not claim global insert reachability.
 - [x] **`[P2]`** **Code review (CQ post-ship):** update-in-place does not rewire graph
   - *Found*: existing-id `add` replaced the vector only; old neighbor wiring remained — queries near the new location could miss the node.
   - *Done (Batch CS)*: existing-id `add` unlinks then re-inserts (full neighbor reselection). Test: `hnsw_update_rewires_graph` (large vector move).
+  - *Residual (CS post-ship)*: update inherited hard-delete bridge partition — fixed by Batch CT reconnect on remove.
+- [x] **`[P2]`** **Code review (CS post-ship):** HNSW hard-delete can partition the graph (bridge remove/update)
+  - *Found*: `remove` stripped edges to the deleted id but never reconnected former neighbors. Chain `a↔b↔c` with entry `a` after `remove(b)` left `c` in `vectors` but unreachable from search. Update-in-place is remove+reinsert, so updating a cut vertex could permanently orphan the other partition.
+  - *Done (Batch CT)*: `remove` snapshots former neighbors, unlinks, then `bridge_reconnect_neighbors` — bidirectional closest-peer edges among survivors up to `max_edges(layer)`, prune with force-keep nearest peer. Tests: `hnsw_bridge_remove_keeps_survivors_reachable`, `hnsw_bridge_update_keeps_ends_reachable`, optional `hnsw_m1_hub_churn_preserves_reachability`.
+- [x] **`[P2]`** **Code review (CS post-ship):** force-keep / docs over-claim global insert reachability
+  - *Found*: force-keep only protects `neighbor → new` for the current insert; later `must_keep` prunes can `kept.pop()` older reverse edges. Docs saying inserts “stay reachable from entry” overstated durability.
+  - *Done (Batch CT, docs honesty)*: `docs/benchmarks.md` + module docs state insert-time only / not a durable global invariant. Optional `M=1` hub-churn smoke is a soft majority check, not a global guarantee. Stronger global reachability (if ever claimed) still needs soft-delete or periodic rebuild.
 - [ ] **`[P2]`** HNSW recall@k / throughput numbers vs FLAT
-  - *Partial*: methodology table in `docs/benchmarks.md`; graph search + connectivity gated by unit tests (CQ/CS). Full recall@k on larger N + measured throughput still TBD.
+  - *Partial*: methodology table in `docs/benchmarks.md`; graph search + CS/CT connectivity gated by unit tests. Full recall@k on larger N + measured throughput still TBD.
 - [x] **`[P2]`** **Code review (CP post-ship):** HNSW search does not use the graph
   - *Found*: `search` full-scanned `self.vectors`; `ef_search` unused; `add` could connect self as neighbor.
   - *Done (Batch CQ)*: graph SEARCH-LAYER + self-exclude on connect; discriminating edge-walk test.
@@ -533,7 +542,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batch CS shipped** (HNSW remove unlinks graph, insert reachability via `M_max≈2M` + force-keep reverse edge, update-in-place rewires). **Open:** HNSW recall@k / throughput numbers; optional structured JSON logging; advanced deadlock features (roadmap); standing “tests for the phase” P0; optional peak-RSS automation.
+Prioritized for next letter batch(es). **Batch CT shipped** (bridge reconnect on remove; CS post-ship partition residual closed; force-keep docs honesty). **Open next:** HNSW recall@k/throughput numbers; optional JSON logging; advanced deadlock; standing tests-for-phase P0. (Force-keep remains insert-time only — not a global invariant.)
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -574,10 +583,12 @@ Prioritized for next letter batch(es). **Batch CS shipped** (HNSW remove unlinks
 | P2 | CB: optional alias-target validate on search `install` | done (CF debug_assert) |
 | P2 | CB post-ship: expand tests (memory, multi-DB, TTL, pubsub, seed, peak) | done (CP) |
 | P2 | HNSW graph search (ef_search; self-exclude; edge-walk tests) | done (CQ) |
-| P2 | CQ post-ship: HNSW remove unlinks graph + re-add clears neighbors | done (CS) |
-| P2 | CQ post-ship: insert M-prune preserves reachability from entry | done (CS) |
-| P2 | CQ post-ship: update-in-place rewire or document | done (CS) |
-| P2 | HNSW recall@k / throughput numbers vs FLAT | open (methodology + CQ/CS correctness; numbers TBD) |
+| P2 | CQ post-ship: HNSW remove unlinks graph + re-add clears neighbors | done (CS local hygiene) |
+| P2 | CQ post-ship: insert M-prune preserves reachability from entry | done (CS insert-time heuristic) |
+| P2 | CQ post-ship: update-in-place rewire or document | done (CS; CT closes bridge residual) |
+| P2 | CS post-ship: hard-delete bridge repair / soft-delete | done (CT reconnect heuristic) |
+| P2 | CS post-ship: force-keep not global reachability (docs + hub-churn tests) | done (CT docs honesty; residual: no global invariant) |
+| P2 | HNSW recall@k / throughput numbers vs FLAT | open (methodology + CQ/CS/CT correctness; numbers TBD) |
 | P2 | CP post-ship: LOADING allowlist PSYNC/SYNC mid-install visibility | done (CR) |
 | P2 | CC post-ship: typed export skip expired keys (no revive without TTL) | done (CD) |
 | P2 | CC nit: unify start_background_sweep create paths | done (CD) |

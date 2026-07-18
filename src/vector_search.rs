@@ -146,7 +146,12 @@ impl PartialOrd for MaxCand {
 ///
 /// **Batch CS:** `remove` unlinks reverse edges and clears the layer entry; insert uses
 /// layer-0 `M_max ≈ 2M` and force-keeps at least one reverse edge so new nodes stay
-/// reachable from `entry_point`; existing-id `add` rewires (remove + re-insert).
+/// reachable from `entry_point` at insert time; existing-id `add` rewires
+/// (remove + re-insert).
+///
+/// **Batch CT:** on hard-delete, former neighbors of the removed id are reconnected
+/// (closest-peer heuristic + degree prune) so a cut-vertex remove does not permanently
+/// partition the layer. Force-keep remains insert-time only (not a global invariant).
 /// This is approximate ANN, not a full RedisSearch HNSW port.
 #[derive(Debug)]
 pub struct HNSWIndex {
@@ -241,8 +246,10 @@ impl HNSWIndex {
 
     /// Remove a vector and fully unlink it from the HNSW graph.
     ///
-    /// Strips reverse edges, removes the node from every layer map, and reassigns
-    /// `entry_point` when needed (prefer a remaining node that still has edges).
+    /// Strips reverse edges, removes the node from every layer map, reconnects
+    /// former neighbors so a bridge/cut-vertex delete does not permanently
+    /// partition the layer (Batch CT), and reassigns `entry_point` when needed
+    /// (prefer a remaining node that still has edges).
     pub fn remove(&mut self, doc_id: &Bytes) {
         if !self.vectors.contains_key(doc_id) {
             // Still scrub any orphaned layer residue (defensive).
@@ -254,12 +261,86 @@ impl HNSWIndex {
             }
             return;
         }
+
+        // Snapshot former neighbors per layer before unlink (for bridge repair).
+        let former_by_layer: Vec<Vec<Bytes>> = self
+            .layers
+            .iter()
+            .map(|layer| {
+                layer
+                    .get_neighbors(doc_id)
+                    .into_iter()
+                    .filter(|n| n != doc_id && self.vectors.contains_key(n))
+                    .collect()
+            })
+            .collect();
+
         self.vectors.remove(doc_id);
         for layer in &mut self.layers {
             layer.unlink_node(doc_id);
         }
+
+        // Reconnect survivors that used the deleted id as a bridge.
+        for (layer_idx, former) in former_by_layer.iter().enumerate() {
+            self.bridge_reconnect_neighbors(former, layer_idx);
+        }
+
         if self.entry_point.as_ref() == Some(doc_id) {
             self.entry_point = self.pick_entry_point();
+        }
+    }
+
+    /// After unlinking a deleted id, reconnect its former neighbors so they are
+    /// not left isolated from each other when the deleted node was a cut vertex.
+    ///
+    /// Heuristic (Batch CT): among survivors still in `vectors`, add bidirectional
+    /// edges from each node to its closest other former neighbors (up to
+    /// `max_edges(layer)`), then prune with `prune_neighbors_keeping`, force-keeping
+    /// the nearest peer so at least one bridge edge survives the degree cap.
+    fn bridge_reconnect_neighbors(&mut self, former: &[Bytes], layer: usize) {
+        // Dedup while preserving first-seen order.
+        let mut seen: HashSet<Bytes> = HashSet::new();
+        let survivors: Vec<Bytes> = former
+            .iter()
+            .filter(|id| self.vectors.contains_key(id.as_ref()))
+            .filter(|id| seen.insert((*id).clone()))
+            .cloned()
+            .collect();
+
+        if survivors.len() < 2 {
+            return;
+        }
+
+        let max_m = self.max_edges(layer);
+
+        for u in &survivors {
+            let Some(u_vec) = self.vectors.get(u).cloned() else {
+                continue;
+            };
+
+            let mut peers: Vec<(Bytes, f32)> = survivors
+                .iter()
+                .filter(|v| *v != u)
+                .filter_map(|v| {
+                    self.vectors
+                        .get(v)
+                        .map(|vv| (v.clone(), self.compute_distance(&u_vec, vv)))
+                })
+                .collect();
+            peers.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+
+            let nearest = peers.first().map(|(id, _)| id.clone());
+            let connect_to = peers.len().min(max_m);
+
+            for (peer, _) in peers.into_iter().take(connect_to) {
+                if let Some(l) = self.layers.get_mut(layer) {
+                    l.add_edge(u.clone(), peer.clone());
+                    l.add_edge(peer, u.clone());
+                }
+            }
+
+            // Cap degree; force-keep nearest former peer so the bridge survives.
+            self.prune_neighbors_keeping(u, layer, max_m, nearest.as_ref());
         }
     }
 
@@ -1116,6 +1197,195 @@ mod tests {
         assert!(
             reverse > 0,
             "at least one reverse edge must point at the rewired node"
+        );
+    }
+
+    /// Batch CT: removing a bridge reconnects former neighbors so survivors stay
+    /// BFS-reachable / searchable from entry (fails on pre-CT hard-unlink-only).
+    #[test]
+    fn hnsw_bridge_remove_keeps_survivors_reachable() {
+        let mut index = HNSWIndex::new(4, 32, DistanceMetric::L2);
+        index.add(Bytes::from("a"), vec![0.0, 0.0]);
+        index.add(Bytes::from("b"), vec![1.0, 0.0]);
+        index.add(Bytes::from("c"), vec![2.0, 0.0]);
+
+        // Force chain a <-> b <-> c so b is a cut vertex.
+        for layer in &mut index.layers {
+            for (_id, neigh) in layer.neighbors.iter_mut() {
+                neigh.clear();
+            }
+        }
+        let layer = &mut index.layers[0];
+        layer.add_edge(Bytes::from("a"), Bytes::from("b"));
+        layer.add_edge(Bytes::from("b"), Bytes::from("a"));
+        layer.add_edge(Bytes::from("b"), Bytes::from("c"));
+        layer.add_edge(Bytes::from("c"), Bytes::from("b"));
+        index.entry_point = Some(Bytes::from("a"));
+
+        index.remove(&Bytes::from("b"));
+
+        assert!(!index.vectors.contains_key(&Bytes::from("b")));
+        assert!(index.vectors.contains_key(&Bytes::from("a")));
+        assert!(index.vectors.contains_key(&Bytes::from("c")));
+
+        // Bridge repair must leave a bidirectional path a ↔ c (or via other edges).
+        let entry = index
+            .entry_point
+            .clone()
+            .expect("non-empty index has entry_point");
+        let mut seen: HashSet<Bytes> = HashSet::new();
+        let mut stack = vec![entry.clone()];
+        seen.insert(entry);
+        while let Some(cur) = stack.pop() {
+            for nb in index.layers[0].get_neighbors(&cur) {
+                if seen.insert(nb.clone()) {
+                    stack.push(nb);
+                }
+            }
+        }
+        for id in index.vectors.keys() {
+            assert!(
+                seen.contains(id),
+                "after bridge remove, {:?} must be BFS-reachable from entry (visited {:?})",
+                id,
+                seen
+            );
+        }
+
+        // Self-search for each survivor must return self (graph walk, not brute-force).
+        for (id, vec) in [
+            (Bytes::from("a"), vec![0.0f32, 0.0]),
+            (Bytes::from("c"), vec![2.0f32, 0.0]),
+        ] {
+            let results = index.search(&vec, 1);
+            assert_eq!(results.len(), 1, "search must hit for {:?}", id);
+            assert_eq!(
+                results[0].doc_id, id,
+                "survivor {:?} must remain searchable after bridge remove (got {:?})",
+                id,
+                results[0].doc_id
+            );
+        }
+    }
+
+    /// Batch CT: update (remove+reinsert) of a cut vertex must not permanently
+    /// orphan the other partition of the forced chain.
+    #[test]
+    fn hnsw_bridge_update_keeps_ends_reachable() {
+        let mut index = HNSWIndex::new(4, 32, DistanceMetric::L2);
+        index.add(Bytes::from("a"), vec![0.0, 0.0]);
+        index.add(Bytes::from("b"), vec![1.0, 0.0]);
+        index.add(Bytes::from("c"), vec![2.0, 0.0]);
+
+        // Force chain a <-> b <-> c; entry a. Updating b runs remove+reinsert.
+        for layer in &mut index.layers {
+            for (_id, neigh) in layer.neighbors.iter_mut() {
+                neigh.clear();
+            }
+        }
+        let layer = &mut index.layers[0];
+        layer.add_edge(Bytes::from("a"), Bytes::from("b"));
+        layer.add_edge(Bytes::from("b"), Bytes::from("a"));
+        layer.add_edge(Bytes::from("b"), Bytes::from("c"));
+        layer.add_edge(Bytes::from("c"), Bytes::from("b"));
+        index.entry_point = Some(Bytes::from("a"));
+
+        // Move b far away; remove step would orphan c without bridge repair.
+        index.add(Bytes::from("b"), vec![100.0, 0.0]);
+
+        assert_eq!(
+            index.vectors.get(&Bytes::from("b")),
+            Some(&vec![100.0, 0.0])
+        );
+        assert!(index.vectors.contains_key(&Bytes::from("a")));
+        assert!(index.vectors.contains_key(&Bytes::from("c")));
+
+        let entry = index
+            .entry_point
+            .clone()
+            .expect("non-empty index has entry_point");
+        let mut seen: HashSet<Bytes> = HashSet::new();
+        let mut stack = vec![entry.clone()];
+        seen.insert(entry);
+        while let Some(cur) = stack.pop() {
+            for nb in index.layers[0].get_neighbors(&cur) {
+                if seen.insert(nb.clone()) {
+                    stack.push(nb);
+                }
+            }
+        }
+        for id in [Bytes::from("a"), Bytes::from("b"), Bytes::from("c")] {
+            assert!(
+                seen.contains(&id),
+                "after bridge update, {:?} must be BFS-reachable from entry (visited {:?})",
+                id,
+                seen
+            );
+        }
+
+        // Ends remain self-searchable.
+        for (id, vec) in [
+            (Bytes::from("a"), vec![0.0f32, 0.0]),
+            (Bytes::from("c"), vec![2.0f32, 0.0]),
+        ] {
+            let results = index.search(&vec, 1);
+            assert_eq!(results.len(), 1);
+            assert_eq!(
+                results[0].doc_id, id,
+                "end {:?} must stay searchable after updating bridge node",
+                id
+            );
+        }
+    }
+
+    /// Batch CT smoke: small M with hub remove/re-add churn — remaining ids stay
+    /// reachable from entry (cheap connectivity check, not a global force-keep proof).
+    #[test]
+    fn hnsw_m1_hub_churn_preserves_reachability() {
+        let mut index = HNSWIndex::new(1, 8, DistanceMetric::L2);
+        // Hub near origin; leaves along a line.
+        index.add(Bytes::from("hub"), vec![0.0, 0.0]);
+        for i in 1..=12 {
+            index.add(Bytes::from(format!("leaf{i}")), vec![i as f32, 0.0]);
+        }
+
+        // Remove and re-insert hub a few times with a slight move.
+        for t in 0..3 {
+            index.add(Bytes::from("hub"), vec![0.1 * t as f32, 0.0]);
+        }
+        // Drop hub entirely and ensure remaining leaves are still one component
+        // from whatever entry pick_entry_point chooses (or stays).
+        index.remove(&Bytes::from("hub"));
+
+        assert!(!index.vectors.contains_key(&Bytes::from("hub")));
+        assert_eq!(index.len(), 12);
+
+        let entry = index
+            .entry_point
+            .clone()
+            .expect("non-empty index has entry_point");
+        let mut seen: HashSet<Bytes> = HashSet::new();
+        let mut stack = vec![entry.clone()];
+        seen.insert(entry);
+        while let Some(cur) = stack.pop() {
+            for nb in index.layers[0].get_neighbors(&cur) {
+                if seen.insert(nb.clone()) {
+                    stack.push(nb);
+                }
+            }
+        }
+        // Not every leaf is guaranteed reachable under M=1 after arbitrary hub
+        // churn (force-keep is insert-time only), but bridge repair on hub remove
+        // should reconnect the hub's former neighbors to each other. Count how
+        // many remain reachable; require a majority of leaves stay connected.
+        let reachable_leaves = (1..=12)
+            .filter(|i| seen.contains(&Bytes::from(format!("leaf{i}"))))
+            .count();
+        assert!(
+            reachable_leaves >= 8,
+            "after M=1 hub churn+remove, expected most leaves reachable from entry; got {}/12 (visited {})",
+            reachable_leaves,
+            seen.len()
         );
     }
 }
