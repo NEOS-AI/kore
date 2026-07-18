@@ -322,7 +322,8 @@ Also tracked in `docs/roadmap.md`.
 
 - [x] **`[P1]`** Prometheus metrics endpoint and/or richer Redis-compatible `INFO` sections
   - *Done (MVP)*: `--metrics-port` (default 0=off) serves hand-rolled Prometheus text on `127.0.0.1`; core series from Stats + repl/persistence; additive `# Health` INFO section. No prometheus crate.
-- [ ] **`[P2]`** Optional structured (JSON) logging
+- [x] **`[P2]`** Optional structured (JSON) logging
+  - *Done (Batch CX)*: `--log-format text|json` (default `text`); `tracing-subscriber` JSON formatter when `json`; clap parse unit tests
 - [x] **`[P1]`** Health / readiness beyond bare `PING` (memory, persistence lag)
   - *Done (MVP)*: `HEALTH` / `HEALTH PING` → OK/PONG; `HEALTH FULL` structured status (`ready`, `role`, memory, `master_link`, `rdb_last_save`, `aof`); replica not ready when master link down.
 
@@ -563,7 +564,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batch CW shipped** (must_keep prune safety + NN-path bridge branch unit test). **Still open from CU/CV post-ship:** O(N) reverse-scan delete; soft CV thresholds / optional larger-N bench. **Open next:** optional JSON logging; advanced deadlock; standing tests-for-phase P0; optional larger-N HNSW bench; O(N) reverse index.
+Prioritized for next letter batch(es). **Batch CX shipped** (optional structured JSON logging via `--log-format`). **Still open from CU/CV post-ship:** O(N) reverse-scan delete; soft CV thresholds / optional larger-N bench. **Open next:** advanced deadlock; standing tests-for-phase P0; optional larger-N HNSW bench; O(N) reverse index.
 
 | Pri | Item | Status |
 |-----|------|--------|

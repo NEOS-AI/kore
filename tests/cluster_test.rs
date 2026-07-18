@@ -43,6 +43,7 @@ fn make_config(cluster_enabled: bool) -> Arc<Config> {
         aclfile: String::new(),
         cluster_enabled,
         unixsocket: String::new(),
+            log_format: "text".to_string(),
     })
 }
 

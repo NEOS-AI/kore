@@ -46,6 +46,7 @@ fn test_config(port: u16, unixsocket: String) -> Config {
         aclfile: String::new(),
         cluster_enabled: false,
         unixsocket,
+        log_format: "text".to_string(),
     }
 }
 

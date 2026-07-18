@@ -47,6 +47,7 @@ fn make_handler_with_auth(cache: Arc<Cache>, auth: &str) -> CommandHandler {
         aclfile: String::new(),
         cluster_enabled: false,
     unixsocket: String::new(),
+            log_format: "text".to_string(),
     };
     let mut h = CommandHandler::new(cache, Arc::new(config));
     h.set_client_id(42);

@@ -65,6 +65,7 @@ async fn test_network_basic_commands() {
         aclfile: String::new(),
         cluster_enabled: false,
 unixsocket: String::new(),
+            log_format: "text".to_string(),
 });
 
     let cache = Cache::new(config.shards, config.maxmemory);
@@ -150,6 +151,7 @@ async fn test_network_concurrent_clients() {
         aclfile: String::new(),
         cluster_enabled: false,
 unixsocket: String::new(),
+            log_format: "text".to_string(),
 });
 
     let cache = Cache::new(config.shards, config.maxmemory);
@@ -265,6 +267,7 @@ async fn test_network_info_command() {
         aclfile: String::new(),
         cluster_enabled: false,
 unixsocket: String::new(),
+            log_format: "text".to_string(),
 });
 
     let cache = Cache::new(config.shards, config.maxmemory);
@@ -343,6 +346,7 @@ async fn test_network_maxconns() {
         aclfile: String::new(),
         cluster_enabled: false,
 unixsocket: String::new(),
+            log_format: "text".to_string(),
 });
 
     let cache = Cache::new(config.shards, config.maxmemory);
@@ -470,6 +474,7 @@ async fn test_network_auth() {
         aclfile: String::new(),
         cluster_enabled: false,
 unixsocket: String::new(),
+            log_format: "text".to_string(),
 });
 
     let cache = Cache::new(config.shards, config.maxmemory);

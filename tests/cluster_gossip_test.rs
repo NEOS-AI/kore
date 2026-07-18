@@ -70,6 +70,7 @@ fn make_config(port: u16, cluster: bool) -> Arc<Config> {
         aclfile: String::new(),
         cluster_enabled: cluster,
     unixsocket: String::new(),
+            log_format: "text".to_string(),
     })
 }
 

@@ -57,6 +57,7 @@ fn test_config(dir: &PathBuf) -> Config {
         aclfile: String::new(),
         cluster_enabled: false,
         unixsocket: String::new(),
+            log_format: "text".to_string(),
     }
 }
 

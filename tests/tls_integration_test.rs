@@ -74,6 +74,7 @@ fn base_config(port: u16) -> Config {
         aclfile: String::new(),
         cluster_enabled: false,
     unixsocket: String::new(),
+            log_format: "text".to_string(),
     }
 }
 

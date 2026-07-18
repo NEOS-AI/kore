@@ -265,6 +265,7 @@ async fn tcp_psync_full_resync_transfers_non_zero_dbs() {
         aclfile: String::new(),
         cluster_enabled: false,
 unixsocket: String::new(),
+            log_format: "text".to_string(),
 });
     let mgr = make_persistence(&dir);
     let databases = make_databases(16);

@@ -217,6 +217,7 @@ fn config_set_maxmemory_policy() {
         aclfile: String::new(),
         cluster_enabled: false,
     unixsocket: String::new(),
+            log_format: "text".to_string(),
     };
     let mut h = CommandHandler::new(cache.clone(), Arc::new(config));
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -375,6 +376,7 @@ fn config_lfu_params_roundtrip() {
         aclfile: String::new(),
         cluster_enabled: false,
         unixsocket: String::new(),
+            log_format: "text".to_string(),
     });
     let mut h = CommandHandler::new(cache.clone(), config);
 
@@ -458,6 +460,7 @@ fn allkeys_lru_evicts_hashes_when_no_string_keys() {
         aclfile: String::new(),
         cluster_enabled: false,
         unixsocket: String::new(),
+            log_format: "text".to_string(),
     });
     let mut h = CommandHandler::new(cache.clone(), config);
 
@@ -538,6 +541,7 @@ fn allkeys_random_evicts_zsets_under_pressure() {
         aclfile: String::new(),
         cluster_enabled: false,
         unixsocket: String::new(),
+            log_format: "text".to_string(),
     });
     let mut h = CommandHandler::new(cache.clone(), config);
 

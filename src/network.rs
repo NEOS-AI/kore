@@ -845,6 +845,7 @@ mod tests {
             aclfile: String::new(),
             cluster_enabled: false,
                 unixsocket: String::new(),
+            log_format: "text".to_string(),
         });
 
         let cache = Cache::new(config.shards, config.maxmemory);

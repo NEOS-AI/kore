@@ -61,6 +61,10 @@ pub struct Config {
     #[arg(short = 'v', long, default_value = "1")]
     pub verbosity: u8,
 
+    /// Log output format: `text` (human-readable, default) or `json` (structured JSON lines)
+    #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+    pub log_format: String,
+
     /// Enable Redlock distributed locking (requires multiple instances)
     #[arg(long, default_value = "false")]
     pub enable_redlock: bool,
@@ -163,6 +167,7 @@ impl Default for Config {
             auth: String::new(),
             maxentrysize: 524288000,
             verbosity: 1,
+            log_format: "text".to_string(),
             enable_redlock: false,
             redlock_instances: String::new(),
             redlock_retry_count: 3,
@@ -422,6 +427,36 @@ impl Config {
             }
             _ => Err(Error::ConfigError(format!("Unknown config key: {}", key)))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn log_format_defaults_to_text() {
+        let c = Config::try_parse_from(["kore"]).expect("default parse");
+        assert_eq!(c.log_format, "text");
+    }
+
+    #[test]
+    fn log_format_json_flag() {
+        let c = Config::try_parse_from(["kore", "--log-format", "json"]).expect("json parse");
+        assert_eq!(c.log_format, "json");
+    }
+
+    #[test]
+    fn log_format_text_explicit() {
+        let c = Config::try_parse_from(["kore", "--log-format", "text"]).expect("text parse");
+        assert_eq!(c.log_format, "text");
+    }
+
+    #[test]
+    fn log_format_rejects_unknown() {
+        let err = Config::try_parse_from(["kore", "--log-format", "xml"]);
+        assert!(err.is_err());
     }
 }
 

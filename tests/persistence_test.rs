@@ -291,6 +291,7 @@ async fn test_config_set_save_updates_rules() {
         aclfile: String::new(),
         cluster_enabled: false,
     unixsocket: String::new(),
+            log_format: "text".to_string(),
     };
     let mut h = CommandHandler::with_persistence(cache, Arc::new(config), Some(mgr.clone()));
 

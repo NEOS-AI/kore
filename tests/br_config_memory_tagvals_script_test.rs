@@ -43,6 +43,7 @@ fn test_config() -> Config {
         aclfile: String::new(),
         cluster_enabled: false,
         unixsocket: "/tmp/kore-br.sock".to_string(),
+            log_format: "text".to_string(),
     }
 }
 

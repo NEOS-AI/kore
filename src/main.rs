@@ -30,10 +30,22 @@ fn main() -> anyhow::Result<()> {
         _ => Level::DEBUG,
     };
 
-    tracing_subscriber::fmt()
-        .with_max_level(level)
-        .with_target(false)
-        .init();
+    // `--log-format json` → structured JSON lines; default `text` stays human-readable.
+    match config.log_format.as_str() {
+        "json" => {
+            tracing_subscriber::fmt()
+                .json()
+                .with_max_level(level)
+                .with_target(false)
+                .init();
+        }
+        _ => {
+            tracing_subscriber::fmt()
+                .with_max_level(level)
+                .with_target(false)
+                .init();
+        }
+    }
 
     // Build Tokio runtime with the configured worker thread count
     let rt = tokio::runtime::Builder::new_multi_thread()

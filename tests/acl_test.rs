@@ -47,6 +47,7 @@ fn make_handler(auth: &str) -> CommandHandler {
         aclfile: String::new(),
         cluster_enabled: false,
     unixsocket: String::new(),
+            log_format: "text".to_string(),
     };
     CommandHandler::new(make_cache(), Arc::new(config))
 }
@@ -479,6 +480,7 @@ fn acl_auto_auth_respects_live_default_nopass() {
         aclfile: String::new(),
         cluster_enabled: false,
     unixsocket: String::new(),
+            log_format: "text".to_string(),
     };
     let config = Arc::new(config);
     let dbs = Databases::create(16, 16, 1024 * 1024 * 50, 500 * 1024 * 1024, false, 0.75);
@@ -627,6 +629,7 @@ fn acl_load_save_roundtrip() {
         aclfile: acl_path.to_string_lossy().to_string(),
         cluster_enabled: false,
     unixsocket: String::new(),
+            log_format: "text".to_string(),
     };
     let config = Arc::new(config);
     let dbs = Databases::create(16, 16, 1024 * 1024 * 50, 500 * 1024 * 1024, false, 0.75);

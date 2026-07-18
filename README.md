@@ -68,6 +68,7 @@ With custom options:
 - `--maxconns <COUNT>`: Maximum number of connections (default: 1024)
 - `--auth <PASSWORD>`: Authentication password (default: none)
 - `-v, --verbosity <LEVEL>`: Verbosity level 0-3 (default: 1)
+- `--log-format <text|json>`: Log output format — human-readable `text` (default) or structured JSON lines (`json`) for log aggregators
 
 ## Supported Commands
 

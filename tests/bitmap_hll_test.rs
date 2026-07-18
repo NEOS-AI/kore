@@ -44,6 +44,7 @@ fn make_handler() -> CommandHandler {
         aclfile: String::new(),
         cluster_enabled: false,
         unixsocket: String::new(),
+            log_format: "text".to_string(),
     };
     CommandHandler::new(cache, Arc::new(config))
 }
