@@ -17,7 +17,9 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] HNSW remove/unlink + insert-time force-keep + update rewire (Batch CS)
 - [x] HNSW hard-delete bridge repair — closest-peer reconnect (Batch CT; 2-chain)
 - [x] HNSW undirected former snapshot + multi-way spanning bridge reconnect (Batch CU)
-- [x] HNSW recall@k / throughput numbers vs FLAT (Batch CV; unit gate + indicative table in `docs/benchmarks.md`)
+- [x] HNSW NN-path bridge branch test + must_keep prune safety (Batch CW)
+- [x] HNSW recall@k unit gate + N=300 indicative micro (Batch CV; not large-N ANN win)
+- [ ] Optional larger-N HNSW throughput / tighter recall (CV post-ship; see TODO.md)
 
 ## Plans
 

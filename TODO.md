@@ -420,9 +420,23 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch CU)*: undirected former snapshot (outgoing ∪ reverse scan). Test: `hnsw_bridge_remove_asymmetric_incoming_reconnects`.
 - [x] **`[P2]`** **Code review (CT post-ship):** multi-way / degree-saturated bridge reconnect incomplete
   - *Found*: each survivor only force-keeps its **single** nearest former peer. With ≥3 former neighbors or leaves already at `max_m` with closer non-former edges, secondary former links can be pruned — directed search from entry may still miss a survivor. CT tests only cover the 2-neighbor mutual-NN chain.
-  - *Done (Batch CU)*: spanning reconnect (full clique when `n-1 ≤ max_m`, else nearest-neighbor path) with force-keep of spanning edges on **both** endpoints; `prune_neighbors_keeping` accepts multiple must-keeps. Test: `hnsw_bridge_remove_star_multiway_reconnects` (degree-saturated star). Not a global non-partition guarantee under later hub churn.
+  - *Done (Batch CU, clique path)*: spanning reconnect (full clique when `n-1 ≤ max_m`, else nearest-neighbor path) with force-keep of spanning edges on **both** endpoints; multi must-keep prune. Test: `hnsw_bridge_remove_star_multiway_reconnects`.
+  - *Done (Batch CW, path branch)*: NN-path reconnect unit test with ≥4 former neighbors + `max_m=2` (`n-1 > max_m`). Test: `hnsw_bridge_remove_path_branch_reconnects` (BFS + farthest-leaf `search`).
 - [x] **`[P2]`** HNSW recall@k / throughput numbers vs FLAT
-  - *Done (Batch CV)*: `hnsw_recall_at_k_vs_flat_and_throughput` in `src/vector_search.rs` — N=300 dim=16 Cosine, Q=40, fixed seed; mean recall@1 ≥ 0.90 / recall@10 ≥ 0.80 vs FLAT; `eprintln!` FLAT vs HNSW search wall time. Indicative numbers + methodology in `docs/benchmarks.md` (at N=300 FLAT still cheaper; recall perfect on seed).
+  - *Done (Batch CV, unit gate + N=300 micro)*: `hnsw_recall_at_k_vs_flat_and_throughput` — N=300 dim=16 Cosine, Q=40, fixed seed; mean recall@1 ≥ 0.90 / recall@10 ≥ 0.80 vs FLAT; indicative wall times in `docs/benchmarks.md` (FLAT still cheaper at this N; recall perfect on seed).
+  - *Residual (CV post-ship)*: soft thresholds vs observed 1.0; single-shot not median-of-3; no post-delete churn; not a large-N ANN win claim.
+- [x] **`[P2]`** **Code review (CU post-ship):** NN-path bridge reconnect branch untested
+  - *Found*: star multi-way test uses 3 survivors + `max_m=2` → `n-1 ≤ max_m` full clique, not the `else` nearest-neighbor path. Path construction / force-keep degree≤2 can regress green.
+  - *Done (Batch CW)*: `hnsw_bridge_remove_path_branch_reconnects` — 4-leaf star, M=1/`max_m=2`, BFS all survivors + `search(self, k=1)` for farthest leaf `d`.
+- [x] **`[P2]`** **Code review (CU post-ship):** `prune_neighbors_keeping` can drop required must-keep edges
+  - *Found*: when `|must_keep| > max_m` and slots are full of required ids, fallback `kept.pop()` may drop a required edge. Layer-0 path currently keeps deg≤2 with `max_m≥2`, so latent for multi-layer `M=1` or oversize must sets.
+  - *Done (Batch CW)*: cap must set to closest `max_m` by distance before force-keep; never pop a still-required id. Test: `prune_neighbors_keeping_caps_must_keep_by_distance`.
+- [ ] **`[P3]`** **Code review (CU post-ship):** undirected remove reverse-scan is O(N)
+  - *Found*: every remove full-scans layer neighbors for reverse edges, then `unlink_node` scans again. Correct but costly as N grows.
+  - *Next*: fuse snapshot+unlink; optional reverse adjacency index.
+- [ ] **`[P3]`** **Code review (CV post-ship):** tighten recall gate / larger-N throughput
+  - *Found*: thresholds 0.90/0.80 leave headroom on easy N/M/ef; throughput is single-shot N=300 where HNSW loses to FLAT.
+  - *Next*: raise gates or harder config; optional `#[ignore]`/`--release` larger-N bench; label table single-shot.
 - [x] **`[P2]`** **Code review (CP post-ship):** HNSW search does not use the graph
   - *Found*: `search` full-scanned `self.vectors`; `ef_search` unused; `add` could connect self as neighbor.
   - *Done (Batch CQ)*: graph SEARCH-LAYER + self-exclude on connect; discriminating edge-walk test.
@@ -549,7 +563,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batch CV shipped** (HNSW recall@k unit gate + indicative throughput vs FLAT in `docs/benchmarks.md`). **Open next:** optional JSON logging; advanced deadlock; standing tests-for-phase P0.
+Prioritized for next letter batch(es). **Batch CW shipped** (must_keep prune safety + NN-path bridge branch unit test). **Still open from CU/CV post-ship:** O(N) reverse-scan delete; soft CV thresholds / optional larger-N bench. **Open next:** optional JSON logging; advanced deadlock; standing tests-for-phase P0; optional larger-N HNSW bench; O(N) reverse index.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -596,8 +610,12 @@ Prioritized for next letter batch(es). **Batch CV shipped** (HNSW recall@k unit 
 | P2 | CS post-ship: hard-delete bridge repair / soft-delete | done (CT 2-chain heuristic) |
 | P2 | CS post-ship: force-keep not global reachability (docs + hub-churn tests) | done (CT docs honesty; hub-churn smoke) |
 | P2 | CT post-ship: undirected former-neighbor snapshot (incoming too) | done (CU) |
-| P2 | CT post-ship: multi-way / degree-saturated bridge reconnect | done (CU) |
-| P2 | HNSW recall@k / throughput numbers vs FLAT | done (CV; unit gate + indicative table) |
+| P2 | CT post-ship: multi-way / degree-saturated bridge reconnect | done (CU clique + CW path) |
+| P2 | CU post-ship: NN-path bridge reconnect unit test (n-1 > max_m) | done (CW) |
+| P2 | CU post-ship: prune must_keep never drops required edges | done (CW) |
+| P3 | CU post-ship: fuse reverse-scan + unlink / reverse index | open |
+| P2 | HNSW recall@k / throughput numbers vs FLAT | done (CV unit gate + N=300 micro) |
+| P3 | CV post-ship: tighter recall / larger-N throughput bench | open |
 | P2 | CP post-ship: LOADING allowlist PSYNC/SYNC mid-install visibility | done (CR) |
 | P2 | CC post-ship: typed export skip expired keys (no revive without TTL) | done (CD) |
 | P2 | CC nit: unify start_background_sweep create paths | done (CD) |

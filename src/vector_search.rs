@@ -574,8 +574,12 @@ impl HNSWIndex {
 
     /// Keep at most `max_m` nearest neighbors of `node_id` (by distance to that node).
     ///
-    /// Every id in `must_keep` is retained when present in `vectors` (evicting the
-    /// furthest non-required edge if needed). Used so reverse edges `neighbor → new`
+    /// **Must-keep policy (Batch CW):** ids in `must_keep` that still exist in
+    /// `vectors` are prioritized. If `|must_keep| > max_m`, only the closest
+    /// `max_m` must-edges (by distance to `node_id`) are retained; farther
+    /// required ids are dropped *before* the force-keep loop. Force-keep never
+    /// pops an id that is still in that capped required set — only non-required
+    /// edges are evicted to make room. Used so reverse edges `neighbor → new`
     /// survive insert prune, and so bridge-repair spanning edges survive on both
     /// endpoints (Batch CU multi-way).
     fn prune_neighbors_keeping(
@@ -592,6 +596,13 @@ impl HNSWIndex {
         let Some(node_vec) = self.vectors.get(node_id).cloned() else {
             return;
         };
+
+        if max_m == 0 {
+            if let Some(layer_mut) = self.layers.get_mut(layer) {
+                layer_mut.set_neighbors(node_id.clone(), Vec::new());
+            }
+            return;
+        }
 
         let mut scored: Vec<(Bytes, f32)> = neighbors
             .into_iter()
@@ -616,11 +627,34 @@ impl HNSWIndex {
             }
         }
 
-        let must: Vec<Bytes> = must_keep
-            .iter()
-            .filter(|k| *k != node_id && self.vectors.contains_key(*k))
-            .cloned()
-            .collect();
+        // Cap must-keep to max_m (closest by distance to node) so force-keep
+        // never needs to pop a still-required edge when the set is oversized.
+        let mut must_scored: Vec<(Bytes, f32)> = Vec::new();
+        let mut must_seen: HashSet<Bytes> = HashSet::new();
+        for keep in must_keep {
+            if keep == node_id || !self.vectors.contains_key(keep) {
+                continue;
+            }
+            if !must_seen.insert(keep.clone()) {
+                continue;
+            }
+            let dist = scored
+                .iter()
+                .find(|(id, _)| id == keep)
+                .map(|(_, d)| *d)
+                .unwrap_or_else(|| {
+                    self.vectors
+                        .get(keep)
+                        .map(|v| self.compute_distance(&node_vec, v))
+                        .unwrap_or(f32::MAX)
+                });
+            must_scored.push((keep.clone(), dist));
+        }
+        if must_scored.len() > max_m {
+            must_scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+            must_scored.truncate(max_m);
+        }
+        let must: Vec<Bytes> = must_scored.into_iter().map(|(id, _)| id).collect();
         let is_must = |id: &Bytes| must.iter().any(|m| m == id);
 
         if scored.len() <= max_m {
@@ -644,6 +678,7 @@ impl HNSWIndex {
             .collect();
 
         // Force-keep each required neighbor, evicting furthest non-required first.
+        // Never pop a still-required id (must already capped to max_m above).
         for keep in &must {
             if kept.iter().any(|id| id == keep) {
                 continue;
@@ -652,11 +687,9 @@ impl HNSWIndex {
                 if let Some(pos) = kept.iter().rposition(|id| !is_must(id)) {
                     kept.remove(pos);
                 } else {
-                    // All slots are required; prefer must_keep over capacity.
-                    // Drop the last required slot only if we still need room.
-                    if kept.len() >= max_m {
-                        kept.pop();
-                    }
+                    // Capacity filled with required edges; skip rather than
+                    // drop a still-required id (Batch CW).
+                    continue;
                 }
             }
             kept.push(keep.clone());
@@ -1568,6 +1601,132 @@ mod tests {
                 seen
             );
         }
+    }
+
+    /// Batch CW: ≥4 former neighbors with `max_m=2` forces the NN-path reconnect
+    /// branch (`n-1 > max_m`), not the full clique covered by the star test.
+    #[test]
+    fn hnsw_bridge_remove_path_branch_reconnects() {
+        // M=1 → layer-0 max_m=2; 4 survivors → n-1=3 > 2 → path branch.
+        let mut index = HNSWIndex::new(1, 8, DistanceMetric::L2);
+        index.add(Bytes::from("hub"), vec![0.0, 0.0]);
+        // Leaves on a line so the NN-path is a–b–c–d (well-defined).
+        index.add(Bytes::from("a"), vec![1.0, 0.0]);
+        index.add(Bytes::from("b"), vec![2.0, 0.0]);
+        index.add(Bytes::from("c"), vec![3.0, 0.0]);
+        index.add(Bytes::from("d"), vec![4.0, 0.0]); // farthest leaf
+
+        // Force star: all leaves ↔ hub only (4 former neighbors).
+        for layer in &mut index.layers {
+            for (_id, neigh) in layer.neighbors.iter_mut() {
+                neigh.clear();
+            }
+        }
+        let layer = &mut index.layers[0];
+        for leaf in ["a", "b", "c", "d"] {
+            layer.add_edge(Bytes::from(leaf), Bytes::from("hub"));
+            layer.add_edge(Bytes::from("hub"), Bytes::from(leaf));
+        }
+        index.entry_point = Some(Bytes::from("a"));
+
+        index.remove(&Bytes::from("hub"));
+
+        assert!(!index.vectors.contains_key(&Bytes::from("hub")));
+        for id in ["a", "b", "c", "d"] {
+            assert!(index.vectors.contains_key(&Bytes::from(id)));
+        }
+
+        let entry = index
+            .entry_point
+            .clone()
+            .expect("non-empty index has entry_point");
+        let mut seen: HashSet<Bytes> = HashSet::new();
+        let mut stack = vec![entry.clone()];
+        seen.insert(entry);
+        while let Some(cur) = stack.pop() {
+            for nb in index.layers[0].get_neighbors(&cur) {
+                if seen.insert(nb.clone()) {
+                    stack.push(nb);
+                }
+            }
+        }
+        for id in [Bytes::from("a"), Bytes::from("b"), Bytes::from("c"), Bytes::from("d")] {
+            assert!(
+                seen.contains(&id),
+                "after path-branch hub remove, {:?} must be BFS-reachable from entry (visited {:?})",
+                id,
+                seen
+            );
+        }
+
+        // Farthest leaf self-search must hit via the repaired path (graph walk).
+        let results = index.search(&[4.0f32, 0.0], 1);
+        assert_eq!(results.len(), 1, "search must hit for farthest leaf d");
+        assert_eq!(
+            results[0].doc_id,
+            Bytes::from("d"),
+            "farthest leaf d must remain searchable after path-branch bridge remove (got {:?})",
+            results[0].doc_id
+        );
+    }
+
+    /// Batch CW: when `|must_keep| > max_m`, keep the closest required edges and
+    /// never drop a still-required id via `kept.pop()` (old oversize fallback).
+    #[test]
+    fn prune_neighbors_keeping_caps_must_keep_by_distance() {
+        let mut index = HNSWIndex::new(1, 8, DistanceMetric::L2);
+        index.add(Bytes::from("node"), vec![0.0, 0.0]);
+        index.add(Bytes::from("m1"), vec![1.0, 0.0]);
+        index.add(Bytes::from("m2"), vec![2.0, 0.0]);
+        index.add(Bytes::from("m3"), vec![3.0, 0.0]); // farthest must — should be dropped
+        index.add(Bytes::from("filler"), vec![0.5, 0.0]); // closer non-must
+
+        for layer in &mut index.layers {
+            for (_id, neigh) in layer.neighbors.iter_mut() {
+                neigh.clear();
+            }
+        }
+        let layer = &mut index.layers[0];
+        // Node linked to all three musts + a closer filler (degree 4 > max_m=2).
+        for id in ["m1", "m2", "m3", "filler"] {
+            layer.add_edge(Bytes::from("node"), Bytes::from(id));
+        }
+
+        let must = [
+            Bytes::from("m1"),
+            Bytes::from("m2"),
+            Bytes::from("m3"),
+        ];
+        // max_m=2 with 3 must-keeps: pre-CW popped a required edge to fit m3.
+        index.prune_neighbors_keeping(&Bytes::from("node"), 0, 2, &must);
+
+        let neigh = index.layers[0].get_neighbors(&Bytes::from("node"));
+        assert_eq!(
+            neigh.len(),
+            2,
+            "pruned neighbor list must respect max_m=2 (got {:?})",
+            neigh
+        );
+        assert!(
+            neigh.iter().any(|n| n == &Bytes::from("m1")),
+            "closest must m1 must be kept (got {:?})",
+            neigh
+        );
+        assert!(
+            neigh.iter().any(|n| n == &Bytes::from("m2")),
+            "second-closest must m2 must be kept — old pop-required dropped it for m3 (got {:?})",
+            neigh
+        );
+        assert!(
+            !neigh.iter().any(|n| n == &Bytes::from("m3")),
+            "farthest must m3 must be dropped when |must| > max_m (got {:?})",
+            neigh
+        );
+        assert!(
+            !neigh.iter().any(|n| n == &Bytes::from("filler")),
+            "non-required filler must yield to capped must-keep set (got {:?})",
+            neigh
+        );
     }
 
     /// Batch CT smoke: small M with hub remove/re-add churn — remaining ids stay
