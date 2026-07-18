@@ -438,8 +438,8 @@ Also tracked in `docs/roadmap.md`.
   - *Found*: commits one DB at a time; concurrent readers (FULLRESYNC) can see DB0 new + DB1 old; panic mid-loop leaves partial multi-DB commit.
   - *Partial (Batch CC)*: whole replace loop under multi-DB autosweep pause.
   - *Partial (Batch CF)*: staged drain of all sources before any target install; multi-DB tests.
-  - *Partial (Batch CH)*: multi-DB AOF/RDB commit **no longer pre-flushes** all DBs before install — mid-install panic leaves remaining DBs with **pre-load** data (not empty). Single-DB `load_bytes` still pre-flushes for peak memory. True cross-DB atomic publish to concurrent readers still open (server-wide load barrier / epoch).
-  - *CH post-ship*: no-pre-flush reopens ~2× dual-residency peak on FULLRESYNC (`load_databases_bytes(..., true)`); document peak cost; optional free-old strategies that do not empty-before-stage.
+  - *Partial (Batch CH)*: multi-DB AOF/RDB commit **no longer pre-flushes** all DBs before install — mid-install panic leaves remaining DBs with **pre-load** data (not empty). Single-DB `load_bytes` still pre-flushes for peak memory.
+  - *Partial (Batch CJ)*: `Databases::load_generation` / `load_in_progress` around `replace_keyspaces_from` (start+end bumps; drop-safe). Docs note ~2× peak dual-residency and exclusive-access requirement. True cross-DB atomic publish for concurrent readers still open (server-wide reader barrier). Tests: `tests/cj_load_gen_and_memory_test.rs`.
 - [x] **`[P1]`** **Code review (CC post-ship):** WATCH bump not atomic with keyspace install (race window)
   - *Found*: `replace_keyspace_from` installs scratch `watch_gens` (usually empty) and releases the lock, then later bumps `pre_watch_keys`. Between those steps `watch_generation` can `or_insert(0)` so a client that WATCHed at gen 0 sees clean EXEC against new/empty data. On `flush=true` the clean window spans flush (which does not touch watch_gens) through end of replace.
   - *Done (Batch CD)*: under one `watch_gens` lock, install `other_watch` and bump all `pre_watch_keys`; AOF/RDB `flush=true` commit calls `touch_all_watch_keys` before flush. Tests: `tests/cd_watch_atomic_and_typed_export_test.rs`.
@@ -457,8 +457,9 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch CD)*: `typed_key_exportable` filters past TTL in zset/geo/hash/list/set/stream export; test expired hash not in `export_hashes` / `from_cache`.
 - [ ] **`[P2]`** **Code review (CB post-ship):** expand CB tests — post-swap memory_tracker + `string_memory_usage`; multi-DB fail/success; typed TTL after swap; PubSub category non-clobber; empty-AOF success on non-empty target; peak-memory budget; seed non-mutation on failed merge; concurrent WATCH race
   - *Partial (Batch CC)*: seed non-mutation + autosweep restore + sequential WATCH + flush=true replace covered in `cc_load_*`.
-  - *Partial (Batch CF)*: multi-DB RDB/AOF fail preserve both DBs + flush=true success updates both DBs (`cf_multidb_*`); remaining expansion open.
-  - *Partial (Batch CG)*: FT.SEARCH after schema-equal name-clash merge + divergent prefix / alias retarget fail cases in `cg_ft_merge_schema_test.rs`. Still open: multi-DB `flush=false` merge; loadfactor preserved on scratch; peak-memory / pubsub / concurrent WATCH expansion.
+  - *Partial (Batch CF)*: multi-DB RDB/AOF fail preserve both DBs + flush=true success updates both DBs (`cf_multidb_*`).
+  - *Partial (Batch CG)*: FT.SEARCH after schema-equal name-clash merge + divergent prefix / alias retarget fail cases.
+  - *Partial (Batch CJ)*: post-swap `string_memory_usage` match; multi-DB `flush=false` merge preserves other DB; empty-AOF success replaces non-empty target; load_generation bumps. Still open: typed TTL after swap; pubsub non-clobber; peak-memory budget; concurrent WATCH race.
 - [ ] **`[P2]`** **Code review (CB):** `drain_all` / `replace_all` not fully failure-atomic across shards
   - *Partial (Batch CB)*: pre-`reserve(self.len())` on `ShardedHashMap`/`ShardedKeyMap` `drain_all`; docs note exclusive access. Mid-panic after partial shard drain still drops drained entries; install-half `replace_all` after target drain is the more dangerous path on the live DB (true OOM-abort policy remains open).
 - [x] **`[P2]`** **Code review (CB nit):** `install_keyspace_counts` not closed over `KEYSPACE_CATEGORIES`
@@ -501,7 +502,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batch CI shipped** (RDB OOM map-then-prefix; AOF multi-DB rustdoc; has_any_state alias coverage). **Open:** multi-DB true atomic publish + FULLRESYNC peak ~2× (P1 partial); HNSW benches; min-replicas FT; CB expand-tests / drain failure-atomic.
+Prioritized for next letter batch(es). **Batch CJ shipped** (multi-DB `load_generation` / `load_in_progress`; post-swap memory + empty-AOF + multi-DB merge tests). **Open:** true multi-DB atomic reader barrier (P1 partial); HNSW benches; min-replicas FT; remaining CB expand / drain failure-atomic.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -517,7 +518,7 @@ Prioritized for next letter batch(es). **Batch CI shipped** (RDB OOM map-then-pr
 | P1 | RDB load `flush=true` must wipe FT schema (BY×BX clash) | done (BZ) |
 | P1 | CB: full keyspace swap under quiesce (typed maps, expires, watch) | done (CB) |
 | P1 | CB: `Cache.memory_usage` + tracker paired install (no double-account) | done (CB) |
-| P1 | CB post-ship: multi-DB replace atomic / server-wide quiesce | partial (CH no pre-flush; true atomic open) |
+| P1 | CB post-ship: multi-DB replace atomic / server-wide quiesce | partial (CJ load_gen; true reader barrier open) |
 | P1 | CF post-ship: FT merge compare schema on name clash (not name-only skip) | done (CG) |
 | P1 | CF post-ship: FT alias merge compare targets on clash | done (CG) |
 | P1 | CB post-ship: bump `watch_gens` on keyspace replace | done (CC+CD) |
@@ -536,7 +537,7 @@ Prioritized for next letter batch(es). **Batch CI shipped** (RDB OOM map-then-pr
 | P2 | CB: `drain_all`/`replace_all` failure-atomic | partial (reserve done) |
 | P2 | CB: `install_keyspace_counts` closed over KEYSPACE_CATEGORIES | done (CB) |
 | P2 | CB: optional alias-target validate on search `install` | done (CF debug_assert) |
-| P2 | CB post-ship: expand tests (memory, multi-DB, TTL, pubsub, seed, peak) | partial (CF multi-DB; rest open) |
+| P2 | CB post-ship: expand tests (memory, multi-DB, TTL, pubsub, seed, peak) | partial (CJ memory/merge/empty-AOF; rest open) |
 | P2 | CC post-ship: typed export skip expired keys (no revive without TTL) | done (CD) |
 | P2 | CC nit: unify start_background_sweep create paths | done (CD) |
 | P2 | CB second-pass: empty_keyspace_like hardcodes loadfactor 0.75 | done (CF) |
