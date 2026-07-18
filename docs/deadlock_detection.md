@@ -23,6 +23,7 @@ Client 2: Holds Lock B, Waits for Lock A
 - **Statistics**: Provides metrics on locks and waits
 - **Configurable**: Adjustable timeouts and auto-resolution
 - **Async API**: Tokio-friendly wrappers + optional background monitor
+- **Cross-process snapshots**: Export/merge wait-for graphs across processes (no built-in transport)
 
 ## How It Works
 
@@ -533,10 +534,112 @@ let redlock = Redlock::new(instances)?
     );
 ```
 
+## Cross-process (snapshot merge)
+
+By default each process has its own in-memory wait-for graph. When **multiple
+processes** share the same Redlock backends, a cycle can span processes: each
+side only sees a half-cycle until graphs are exchanged.
+
+Kore provides a **snapshot export/merge MVP** — no built-in network protocol
+or cluster gossip. You transport snapshots over whatever bus you already have
+(HTTP, message queue, shared file, admin RPC, …).
+
+### Types
+
+| Type | Role |
+|------|------|
+| `HeldLockSnapshot` | resource, client_id (UTF-8 lossy), `ttl_ms`, `held_for_ms` |
+| `WaitEdgeSnapshot` | waiter, holder, resource, `wait_elapsed_ms` |
+| `DeadlockGraphSnapshot` | `held`, `waits`, optional `source_id` |
+
+`Instant` is not serializable; relative durations are stored and reconstructed
+approximately on import. Types implement `serde::Serialize` /
+`Deserialize` for JSON or any other serde format.
+
+### API
+
+```rust
+use kore::{DeadlockDetector, DeadlockGraphSnapshot, DeadlockStatus};
+use bytes::Bytes;
+
+// --- Process 1 (holds A, waits for B held by client-2) ---
+let det1 = DeadlockDetector::new(30_000, false);
+let c1 = Bytes::from("client-1");
+let c2 = Bytes::from("client-2");
+det1.record_lock_acquired("resource-a".into(), c1.clone(), 10_000);
+// Optional: record peer hold learned via GET / admin channel
+det1.record_lock_acquired("resource-b".into(), c2.clone(), 10_000);
+det1.record_lock_wait("resource-b".into(), c1.clone(), 10_000);
+
+// --- Process 2 (holds B, waits for A held by client-1) ---
+let det2 = DeadlockDetector::new(30_000, false);
+det2.record_lock_acquired("resource-b".into(), c2.clone(), 10_000);
+det2.record_lock_acquired("resource-a".into(), c1.clone(), 10_000);
+det2.record_lock_wait("resource-a".into(), c2.clone(), 10_000);
+
+// Neither process alone sees a full cycle yet.
+assert!(matches!(det1.detect_deadlock(), DeadlockStatus::NoDeadlock));
+assert!(matches!(det2.detect_deadlock(), DeadlockStatus::NoDeadlock));
+
+// Exchange snapshots over your own transport, then merge:
+let mut snap1 = det1.export_snapshot();
+snap1.source_id = Some("proc-1".into());
+let mut snap2 = det2.export_snapshot();
+snap2.source_id = Some("proc-2".into());
+
+// ... send snap1 to process 2, snap2 to process 1 ...
+
+det1.merge_snapshot(&snap2);
+det2.merge_snapshot(&snap1);
+
+// Multi-process cycle is now visible:
+match det1.detect_deadlock() {
+    DeadlockStatus::Deadlock { cycle, resources } => {
+        println!("cross-process deadlock: {:?} on {:?}", cycle, resources);
+    }
+    DeadlockStatus::NoDeadlock => {}
+}
+```
+
+### Merge rules
+
+1. **Held locks — local wins**: if both claim the same resource, the local
+   hold is kept; the remote claim is ignored.
+2. **Wait edges — union + dedupe**: edges are keyed by
+   `(waiter, resource, holder)`. Merging the same snapshot twice does not
+   duplicate edges.
+3. After merge, `detect_deadlock()` / auto-resolve / monitors use the combined
+   graph like any other local state.
+
+### How to use from two processes
+
+1. Each process records local acquires and waits as usual (Redlock path or
+   standalone `record_*` APIs).
+2. Periodically (or on long wait) call `export_snapshot()`.
+3. Publish the snapshot (JSON via serde, or any format) to peers that share
+   the same lock namespace.
+4. On receive, `merge_snapshot(&peer)` then `detect_deadlock()`.
+5. If auto-resolve is enabled, resolution still only unlocks **local** graph
+   state (and Redlock backends when using Redlock paths) — remote processes
+   must also observe the resolution via their own merge/detect loop or lock
+   TTL expiry.
+
+### Honest limitations
+
+| Limitation | Detail |
+|------------|--------|
+| **No transport** | Kore does not ship gossip, HTTP, or Redis pub/sub for snapshots. |
+| **Not consensus** | Last-writer is not used for holds; local always wins. Stale remote holds can linger until TTL cleanup. |
+| **Timestamp approximation** | `held_for_ms` / `wait_elapsed_ms` reconstruct `Instant`s relative to import time — not wall-clock synchronized. |
+| **Partial views** | A wait edge needs a known holder. If process A waits for a lock held only in process B and never learns the holder, export has no edge until a peer snapshot (or local GET) supplies it. Recording peer holds when known (as in the example) closes that gap. |
+| **No Web UI** | Visualization remains open (see roadmap). |
+| **Client id encoding** | Export uses UTF-8 lossy strings; binary tokens with invalid UTF-8 are mangled on the wire. |
+
 ## Limitations
 
-1. **Single-Instance Scope**: Currently detects deadlocks within a single Redlock instance
-2. **No Cross-Process Detection**: Doesn't detect deadlocks across different processes (yet)
+1. **Per-process graph by default**: In-process detection only, unless you
+   exchange and merge snapshots (see [Cross-process](#cross-process-snapshot-merge)).
+2. **No automatic cross-process transport**: Snapshot API only; no cluster gossip.
 3. **Redlock acquire is still sync**: `Redlock::lock` uses blocking retries; prefer async
    detect/stats/monitor APIs for Tokio integration rather than awaiting `lock` on a worker
 4. **Detection Overhead**: Small performance cost on each lock operation
@@ -622,3 +725,5 @@ Available tests:
 - `test_redlock_auto_resolve_youngest_releases_backend`: two-client cycle; Youngest victim backend key gone
 - `test_redlock_auto_resolve_false_fail_fast`: `DeadlockDetected`, backends unchanged
 - `test_redlock_spawn_monitor_unlocks_backends`: `spawn_deadlock_monitor` backend + graph
+- Unit tests in `src/deadlock.rs`: `test_cross_process_cycle_detected_after_snapshot_merge`,
+  `test_merge_local_held_not_overwritten_by_remote`, `test_merge_wait_edges_deduped_on_double_merge`

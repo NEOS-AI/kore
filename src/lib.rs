@@ -62,7 +62,10 @@ pub use stream_type::{
 };
 pub use geospatial::{GeoSet, GeoPoint, DistanceUnit};
 pub use redlock::{LocalCacheBackend, Lock, LockBackend, Redlock, RespBackend};
-pub use deadlock::{DeadlockDetector, DeadlockStatus, LockInfo, VictimSelectionStrategy};
+pub use deadlock::{
+    DeadlockDetector, DeadlockGraphSnapshot, DeadlockStatus, HeldLockSnapshot, LockInfo,
+    VictimSelectionStrategy, WaitEdgeSnapshot,
+};
 pub use fair_queue::{FairQueue, QueuedClient, FairQueueStats};
 pub use pubsub::{
     ClientId, PublishOutcome, PubSub, DEFAULT_CLIENT_BUFFER_CAPACITY,

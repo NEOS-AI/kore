@@ -344,7 +344,8 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P1]`** Fair lock queueing: production hardening, metrics, docs
   - *Done*: atomic `try_acquire` under write lock; `dequeue_client` front-safe pop; retry cleanup uses `max_attempts`; Drop stops cleanup thread; CLI `--enable-fair-queue` / max-size / cleanup-ms; INFO `# FairQueue` section; docs
 - [ ] **`[P2]`** Deadlock detection advanced (from roadmap)
-  - [ ] **`[P2]`** Cross-process detection
+  - [x] **`[P2]`** Cross-process detection
+    - *Done (Batch DC, MVP)*: `HeldLockSnapshot` / `WaitEdgeSnapshot` / `DeadlockGraphSnapshot` (serde); `export_snapshot` / `merge_snapshot` (local held wins, wait edges union+dedupe); multi-process half-cycle tests; docs “Cross-process (snapshot merge)”. No transport/Web UI.
   - [x] **`[P2]`** Async support
     - *Done (Batch DA, standalone surface)*: `detect_deadlock_async` / `resolve_deadlock_async` / `get_stats_async` / `check_long_waits_async` (thin Tokio wrappers over short sync critical sections); `release_client_locks`; `DeadlockDetector::spawn_monitor` (abort `JoinHandle`, auto-resolve + tracing); `Redlock::check_deadlock_async` / `get_deadlock_stats_async`; unit + integration tests; docs
     - *Done (Batch DB)*: `Redlock::deadlock_detector()` / `spawn_deadlock_monitor` (backend unlock + graph); residual async is still sync-on-poll under contention.

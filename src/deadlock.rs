@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,6 +16,62 @@ pub struct LockInfo {
     pub timestamp: Instant,
     /// TTL in milliseconds (if applicable)
     pub ttl_ms: u64,
+}
+
+// ── Cross-process snapshot types ───────────────────────────────────────────
+//
+// `Instant` is not serializable. Snapshots store relative durations
+// (`held_for_ms` / `wait_elapsed_ms`) so peers can reconstruct approximate
+// local Instants on import. Client ids are UTF-8 lossy strings (fine for
+// typical Redlock tokens; non-UTF-8 bytes are replaced on export).
+
+/// Serializable snapshot of a held lock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldLockSnapshot {
+    /// Resource being locked
+    pub resource: String,
+    /// Client holding the lock (UTF-8 lossy encoding of raw bytes)
+    pub client_id: String,
+    /// Original TTL in milliseconds at acquisition
+    pub ttl_ms: u64,
+    /// Milliseconds elapsed since the lock was acquired (export-time relative)
+    pub held_for_ms: u64,
+}
+
+/// Serializable snapshot of a wait-for graph edge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitEdgeSnapshot {
+    /// Client waiting for the resource
+    pub waiter: String,
+    /// Client currently holding the resource
+    pub holder: String,
+    /// Resource being waited for
+    pub resource: String,
+    /// Milliseconds elapsed since the wait started (export-time relative)
+    pub wait_elapsed_ms: u64,
+}
+
+/// Portable wait-for graph snapshot for cross-process deadlock detection.
+///
+/// Exchange these between processes that share Redlock resources (over any
+/// bus you choose), then [`DeadlockDetector::merge_snapshot`] and
+/// [`DeadlockDetector::detect_deadlock`]. There is **no** built-in transport.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DeadlockGraphSnapshot {
+    /// Locks held in the source process's view
+    pub held: Vec<HeldLockSnapshot>,
+    /// Wait-for edges known to the source process
+    pub waits: Vec<WaitEdgeSnapshot>,
+    /// Optional identifier of the exporting process (for logging / debugging)
+    pub source_id: Option<String>,
+}
+
+fn client_id_to_string(id: &Bytes) -> String {
+    String::from_utf8_lossy(id).into_owned()
+}
+
+fn client_id_from_string(s: &str) -> Bytes {
+    Bytes::copy_from_slice(s.as_bytes())
 }
 
 impl LockInfo {
@@ -500,6 +557,139 @@ impl DeadlockDetector {
             .filter(|(_, info)| info.client_id == *client_id)
             .map(|(resource, _)| resource.clone())
             .collect()
+    }
+
+    // ── Cross-process snapshot export / merge ──────────────────────────────
+    //
+    // MVP: processes export their local wait-for graph, exchange snapshots
+    // out-of-band, and merge peer state so cycle detection spans processes
+    // that share Redlock resources. No transport or consensus is provided.
+
+    /// Export the current held locks and wait-for edges as a portable snapshot.
+    ///
+    /// Timestamps are converted to relative durations (`held_for_ms` /
+    /// `wait_elapsed_ms`) because [`Instant`] is not serializable.
+    /// `source_id` is left as `None`; callers may set it after export.
+    pub fn export_snapshot(&self) -> DeadlockGraphSnapshot {
+        let held = self.held_locks.read();
+        let graph = self.wait_graph.read();
+
+        let held_snaps: Vec<HeldLockSnapshot> = held
+            .values()
+            .map(|info| HeldLockSnapshot {
+                resource: info.resource.clone(),
+                client_id: client_id_to_string(&info.client_id),
+                ttl_ms: info.ttl_ms,
+                held_for_ms: info.timestamp.elapsed().as_millis() as u64,
+            })
+            .collect();
+
+        let wait_snaps: Vec<WaitEdgeSnapshot> = graph
+            .iter()
+            .map(|edge| WaitEdgeSnapshot {
+                waiter: client_id_to_string(&edge.waiter),
+                holder: client_id_to_string(&edge.holder),
+                resource: edge.resource.clone(),
+                wait_elapsed_ms: edge.timestamp.elapsed().as_millis() as u64,
+            })
+            .collect();
+
+        DeadlockGraphSnapshot {
+            held: held_snaps,
+            waits: wait_snaps,
+            source_id: None,
+        }
+    }
+
+    /// Merge a remote process's wait-for graph into this detector.
+    ///
+    /// Merge rules (MVP):
+    /// - **Held locks**: local ownership wins. A remote hold is inserted only
+    ///   when the resource is not already held locally.
+    /// - **Wait edges**: union by `(waiter, resource, holder)` — duplicates
+    ///   (including a second merge of the same snapshot) are ignored.
+    /// - Remote `waiting_for` entries are synthesised from new wait edges so
+    ///   stats stay consistent.
+    ///
+    /// After a mutual export/merge, [`Self::detect_deadlock`] can find cycles
+    /// that span multiple processes (e.g. P1 holds A waits B; P2 holds B
+    /// waits A).
+    ///
+    /// # Limitations
+    /// - No automatic transport — callers exchange snapshots themselves.
+    /// - Not consensus: stale remote holds may linger until TTL cleanup.
+    /// - Relative timestamps are approximate (`Instant` reconstructed from
+    ///   elapsed ms at export time).
+    pub fn merge_snapshot(&self, remote: &DeadlockGraphSnapshot) {
+        let mut held = self.held_locks.write();
+        let mut waiting = self.waiting_for.write();
+        let mut graph = self.wait_graph.write();
+
+        // 1. Merge held locks — local wins on conflict.
+        for remote_hold in &remote.held {
+            if held.contains_key(&remote_hold.resource) {
+                continue;
+            }
+            let client_id = client_id_from_string(&remote_hold.client_id);
+            let held_for = Duration::from_millis(remote_hold.held_for_ms);
+            // Reconstruct an Instant approximately held_for ago.
+            let timestamp = Instant::now()
+                .checked_sub(held_for)
+                .unwrap_or_else(Instant::now);
+            held.insert(
+                remote_hold.resource.clone(),
+                LockInfo {
+                    resource: remote_hold.resource.clone(),
+                    client_id,
+                    timestamp,
+                    ttl_ms: remote_hold.ttl_ms,
+                },
+            );
+        }
+
+        // 2. Union wait edges (dedupe waiter + resource + holder).
+        for remote_edge in &remote.waits {
+            let waiter = client_id_from_string(&remote_edge.waiter);
+            let holder = client_id_from_string(&remote_edge.holder);
+            let is_dup = graph.iter().any(|e| {
+                e.waiter == waiter
+                    && e.holder == holder
+                    && e.resource == remote_edge.resource
+            });
+            if is_dup {
+                continue;
+            }
+
+            let wait_elapsed = Duration::from_millis(remote_edge.wait_elapsed_ms);
+            let timestamp = Instant::now()
+                .checked_sub(wait_elapsed)
+                .unwrap_or_else(Instant::now);
+
+            // Keep waiting_for in sync for stats / long-wait reporting.
+            let already_waiting = waiting
+                .get(&waiter)
+                .map(|list| list.iter().any(|i| i.resource == remote_edge.resource))
+                .unwrap_or(false);
+            if !already_waiting {
+                waiting
+                    .entry(waiter.clone())
+                    .or_insert_with(Vec::new)
+                    .push(LockInfo {
+                        resource: remote_edge.resource.clone(),
+                        client_id: waiter.clone(),
+                        timestamp,
+                        // Use remaining max-wait budget as a soft TTL for the wait entry.
+                        ttl_ms: self.max_wait_time_ms,
+                    });
+            }
+
+            graph.push(WaitEdge {
+                waiter,
+                holder,
+                resource: remote_edge.resource.clone(),
+                timestamp,
+            });
+        }
     }
 
     // ── Async API ──────────────────────────────────────────────────────────
@@ -1051,5 +1241,171 @@ mod tests {
 
         handle.abort();
         let _ = handle.await;
+    }
+
+    // ── Cross-process snapshot merge (Batch DC) ────────────────────────────
+
+    /// Plant a half-cycle on each detector:
+    /// - det1: c1 holds A, c2 holds B (peer knowledge), c1 waits for B
+    /// - det2: c2 holds B, c1 holds A (peer knowledge), c2 waits for A
+    /// Neither has a full cycle alone; mutual merge reveals the deadlock.
+    fn plant_cross_process_half_cycles(
+        det1: &DeadlockDetector,
+        det2: &DeadlockDetector,
+    ) -> (Bytes, Bytes) {
+        let c1 = Bytes::from("xp-c1");
+        let c2 = Bytes::from("xp-c2");
+        let a = "xp-resource-a".to_string();
+        let b = "xp-resource-b".to_string();
+
+        // Process 1 partial view: holds A, knows c2 holds B, waits for B
+        det1.record_lock_acquired(a.clone(), c1.clone(), 10_000);
+        det1.record_lock_acquired(b.clone(), c2.clone(), 10_000);
+        det1.record_lock_wait(b.clone(), c1.clone(), 10_000);
+
+        // Process 2 partial view: holds B, knows c1 holds A, waits for A
+        det2.record_lock_acquired(b, c2.clone(), 10_000);
+        det2.record_lock_acquired(a, c1.clone(), 10_000);
+        det2.record_lock_wait("xp-resource-a".to_string(), c2.clone(), 10_000);
+
+        (c1, c2)
+    }
+
+    #[test]
+    fn test_cross_process_cycle_detected_after_snapshot_merge() {
+        let det1 = DeadlockDetector::new(5000, false);
+        let det2 = DeadlockDetector::new(5000, false);
+        let (c1, c2) = plant_cross_process_half_cycles(&det1, &det2);
+
+        // Neither process alone sees a cycle
+        assert!(
+            matches!(det1.detect_deadlock(), DeadlockStatus::NoDeadlock),
+            "process 1 half-cycle alone must not detect deadlock"
+        );
+        assert!(
+            matches!(det2.detect_deadlock(), DeadlockStatus::NoDeadlock),
+            "process 2 half-cycle alone must not detect deadlock"
+        );
+
+        // Mutual export / merge
+        let snap1 = det1.export_snapshot();
+        let snap2 = det2.export_snapshot();
+        assert_eq!(snap1.waits.len(), 1, "each half-cycle exports one wait edge");
+        assert_eq!(snap2.waits.len(), 1);
+
+        det1.merge_snapshot(&snap2);
+        det2.merge_snapshot(&snap1);
+
+        // Both should now detect a multi-client cycle
+        match det1.detect_deadlock() {
+            DeadlockStatus::Deadlock { cycle, resources } => {
+                assert!(cycle.len() >= 2);
+                assert!(
+                    cycle.contains(&c1) && cycle.contains(&c2),
+                    "cycle should involve both clients: {:?}",
+                    cycle
+                );
+                assert!(
+                    resources.iter().any(|r| r.contains("xp-resource")),
+                    "resources: {:?}",
+                    resources
+                );
+            }
+            DeadlockStatus::NoDeadlock => panic!("det1 should detect cycle after merge"),
+        }
+        match det2.detect_deadlock() {
+            DeadlockStatus::Deadlock { cycle, .. } => {
+                assert!(cycle.contains(&c1) && cycle.contains(&c2));
+            }
+            DeadlockStatus::NoDeadlock => panic!("det2 should detect cycle after merge"),
+        }
+    }
+
+    #[test]
+    fn test_merge_local_held_not_overwritten_by_remote() {
+        let local = DeadlockDetector::new(5000, false);
+        let remote = DeadlockDetector::new(5000, false);
+
+        let local_client = Bytes::from("local-owner");
+        let remote_client = Bytes::from("remote-owner");
+        let resource = "contested".to_string();
+
+        local.record_lock_acquired(resource.clone(), local_client.clone(), 10_000);
+        remote.record_lock_acquired(resource.clone(), remote_client.clone(), 10_000);
+
+        let snap = remote.export_snapshot();
+        assert_eq!(snap.held.len(), 1);
+        assert_eq!(snap.held[0].client_id, "remote-owner");
+
+        local.merge_snapshot(&snap);
+
+        let held = local.get_held_locks();
+        assert_eq!(held.len(), 1);
+        assert_eq!(
+            held[0].client_id, local_client,
+            "local ownership must win over remote claim for the same resource"
+        );
+        assert_eq!(held[0].resource, resource);
+    }
+
+    #[test]
+    fn test_merge_wait_edges_deduped_on_double_merge() {
+        let local = DeadlockDetector::new(5000, false);
+        let remote = DeadlockDetector::new(5000, false);
+
+        let c1 = Bytes::from("dedupe-c1");
+        let c2 = Bytes::from("dedupe-c2");
+
+        remote.record_lock_acquired("r-a".to_string(), c1.clone(), 10_000);
+        remote.record_lock_acquired("r-b".to_string(), c2.clone(), 10_000);
+        remote.record_lock_wait("r-b".to_string(), c1.clone(), 10_000);
+
+        let snap = remote.export_snapshot();
+        assert_eq!(snap.waits.len(), 1);
+
+        local.merge_snapshot(&snap);
+        let edges_after_first = local.get_stats().wait_graph_edges;
+        assert_eq!(edges_after_first, 1);
+
+        // Second merge of the same snapshot must not duplicate edges
+        local.merge_snapshot(&snap);
+        assert_eq!(
+            local.get_stats().wait_graph_edges,
+            edges_after_first,
+            "double merge must dedupe wait edges"
+        );
+
+        // Held from remote should still be present once
+        assert_eq!(local.get_held_locks().len(), 2);
+        local.merge_snapshot(&snap);
+        assert_eq!(
+            local.get_held_locks().len(),
+            2,
+            "double merge must not duplicate held locks"
+        );
+    }
+
+    #[test]
+    fn test_export_snapshot_roundtrip_fields() {
+        let det = DeadlockDetector::new(5000, false);
+        let c1 = Bytes::from("rt-c1");
+        let c2 = Bytes::from("rt-c2");
+        det.record_lock_acquired("rt-a".to_string(), c1.clone(), 8_000);
+        det.record_lock_acquired("rt-b".to_string(), c2.clone(), 8_000);
+        det.record_lock_wait("rt-b".to_string(), c1, 8_000);
+
+        let mut snap = det.export_snapshot();
+        snap.source_id = Some("proc-test".into());
+
+        assert_eq!(snap.held.len(), 2);
+        assert_eq!(snap.waits.len(), 1);
+        assert_eq!(snap.waits[0].waiter, "rt-c1");
+        assert_eq!(snap.waits[0].holder, "rt-c2");
+        assert_eq!(snap.waits[0].resource, "rt-b");
+        assert_eq!(snap.source_id.as_deref(), Some("proc-test"));
+
+        // All held resources present
+        let resources: HashSet<&str> = snap.held.iter().map(|h| h.resource.as_str()).collect();
+        assert!(resources.contains("rt-a") && resources.contains("rt-b"));
     }
 }
