@@ -88,11 +88,10 @@ impl IndexDefinition {
     ///
     /// This is the **single** FT.CREATE schema parser used by both the live
     /// command path (`FT.CREATE`) and AOF load, so PREFIX / SCHEMA / field
-    /// options (TEXT WEIGHT/SORTABLE, TAG SEPARATOR, VECTOR HNSW M, metrics)
-    /// cannot drift between the two.
+    /// options (TEXT WEIGHT/SORTABLE, TAG SEPARATOR, VECTOR HNSW M /
+    /// EF_CONSTRUCTION, metrics) cannot drift between the two.
     ///
-    /// HNSW `ef_construction` is not yet user-configurable via FT.CREATE; the
-    /// default (`200`) lives only here.
+    /// HNSW defaults: `M=16`, `EF_CONSTRUCTION=200` when omitted.
     pub fn from_ft_create_argv(argv: &[Bytes]) -> Result<IndexDefinition, String> {
         // Accept either full argv (`FT.CREATE` first) or args starting at the
         // index name (command-handler slice after the command token).
@@ -238,22 +237,44 @@ impl IndexDefinition {
                         "FLAT" => VectorAlgorithm::Flat,
                         "HNSW" => {
                             let mut m = 16usize;
-                            // Default only lives in this shared parser (not yet CLI-configurable).
                             const DEFAULT_EF_CONSTRUCTION: usize = 200;
-                            if i < args.len()
-                                && String::from_utf8_lossy(&args[i]).eq_ignore_ascii_case("M")
-                            {
-                                i += 1;
+                            let mut ef_construction = DEFAULT_EF_CONSTRUCTION;
+                            // Optional HNSW options: M <n> and/or EF_CONSTRUCTION <n>
+                            // (order-independent; stop at TYPE / unknown keyword).
+                            loop {
                                 if i >= args.len() {
-                                    return Err("ERR missing HNSW M value".into());
+                                    break;
                                 }
-                                m = parse_ft_usize(&args[i])
-                                    .ok_or_else(|| "ERR invalid HNSW M value".to_string())?;
-                                i += 1;
+                                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                                match opt.as_str() {
+                                    "M" => {
+                                        i += 1;
+                                        if i >= args.len() {
+                                            return Err("ERR missing HNSW M value".into());
+                                        }
+                                        m = parse_ft_usize(&args[i]).ok_or_else(|| {
+                                            "ERR invalid HNSW M value".to_string()
+                                        })?;
+                                        i += 1;
+                                    }
+                                    "EF_CONSTRUCTION" => {
+                                        i += 1;
+                                        if i >= args.len() {
+                                            return Err(
+                                                "ERR missing HNSW EF_CONSTRUCTION value".into(),
+                                            );
+                                        }
+                                        ef_construction = parse_ft_usize(&args[i]).ok_or_else(
+                                            || "ERR invalid HNSW EF_CONSTRUCTION value".to_string(),
+                                        )?;
+                                        i += 1;
+                                    }
+                                    _ => break,
+                                }
                             }
                             VectorAlgorithm::HNSW {
                                 m,
-                                ef_construction: DEFAULT_EF_CONSTRUCTION,
+                                ef_construction,
                             }
                         }
                         _ => {

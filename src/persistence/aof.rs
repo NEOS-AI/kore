@@ -125,10 +125,16 @@ fn encode_search_create_commands(cache: &Cache, buf: &mut Vec<u8>) {
                         VectorAlgorithm::Flat => {
                             args.push(Bytes::from_static(b"FLAT"));
                         }
-                        VectorAlgorithm::HNSW { m, .. } => {
+                        VectorAlgorithm::HNSW {
+                            m,
+                            ef_construction,
+                        } => {
                             args.push(Bytes::from_static(b"HNSW"));
                             args.push(Bytes::from_static(b"M"));
                             args.push(Bytes::from(m.to_string()));
+                            // Round-trip ef_construction (parser default 200 when omitted).
+                            args.push(Bytes::from_static(b"EF_CONSTRUCTION"));
+                            args.push(Bytes::from(ef_construction.to_string()));
                         }
                     }
                     args.push(Bytes::from_static(b"TYPE"));

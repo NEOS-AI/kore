@@ -376,18 +376,19 @@ Also tracked in `docs/roadmap.md`.
 - [ ] **`[P2]`** **Code review (BZ nit):** raw `DbSnapshot::load_into` / `MultiDbSnapshot::load_into_*` still leave partial state on `Err` if called directly
   - *Found*: production paths use `load_bytes` / `load_databases_bytes` / AOF `load_into_*` wrappers (scratch-load after CB). Direct `load_into` remains non-transactional.
   - *Fix*: document wrappers as the only supported load API; or route raw `load_into` through scratch as well.
-- [ ] **`[P2]`** **Code review (BY nit):** no HNSW `M` / `ef_construction` RDB round-trip test (FLAT covered in `by_rdb_ft_section_test`; RDB encoder already writes both HNSW params)
+- [x] **`[P2]`** **Code review (BY nit):** no HNSW `M` / `ef_construction` RDB round-trip test (FLAT covered in `by_rdb_ft_section_test`; RDB encoder already writes both HNSW params)
+  - *Done (Batch CE)*: `tests/ce_acl_search_hnsw_test.rs` — FT.CREATE HNSW M+EF_CONSTRUCTION, RDB save/load preserves both
 - [ ] **`[P2]`** **Code review (BY nit):** RDB FT mutator errors always `Error::InvalidArgument` — align with AOF `map_ft_mutator_error` (OOM → `OutOfMemory`) if search layer can return OOM on create
-- [ ] **`[P2]`** ACL `@search` category for FT.* (fine-grained users; default `+@all` unaffected)
+- [x] **`[P2]`** ACL `@search` category for FT.* (fine-grained users; default `+@all` unaffected)
+  - *Done (Batch CE)*: `@search` in `category_names` / `category_commands`; FT read/write also under `@read`/`@write`; `+@all` expands via `all_known_commands`. Tests: `tests/ce_acl_search_hnsw_test.rs`
 - [ ] **`[P2]`** HNSW correctness/performance benchmarks vs FLAT
 - [ ] **`[P2]`** **Code review (BT nit):** optional single critical section for `get_index` resolve+lookup; min-replicas FT test
 - [x] **`[P2]`** **Code review (BU):** share one FT.CREATE parser between command path and AOF load
   - *Found*: `parse_ft_create_definition` in `aof.rs` duplicates `handle_ft_create` in `commands/search.rs` — schema options can drift (already two HNSW option loops)
   - *Done (Batch CA)*: shared `IndexDefinition::from_ft_create_argv` / `from_ft_create_args` in `search_index.rs`; command path + AOF load both call it (single `ef_construction` default 200). Tests: unit in `search_index`, `tests/ca_shared_ft_create_parser_test.rs`
-- [ ] **`[P2]`** **Code review (BU):** HNSW `ef_construction` not round-tripped in AOF rewrite
+- [x] **`[P2]`** **Code review (BU):** HNSW `ef_construction` not round-tripped in AOF rewrite
   - *Found*: rewrite emits `HNSW M <n>` only; load hardcodes `ef_construction: 200` (command path also hardcodes 200 / unused `mut`)
-  - *Fix*: when EF becomes configurable, encode/parse `EF_CONSTRUCTION` and store on `VectorAlgorithm::HNSW`
-  - *Note (BY)*: RDB v5 already persists `ef_construction` on HNSW fields; AOF path still lags
+  - *Done (Batch CE)*: parse `EF_CONSTRUCTION` in shared FT.CREATE parser (order-independent with `M`); AOF rewrite emits `EF_CONSTRUCTION`; default 200 when omitted. Tests: `ce_acl_search_hnsw_test` + CA rewrite asserts.
 - [x] **`[P2]`** **Code review (BU nit):** VECTOR/NUMERIC AOF rewrite round-trip test; `has_search_state` can avoid double list locks
   - *Done (Batch BX, partial)*: VECTOR/NUMERIC rewrite round-trip in `tests/bu_aof_ft_rewrite_test.rs`; `has_search_state` double-list lock still open
 - [x] **`[P2]`** **Code review (BV):** AOF load is not transactional on FT failure
@@ -478,7 +479,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batch CD shipped** (atomic WATCH install+bump, pre-flush touch, expire cycle lock for pause, typed export skips expired). **Next:** ACL `@search`; HNSW AOF/`ef_construction` + RDB round-trip; multi-DB atomic install (still partial); remaining BZ/CB nits.
+Prioritized for next letter batch(es). **Batch CE shipped** (ACL `@search`; HNSW `EF_CONSTRUCTION` parse + AOF/RDB round-trip). **Next:** multi-DB atomic install (P1 partial); BZ nits (flush=false FT merge, mid-fail assert, raw load_into); remaining CB nits (loadfactor, expand tests).
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -501,9 +502,9 @@ Prioritized for next letter batch(es). **Batch CD shipped** (atomic WATCH instal
 | P2 | FT RDB section | done (BY) |
 | P2 | RDB load wipe-on-FT-failure (mirror AOF BW) | done (BZ) |
 | P2 | RDB `flush=false` FT merge / name-clash semantics | open (Err preserves after CB) |
-| P2 | ACL `@search` | open |
+| P2 | ACL `@search` | done (CE) |
 | P2 | Shared FT.CREATE parser (cmd + AOF load) | done (CA) |
-| P2 | HNSW `ef_construction` AOF round-trip | open (RDB done in BY) |
+| P2 | HNSW `ef_construction` AOF round-trip | done (CE) |
 | P2 | AOF load all-or-nothing on FT failure (BV review) | done (BW) |
 | P2 | FLUSHDB vs FT schema (BW: flush clears indices) | done (BX) |
 | P2 | Scratch-load swap if AOF/RDB load targets non-empty DB | done (CB) |
@@ -516,7 +517,7 @@ Prioritized for next letter batch(es). **Batch CD shipped** (atomic WATCH instal
 | P2 | CB second-pass: empty_keyspace_like hardcodes loadfactor 0.75 | open |
 | P2 | `get_index` atomic resolve; min-replicas FT test | open |
 | P2 | VECTOR/NUMERIC rewrite tests | done (BX) |
-| P2 | HNSW RDB round-trip test | open |
+| P2 | HNSW RDB round-trip test | done (CE) |
 | P2 | RDB FT OOM → OutOfMemory map | open |
 | P2 | BZ mid-fail test: tighten InvalidArgument assert | open |
 | P2 | raw load_into non-transactional (wrappers are safe) | open |

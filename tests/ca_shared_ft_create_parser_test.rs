@@ -176,8 +176,12 @@ fn shared_parser_hnsw_matches_command_and_aof_load() {
     aof::rewrite_databases(&databases, &path).unwrap();
     let text = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
     assert!(
-        text.contains("HNSW") && text.contains("M") && text.contains("24"),
-        "rewrite must emit HNSW M; got:\n{text}"
+        text.contains("HNSW")
+            && text.contains("M")
+            && text.contains("24")
+            && text.contains("EF_CONSTRUCTION")
+            && text.contains("200"),
+        "rewrite must emit HNSW M + EF_CONSTRUCTION; got:\n{text}"
     );
 
     let loaded = make_databases();

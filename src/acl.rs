@@ -706,6 +706,7 @@ pub fn category_names() -> &'static [&'static str] {
         "connection",
         "transaction",
         "scripting",
+        "search",
         "all",
     ]
 }
@@ -731,6 +732,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "geopos", "geodist", "geohash", "geosearch", "georadius_ro", "georadiusbymember_ro", "info", "role", "lastsave", "object",
             "memory", "dump", "strlen", "getbit", "bitcount", "bitpos", "bitfield_ro", "pfcount", "time", "sort", "lolwut",
             "eval_ro", "evalsha_ro",
+            "ft.search", "ft.info", "ft._list", "ft.tagvals",
         ],
         "write" => &[
             "set", "del", "mset", "msetnx", "append", "setrange", "setex", "psetex", "getset", "unlink", "rename", "renamenx",
@@ -744,6 +746,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "xadd", "xdel", "xtrim", "xgroup", "xack", "xreadgroup", "xclaim", "xautoclaim", "xsetid",
             "geoadd", "geosearchstore", "georadius", "georadiusbymember", "flushdb", "flushall", "swapdb",
             "setbit", "bitop", "bitfield", "pfadd", "pfmerge",
+            "ft.create", "ft.dropindex", "ft.aliasadd", "ft.aliasdel", "ft.aliasupdate",
         ],
         "admin" => &[
             "acl", "config", "save", "bgsave", "bgrewriteaof", "lastsave", "replicaof", "slaveof",
@@ -805,6 +808,18 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
         ],
         "transaction" => &["multi", "exec", "discard", "watch", "unwatch"],
         "scripting" => &["eval", "eval_ro", "evalsha", "evalsha_ro", "script"],
+        // RediSearch-style FT.* category (also listed under @read / @write).
+        "search" => &[
+            "ft.create",
+            "ft.dropindex",
+            "ft._list",
+            "ft.info",
+            "ft.search",
+            "ft.tagvals",
+            "ft.aliasadd",
+            "ft.aliasdel",
+            "ft.aliasupdate",
+        ],
         "fast" | "slow" | "blocking" => &[],
         _ => return Err(format!("ERR Unknown category '{}'", cat)),
     };
@@ -832,6 +847,7 @@ fn all_known_commands() -> Vec<String> {
         "keyspace",
         "dangerous",
         "scripting",
+        "search",
     ] {
         if let Ok(cmds) = category_commands(cat) {
             set.extend(cmds);
