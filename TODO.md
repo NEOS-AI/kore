@@ -396,8 +396,17 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** HNSW graph-based search (Batch CQ)
   - *Done (Batch CQ)*: `HNSWIndex::search` walks layer-0 neighbor edges (SEARCH-LAYER) with `ef_search`; `add` selects neighbors **before** inserting the vector (no self-loops); simple M-prune on reverse edges. Multi-layer insert still simplified (all nodes on layer 0) — documented in code + `docs/benchmarks.md`.
   - *Tests*: `hnsw_top1_matches_flat_on_small_set` (kept); `hnsw_search_follows_edges_not_full_scan` (fails under full-scan); `hnsw_add_excludes_self_from_neighbors`; `hnsw_graph_has_edges_after_inserts`.
+- [x] **`[P2]`** **Code review (CQ post-ship):** HNSW `remove` leaves stale graph edges
+  - *Found*: `remove` deleted the vector (and may reassign `entry_point` via arbitrary `keys().next()`) but did **not** remove the node from the layer map, strip reverse edges, or repair bridges. Re-`add` of the same id used `or_insert` and could **revive stale neighbor lists**.
+  - *Done (Batch CS)*: `remove` unlinks reverse edges + drops layer entry; `add_node` always resets neighbor list; `pick_entry_point` prefers a remaining node with edges. Tests: `hnsw_remove_middle_unlinks_graph`, `hnsw_remove_entry_reassigns`, `hnsw_remove_readd_clears_stale_neighbors`.
+- [x] **`[P2]`** **Code review (CQ post-ship):** M-prune can make new nodes unreachable from entry
+  - *Found*: after bidirectional connect, prune rewrote only each neighbor’s **outgoing** list. With small `M`, reverse edges `neighbor → new` could all be dropped — search from entry never visited the new node.
+  - *Done (Batch CS)*: layer-0 `M_max ≈ 2M`; `prune_neighbors_keeping` force-keeps reverse edge to the new node. Test: `hnsw_insert_preserves_reachability_from_entry` (BFS + self-search).
+- [x] **`[P2]`** **Code review (CQ post-ship):** update-in-place does not rewire graph
+  - *Found*: existing-id `add` replaced the vector only; old neighbor wiring remained — queries near the new location could miss the node.
+  - *Done (Batch CS)*: existing-id `add` unlinks then re-inserts (full neighbor reselection). Test: `hnsw_update_rewires_graph` (large vector move).
 - [ ] **`[P2]`** HNSW recall@k / throughput numbers vs FLAT
-  - *Partial*: methodology table in `docs/benchmarks.md`; graph search correctness gated by unit tests (CQ). Full recall@k on larger N + measured throughput still TBD.
+  - *Partial*: methodology table in `docs/benchmarks.md`; graph search + connectivity gated by unit tests (CQ/CS). Full recall@k on larger N + measured throughput still TBD.
 - [x] **`[P2]`** **Code review (CP post-ship):** HNSW search does not use the graph
   - *Found*: `search` full-scanned `self.vectors`; `ef_search` unused; `add` could connect self as neighbor.
   - *Done (Batch CQ)*: graph SEARCH-LAYER + self-exclude on connect; discriminating edge-walk test.
@@ -524,7 +533,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batch CR shipped** (deny `SYNC`/`PSYNC` during LOADING replace; allowlist documented; CQ HNSW graph search kept). **Open:** HNSW recall@k / throughput numbers; optional structured JSON logging; advanced deadlock features (roadmap); standing “tests for the phase” P0; optional peak-RSS automation.
+Prioritized for next letter batch(es). **Batch CS shipped** (HNSW remove unlinks graph, insert reachability via `M_max≈2M` + force-keep reverse edge, update-in-place rewires). **Open:** HNSW recall@k / throughput numbers; optional structured JSON logging; advanced deadlock features (roadmap); standing “tests for the phase” P0; optional peak-RSS automation.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -565,7 +574,10 @@ Prioritized for next letter batch(es). **Batch CR shipped** (deny `SYNC`/`PSYNC`
 | P2 | CB: optional alias-target validate on search `install` | done (CF debug_assert) |
 | P2 | CB post-ship: expand tests (memory, multi-DB, TTL, pubsub, seed, peak) | done (CP) |
 | P2 | HNSW graph search (ef_search; self-exclude; edge-walk tests) | done (CQ) |
-| P2 | HNSW recall@k / throughput numbers vs FLAT | open (methodology + CQ correctness; numbers TBD) |
+| P2 | CQ post-ship: HNSW remove unlinks graph + re-add clears neighbors | done (CS) |
+| P2 | CQ post-ship: insert M-prune preserves reachability from entry | done (CS) |
+| P2 | CQ post-ship: update-in-place rewire or document | done (CS) |
+| P2 | HNSW recall@k / throughput numbers vs FLAT | open (methodology + CQ/CS correctness; numbers TBD) |
 | P2 | CP post-ship: LOADING allowlist PSYNC/SYNC mid-install visibility | done (CR) |
 | P2 | CC post-ship: typed export skip expired keys (no revive without TTL) | done (CD) |
 | P2 | CC nit: unify start_background_sweep create paths | done (CD) |

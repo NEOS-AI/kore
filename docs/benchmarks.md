@@ -137,12 +137,18 @@ comparison:
    - `hnsw_top1_matches_flat_on_small_set` (tiny N; graph search should still match FLAT)
    - `hnsw_search_follows_edges_not_full_scan` (fails if search ignores edges)
    - `hnsw_add_excludes_self_from_neighbors`
+   - `hnsw_remove_middle_unlinks_graph` / `hnsw_remove_entry_reassigns` / `hnsw_remove_readd_clears_stale_neighbors` (Batch CS)
+   - `hnsw_insert_preserves_reachability_from_entry` (Batch CS; small M, BFS + self-search)
+   - `hnsw_update_rewires_graph` (Batch CS; large vector move)
 
-**Implementation note (Batch CQ):** `HNSWIndex::search` walks neighbor edges
+**Implementation note (Batch CQ + CS):** `HNSWIndex::search` walks neighbor edges
 (SEARCH-LAYER) with candidate list size `ef_search` (defaults to
 `ef_construction`). Insert still assigns all nodes to **layer 0** only
-(multi-layer assignment simplified). This is approximate ANN and may not match
-full RedisSearch HNSW; use FLAT for exact recall baselines. Brute-force over
+(multi-layer assignment simplified). Layer-0 prune uses `M_max ≈ 2M` and
+force-keeps a reverse edge to each new node so inserts stay reachable from
+`entry_point`. `remove` unlinks reverse edges; existing-id `add` rewires
+(remove + re-insert). This is approximate ANN and may not match full
+RedisSearch HNSW; use FLAT for exact recall baselines. Brute-force over
 `vectors` remains only as a defensive fallback when the entry-point vector is
 missing.
 

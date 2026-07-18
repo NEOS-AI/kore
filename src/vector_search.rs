@@ -25,8 +25,12 @@ impl HNSWLayer {
         }
     }
 
+    /// Insert or reset a node with an empty neighbor list.
+    ///
+    /// Always clears edges so a re-`add` of the same id cannot revive stale
+    /// neighbors left behind by a prior life (Batch CS).
     fn add_node(&mut self, node_id: Bytes) {
-        self.neighbors.entry(node_id).or_insert_with(Vec::new);
+        self.neighbors.insert(node_id, Vec::new());
     }
 
     /// Add a directed edge, skipping self-loops and duplicates.
@@ -46,6 +50,14 @@ impl HNSWLayer {
 
     fn set_neighbors(&mut self, node_id: Bytes, neighbors: Vec<Bytes>) {
         self.neighbors.insert(node_id, neighbors);
+    }
+
+    /// Drop every directed edge that points at `node_id` (and the node entry).
+    fn unlink_node(&mut self, node_id: &Bytes) {
+        for edges in self.neighbors.values_mut() {
+            edges.retain(|n| n != node_id);
+        }
+        self.neighbors.remove(node_id);
     }
 }
 
@@ -131,6 +143,10 @@ impl PartialOrd for MaxCand {
 /// **Batch CQ:** query search walks neighbor edges (SEARCH-LAYER) with candidate list
 /// size `ef_search`. Insert still assigns all nodes to **layer 0** only (multi-layer
 /// assignment is simplified); edges on that layer are real and used at query time.
+///
+/// **Batch CS:** `remove` unlinks reverse edges and clears the layer entry; insert uses
+/// layer-0 `M_max ≈ 2M` and force-keeps at least one reverse edge so new nodes stay
+/// reachable from `entry_point`; existing-id `add` rewires (remove + re-insert).
 /// This is approximate ANN, not a full RedisSearch HNSW port.
 #[derive(Debug)]
 pub struct HNSWIndex {
@@ -163,15 +179,25 @@ impl HNSWIndex {
         }
     }
 
+    /// Max outgoing edges kept after prune. Layer 0 uses `≈ 2M` (classic HNSW
+    /// `M_max0`) so reverse links survive better under degree caps.
+    fn max_edges(&self, layer: usize) -> usize {
+        if layer == 0 {
+            self.m.saturating_mul(2).max(self.m)
+        } else {
+            self.m
+        }
+    }
+
     /// Add a vector to the index.
     ///
     /// Neighbors are selected via graph search **before** the vector is stored, so the
-    /// new node is never chosen as its own neighbor. Existing IDs only update the vector.
+    /// new node is never chosen as its own neighbor. Existing IDs rewire the graph
+    /// (unlink old edges, re-select neighbors for the new vector).
     pub fn add(&mut self, doc_id: Bytes, vector: Vec<f32>) {
-        // Update-in-place for existing documents (keep graph wiring).
+        // Update-in-place: full graph rewire so queries near the new location work.
         if self.vectors.contains_key(&doc_id) {
-            self.vectors.insert(doc_id, vector);
-            return;
+            self.remove(&doc_id);
         }
 
         // Simplified multi-layer: all nodes live on layer 0.
@@ -181,7 +207,7 @@ impl HNSWIndex {
         }
 
         // First node becomes the entry point; no edges yet.
-        if self.entry_point.is_none() {
+        if self.entry_point.is_none() || self.vectors.is_empty() {
             self.layers[layer].add_node(doc_id.clone());
             self.vectors.insert(doc_id.clone(), vector);
             self.entry_point = Some(doc_id);
@@ -197,27 +223,65 @@ impl HNSWIndex {
         let candidates = self.search_layer(&vector, &entry, ef, layer);
         let neighbors = Self::select_top_m(candidates, self.m);
 
-        // Insert vector + node, then bidirectional edges (no self-loops).
+        // Insert vector + node (empty neighbor list — no stale revive), then edges.
         self.vectors.insert(doc_id.clone(), vector);
         self.layers[layer].add_node(doc_id.clone());
 
+        let max_m = self.max_edges(layer);
         for neighbor in &neighbors {
             debug_assert_ne!(neighbor, &doc_id, "neighbor selection must exclude self");
             self.layers[layer].add_edge(doc_id.clone(), neighbor.clone());
             self.layers[layer].add_edge(neighbor.clone(), doc_id.clone());
-            // Cap degree on the existing neighbor (simple M-prune, not full HNSW heuristic).
-            self.prune_neighbors(neighbor, layer, self.m);
+            // Cap degree on the existing neighbor; force-keep reverse edge to the
+            // new node so it remains reachable from entry via outgoing walks.
+            self.prune_neighbors_keeping(neighbor, layer, max_m, Some(&doc_id));
         }
-        self.prune_neighbors(&doc_id, layer, self.m);
+        self.prune_neighbors_keeping(&doc_id, layer, max_m, None);
     }
 
-    /// Remove a vector from the index
+    /// Remove a vector and fully unlink it from the HNSW graph.
+    ///
+    /// Strips reverse edges, removes the node from every layer map, and reassigns
+    /// `entry_point` when needed (prefer a remaining node that still has edges).
     pub fn remove(&mut self, doc_id: &Bytes) {
-        self.vectors.remove(doc_id);
-        // Note: In a full implementation, we'd also clean up the graph connections
-        if self.entry_point.as_ref() == Some(doc_id) {
-            self.entry_point = self.vectors.keys().next().cloned();
+        if !self.vectors.contains_key(doc_id) {
+            // Still scrub any orphaned layer residue (defensive).
+            for layer in &mut self.layers {
+                layer.unlink_node(doc_id);
+            }
+            if self.entry_point.as_ref() == Some(doc_id) {
+                self.entry_point = self.pick_entry_point();
+            }
+            return;
         }
+        self.vectors.remove(doc_id);
+        for layer in &mut self.layers {
+            layer.unlink_node(doc_id);
+        }
+        if self.entry_point.as_ref() == Some(doc_id) {
+            self.entry_point = self.pick_entry_point();
+        }
+    }
+
+    /// Choose a new entry point among remaining vectors; prefer one with edges.
+    fn pick_entry_point(&self) -> Option<Bytes> {
+        if self.vectors.is_empty() {
+            return None;
+        }
+        let layer0 = self.layers.first();
+        let mut fallback: Option<Bytes> = None;
+        for id in self.vectors.keys() {
+            let has_edges = layer0
+                .map(|l| !l.get_neighbors(id).is_empty())
+                .unwrap_or(false);
+            if has_edges {
+                return Some(id.clone());
+            }
+            if fallback.is_none() {
+                fallback = Some(id.clone());
+            }
+        }
+        fallback
     }
 
     /// Search for k nearest neighbors by walking the HNSW graph (layer 0).
@@ -341,14 +405,21 @@ impl HNSWIndex {
     }
 
     /// Keep at most `max_m` nearest neighbors of `node_id` (by distance to that node).
-    fn prune_neighbors(&mut self, node_id: &Bytes, layer: usize, max_m: usize) {
+    ///
+    /// When `must_keep` is set, that neighbor is always retained (evicting the
+    /// furthest other edge if needed). Used so reverse edges `neighbor → new`
+    /// survive prune and the new node stays reachable from `entry_point`.
+    fn prune_neighbors_keeping(
+        &mut self,
+        node_id: &Bytes,
+        layer: usize,
+        max_m: usize,
+        must_keep: Option<&Bytes>,
+    ) {
         let Some(layer_ref) = self.layers.get(layer) else {
             return;
         };
         let neighbors = layer_ref.get_neighbors(node_id);
-        if neighbors.len() <= max_m {
-            return;
-        }
         let Some(node_vec) = self.vectors.get(node_id).cloned() else {
             return;
         };
@@ -362,11 +433,53 @@ impl HNSWIndex {
                     .map(|v| (n, self.compute_distance(&node_vec, v)))
             })
             .collect();
+
+        // Ensure must_keep is present even if it was somehow missing.
+        if let Some(keep) = must_keep {
+            if keep != node_id
+                && self.vectors.contains_key(keep)
+                && !scored.iter().any(|(id, _)| id == keep)
+            {
+                if let Some(v) = self.vectors.get(keep) {
+                    let dist = self.compute_distance(&node_vec, v);
+                    scored.push((keep.clone(), dist));
+                }
+            }
+        }
+
+        if scored.len() <= max_m {
+            // Still rewrite if we had to re-add must_keep or clean self-loops.
+            if let Some(layer_mut) = self.layers.get_mut(layer) {
+                let kept: Vec<Bytes> = scored.into_iter().map(|(id, _)| id).collect();
+                layer_mut.set_neighbors(node_id.clone(), kept);
+            }
+            return;
+        }
+
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
         // Dedup by id (keep first = closest)
         let mut seen = HashSet::new();
         scored.retain(|(id, _)| seen.insert(id.clone()));
-        let kept: Vec<Bytes> = scored.into_iter().take(max_m).map(|(id, _)| id).collect();
+
+        let mut kept: Vec<Bytes> = scored
+            .iter()
+            .take(max_m)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        if let Some(keep) = must_keep {
+            if keep != node_id
+                && self.vectors.contains_key(keep)
+                && !kept.iter().any(|id| id == keep)
+            {
+                // Force-keep: drop furthest of the current set, then push keep.
+                if kept.len() >= max_m {
+                    kept.pop();
+                }
+                kept.push(keep.clone());
+            }
+        }
+
         if let Some(layer_mut) = self.layers.get_mut(layer) {
             layer_mut.set_neighbors(node_id.clone(), kept);
         }
@@ -759,5 +872,250 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Batch CS: remove unlinks reverse edges and drops the layer entry.
+    #[test]
+    fn hnsw_remove_middle_unlinks_graph() {
+        let mut index = HNSWIndex::new(4, 32, DistanceMetric::L2);
+        index.add(Bytes::from("a"), vec![0.0, 0.0]);
+        index.add(Bytes::from("b"), vec![1.0, 0.0]);
+        index.add(Bytes::from("c"), vec![2.0, 0.0]);
+
+        // Force a chain a <-> b <-> c so b is a bridge.
+        for layer in &mut index.layers {
+            for (_id, neigh) in layer.neighbors.iter_mut() {
+                neigh.clear();
+            }
+        }
+        let layer = &mut index.layers[0];
+        layer.add_edge(Bytes::from("a"), Bytes::from("b"));
+        layer.add_edge(Bytes::from("b"), Bytes::from("a"));
+        layer.add_edge(Bytes::from("b"), Bytes::from("c"));
+        layer.add_edge(Bytes::from("c"), Bytes::from("b"));
+        index.entry_point = Some(Bytes::from("a"));
+
+        index.remove(&Bytes::from("b"));
+
+        assert!(!index.vectors.contains_key(&Bytes::from("b")));
+        assert!(
+            !index.layers[0].neighbors.contains_key(&Bytes::from("b")),
+            "removed id must leave the layer map"
+        );
+        for (id, neighs) in &index.layers[0].neighbors {
+            assert!(
+                !neighs.iter().any(|n| n == &Bytes::from("b")),
+                "stale reverse edge to b from {:?}",
+                id
+            );
+        }
+        // Survivors still present.
+        assert!(index.vectors.contains_key(&Bytes::from("a")));
+        assert!(index.vectors.contains_key(&Bytes::from("c")));
+    }
+
+    /// Batch CS: removing the entry point reassigns to a remaining vector.
+    #[test]
+    fn hnsw_remove_entry_reassigns() {
+        let mut index = HNSWIndex::new(4, 32, DistanceMetric::L2);
+        index.add(Bytes::from("entry"), vec![0.0, 0.0]);
+        index.add(Bytes::from("other"), vec![1.0, 0.0]);
+        index.add(Bytes::from("third"), vec![2.0, 0.0]);
+        assert_eq!(index.entry_point, Some(Bytes::from("entry")));
+
+        index.remove(&Bytes::from("entry"));
+
+        let ep = index
+            .entry_point
+            .clone()
+            .expect("entry_point must be reassigned");
+        assert_ne!(ep, Bytes::from("entry"));
+        assert!(
+            index.vectors.contains_key(&ep),
+            "new entry_point must still be in vectors"
+        );
+        assert!(!index.vectors.contains_key(&Bytes::from("entry")));
+        assert!(
+            !index.layers[0].neighbors.contains_key(&Bytes::from("entry")),
+            "old entry must leave layer map"
+        );
+
+        // Empty index clears entry.
+        index.remove(&Bytes::from("other"));
+        index.remove(&Bytes::from("third"));
+        assert!(index.entry_point.is_none());
+        assert!(index.vectors.is_empty());
+    }
+
+    /// Batch CS: remove + re-add same id must not revive stale neighbors.
+    #[test]
+    fn hnsw_remove_readd_clears_stale_neighbors() {
+        let mut index = HNSWIndex::new(4, 32, DistanceMetric::L2);
+        index.add(Bytes::from("a"), vec![0.0, 0.0]);
+        index.add(Bytes::from("b"), vec![1.0, 0.0]);
+        index.add(Bytes::from("c"), vec![2.0, 0.0]);
+
+        // Plant a stale neighbor list for "ghost" that is not in vectors.
+        // Simulate pre-CS remove that left layer residue, then re-add.
+        index.layers[0].set_neighbors(
+            Bytes::from("ghost"),
+            vec![Bytes::from("a"), Bytes::from("b"), Bytes::from("stale")],
+        );
+        // Pre-condition: or_insert-style add_node would keep these.
+        assert_eq!(
+            index.layers[0].get_neighbors(&Bytes::from("ghost")).len(),
+            3
+        );
+
+        // Real remove path (ghost not in vectors) still scrubs residue.
+        index.remove(&Bytes::from("ghost"));
+        assert!(!index.layers[0].neighbors.contains_key(&Bytes::from("ghost")));
+
+        // Re-add ghost: neighbor list must start empty then get fresh edges.
+        index.add(Bytes::from("ghost"), vec![10.0, 0.0]);
+        let neighs = index.layers[0].get_neighbors(&Bytes::from("ghost"));
+        assert!(
+            !neighs.iter().any(|n| n == &Bytes::from("stale")),
+            "stale neighbor must not revive on re-add: {:?}",
+            neighs
+        );
+        // Fresh insert should connect to real neighbors only.
+        for n in &neighs {
+            assert!(
+                index.vectors.contains_key(n),
+                "neighbor {:?} must exist in vectors",
+                n
+            );
+        }
+        // And no reverse edge should point at a non-existent id.
+        for (id, ns) in &index.layers[0].neighbors {
+            for n in ns {
+                assert!(
+                    index.vectors.contains_key(n),
+                    "edge {:?} → {:?} targets missing vector",
+                    id,
+                    n
+                );
+            }
+        }
+    }
+
+    /// Batch CS: small M + many inserts — every id reachable from entry.
+    #[test]
+    fn hnsw_insert_preserves_reachability_from_entry() {
+        // Small M stresses prune; M_max0=2M + force-keep reverse should still
+        // leave every node reachable via outgoing walks from entry.
+        let mut index = HNSWIndex::new(2, 16, DistanceMetric::L2);
+        let n = 40;
+        for i in 0..n {
+            index.add(
+                Bytes::from(format!("n{i}")),
+                vec![i as f32, (i % 7) as f32],
+            );
+        }
+        assert_eq!(index.len(), n);
+
+        let entry = index
+            .entry_point
+            .clone()
+            .expect("non-empty index has entry_point");
+
+        // BFS over outgoing edges from entry must visit every vector id.
+        let mut seen: HashSet<Bytes> = HashSet::new();
+        let mut stack = vec![entry.clone()];
+        seen.insert(entry);
+        while let Some(cur) = stack.pop() {
+            for nb in index.layers[0].get_neighbors(&cur) {
+                if seen.insert(nb.clone()) {
+                    stack.push(nb);
+                }
+            }
+        }
+        for id in index.vectors.keys() {
+            assert!(
+                seen.contains(id),
+                "node {:?} unreachable from entry via outgoing edges (visited {})",
+                id,
+                seen.len()
+            );
+        }
+
+        // search(self-vector, k=1) returns self for every id (distance 0).
+        let snapshot: Vec<(Bytes, Vec<f32>)> = index
+            .vectors
+            .iter()
+            .map(|(id, v)| (id.clone(), v.clone()))
+            .collect();
+        for (id, vec) in snapshot {
+            let results = index.search(&vec, 1);
+            assert_eq!(
+                results.len(),
+                1,
+                "search must return a hit for {:?}",
+                id
+            );
+            assert_eq!(
+                results[0].doc_id, id,
+                "self-search must return self (got {:?}); indicates unreachability",
+                results[0].doc_id
+            );
+        }
+    }
+
+    /// Batch CS: existing-id add rewires so a large move is findable near the new loc.
+    #[test]
+    fn hnsw_update_rewires_graph() {
+        let mut index = HNSWIndex::new(3, 8, DistanceMetric::L2);
+        // Near-origin cluster.
+        for i in 0..15 {
+            index.add(
+                Bytes::from(format!("near{i}")),
+                vec![i as f32 * 0.1, 0.0],
+            );
+        }
+        // Far cluster around x=100.
+        for i in 0..15 {
+            index.add(
+                Bytes::from(format!("far{i}")),
+                vec![100.0 + i as f32 * 0.1, 0.0],
+            );
+        }
+        // Target starts near origin, then jumps to the far cluster.
+        index.add(Bytes::from("target"), vec![0.5, 0.0]);
+        index.add(Bytes::from("target"), vec![100.5, 0.0]);
+
+        assert_eq!(
+            index.vectors.get(&Bytes::from("target")),
+            Some(&vec![100.5, 0.0]),
+            "vector value must update"
+        );
+
+        // Query at the new location: rewired graph should rank target #1.
+        let results = index.search(&[100.5f32, 0.0], 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].doc_id,
+            Bytes::from("target"),
+            "after large move, self-query at new location must find target"
+        );
+
+        // Target should have at least one neighbor still in vectors (rewired, not orphaned).
+        let t_neighs = index.layers[0].get_neighbors(&Bytes::from("target"));
+        assert!(
+            !t_neighs.is_empty(),
+            "updated node should be re-connected"
+        );
+        // At least one reverse edge into target (reachable from someone).
+        let reverse: usize = index.layers[0]
+            .neighbors
+            .iter()
+            .filter(|(id, ns)| {
+                *id != &Bytes::from("target") && ns.iter().any(|n| n == &Bytes::from("target"))
+            })
+            .count();
+        assert!(
+            reverse > 0,
+            "at least one reverse edge must point at the rewired node"
+        );
     }
 }
