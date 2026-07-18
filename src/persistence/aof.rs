@@ -1140,7 +1140,10 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
 }
 
 /// Map FT mutator string errors to typed `Error` (OOM-ish → OutOfMemory).
-fn map_ft_mutator_error(msg: String) -> Error {
+///
+/// Shared by AOF apply and RDB `load_into` so OOM strings from the search
+/// layer surface as [`Error::OutOfMemory`] consistently.
+pub(crate) fn map_ft_mutator_error(msg: String) -> Error {
     // Search layer emits `"OOM: …"` (see account_search_index_write); match that
     // prefix rather than any substring containing the letters OOM.
     if msg.starts_with("OOM:") || msg.starts_with("OOM ") || msg == "OOM" {
@@ -1224,10 +1227,12 @@ pub fn load_into_databases(databases: &Databases, path: &Path) -> Result<usize> 
     match result {
         Ok(n) => {
             databases.with_autosweep_paused_all(|| {
+                // Dirty WATCH before replace. No multi-DB pre-flush: each DB is
+                // fully swapped by replace_keyspaces_from (mid-install panic
+                // leaves remaining DBs with pre-load data).
                 for db in databases.iter() {
                     db.touch_all_watch_keys();
                 }
-                databases.flush_all_including_search();
                 databases.replace_keyspaces_from(&scratch);
             });
             Ok(n)

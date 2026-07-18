@@ -386,11 +386,13 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch CF)*: rustdoc on raw `load_into` / `load_into_*` marks them non-transactional; public wrappers documented as the supported transactional/scratch-load APIs.
 - [x] **`[P2]`** **Code review (BY nit):** no HNSW `M` / `ef_construction` RDB round-trip test (FLAT covered in `by_rdb_ft_section_test`; RDB encoder already writes both HNSW params)
   - *Done (Batch CE)*: `tests/ce_acl_search_hnsw_test.rs` — FT.CREATE HNSW M+EF_CONSTRUCTION, RDB save/load preserves both
-- [ ] **`[P2]`** **Code review (BY nit):** RDB FT mutator errors always `Error::InvalidArgument` — align with AOF `map_ft_mutator_error` (OOM → `OutOfMemory`) if search layer can return OOM on create
+- [x] **`[P2]`** **Code review (BY nit):** RDB FT mutator errors always `Error::InvalidArgument` — align with AOF `map_ft_mutator_error` (OOM → `OutOfMemory`) if search layer can return OOM on create
+  - *Done (Batch CH)*: RDB `load_into` CREATE/ALIASADD use shared `aof::map_ft_mutator_error` (OOM prefix → `OutOfMemory`).
 - [x] **`[P2]`** ACL `@search` category for FT.* (fine-grained users; default `+@all` unaffected)
   - *Done (Batch CE)*: `@search` in `category_names` / `category_commands`; FT read/write also under `@read`/`@write`; `+@all` expands via `all_known_commands`. Tests: `tests/ce_acl_search_hnsw_test.rs`
 - [ ] **`[P2]`** HNSW correctness/performance benchmarks vs FLAT
-- [ ] **`[P2]`** **Code review (BT nit):** optional single critical section for `get_index` resolve+lookup; min-replicas FT test
+- [x] **`[P2]`** **Code review (BT nit):** optional single critical section for `get_index` resolve+lookup; min-replicas FT test
+  - *Done (Batch CH, partial)*: `get_index` holds aliases then indices for resolve+lookup. Min-replicas FT test still open.
 - [x] **`[P2]`** **Code review (BU):** share one FT.CREATE parser between command path and AOF load
   - *Found*: `parse_ft_create_definition` in `aof.rs` duplicates `handle_ft_create` in `commands/search.rs` — schema options can drift (already two HNSW option loops)
   - *Done (Batch CA)*: shared `IndexDefinition::from_ft_create_argv` / `from_ft_create_args` in `search_index.rs`; command path + AOF load both call it (single `ef_construction` default 200). Tests: unit in `search_index`, `tests/ca_shared_ft_create_parser_test.rs`
@@ -412,8 +414,10 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch CB)*: scratch-load + swap — AOF `load_into_*` and RDB `load_*_bytes` apply into empty (or merge-seeded) scratch; on `Ok` `replace_keyspace_from` / `replace_keyspaces_from`; on `Err` target untouched. Tests: `tests/cb_scratch_load_preserves_target_test.rs`; BW/BZ tests updated for preserve-on-Err semantics.
 - [x] **`[P2]`** **Code review (BW nit):** `map_ft_mutator_error` uses `msg.contains("OOM")` (substring); prefer exact/prefix match or typed errors from search layer
   - *Done (Batch BX)*: match `starts_with("OOM:")` / `starts_with("OOM ")` / exact `"OOM"` (search layer emits `"OOM: …"`)
-- [ ] **`[P2]`** **Code review (BX nit):** `has_search_state` still double-lists (indices + aliases locks); optional single snapshot API
-- [ ] **`[P2]`** **Code review (BX nit):** `clear_documents` does not adjust `MemoryTracker` Search bytes by itself — safe only because `flush` always `memory_tracker.reset()` afterward; document or pair with deallocate if reused outside flush
+- [x] **`[P2]`** **Code review (BX nit):** `has_search_state` still double-lists (indices + aliases locks); optional single snapshot API
+  - *Done (Batch CH)*: `SearchIndexManager::has_any_state` holds aliases+indices once; `Cache::has_search_state` uses it.
+- [x] **`[P2]`** **Code review (BX nit):** `clear_documents` does not adjust `MemoryTracker` Search bytes by itself — safe only because `flush` always `memory_tracker.reset()` afterward; document or pair with deallocate if reused outside flush
+  - *Done (Batch CH)*: rustdoc on `SearchIndexManager::clear_documents` documents MemoryTracker coupling (flush resets).
 - [x] **`[P1]`** **Code review (CB):** wire full keyspace swap under quiesce (not just sharded maps)
   - *Done (Batch CB)*: `Cache::empty_keyspace_like` / `replace_keyspace_from` move strings + sorted_sets + geo_sets + hashes/lists/sets/streams + typed_expires + watch_gens + search take/install + tracker keyspace counts + `memory_usage`; leave pubsub/stats/blockers/maxmemory. Scratch uses `start_sweep: false`; helpers document exclusive-access / load-time quiesce. `Databases::empty_like` / `replace_keyspaces_from` wrap per-DB swap.
 - [x] **`[P1]`** **Code review (CB):** keep `Cache.memory_usage` in sync with tracker on swap
@@ -429,9 +433,9 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch CC)*: `Cache::export_strings` + `DbSnapshot::from_cache` non-mutating (skip expired, no touch/lazy-delete/stats); save + seed share the same path. Tests: failed merge keeps expired for sweep, live key, zero unexpected cmd_get/hits/evicted_expired.
 - [ ] **`[P1]`** **Code review (CB post-ship):** multi-DB `replace_keyspaces_from` is not atomic across DBs
   - *Found*: commits one DB at a time; concurrent readers (FULLRESYNC) can see DB0 new + DB1 old; panic mid-loop leaves partial multi-DB commit.
-  - *Partial (Batch CC)*: whole replace loop under multi-DB autosweep pause; `flush=true` empties all DBs first then per-DB install — tear becomes DB0 new + DB1 empty (not old), still not atomic.
-  - *Partial (Batch CF)*: documented concurrent-reader intermediate-DB visibility + exclusive-access requirement; staged drain of **all** source DBs before any target install (panic while preparing later DBs leaves all targets intact; mid-install panic still partial). Multi-DB fail/success load tests in `tests/cf_multidb_replace_and_merge_test.rs`. True cross-DB atomic publish to concurrent readers still open (server-wide load barrier).
-  - *CF post-ship*: reconfirmed — install still per-DB; after `flush=true`, mid-install panic loses uninstalled DBs (targets already wiped). Optional: delay flush until after successful stage (peak-memory tradeoff).
+  - *Partial (Batch CC)*: whole replace loop under multi-DB autosweep pause.
+  - *Partial (Batch CF)*: staged drain of all sources before any target install; multi-DB tests.
+  - *Partial (Batch CH)*: multi-DB AOF/RDB commit **no longer pre-flushes** all DBs before install — mid-install panic leaves remaining DBs with **pre-load** data (not empty). Single-DB `load_bytes` still pre-flushes for peak memory. True cross-DB atomic publish to concurrent readers still open (server-wide load barrier / epoch).
 - [x] **`[P1]`** **Code review (CC post-ship):** WATCH bump not atomic with keyspace install (race window)
   - *Found*: `replace_keyspace_from` installs scratch `watch_gens` (usually empty) and releases the lock, then later bumps `pre_watch_keys`. Between those steps `watch_generation` can `or_insert(0)` so a client that WATCHed at gen 0 sees clean EXEC against new/empty data. On `flush=true` the clean window spans flush (which does not touch watch_gens) through end of replace.
   - *Done (Batch CD)*: under one `watch_gens` lock, install `other_watch` and bump all `pre_watch_keys`; AOF/RDB `flush=true` commit calls `touch_all_watch_keys` before flush. Tests: `tests/cd_watch_atomic_and_typed_export_test.rs`.
@@ -493,7 +497,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batch CG shipped** (FT merge schema_eq + alias target compare; CF equal-schema success path). **Open:** multi-DB true atomic publish (P1); remaining P2s (HNSW benches, RDB OOM map, test expansion, nits).
+Prioritized for next letter batch(es). **Batch CH shipped** (multi-DB no pre-flush on commit; RDB FT OOM map via shared helper; `has_any_state`; `get_index` dual-lock; clear_documents MemoryTracker docs). **Open:** true multi-DB atomic publish (P1 partial); HNSW benches; min-replicas FT test; CB expand-tests / drain failure-atomic leftovers.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -508,7 +512,7 @@ Prioritized for next letter batch(es). **Batch CG shipped** (FT merge schema_eq 
 | P1 | RDB load `flush=true` must wipe FT schema (BY×BX clash) | done (BZ) |
 | P1 | CB: full keyspace swap under quiesce (typed maps, expires, watch) | done (CB) |
 | P1 | CB: `Cache.memory_usage` + tracker paired install (no double-account) | done (CB) |
-| P1 | CB post-ship: multi-DB replace atomic / server-wide quiesce | partial (CF stage+docs; true atomic open) |
+| P1 | CB post-ship: multi-DB replace atomic / server-wide quiesce | partial (CH no pre-flush; true atomic open) |
 | P1 | CF post-ship: FT merge compare schema on name clash (not name-only skip) | done (CG) |
 | P1 | CF post-ship: FT alias merge compare targets on clash | done (CG) |
 | P1 | CB post-ship: bump `watch_gens` on keyspace replace | done (CC+CD) |
@@ -531,14 +535,14 @@ Prioritized for next letter batch(es). **Batch CG shipped** (FT merge schema_eq 
 | P2 | CC post-ship: typed export skip expired keys (no revive without TTL) | done (CD) |
 | P2 | CC nit: unify start_background_sweep create paths | done (CD) |
 | P2 | CB second-pass: empty_keyspace_like hardcodes loadfactor 0.75 | done (CF) |
-| P2 | `get_index` atomic resolve; min-replicas FT test | open |
+| P2 | `get_index` atomic resolve; min-replicas FT test | partial (CH get_index; min-replicas open) |
 | P2 | VECTOR/NUMERIC rewrite tests | done (BX) |
 | P2 | HNSW RDB round-trip test | done (CE) |
-| P2 | RDB FT OOM → OutOfMemory map | open |
+| P2 | RDB FT OOM → OutOfMemory map | done (CH) |
 | P2 | BZ mid-fail test: tighten InvalidArgument assert | done (CF) |
 | P2 | raw load_into non-transactional (wrappers are safe) | done (CF docs) |
-| P2 | `has_search_state` double-list lock nit | open |
-| P2 | `clear_documents` + MemoryTracker coupling (flush-only) | open |
+| P2 | `has_search_state` double-list lock nit | done (CH) |
+| P2 | `clear_documents` + MemoryTracker coupling (flush-only) | done (CH) |
 | P2 | OOM→OutOfMemory map; DROPINDEX/ALIASDEL missing tests | done (BW) |
 | P2 | `map_ft_mutator_error` OOM match hygiene | done (BX) |
 | P2 | Lua SELECT DB side-effect test | done (BT) |

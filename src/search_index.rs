@@ -859,11 +859,24 @@ impl SearchIndexManager {
     /// Clear documents from every index while keeping definitions and aliases.
     ///
     /// Used by FLUSHDB/FLUSHALL (RediSearch-style: keys/docs gone, schema remains).
+    ///
+    /// **Memory:** this does **not** adjust [`crate::memory::MemoryTracker`]
+    /// Search bytes. Callers that account search memory must reset or
+    /// deallocate separately — e.g. [`crate::cache::Cache::flush`] always
+    /// `memory_tracker.reset()` afterward. Safe only when paired that way.
     pub fn clear_documents(&self) {
         let indices = self.indices.read();
         for idx in indices.values() {
             idx.write().clear_documents();
         }
+    }
+
+    /// True if any index definition or alias is present (single lock pair).
+    pub fn has_any_state(&self) -> bool {
+        // Lock order: aliases then indices (matches create/drop/alias_*).
+        let aliases = self.aliases.read();
+        let indices = self.indices.read();
+        !aliases.is_empty() || !indices.is_empty()
     }
 
     /// Resolve `name` if it is an alias; otherwise return `name` unchanged.
@@ -919,9 +932,14 @@ impl SearchIndexManager {
         Ok(())
     }
 
-    /// Get an index (resolves aliases)
+    /// Get an index (resolves aliases).
+    ///
+    /// Holds aliases then indices locks for the resolve+lookup (no TOCTOU
+    /// between a concurrent alias retarget and the indices map read).
     pub fn get_index(&self, name: &str) -> Option<Arc<RwLock<SearchIndex>>> {
-        let real = self.resolve_name(name);
+        // Lock order: aliases then indices (matches create/drop/alias_*).
+        let aliases = self.aliases.read();
+        let real = Self::resolve_name_locked(&aliases, name);
         let indices = self.indices.read();
         indices.get(&real).cloned()
     }
@@ -1406,6 +1424,28 @@ mod tests {
         manager.drop_index("idx2").unwrap();
         assert!(manager.get_index("a2").is_none());
         assert!(manager.alias_del("a2").is_err());
+    }
+
+    #[test]
+    fn has_any_state_indices_or_aliases() {
+        let manager = SearchIndexManager::new();
+        assert!(!manager.has_any_state());
+        manager
+            .create_index(IndexDefinition::new(
+                "idx".to_string(),
+                vec!["doc:".to_string()],
+                vec![FieldDefinition {
+                    name: "t".to_string(),
+                    field_type: FieldType::Text {
+                        weight: 1.0,
+                        sortable: false,
+                    },
+                }],
+            ))
+            .unwrap();
+        assert!(manager.has_any_state());
+        manager.drop_index("idx").unwrap();
+        assert!(!manager.has_any_state());
     }
 
     #[test]

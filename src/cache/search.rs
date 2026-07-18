@@ -69,8 +69,7 @@ impl Cache {
 
     /// True when this DB has any search index or alias (rewrite even if keyspace empty).
     pub fn has_search_state(&self) -> bool {
-        !self.search_index_manager.list_indices().is_empty()
-            || !self.search_index_manager.list_aliases().is_empty()
+        self.search_index_manager.has_any_state()
     }
 
     /// Get search index information

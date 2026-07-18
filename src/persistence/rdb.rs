@@ -899,7 +899,9 @@ impl DbSnapshot {
             }
             cache
                 .create_search_index(def.clone())
-                .map_err(|e| Error::InvalidArgument(format!("RDB FT.CREATE: {}", e)))?;
+                .map_err(|e| {
+                    crate::persistence::aof::map_ft_mutator_error(format!("RDB FT.CREATE: {}", e))
+                })?;
         }
 
         for s in &self.strings {
@@ -1010,7 +1012,9 @@ impl DbSnapshot {
             }
             cache
                 .alias_add(alias, index)
-                .map_err(|e| Error::InvalidArgument(format!("RDB FT.ALIASADD: {}", e)))?;
+                .map_err(|e| {
+                    crate::persistence::aof::map_ft_mutator_error(format!("RDB FT.ALIASADD: {}", e))
+                })?;
         }
 
         Ok(loaded)
@@ -1258,9 +1262,14 @@ pub fn load_bytes(cache: &Cache, data: &[u8], flush: bool) -> Result<usize> {
 /// but **not** atomic to concurrent readers — see
 /// [`Databases::replace_keyspaces_from`].
 ///
-/// - `flush = true` (**snapshot replace**): empty scratch; successful load
-///   flushes all target DBs (including FT) then replaces (peak-memory recovery
-///   for FULLRESYNC).
+/// - `flush = true` (**snapshot replace**): empty scratch; on success each
+///   target DB is swapped from scratch via [`Databases::replace_keyspaces_from`]
+///   (full keyspace replace per DB — **no** pre-flush of all DBs). That way a
+///   mid-install panic leaves remaining DBs with their **pre-load** data
+///   instead of empty. Single-DB [`load_bytes`] still pre-flushes for peak
+///   memory on FULLRESYNC of one cache. Concurrent readers can still see
+///   mixed old/new DBs mid-loop (exclusive access required for a consistent
+///   multi-DB view).
 /// - `flush = false` (**merge**): scratch seeded from non-mutating multi-DB
 ///   snapshot, then merged (existing FT names kept only when schema/target
 ///   equal; clash otherwise fails — see [`DbSnapshot::load_into`]).
@@ -1274,11 +1283,14 @@ pub fn load_databases_bytes(databases: &Databases, data: &[u8], flush: bool) -> 
     match snap.load_into_databases(&scratch) {
         Ok(n) => {
             databases.with_autosweep_paused_all(|| {
+                // Dirty WATCH before replace so no clean-gen window. Do **not**
+                // flush_all first: replace_keyspaces_from already swaps each
+                // DB fully; pre-flush would empty every DB before any install
+                // (worse multi-DB tear / panic recovery).
                 if flush {
                     for db in databases.iter() {
                         db.touch_all_watch_keys();
                     }
-                    databases.flush_all_including_search();
                 }
                 databases.replace_keyspaces_from(&scratch);
             });
