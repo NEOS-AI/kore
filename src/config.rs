@@ -57,11 +57,11 @@ pub struct Config {
     #[arg(long, default_value = "524288000")]
     pub maxentrysize: usize,
 
-    /// Verbosity level (0-3)
+    /// Verbosity level 0–3: ERROR/WARN/INFO/DEBUG (default 1 = WARN). Boot-only; RUST_LOG overrides.
     #[arg(short = 'v', long, default_value = "1")]
     pub verbosity: u8,
 
-    /// Log output format: `text` (human-readable, default) or `json` (structured JSON lines)
+    /// Log format: `text` (default) or `json` (structured lines, targets on). Boot-only (not CONFIG SET).
     #[arg(long, default_value = "text", value_parser = ["text", "json"])]
     pub log_format: String,
 

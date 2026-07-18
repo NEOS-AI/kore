@@ -5,7 +5,7 @@ use kore::{Config, Databases, PersistenceConfig, PersistenceManager, Redlock};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{info, warn, Level};
-use tracing_subscriber;
+use tracing_subscriber::EnvFilter;
 
 fn main() -> anyhow::Result<()> {
     // Parse command line arguments
@@ -17,31 +17,31 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
-    // Initialize tracing/logging
-    // verbosity level (higher is more verbose):
-    // 0 = ERROR
-    // 1 = WARN
-    // 2 = INFO
-    // 3+ = DEBUG
+    // Initialize tracing/logging (boot-only — not live via CONFIG SET).
+    // Verbosity 0–3 maps to ERROR / WARN / INFO / DEBUG (default 1 = WARN).
+    // `RUST_LOG` / EnvFilter overrides the verbosity floor when set.
     let level = match config.verbosity {
         0 => Level::ERROR,
         1 => Level::WARN,
         2 => Level::INFO,
         _ => Level::DEBUG,
     };
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(level.to_string()));
 
-    // `--log-format json` → structured JSON lines; default `text` stays human-readable.
+    // `--log-format json` → structured JSON lines (targets on for aggregators);
+    // default `text` stays human-readable (targets off for quieter console).
     match config.log_format.as_str() {
         "json" => {
             tracing_subscriber::fmt()
                 .json()
-                .with_max_level(level)
-                .with_target(false)
+                .with_env_filter(filter)
+                .with_target(true)
                 .init();
         }
         _ => {
             tracing_subscriber::fmt()
-                .with_max_level(level)
+                .with_env_filter(filter)
                 .with_target(false)
                 .init();
         }
@@ -275,4 +275,72 @@ fn main() -> anyhow::Result<()> {
 
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod log_format_tests {
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+    use tracing::info;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// Capture writer for a one-shot JSON log smoke (Batch CY ops polish).
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> MakeWriter<'a> for Buf {
+        type Writer = Guard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            Guard(self.0.clone())
+        }
+    }
+
+    struct Guard(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Guard {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("buf lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn json_log_line_is_parseable_object() {
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_target(true)
+            .with_writer(buf.clone())
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            info!(target: "kore::test", "cy_json_smoke");
+        });
+
+        let bytes = buf.0.lock().expect("buf lock").clone();
+        let line = String::from_utf8(bytes).expect("utf8 log");
+        let line = line.trim();
+        assert!(
+            line.starts_with('{') && line.ends_with('}'),
+            "JSON log must be a single object line, got: {line}"
+        );
+        // tracing-subscriber JSON fields: level + message (+ target when enabled)
+        assert!(
+            line.contains("\"level\"") || line.contains("\"INFO\""),
+            "expected level field in JSON log: {line}"
+        );
+        assert!(
+            line.contains("cy_json_smoke"),
+            "expected message body in JSON log: {line}"
+        );
+        assert!(
+            line.contains("kore::test") || line.contains("\"target\""),
+            "expected target in JSON log (with_target true): {line}"
+        );
+    }
 }

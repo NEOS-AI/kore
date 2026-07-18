@@ -67,8 +67,8 @@ With custom options:
 - `--loadfactor <FLOAT>`: Load factor (0.55-0.95) (default: 0.75)
 - `--maxconns <COUNT>`: Maximum number of connections (default: 1024)
 - `--auth <PASSWORD>`: Authentication password (default: none)
-- `-v, --verbosity <LEVEL>`: Verbosity level 0-3 (default: 1)
-- `--log-format <text|json>`: Log output format — human-readable `text` (default) or structured JSON lines (`json`) for log aggregators
+- `-v, --verbosity <LEVEL>`: Verbosity level 0–3 (default: **1 = WARN**). Mapping: `0` → ERROR, `1` → WARN, `2` → INFO, `3` → DEBUG
+- `--log-format <text|json>`: Log output format — human-readable `text` (default) or structured JSON lines (`json`) for log aggregators. **Boot-only** (not changeable via `CONFIG SET`). JSON includes `target` fields for aggregator indexing; text keeps targets off for quieter consoles. Optional `RUST_LOG` / `EnvFilter` overrides the verbosity floor when set (e.g. `RUST_LOG=kore=debug`)
 
 ## Supported Commands
 

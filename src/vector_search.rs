@@ -53,11 +53,56 @@ impl HNSWLayer {
     }
 
     /// Drop every directed edge that points at `node_id` (and the node entry).
+    ///
+    /// Prefer [`unlink_collecting_undirected_former`] on the remove path so the
+    /// reverse scan is not repeated (Batch CY).
     fn unlink_node(&mut self, node_id: &Bytes) {
         for edges in self.neighbors.values_mut() {
             edges.retain(|n| n != node_id);
         }
         self.neighbors.remove(node_id);
+    }
+
+    /// One full-layer reverse pass: collect undirected former neighbors of
+    /// `node_id` (outgoing ∪ predecessors) among `live` ids, strip reverse
+    /// edges, and drop the node entry.
+    ///
+    /// **Complexity (Batch CY):** O(N_layer + deg(node)) instead of two separate
+    /// O(N_layer) scans (snapshot reverse-scan then `unlink_node`).
+    fn unlink_collecting_undirected_former(
+        &mut self,
+        node_id: &Bytes,
+        live: &HashMap<Bytes, Vec<f32>>,
+    ) -> Vec<Bytes> {
+        let mut seen: HashSet<Bytes> = HashSet::new();
+        let mut former: Vec<Bytes> = Vec::new();
+
+        // Outgoing neighbors of the deleted node (asymmetric case: out only).
+        if let Some(out) = self.neighbors.get(node_id) {
+            for n in out {
+                if n != node_id && live.contains_key(n) && seen.insert(n.clone()) {
+                    former.push(n.clone());
+                }
+            }
+        }
+
+        // Reverse pass: strip edges → node_id and collect live predecessors.
+        for (id, neighs) in self.neighbors.iter_mut() {
+            if id == node_id {
+                continue;
+            }
+            let had_edge = neighs.iter().any(|n| n == node_id);
+            if !had_edge {
+                continue;
+            }
+            neighs.retain(|n| n != node_id);
+            if live.contains_key(id) && seen.insert(id.clone()) {
+                former.push(id.clone());
+            }
+        }
+
+        self.neighbors.remove(node_id);
+        former
     }
 }
 
@@ -149,9 +194,10 @@ impl PartialOrd for MaxCand {
 /// reachable from `entry_point` at insert time; existing-id `add` rewires
 /// (remove + re-insert).
 ///
-/// **Batch CT/CU:** on hard-delete, former neighbors are snapshotted as an
-/// **undirected** adjacency (outgoing ∪ reverse scan), then reconnected with a
-/// spanning structure among survivors (full clique when degree fits, else a
+/// **Batch CT/CU/CY:** on hard-delete, former neighbors are snapshotted as an
+/// **undirected** adjacency (outgoing ∪ reverse edges) in **one** reverse pass
+/// that also unlinks the node (no second full-layer scan). Survivors are then
+/// reconnected with a spanning structure (full clique when degree fits, else a
 /// nearest-neighbor path) and force-keep of those tree/clique edges on both
 /// endpoints. Fixes bidirectional 2-chains, asymmetric incoming-only links, and
 /// multi-way stars under degree caps. Not a global non-partition guarantee under
@@ -252,8 +298,12 @@ impl HNSWIndex {
     ///
     /// Strips reverse edges, removes the node from every layer map, reconnects
     /// former neighbors so a bridge/cut-vertex delete does not permanently
-    /// partition the layer (Batch CT/CU), and reassigns `entry_point` when needed
-    /// (prefer a remaining node that still has edges).
+    /// partition the layer (Batch CT/CU/CY), and reassigns `entry_point` when
+    /// needed (prefer a remaining node that still has edges).
+    ///
+    /// Per layer, undirected former-neighbor collection and unlink share a
+    /// single reverse pass (`unlink_collecting_undirected_former`) — O(N_layer)
+    /// once, not snapshot-then-unlink twice.
     pub fn remove(&mut self, doc_id: &Bytes) {
         if !self.vectors.contains_key(doc_id) {
             // Still scrub any orphaned layer residue (defensive).
@@ -266,39 +316,19 @@ impl HNSWIndex {
             return;
         }
 
-        // Undirected former-neighbor snapshot per layer (Batch CU):
-        // outgoing neighbors of deleted ∪ nodes that list deleted as a neighbor.
-        // Outgoing-only missed asymmetric predecessors and left them unrepaired.
-        let former_by_layer: Vec<Vec<Bytes>> = self
-            .layers
-            .iter()
-            .map(|layer| {
-                let mut seen: HashSet<Bytes> = HashSet::new();
-                let mut former: Vec<Bytes> = Vec::new();
-                for n in layer.get_neighbors(doc_id) {
-                    if n != *doc_id && self.vectors.contains_key(&n) && seen.insert(n.clone()) {
-                        former.push(n);
-                    }
-                }
-                for (id, neighs) in &layer.neighbors {
-                    if id == doc_id {
-                        continue;
-                    }
-                    if !neighs.iter().any(|n| n == doc_id) {
-                        continue;
-                    }
-                    if self.vectors.contains_key(id) && seen.insert(id.clone()) {
-                        former.push(id.clone());
-                    }
-                }
-                former
-            })
-            .collect();
+        // Fuse undirected snapshot + unlink per layer (Batch CY). Live set is
+        // still `self.vectors` (deleted id is live until after the pass so its
+        // outgoing list is readable; it is excluded from `former` by id check /
+        // not being a predecessor of itself in the reverse pass).
+        let former_by_layer: Vec<Vec<Bytes>> = {
+            let vectors = &self.vectors;
+            self.layers
+                .iter_mut()
+                .map(|layer| layer.unlink_collecting_undirected_former(doc_id, vectors))
+                .collect()
+        };
 
         self.vectors.remove(doc_id);
-        for layer in &mut self.layers {
-            layer.unlink_node(doc_id);
-        }
 
         // Reconnect survivors that used the deleted id as a bridge.
         for (layer_idx, former) in former_by_layer.iter().enumerate() {
@@ -1603,8 +1633,10 @@ mod tests {
         }
     }
 
-    /// Batch CW: ≥4 former neighbors with `max_m=2` forces the NN-path reconnect
-    /// branch (`n-1 > max_m`), not the full clique covered by the star test.
+    /// Batch CW/CY: ≥4 former neighbors with `max_m=2` forces the NN-path
+    /// reconnect branch (`n-1 > max_m`). Degree-saturating decoys (Batch CY)
+    /// fill each leaf's `max_m` with closer non-survivors so **bonus density
+    /// alone cannot reconnect** the line — path force-keep is load-bearing.
     #[test]
     fn hnsw_bridge_remove_path_branch_reconnects() {
         // M=1 → layer-0 max_m=2; 4 survivors → n-1=3 > 2 → path branch.
@@ -1615,8 +1647,19 @@ mod tests {
         index.add(Bytes::from("b"), vec![2.0, 0.0]);
         index.add(Bytes::from("c"), vec![3.0, 0.0]);
         index.add(Bytes::from("d"), vec![4.0, 0.0]); // farthest leaf
+        // max_m=2 decoys per leaf, closer than any other survivor (mirror CU star).
+        // Without path force-keep, prune keeps only decoys and orphans the line.
+        index.add(Bytes::from("da1"), vec![1.0, 0.01]);
+        index.add(Bytes::from("da2"), vec![1.0, 0.02]);
+        index.add(Bytes::from("db1"), vec![2.0, 0.01]);
+        index.add(Bytes::from("db2"), vec![2.0, 0.02]);
+        index.add(Bytes::from("dc1"), vec![3.0, 0.01]);
+        index.add(Bytes::from("dc2"), vec![3.0, 0.02]);
+        index.add(Bytes::from("dd1"), vec![4.0, 0.01]);
+        index.add(Bytes::from("dd2"), vec![4.0, 0.02]);
 
-        // Force star: all leaves ↔ hub only (4 former neighbors).
+        // Force star: leaves ↔ hub only as former set; each leaf also saturates
+        // degree with its two decoys (decoys are not hub neighbors).
         for layer in &mut index.layers {
             for (_id, neigh) in layer.neighbors.iter_mut() {
                 neigh.clear();
@@ -1626,6 +1669,17 @@ mod tests {
         for leaf in ["a", "b", "c", "d"] {
             layer.add_edge(Bytes::from(leaf), Bytes::from("hub"));
             layer.add_edge(Bytes::from("hub"), Bytes::from(leaf));
+        }
+        for (leaf, d1, d2) in [
+            ("a", "da1", "da2"),
+            ("b", "db1", "db2"),
+            ("c", "dc1", "dc2"),
+            ("d", "dd1", "dd2"),
+        ] {
+            layer.add_edge(Bytes::from(leaf), Bytes::from(d1));
+            layer.add_edge(Bytes::from(leaf), Bytes::from(d2));
+            layer.add_edge(Bytes::from(d1), Bytes::from(leaf));
+            layer.add_edge(Bytes::from(d2), Bytes::from(leaf));
         }
         index.entry_point = Some(Bytes::from("a"));
 
@@ -1653,7 +1707,7 @@ mod tests {
         for id in [Bytes::from("a"), Bytes::from("b"), Bytes::from("c"), Bytes::from("d")] {
             assert!(
                 seen.contains(&id),
-                "after path-branch hub remove, {:?} must be BFS-reachable from entry (visited {:?})",
+                "after path-branch hub remove under degree pressure, {:?} must be BFS-reachable from entry (visited {:?})",
                 id,
                 seen
             );
@@ -1665,7 +1719,7 @@ mod tests {
         assert_eq!(
             results[0].doc_id,
             Bytes::from("d"),
-            "farthest leaf d must remain searchable after path-branch bridge remove (got {:?})",
+            "farthest leaf d must remain searchable after path-branch bridge remove under decoy pressure (got {:?})",
             results[0].doc_id
         );
     }
