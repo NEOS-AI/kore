@@ -139,6 +139,11 @@ impl DeadlockDetector {
     pub fn victim_strategy(&self) -> VictimSelectionStrategy {
         self.victim_strategy
     }
+
+    /// Whether automatic deadlock resolution is enabled.
+    pub fn auto_resolve(&self) -> bool {
+        self.auto_resolve
+    }
     
     /// Record a lock acquisition
     pub fn record_lock_acquired(&self, resource: String, client_id: Bytes, ttl_ms: u64) {
@@ -292,21 +297,38 @@ impl DeadlockDetector {
         false
     }
     
-    /// Clean up expired locks and long waits
+    /// Clean up expired locks and long waits.
+    ///
+    /// Expired held locks also drop matching wait-graph edges and
+    /// `waiting_for` entries so detect does not leave unresolvable cycles
+    /// (holder gone, edges still present → resolve returns `None`).
+    ///
+    /// Lock order: `held_locks` → `waiting_for` → `wait_graph`.
     fn cleanup_expired_locks(&self) {
-        // Remove expired held locks
-        self.held_locks.write().retain(|_, info| !info.is_expired());
-        
-        // Remove long waits that exceed max wait time
-        let max_wait = Duration::from_millis(self.max_wait_time_ms);
-        self.wait_graph.write().retain(|edge| {
-            edge.timestamp.elapsed() < max_wait
-        });
-        
-        // Clean up waiting list
+        let mut held = self.held_locks.write();
         let mut waiting = self.waiting_for.write();
+        let mut graph = self.wait_graph.write();
+
+        let mut expired_resources: HashSet<String> = HashSet::new();
+        held.retain(|resource, info| {
+            if info.is_expired() {
+                expired_resources.insert(resource.clone());
+                false
+            } else {
+                true
+            }
+        });
+
+        let max_wait = Duration::from_millis(self.max_wait_time_ms);
+        graph.retain(|edge| {
+            !expired_resources.contains(&edge.resource)
+                && edge.timestamp.elapsed() < max_wait
+        });
+
         waiting.retain(|_, wait_list| {
-            wait_list.retain(|info| !info.is_expired());
+            wait_list.retain(|info| {
+                !info.is_expired() && !expired_resources.contains(&info.resource)
+            });
             !wait_list.is_empty()
         });
     }
@@ -419,22 +441,65 @@ impl DeadlockDetector {
 
     /// Release all locks currently tracked as held by `client_id`.
     ///
-    /// Also drops wait-graph edges for those resources. Returns the resource
-    /// names that were released. Used by auto-resolution paths (e.g. the
-    /// background monitor) to break a deadlock cycle in the wait-for graph.
+    /// Single write critical section (lock order: `held_locks` →
+    /// `waiting_for` → `wait_graph`):
+    /// 1. Retain-by-client on `held_locks` (collect released resource names)
+    /// 2. Strip wait-graph edges for those resources **and** edges where the
+    ///    victim is the waiter
+    /// 3. Prune `waiting_for` for the victim entirely and for any waiter
+    ///    whose resource was released
+    ///
+    /// Callers do **not** need a separate [`Self::remove_from_waiting`] —
+    /// victim waits are cleared here. Returns the resource names that were
+    /// released from the graph (backends must be unlocked separately when
+    /// used from Redlock).
+    ///
+    /// This is race-safe against another client re-acquiring a resource
+    /// mid-cleanup: only entries whose `client_id` matches the victim are
+    /// removed under the held-locks write lock.
     pub fn release_client_locks(&self, client_id: &Bytes) -> Vec<String> {
-        let resources: Vec<String> = self
-            .held_locks
+        let mut held = self.held_locks.write();
+        let mut waiting = self.waiting_for.write();
+        let mut graph = self.wait_graph.write();
+
+        let mut released: Vec<String> = Vec::new();
+        held.retain(|resource, info| {
+            if info.client_id == *client_id {
+                released.push(resource.clone());
+                false
+            } else {
+                true
+            }
+        });
+
+        let released_set: HashSet<&str> =
+            released.iter().map(String::as_str).collect();
+
+        // Drop edges for released resources and any wait edges from the victim.
+        graph.retain(|edge| {
+            edge.waiter != *client_id && !released_set.contains(edge.resource.as_str())
+        });
+
+        // Victim no longer waits; other waiters drop entries for released resources.
+        waiting.remove(client_id);
+        waiting.retain(|_, wait_list| {
+            wait_list.retain(|info| !released_set.contains(info.resource.as_str()));
+            !wait_list.is_empty()
+        });
+
+        released
+    }
+
+    /// Resources currently tracked as held by `client_id` (snapshot under read lock).
+    ///
+    /// Used by Redlock auto-resolve to unlock backends **before** graph cleanup.
+    pub fn held_resources_for_client(&self, client_id: &Bytes) -> Vec<String> {
+        self.held_locks
             .read()
             .iter()
             .filter(|(_, info)| info.client_id == *client_id)
             .map(|(resource, _)| resource.clone())
-            .collect();
-
-        for resource in &resources {
-            self.record_lock_released(resource);
-        }
-        resources
+            .collect()
     }
 
     // ── Async API ──────────────────────────────────────────────────────────
@@ -501,12 +566,17 @@ impl DeadlockDetector {
                             "deadlock detected by background monitor"
                         );
                         if let Some(victim) = self.resolve_deadlock(&cycle) {
+                            // release_client_locks also clears victim waiting_for
                             let released = self.release_client_locks(&victim);
-                            self.remove_from_waiting(&victim);
                             tracing::info!(
                                 victim = %String::from_utf8_lossy(&victim),
                                 released = ?released,
                                 "deadlock victim released by background monitor"
+                            );
+                        } else if self.auto_resolve {
+                            tracing::warn!(
+                                cycle_len = cycle.len(),
+                                "deadlock detected but no victim selected (auto_resolve)"
                             );
                         }
                     }
@@ -755,8 +825,8 @@ mod tests {
             DeadlockStatus::Deadlock { .. }
         ));
 
+        // release_client_locks also clears victim waiting_for — no second call
         let released = detector.release_client_locks(&client2);
-        detector.remove_from_waiting(&client2);
         assert!(
             released.contains(&"resource-2".to_string()),
             "should release client2's held resource"
@@ -770,6 +840,121 @@ mod tests {
             .get_held_locks()
             .iter()
             .any(|l| l.client_id == client1));
+        // victim waiting_for pruned
+        assert!(!detector.get_waiting_clients().contains_key(&client2));
+    }
+
+    /// Atomic retain-by-client: after release, a re-acquire by another client
+    /// must still be tracked (TOCTOU-safe — we never delete by resource name
+    /// collected under a prior read lock).
+    #[test]
+    fn test_release_client_locks_toctou_safe_reacquire() {
+        let detector = DeadlockDetector::new(5000, true);
+        let client1 = Bytes::from("toctou-c1");
+        let client2 = Bytes::from("toctou-c2");
+
+        detector.record_lock_acquired("shared".to_string(), client1.clone(), 10000);
+        let released = detector.release_client_locks(&client1);
+        assert_eq!(released, vec!["shared".to_string()]);
+
+        // Another client re-acquires the same resource name
+        detector.record_lock_acquired("shared".to_string(), client2.clone(), 10000);
+
+        let held = detector.get_held_locks();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].client_id, client2);
+        assert_eq!(held[0].resource, "shared");
+    }
+
+    /// Waiters on released resources are pruned; victim waits cleared.
+    #[test]
+    fn test_release_client_locks_prunes_waiting_for() {
+        let detector = DeadlockDetector::new(5000, true);
+        let client1 = Bytes::from("hold-c1");
+        let client2 = Bytes::from("hold-c2");
+        let waiter = Bytes::from("waiter");
+
+        detector.record_lock_acquired("r1".to_string(), client1.clone(), 10000);
+        detector.record_lock_acquired("r2".to_string(), client2.clone(), 10000);
+        // waiter and client2 both wait for r1 (held by client1)
+        detector.record_lock_wait("r1".to_string(), waiter.clone(), 10000);
+        detector.record_lock_wait("r1".to_string(), client2.clone(), 10000);
+        // client1 also waits for r2 (victim will lose this wait entry too)
+        detector.record_lock_wait("r2".to_string(), client1.clone(), 10000);
+
+        let released = detector.release_client_locks(&client1);
+        assert!(released.contains(&"r1".to_string()));
+
+        let waiting = detector.get_waiting_clients();
+        // victim fully removed from waiting_for
+        assert!(!waiting.contains_key(&client1));
+        // other waiters no longer wait for released r1
+        assert!(
+            !waiting.contains_key(&waiter),
+            "waiter only waited for r1 — entry should be gone"
+        );
+        if let Some(list) = waiting.get(&client2) {
+            assert!(
+                !list.iter().any(|i| i.resource == "r1"),
+                "client2 must not still wait for released r1"
+            );
+        }
+        // wait-graph edges for r1 gone
+        assert_eq!(detector.get_stats().wait_graph_edges, 0);
+        // client2's hold remains
+        assert!(detector
+            .get_held_locks()
+            .iter()
+            .any(|l| l.client_id == client2 && l.resource == "r2"));
+    }
+
+    /// Expired held locks drop matching wait-graph edges and waiting_for entries.
+    #[test]
+    fn test_cleanup_expired_drops_edges_and_waiting() {
+        let detector = DeadlockDetector::new(5000, false);
+        let client1 = Bytes::from("exp-c1");
+        let client2 = Bytes::from("exp-c2");
+
+        // Short TTL on the held resource that client2 waits for
+        detector.record_lock_acquired("expiring".to_string(), client1.clone(), 40);
+        detector.record_lock_acquired("stable".to_string(), client2.clone(), 10000);
+        detector.record_lock_wait("expiring".to_string(), client2.clone(), 10000);
+
+        assert_eq!(detector.get_stats().wait_graph_edges, 1);
+
+        std::thread::sleep(Duration::from_millis(60));
+        // detect_deadlock runs cleanup_expired_locks first
+        let status = detector.detect_deadlock();
+        assert!(
+            matches!(status, DeadlockStatus::NoDeadlock),
+            "expired hold should not leave a resolvable/unresolvable cycle"
+        );
+
+        assert!(
+            !detector
+                .get_held_locks()
+                .iter()
+                .any(|l| l.resource == "expiring"),
+            "expired held lock removed"
+        );
+        assert_eq!(
+            detector.get_stats().wait_graph_edges,
+            0,
+            "edges for expired resource must be dropped"
+        );
+        let waiting = detector.get_waiting_clients();
+        assert!(
+            !waiting.contains_key(&client2)
+                || !waiting[&client2]
+                    .iter()
+                    .any(|i| i.resource == "expiring"),
+            "waiting_for entry for expired resource must be pruned"
+        );
+        // stable hold remains
+        assert!(detector
+            .get_held_locks()
+            .iter()
+            .any(|l| l.resource == "stable"));
     }
 
     #[tokio::test]

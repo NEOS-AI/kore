@@ -122,15 +122,52 @@ match detector.detect_deadlock() {
 }
 ```
 
-### Auto-Resolution Mode
+### Auto-Resolution Mode (Redlock + backends)
+
+When `auto_resolve` is **true**, a deadlock found during `lock` /
+`lock_with_priority`:
+
+1. Selects a victim via the configured [`VictimSelectionStrategy`]
+2. **Unlocks the victim's held resources on all Redlock backends**
+   (token = client id / `val` — Redlock uses the same value for both)
+3. Atomically cleans the wait-for graph (`release_client_locks`: held locks,
+   wait edges, and waiting entries for the victim and for released resources)
+4. Continues the acquisition loop so a non-victim waiter can proceed
+
+When `auto_resolve` is **false**, Redlock **fail-fasts** with
+`Error::DeadlockDetected` (no backend unlock, no graph resolve). Callers
+must release locks or retry manually.
 
 ```rust
-// Enable automatic deadlock resolution
+// Enable automatic deadlock resolution (backend unlock + graph cleanup)
 let redlock = Redlock::new(vec![cache1, cache2, cache3])?
     .with_deadlock_detection(30000, true); // auto_resolve = true
 
-// Deadlocks will be automatically resolved by selecting a victim
+// Or with an explicit strategy:
+use kore::VictimSelectionStrategy;
+let redlock = Redlock::new(vec![cache1, cache2, cache3])?
+    .with_deadlock_detection_strategy(
+        30000,
+        true,
+        VictimSelectionStrategy::Youngest, // or Oldest / FewestLocks
+    );
+
+// Deadlocks on the lock path are resolved: victim backend keys released,
+// wait-for graph cleaned; non-victim side can acquire.
 ```
+
+**Graph-only vs backend unlock**
+
+| Path | Backend unlock | Graph cleanup |
+|------|----------------|---------------|
+| `Redlock::lock` with `auto_resolve=true` | Yes (`release_if_equal` on all instances) | Yes (`release_client_locks`) |
+| `Redlock::lock` with `auto_resolve=false` | No — returns `DeadlockDetected` | Waiter removed only for the failing client |
+| `DeadlockDetector::spawn_monitor` | No (detector has no backends) | Yes when `auto_resolve` |
+| `Redlock::spawn_deadlock_monitor` | Yes | Yes when `auto_resolve` |
+
+Standalone detector APIs only mutate the in-process wait-for graph. Use
+Redlock's lock path or `spawn_deadlock_monitor` when backend keys must be
+released too.
 
 ### Checking Statistics
 
@@ -326,10 +363,10 @@ async fn check(detector: &DeadlockDetector) {
     match detector.detect_deadlock_async().await {
         DeadlockStatus::Deadlock { cycle, resources } => {
             println!("cycle={:?} resources={:?}", cycle, resources);
-            // Optional: pick a victim (requires auto_resolve = true)
+            // Optional: pick a victim (requires auto_resolve = true).
+            // release_client_locks also clears victim waiting_for.
             if let Some(victim) = detector.resolve_deadlock_async(&cycle).await {
                 detector.release_client_locks(&victim);
-                detector.remove_from_waiting(&victim);
             }
         }
         DeadlockStatus::NoDeadlock => {}
@@ -367,15 +404,35 @@ let handle = DeadlockDetector::spawn_monitor(
 handle.abort();
 ```
 
-On each tick the monitor:
+On each tick the **standalone** monitor:
 1. Runs cycle detection
 2. If a deadlock is found **and** `auto_resolve` is enabled, selects a victim
-   (via the configured [`VictimSelectionStrategy`]), releases that client's
-   tracked locks (`release_client_locks`), and removes them from the wait graph
-3. Logs with `tracing` (`warn` on detect, `info` on victim release)
+   (via the configured [`VictimSelectionStrategy`]) and runs atomic
+   `release_client_locks` (held locks + wait edges + waiting_for for the
+   victim and for released resources)
+3. Logs with `tracing` (`warn` on detect, `info` on victim release; `warn`
+   if auto_resolve but no victim)
 
 When `auto_resolve` is `false`, the monitor only logs detections and leaves
 the wait-for graph unchanged.
+
+**Abort handle is still required** — dropping a `JoinHandle` does not stop the
+task. Always `handle.abort()` (and optionally `await` it) on shutdown.
+
+### Redlock monitor + accessor
+
+```rust
+// Shared Arc for custom monitoring / tests
+if let Some(detector) = redlock.deadlock_detector() {
+    let _ = detector.detect_deadlock();
+}
+
+// Monitor that unlocks backends + cleans the graph
+if let Some(handle) = redlock.spawn_deadlock_monitor(Duration::from_secs(1)) {
+    // ... later ...
+    handle.abort();
+}
+```
 
 ### Redlock async helpers
 
@@ -483,6 +540,11 @@ let redlock = Redlock::new(instances)?
 3. **Redlock acquire is still sync**: `Redlock::lock` uses blocking retries; prefer async
    detect/stats/monitor APIs for Tokio integration rather than awaiting `lock` on a worker
 4. **Detection Overhead**: Small performance cost on each lock operation
+5. **Token model**: Auto-resolve backend unlock assumes Redlock `val` is both client id
+   and lock token (the normal Redlock usage). Custom schemes that use a different token
+   than the detector client id are not supported for backend release.
+6. **Standalone monitor is graph-only**: `DeadlockDetector::spawn_monitor` does not
+   touch Redlock backends — use `Redlock::spawn_deadlock_monitor` for backend unlock.
 
 ## Example: Complete Deadlock-Safe Application
 
@@ -549,7 +611,7 @@ cargo test --test deadlock_test
 ```
 
 Available tests:
-- `test_deadlock_detection_simple`: Basic 2-client deadlock
+- `test_deadlock_detection_simple`: Basic 2-client deadlock (fail-fast)
 - `test_three_way_deadlock`: 3-client circular dependency
 - `test_deadlock_release_breaks_cycle`: Verifying cycle breaking
 - `test_victim_selection`: Auto-resolve victim selection
@@ -557,3 +619,6 @@ Available tests:
 - `test_lock_expiration_cleanup`: TTL-based cleanup
 - `test_async_detect_planted_cycle`: Async detect + Redlock `check_deadlock_async`
 - `test_background_monitor_auto_resolves`: `spawn_monitor` clears cycle with auto_resolve
+- `test_redlock_auto_resolve_youngest_releases_backend`: two-client cycle; Youngest victim backend key gone
+- `test_redlock_auto_resolve_false_fail_fast`: `DeadlockDetected`, backends unchanged
+- `test_redlock_spawn_monitor_unlocks_backends`: `spawn_deadlock_monitor` backend + graph

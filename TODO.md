@@ -346,9 +346,15 @@ Also tracked in `docs/roadmap.md`.
 - [ ] **`[P2]`** Deadlock detection advanced (from roadmap)
   - [ ] **`[P2]`** Cross-process detection
   - [x] **`[P2]`** Async support
-    - *Done (Batch DA)*: `detect_deadlock_async` / `resolve_deadlock_async` / `get_stats_async` / `check_long_waits_async` (thin Tokio wrappers over short sync critical sections); `release_client_locks`; `DeadlockDetector::spawn_monitor` (abortable `JoinHandle`, auto-resolve victim + tracing); `Redlock::check_deadlock_async` / `get_deadlock_stats_async`; unit + integration tests; docs
+    - *Done (Batch DA, standalone surface)*: `detect_deadlock_async` / `resolve_deadlock_async` / `get_stats_async` / `check_long_waits_async` (thin Tokio wrappers over short sync critical sections); `release_client_locks`; `DeadlockDetector::spawn_monitor` (abort `JoinHandle`, auto-resolve + tracing); `Redlock::check_deadlock_async` / `get_deadlock_stats_async`; unit + integration tests; docs
+    - *Done (Batch DB)*: `Redlock::deadlock_detector()` / `spawn_deadlock_monitor` (backend unlock + graph); residual async is still sync-on-poll under contention.
   - [x] **`[P2]`** Custom victim selection strategies
-    - *Done (Batch CZ)*: `VictimSelectionStrategy` {`Youngest` (default), `Oldest`, `FewestLocks`}; `DeadlockDetector::new_with_strategy` / `with_victim_strategy`; `Redlock::with_deadlock_detection_strategy`; unit tests for each strategy + `auto_resolve=false`
+    - *Done (Batch CZ, detector-level)*: `VictimSelectionStrategy` {`Youngest` (default), `Oldest`, `FewestLocks`}; `new_with_strategy` / `with_victim_strategy`; `Redlock::with_deadlock_detection_strategy` constructs detector; unit tests per strategy
+    - *Done (Batch DB)*: Redlock lock path honors `auto_resolve` + strategy — backend unlock then atomic graph cleanup; fail-fast when auto_resolve=false.
+  - [x] **`[P2]`** **Code review (CZ/DA post-ship):** wire auto-resolve + strategy through Redlock backend unlock
+    - *Done (Batch DB)*: on detect + auto_resolve, `resolve_deadlock` → unlock victim resources on backends (`val` = client id token) → `release_client_locks`; E2E tests (Youngest backend release, fail-fast, Redlock monitor).
+  - [x] **`[P2]`** **Code review (DA post-ship):** `release_client_locks` TOCTOU + incomplete wait cleanup
+    - *Done (Batch DB)*: single write section retain-by-client; waiting_for + edge prune for victim and released resources; `cleanup_expired` drops edges/waiting for expired holds; monitor logs resolve-None; unit tests TOCTOU re-acquire / prune / expired.
   - [ ] **`[P2]`** Web UI monitoring
 
 ### Search & vectors
@@ -578,7 +584,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batch DA shipped** (async deadlock detection API + background monitor). **Batch CZ shipped** (custom deadlock victim selection strategies: Youngest/Oldest/FewestLocks). **CY post-ship review residuals** remain (JSON smoke parse, RUST_LOG replaces -v, path adjacency asserts, O(E) complexity honesty). **Open next:** advanced deadlock remaining (cross-process, Web UI); standing tests-for-phase P0; optional larger-N HNSW recall; multi-layer must_keep residual.
+Prioritized for next letter batch(es). **Batches CZ+DA+DB shipped** (victim strategies; async/monitor; Redlock auto-resolve + safe release). **Open next:** cross-process detection; Web UI; standing tests-for-phase P0; optional larger-N HNSW recall.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -634,6 +640,10 @@ Prioritized for next letter batch(es). **Batch DA shipped** (async deadlock dete
 | P3 | CV post-ship: tighter recall / larger-N throughput bench | open |
 | P2 | Optional structured JSON logging | done (CX MVP) |
 | P3 | CX post-ship: EnvFilter / JSON smoke / boot-only docs | done (CY; smoke/EnvFilter residual) |
+| P2 | CZ victim strategies (Youngest/Oldest/FewestLocks) | done (CZ + DB Redlock wiring) |
+| P2 | DA async API + spawn_monitor | done (DA + DB Redlock monitor/accessor) |
+| P2 | CZ/DA post-ship: Redlock auto-resolve + strategy + backend unlock | done (DB) |
+| P2 | DA post-ship: release_client_locks TOCTOU + wait cleanup | done (DB) |
 | P2 | CP post-ship: LOADING allowlist PSYNC/SYNC mid-install visibility | done (CR) |
 | P2 | CC post-ship: typed export skip expired keys (no revive without TTL) | done (CD) |
 | P2 | CC nit: unify start_background_sweep create paths | done (CD) |

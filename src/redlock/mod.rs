@@ -214,6 +214,73 @@ impl Redlock {
         )));
         self
     }
+
+    /// Shared deadlock detector, if configured via
+    /// [`Self::with_deadlock_detection`] / [`Self::with_deadlock_detection_strategy`].
+    pub fn deadlock_detector(&self) -> Option<Arc<DeadlockDetector>> {
+        self.deadlock_detector.clone()
+    }
+
+    /// Spawn a background monitor on the shared detector (if present).
+    ///
+    /// On each tick: detect → if `auto_resolve`, select victim via the configured
+    /// strategy, **unlock victim resources on Redlock backends** (token = client
+    /// id / `val`), then atomic graph cleanup via
+    /// [`DeadlockDetector::release_client_locks`].
+    ///
+    /// Returns `None` when deadlock detection is not enabled. Dropping the
+    /// handle does **not** stop the task — call [`tokio::task::JoinHandle::abort`].
+    pub fn spawn_deadlock_monitor(
+        &self,
+        interval: Duration,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let detector = self.deadlock_detector.clone()?;
+        let redlock = self.clone();
+        Some(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match detector.detect_deadlock() {
+                    DeadlockStatus::Deadlock { cycle, resources } => {
+                        tracing::warn!(
+                            cycle_len = cycle.len(),
+                            resources = ?resources,
+                            "deadlock detected by Redlock monitor"
+                        );
+                        if let Some(victim) = detector.resolve_deadlock(&cycle) {
+                            redlock.unlock_victim_backends(&detector, &victim);
+                            let released = detector.release_client_locks(&victim);
+                            tracing::info!(
+                                victim = %String::from_utf8_lossy(&victim),
+                                released = ?released,
+                                "Redlock monitor released victim backends + graph"
+                            );
+                        } else if detector.auto_resolve() {
+                            tracing::warn!(
+                                cycle_len = cycle.len(),
+                                "Redlock monitor: deadlock but no victim selected"
+                            );
+                        }
+                    }
+                    DeadlockStatus::NoDeadlock => {}
+                }
+            }
+        }))
+    }
+
+    /// Unlock all backends for resources held by `victim` in the detector graph.
+    ///
+    /// Redlock records `val` as both client id and lock token, so the victim
+    /// client id is the expected value for `release_if_equal`.
+    fn unlock_victim_backends(&self, detector: &DeadlockDetector, victim: &Bytes) {
+        let resources = detector.held_resources_for_client(victim);
+        let all_instances: Vec<usize> = (0..self.instances.len()).collect();
+        for resource in resources {
+            let key = Bytes::from(format!("lock:{}", resource));
+            self.unlock_instances(&key, victim, &all_instances);
+        }
+    }
     
     /// Enable fair lock queueing
     ///
@@ -400,14 +467,28 @@ impl Redlock {
             if let Some(ref detector) = self.deadlock_detector {
                 match detector.detect_deadlock() {
                     DeadlockStatus::Deadlock { cycle, resources } => {
-                        // Clean up wait record
-                        detector.remove_from_waiting(&val);
-                        
-                        return Err(Error::DeadlockDetected(format!(
-                            "Deadlock detected involving {} clients and resources: {:?}",
-                            cycle.len(),
-                            resources
-                        )));
+                        if detector.auto_resolve() {
+                            // Strategy-selected victim → backend unlock → atomic graph cleanup.
+                            // Then continue the acquisition loop (cycle broken).
+                            if let Some(victim) = detector.resolve_deadlock(&cycle) {
+                                self.unlock_victim_backends(detector, &victim);
+                                let released = detector.release_client_locks(&victim);
+                                tracing::info!(
+                                    victim = %String::from_utf8_lossy(&victim),
+                                    released = ?released,
+                                    "Redlock auto-resolved deadlock (backend unlock + graph)"
+                                );
+                            }
+                            // Continue trying lock acquisition after resolve attempt
+                        } else {
+                            // Fail-fast: detection only — caller handles DeadlockDetected
+                            detector.remove_from_waiting(&val);
+                            return Err(Error::DeadlockDetected(format!(
+                                "Deadlock detected involving {} clients and resources: {:?}",
+                                cycle.len(),
+                                resources
+                            )));
+                        }
                     }
                     DeadlockStatus::NoDeadlock => {
                         // Continue with lock acquisition
