@@ -29,8 +29,8 @@ Tracked in detail in root `TODO.md`. High level:
 - [ ] Cluster automatic reshard / full multi-type MIGRATE orchestration
 - [ ] 데드락 감지 고급 기능
     - [ ] 크로스 프로세스 감지
-    - [ ] 비동기(async) 지원
-    - [ ] 커스텀 희생자 선택 전략
+    - [x] 비동기(async) 지원
+    - [x] 커스텀 희생자 선택 전략
     - [ ] 웹 UI 모니터링
 - [x] Export data to file
     - [x] Export to 'RDB' file (Kore `KORDB` format; `SAVE` / `BGSAVE`)

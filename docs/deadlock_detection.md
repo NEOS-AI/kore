@@ -22,6 +22,7 @@ Client 2: Holds Lock B, Waits for Lock A
 - **Victim Selection**: Chooses which lock to release (auto-resolve mode)
 - **Statistics**: Provides metrics on locks and waits
 - **Configurable**: Adjustable timeouts and auto-resolution
+- **Async API**: Tokio-friendly wrappers + optional background monitor
 
 ## How It Works
 
@@ -307,6 +308,90 @@ let redlock = Redlock::new(instances)?
     );
 ```
 
+## Async API (Tokio)
+
+`DeadlockDetector` remains synchronous under the hood (`parking_lot::RwLock`
+with short critical sections). Async wrappers call the sync methods directly —
+they are safe to `.await` on a Tokio worker without `spawn_blocking`.
+
+### Async detect / resolve / stats
+
+```rust
+use kore::{DeadlockDetector, DeadlockStatus};
+use bytes::Bytes;
+use std::sync::Arc;
+use std::time::Duration;
+
+async fn check(detector: &DeadlockDetector) {
+    match detector.detect_deadlock_async().await {
+        DeadlockStatus::Deadlock { cycle, resources } => {
+            println!("cycle={:?} resources={:?}", cycle, resources);
+            // Optional: pick a victim (requires auto_resolve = true)
+            if let Some(victim) = detector.resolve_deadlock_async(&cycle).await {
+                detector.release_client_locks(&victim);
+                detector.remove_from_waiting(&victim);
+            }
+        }
+        DeadlockStatus::NoDeadlock => {}
+    }
+
+    let stats = detector.get_stats_async().await;
+    let _long = detector.check_long_waits_async().await;
+    let _ = stats;
+}
+```
+
+| Sync | Async |
+|------|-------|
+| `detect_deadlock` | `detect_deadlock_async` |
+| `resolve_deadlock` | `resolve_deadlock_async` |
+| `get_stats` | `get_stats_async` |
+| `check_long_waits` | `check_long_waits_async` |
+
+### Background monitor
+
+```rust
+use kore::DeadlockDetector;
+use std::sync::Arc;
+use std::time::Duration;
+
+let detector = Arc::new(DeadlockDetector::new(30_000, true)); // auto_resolve
+let handle = DeadlockDetector::spawn_monitor(
+    Arc::clone(&detector),
+    Duration::from_secs(1),
+);
+
+// ... application work ...
+
+// Stop the monitor (dropping the handle alone does not abort the task)
+handle.abort();
+```
+
+On each tick the monitor:
+1. Runs cycle detection
+2. If a deadlock is found **and** `auto_resolve` is enabled, selects a victim
+   (via the configured [`VictimSelectionStrategy`]), releases that client's
+   tracked locks (`release_client_locks`), and removes them from the wait graph
+3. Logs with `tracing` (`warn` on detect, `info` on victim release)
+
+When `auto_resolve` is `false`, the monitor only logs detections and leaves
+the wait-for graph unchanged.
+
+### Redlock async helpers
+
+```rust
+// Returns None when deadlock detection is not enabled
+if let Some(status) = redlock.check_deadlock_async().await {
+    // handle status
+}
+let stats = redlock.get_deadlock_stats_async().await;
+```
+
+Lock acquisition itself remains synchronous (`std::thread::sleep` retries).
+Use the async check/stats helpers from async tasks for monitoring; do not hold
+a Tokio worker across a long `Redlock::lock` call — run that on a blocking
+pool if needed.
+
 ## Performance Considerations
 
 ### Time Complexity
@@ -395,7 +480,8 @@ let redlock = Redlock::new(instances)?
 
 1. **Single-Instance Scope**: Currently detects deadlocks within a single Redlock instance
 2. **No Cross-Process Detection**: Doesn't detect deadlocks across different processes (yet)
-3. **Async Not Supported**: Works with synchronous code only
+3. **Redlock acquire is still sync**: `Redlock::lock` uses blocking retries; prefer async
+   detect/stats/monitor APIs for Tokio integration rather than awaiting `lock` on a worker
 4. **Detection Overhead**: Small performance cost on each lock operation
 
 ## Example: Complete Deadlock-Safe Application
@@ -469,3 +555,5 @@ Available tests:
 - `test_victim_selection`: Auto-resolve victim selection
 - `test_deadlock_statistics`: Statistics tracking
 - `test_lock_expiration_cleanup`: TTL-based cleanup
+- `test_async_detect_planted_cycle`: Async detect + Redlock `check_deadlock_async`
+- `test_background_monitor_auto_resolves`: `spawn_monitor` clears cycle with auto_resolve

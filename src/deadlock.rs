@@ -416,6 +416,105 @@ impl DeadlockDetector {
             })
             .collect()
     }
+
+    /// Release all locks currently tracked as held by `client_id`.
+    ///
+    /// Also drops wait-graph edges for those resources. Returns the resource
+    /// names that were released. Used by auto-resolution paths (e.g. the
+    /// background monitor) to break a deadlock cycle in the wait-for graph.
+    pub fn release_client_locks(&self, client_id: &Bytes) -> Vec<String> {
+        let resources: Vec<String> = self
+            .held_locks
+            .read()
+            .iter()
+            .filter(|(_, info)| info.client_id == *client_id)
+            .map(|(resource, _)| resource.clone())
+            .collect();
+
+        for resource in &resources {
+            self.record_lock_released(resource);
+        }
+        resources
+    }
+
+    // ── Async API ──────────────────────────────────────────────────────────
+    //
+    // Critical sections use short `parking_lot::RwLock` holds, so these async
+    // wrappers call the sync implementations directly. They are safe to await
+    // on a Tokio worker: they do not perform I/O or long blocking work.
+    // Prefer these from async contexts for a clear async surface; call the
+    // sync methods when already on a blocking path.
+
+    /// Async wrapper around [`Self::detect_deadlock`].
+    ///
+    /// Critical sections are short; this does not spawn a blocking task.
+    pub async fn detect_deadlock_async(&self) -> DeadlockStatus {
+        self.detect_deadlock()
+    }
+
+    /// Async wrapper around [`Self::resolve_deadlock`].
+    pub async fn resolve_deadlock_async(&self, cycle: &[Bytes]) -> Option<Bytes> {
+        self.resolve_deadlock(cycle)
+    }
+
+    /// Async wrapper around [`Self::get_stats`].
+    pub async fn get_stats_async(&self) -> DeadlockStats {
+        self.get_stats()
+    }
+
+    /// Async wrapper around [`Self::check_long_waits`].
+    pub async fn check_long_waits_async(&self) -> Vec<LongWaitInfo> {
+        self.check_long_waits()
+    }
+
+    /// Spawn a background Tokio task that periodically detects deadlocks.
+    ///
+    /// On each tick:
+    /// 1. Run [`Self::detect_deadlock`].
+    /// 2. If a cycle is found and `auto_resolve` is enabled, select a victim
+    ///    via [`Self::resolve_deadlock`], release their tracked locks, and
+    ///    remove them from the wait graph.
+    ///
+    /// The task runs until the returned [`tokio::task::JoinHandle`] is aborted
+    /// or the runtime shuts down. Dropping the handle alone does **not** stop
+    /// the task — call [`tokio::task::JoinHandle::abort`].
+    ///
+    /// # Example
+    /// ```ignore
+    /// let detector = Arc::new(DeadlockDetector::new(30_000, true));
+    /// let handle = DeadlockDetector::spawn_monitor(detector, Duration::from_secs(1));
+    /// // ... later ...
+    /// handle.abort();
+    /// ```
+    pub fn spawn_monitor(self: Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // First tick completes immediately; skip so we wait a full interval first.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match self.detect_deadlock() {
+                    DeadlockStatus::Deadlock { cycle, resources } => {
+                        tracing::warn!(
+                            cycle_len = cycle.len(),
+                            resources = ?resources,
+                            "deadlock detected by background monitor"
+                        );
+                        if let Some(victim) = self.resolve_deadlock(&cycle) {
+                            let released = self.release_client_locks(&victim);
+                            self.remove_from_waiting(&victim);
+                            tracing::info!(
+                                victim = %String::from_utf8_lossy(&victim),
+                                released = ?released,
+                                "deadlock victim released by background monitor"
+                            );
+                        }
+                    }
+                    DeadlockStatus::NoDeadlock => {}
+                }
+            }
+        })
+    }
 }
 
 impl Default for DeadlockDetector {
@@ -644,5 +743,128 @@ mod tests {
         let detector = DeadlockDetector::new(5000, true)
             .with_victim_strategy(VictimSelectionStrategy::Oldest);
         assert_eq!(detector.victim_strategy(), VictimSelectionStrategy::Oldest);
+    }
+
+    #[test]
+    fn test_release_client_locks_breaks_cycle() {
+        let detector = DeadlockDetector::new(5000, true);
+        let (client1, client2) = setup_two_client_cycle(&detector);
+
+        assert!(matches!(
+            detector.detect_deadlock(),
+            DeadlockStatus::Deadlock { .. }
+        ));
+
+        let released = detector.release_client_locks(&client2);
+        detector.remove_from_waiting(&client2);
+        assert!(
+            released.contains(&"resource-2".to_string()),
+            "should release client2's held resource"
+        );
+        assert!(matches!(
+            detector.detect_deadlock(),
+            DeadlockStatus::NoDeadlock
+        ));
+        // client1's lock remains
+        assert!(detector
+            .get_held_locks()
+            .iter()
+            .any(|l| l.client_id == client1));
+    }
+
+    #[tokio::test]
+    async fn test_detect_deadlock_async_finds_cycle() {
+        let detector = DeadlockDetector::new(5000, false);
+        let client1 = Bytes::from("async-c1");
+        let client2 = Bytes::from("async-c2");
+
+        detector.record_lock_acquired("a".to_string(), client1.clone(), 10000);
+        detector.record_lock_acquired("b".to_string(), client2.clone(), 10000);
+        detector.record_lock_wait("b".to_string(), client1.clone(), 10000);
+        detector.record_lock_wait("a".to_string(), client2.clone(), 10000);
+
+        match detector.detect_deadlock_async().await {
+            DeadlockStatus::Deadlock { cycle, resources } => {
+                assert!(cycle.len() >= 2);
+                assert!(resources.len() >= 2);
+            }
+            DeadlockStatus::NoDeadlock => panic!("expected deadlock via async detect"),
+        }
+
+        let stats = detector.get_stats_async().await;
+        assert_eq!(stats.held_locks_count, 2);
+        assert_eq!(stats.waiting_clients_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_deadlock_async_youngest() {
+        let detector = DeadlockDetector::new_with_strategy(
+            5000,
+            true,
+            VictimSelectionStrategy::Youngest,
+        );
+        let (client1, client2) = setup_two_client_cycle(&detector);
+        let cycle = vec![client1, client2.clone()];
+
+        let victim = detector
+            .resolve_deadlock_async(&cycle)
+            .await
+            .expect("auto_resolve should pick a victim");
+        assert_eq!(victim, client2);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_monitor_auto_resolves_deadlock() {
+        let detector = Arc::new(DeadlockDetector::new_with_strategy(
+            5000,
+            true,
+            VictimSelectionStrategy::Youngest,
+        ));
+        let (_client1, client2) = setup_two_client_cycle(&detector);
+
+        assert!(matches!(
+            detector.detect_deadlock(),
+            DeadlockStatus::Deadlock { .. }
+        ));
+
+        let handle =
+            DeadlockDetector::spawn_monitor(Arc::clone(&detector), Duration::from_millis(20));
+
+        // Wait for at least one monitor tick + resolution
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        assert!(
+            matches!(detector.detect_deadlock(), DeadlockStatus::NoDeadlock),
+            "background monitor with auto_resolve should break the cycle"
+        );
+        // Youngest victim is client2 — their held lock should be gone
+        assert!(
+            !detector
+                .get_held_locks()
+                .iter()
+                .any(|l| l.client_id == client2),
+            "youngest victim (client2) locks should be released"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn test_spawn_monitor_no_auto_resolve_leaves_cycle() {
+        let detector = Arc::new(DeadlockDetector::new(5000, false));
+        let _ = setup_two_client_cycle(&detector);
+
+        let handle =
+            DeadlockDetector::spawn_monitor(Arc::clone(&detector), Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        assert!(
+            matches!(detector.detect_deadlock(), DeadlockStatus::Deadlock { .. }),
+            "without auto_resolve the monitor must not break the cycle"
+        );
+
+        handle.abort();
+        let _ = handle.await;
     }
 }

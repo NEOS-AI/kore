@@ -345,7 +345,8 @@ Also tracked in `docs/roadmap.md`.
   - *Done*: atomic `try_acquire` under write lock; `dequeue_client` front-safe pop; retry cleanup uses `max_attempts`; Drop stops cleanup thread; CLI `--enable-fair-queue` / max-size / cleanup-ms; INFO `# FairQueue` section; docs
 - [ ] **`[P2]`** Deadlock detection advanced (from roadmap)
   - [ ] **`[P2]`** Cross-process detection
-  - [ ] **`[P2]`** Async support
+  - [x] **`[P2]`** Async support
+    - *Done (Batch DA)*: `detect_deadlock_async` / `resolve_deadlock_async` / `get_stats_async` / `check_long_waits_async` (thin Tokio wrappers over short sync critical sections); `release_client_locks`; `DeadlockDetector::spawn_monitor` (abortable `JoinHandle`, auto-resolve victim + tracing); `Redlock::check_deadlock_async` / `get_deadlock_stats_async`; unit + integration tests; docs
   - [x] **`[P2]`** Custom victim selection strategies
     - *Done (Batch CZ)*: `VictimSelectionStrategy` {`Youngest` (default), `Oldest`, `FewestLocks`}; `DeadlockDetector::new_with_strategy` / `with_victim_strategy`; `Redlock::with_deadlock_detection_strategy`; unit tests for each strategy + `auto_resolve=false`
   - [ ] **`[P2]`** Web UI monitoring
@@ -577,7 +578,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batch CZ shipped** (custom deadlock victim selection strategies: Youngest/Oldest/FewestLocks). **CY post-ship review residuals** remain (JSON smoke parse, RUST_LOG replaces -v, path adjacency asserts, O(E) complexity honesty). **Open next:** advanced deadlock remaining (cross-process, async, Web UI); standing tests-for-phase P0; optional larger-N HNSW recall; multi-layer must_keep residual.
+Prioritized for next letter batch(es). **Batch DA shipped** (async deadlock detection API + background monitor). **Batch CZ shipped** (custom deadlock victim selection strategies: Youngest/Oldest/FewestLocks). **CY post-ship review residuals** remain (JSON smoke parse, RUST_LOG replaces -v, path adjacency asserts, O(E) complexity honesty). **Open next:** advanced deadlock remaining (cross-process, Web UI); standing tests-for-phase P0; optional larger-N HNSW recall; multi-layer must_keep residual.
 
 | Pri | Item | Status |
 |-----|------|--------|

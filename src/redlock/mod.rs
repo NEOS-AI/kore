@@ -265,10 +265,29 @@ impl Redlock {
     pub fn check_deadlock(&self) -> Option<DeadlockStatus> {
         self.deadlock_detector.as_ref().map(|d| d.detect_deadlock())
     }
+
+    /// Async deadlock check safe to call from Tokio tasks.
+    ///
+    /// Wraps [`DeadlockDetector::detect_deadlock_async`]. Returns `None` when
+    /// deadlock detection is not enabled on this Redlock instance.
+    pub async fn check_deadlock_async(&self) -> Option<DeadlockStatus> {
+        match &self.deadlock_detector {
+            Some(d) => Some(d.detect_deadlock_async().await),
+            None => None,
+        }
+    }
     
     /// Get deadlock statistics
     pub fn get_deadlock_stats(&self) -> Option<crate::deadlock::DeadlockStats> {
         self.deadlock_detector.as_ref().map(|d| d.get_stats())
+    }
+
+    /// Async deadlock statistics (see [`Self::get_deadlock_stats`]).
+    pub async fn get_deadlock_stats_async(&self) -> Option<crate::deadlock::DeadlockStats> {
+        match &self.deadlock_detector {
+            Some(d) => Some(d.get_stats_async().await),
+            None => None,
+        }
     }
     
     /// Get fair queue statistics

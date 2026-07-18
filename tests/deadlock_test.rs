@@ -254,3 +254,76 @@ fn test_victim_selection() {
         panic!("Expected deadlock");
     }
 }
+
+#[tokio::test]
+async fn test_async_detect_planted_cycle() {
+    let detector = DeadlockDetector::new(5000, false);
+    let client1 = Bytes::from("async-client-1");
+    let client2 = Bytes::from("async-client-2");
+
+    detector.record_lock_acquired("resource-a".to_string(), client1.clone(), 10000);
+    detector.record_lock_acquired("resource-b".to_string(), client2.clone(), 10000);
+    detector.record_lock_wait("resource-b".to_string(), client1.clone(), 10000);
+    detector.record_lock_wait("resource-a".to_string(), client2.clone(), 10000);
+
+    match detector.detect_deadlock_async().await {
+        DeadlockStatus::Deadlock { cycle, resources } => {
+            assert!(cycle.len() >= 2);
+            assert!(resources.len() >= 2);
+        }
+        DeadlockStatus::NoDeadlock => panic!("async detect should find planted cycle"),
+    }
+
+    // Redlock async surface
+    let cache1 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+    let cache2 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+    let cache3 = Cache::new_with_sweep(256, 100 * 1024 * 1024, 1024 * 1024, false);
+    let redlock = Redlock::new(vec![cache1, cache2, cache3])
+        .unwrap()
+        .with_deadlock_detection(5000, false);
+    // No waits recorded via Redlock path — expect NoDeadlock
+    assert!(matches!(
+        redlock.check_deadlock_async().await,
+        Some(DeadlockStatus::NoDeadlock)
+    ));
+}
+
+#[tokio::test]
+async fn test_background_monitor_auto_resolves() {
+    use std::sync::Arc;
+
+    let detector = Arc::new(DeadlockDetector::new(5000, true)); // Youngest default
+    let client1 = Bytes::from("mon-client-1");
+    let client2 = Bytes::from("mon-client-2");
+
+    detector.record_lock_acquired("resource-a".to_string(), client1.clone(), 10000);
+    thread::sleep(Duration::from_millis(5));
+    detector.record_lock_acquired("resource-b".to_string(), client2.clone(), 10000);
+    detector.record_lock_wait("resource-b".to_string(), client1, 10000);
+    detector.record_lock_wait("resource-a".to_string(), client2.clone(), 10000);
+
+    assert!(matches!(
+        detector.detect_deadlock(),
+        DeadlockStatus::Deadlock { .. }
+    ));
+
+    let handle =
+        DeadlockDetector::spawn_monitor(Arc::clone(&detector), Duration::from_millis(25));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert!(
+        matches!(detector.detect_deadlock(), DeadlockStatus::NoDeadlock),
+        "monitor should auto-resolve planted deadlock"
+    );
+    // Youngest = client2
+    assert!(
+        !detector
+            .get_held_locks()
+            .iter()
+            .any(|l| l.client_id == client2),
+        "victim locks should be released from the wait-for graph"
+    );
+
+    handle.abort();
+    let _ = handle.await;
+}
