@@ -374,6 +374,21 @@ Also tracked in `docs/roadmap.md`.
     - *Done (Batch DE)*: on acquire, rewrite/drop edges for that resource and re-link `waiting_for` (mirror merge steps 2+5); tests `test_record_lock_acquired_rewrites_holders_and_relinks_waits`, `test_release_then_acquire_relinks_waiters`.
   - [x] **`[P2]`** Web UI monitoring
     - *Done (Batch DF, MVP)*: `--deadlock-ui-port` (default 0=off) serves hand-rolled HTML (`/`, `/deadlock`) + JSON (`/api/deadlock`, `/deadlock.json`) on `127.0.0.1` only; shares Redlock detector (auto-enabled when UI port set + redlock on); disabled state when no detector; unit/HTTP tests with planted cycle; docs.
+  - [ ] **`[P2]`** **Code review (DF post-ship):** UI snapshot not atomic; detect side-effects on poll
+    - *Found*: `DeadlockUiSnapshot::from_detector` calls `detect_deadlock()` (which runs `cleanup_expired_locks`), then `get_stats()`, then `export_snapshot()` under **separate** lock acquisitions. Concurrent acquire/release can yield cycle≠held/waits mismatch; docs claim “read-only” but each poll mutates via cleanup.
+    - *Next*: single critical-section collect (or export-then-detect on one consistent graph copy); document cleanup-on-poll; optional pure read path for UI.
+  - [ ] **`[P2]`** **Code review (DF post-ship):** no CLI for deadlock params; UI hardcodes detector
+    - *Found*: `Redlock::from_config` only enables detection when `deadlock_ui_port != 0`, with fixed `max_wait=30_000`, `auto_resolve=false`. No `--enable-deadlock-detection` / strategy / auto-resolve flags; cannot run detector without UI, or UI+auto-resolve, without code changes.
+    - *Next*: explicit CLI flags (or CONFIG) for enable / max-wait / auto-resolve / strategy; UI port only binds HTTP; surface params in JSON.
+  - [ ] **`[P3]`** **Code review (DF post-ship):** no `from_config` wiring test for UI auto-enable
+    - *Found*: unit tests cover server + planted cycle + disabled `None` detector, but nothing asserts `Redlock::from_config` with `--deadlock-ui-port` attaches a detector (or that port=0 leaves detection off).
+    - *Next*: integration test in `redlock_wiring_test` (or similar) for UI-port → detector present / absent.
+  - [ ] **`[P3]`** **Code review (DF post-ship):** JS poll only updates status badge
+    - *Found*: 5s `fetch('/api/deadlock')` rewrites `.badge` class/text only; held/wait tables rely on full meta-refresh. If meta-refresh is blocked, tables go stale while badge updates.
+    - *Next*: repaint tables from JSON or drop dual refresh paths; document meta-refresh dependency.
+  - [ ] **`[P3]`** **Code review (DF post-ship):** HTTP MVP gaps shared with metrics server
+    - *Found*: single 4KiB read (no full header parse); non-GET → 404 not 405; test binds `127.0.0.1:0` then rebinds same port (TOCTOU flake risk under load). Acceptable for localhost admin MVP.
+    - *Next*: only if hardening admin HTTP generally (shared helper with metrics).
 
 ### Search & vectors
 
