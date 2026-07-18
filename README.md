@@ -434,6 +434,7 @@ lock.extend(5000)?;
 - [Distributed Locks Guide](docs/distributed_locks.md)
 - [Redlock Implementation](docs/redlock.md)
 - [Deadlock Detection](docs/deadlock_detection.md)
+- [Locking guidelines](docs/locking.md) (contributor lock orders / load commit)
 
 ## Example Usage
 

@@ -120,6 +120,38 @@ fn set_denied_while_load_in_progress_ping_and_info_allowed() {
 }
 
 #[test]
+fn watch_and_exec_denied_while_load_in_progress() {
+    let dbs = Databases::create(4, 8, 1024 * 1024 * 50, 500 * 1024 * 1024, false, 0.75);
+    let mut h = make_handler(dbs.clone());
+    assert!(matches!(
+        handle(&mut h, cmd(&["SET", "w", "1"])),
+        RespValue::SimpleString(_)
+    ));
+
+    dbs.with_load_in_progress_flag(|| {
+        for (name, parts) in [
+            ("WATCH", &["WATCH", "w"][..]),
+            ("MULTI", &["MULTI"][..]),
+            ("EXEC", &["EXEC"][..]),
+            ("SET", &["SET", "w", "2"][..]),
+        ] {
+            let resp = handle(&mut h, cmd(parts));
+            assert!(
+                is_loading(&resp),
+                "{name} should LOADING during multi-DB replace, got {:?}",
+                resp
+            );
+        }
+    });
+
+    // After load flag clears, WATCH/EXEC work
+    assert!(matches!(
+        handle(&mut h, cmd(&["WATCH", "w"])),
+        RespValue::SimpleString(_)
+    ));
+}
+
+#[test]
 fn typed_ttl_survives_rdb_snapshot_replace() {
     let dbs = Databases::create(2, 4, 1024 * 1024 * 50, 500 * 1024 * 1024, false, 0.75);
     let mut h = make_handler(dbs.clone());
