@@ -404,6 +404,14 @@ impl ShardedHashMap {
     /// path with [`drain_all`]).
     pub fn replace_all(&self, entries: Vec<(Bytes, SharedEntry)>) {
         let _discard = self.drain_all();
+        self.fill_all(entries);
+    }
+
+    /// Insert `entries` into an **already empty** map (no drain/clear).
+    ///
+    /// Used after an external [`drain_all`] so install paths do not double-drain.
+    /// **Exclusive access** required; caller owns emptiness invariant.
+    pub fn fill_all(&self, entries: Vec<(Bytes, SharedEntry)>) {
         for (k, v) in entries {
             self.insert(k, v);
         }
@@ -653,10 +661,14 @@ impl<V: Clone> ShardedKeyMap<V> {
 
     /// Replace contents with `entries` (rehashes into this map's shards).
     ///
-    /// **Exclusive access**: destructive clear-then-fill.
     /// **Exclusive access**: drain-then-fill (see [`ShardedHashMap::replace_all`]).
     pub fn replace_all(&self, entries: Vec<(Bytes, V)>) {
         let _discard = self.drain_all();
+        self.fill_all(entries);
+    }
+
+    /// Insert into an already-empty map (no drain). See [`ShardedHashMap::fill_all`].
+    pub fn fill_all(&self, entries: Vec<(Bytes, V)>) {
         for (k, v) in entries {
             self.insert(k, v);
         }

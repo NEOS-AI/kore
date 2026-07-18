@@ -396,6 +396,9 @@ Also tracked in `docs/roadmap.md`.
 - [ ] **`[P2]`** HNSW correctness/performance benchmarks vs FLAT
 - [x] **`[P2]`** **Code review (BT nit):** optional single critical section for `get_index` resolve+lookup; min-replicas FT test
   - *Done (Batch CH + CL)*: `get_index` dual-lock; `tests/cl_min_replicas_ft_test.rs` — FT.CREATE gated by min-replicas-to-write, FT.SEARCH not gated.
+- [x] **`[P2]`** **Code review (CL post-ship):** strengthen min-replicas FT tests
+  - *Found*: FT.SEARCH “not gated” asserts while a good replica is still registered (min-replicas budget still satisfied — would pass even if SEARCH were a write). Only FT.CREATE checked under NOREPLICAS; DROPINDEX/ALIAS* untested.
+  - *Done (Batch CM)*: SEARCH with 0 good replicas (not NOREPLICAS); DROPINDEX/ALIASDEL/ALIASUPDATE under min-replicas=2 with one feed.
 - [x] **`[P2]`** **Code review (BU):** share one FT.CREATE parser between command path and AOF load
   - *Found*: `parse_ft_create_definition` in `aof.rs` duplicates `handle_ft_create` in `commands/search.rs` — schema options can drift (already two HNSW option loops)
   - *Done (Batch CA)*: shared `IndexDefinition::from_ft_create_argv` / `from_ft_create_args` in `search_index.rs`; command path + AOF load both call it (single `ef_construction` default 200). Tests: unit in `search_index`, `tests/ca_shared_ft_create_parser_test.rs`
@@ -466,6 +469,9 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (CB):** `drain_all` / `replace_all` not fully failure-atomic across shards
   - *Partial (Batch CB)*: pre-`reserve(self.len())` on drain_all; exclusive-access docs.
   - *Done (Batch CL)*: `replace_all` on `ShardedHashMap`/`ShardedKeyMap` uses drain-then-fill (holds discard until inserts finish). True multi-shard atomic under concurrent mutators still not claimed — exclusive load-time use only.
+- [x] **`[P2]`** **Code review (CL post-ship):** `install_keyspace_payload` double-drains maps via `replace_all`
+  - *Found*: payload install already `drain_all`s into outer `discard_*`, then `replace_all` drains again (empty). Extra alloc/work; CL durability claim is on the outer discards, not `replace_all`.
+  - *Done (Batch CM)*: `fill_all` on `ShardedHashMap`/`ShardedKeyMap`; install uses fill after external drain.
 - [x] **`[P2]`** **Code review (CB nit):** `install_keyspace_counts` not closed over `KEYSPACE_CATEGORIES`
   - *Done (Batch CB)*: install always writes fixed `KEYSPACE_CATEGORIES` slots (ignores fabricated category tags; PubSub cannot be clobbered).
 - [x] **`[P2]`** **Code review (CB nit):** `SearchIndexManager::install` does not validate alias targets exist in indices (fine if only fed `take_all` output)
@@ -507,7 +513,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batch CL shipped** (min-replicas FT.CREATE gate test; PubSub take/install unit test; drain-then-fill `replace_all`). **Open:** true multi-DB atomic install residual (P1); HNSW benches; peak-memory / concurrent WATCH expand; eng-quality P2s.
+Prioritized for next letter batch(es). **Batch CM shipped** (stronger min-replicas FT tests; `fill_all` avoids double-drain on install). **Open:** true multi-DB atomic install residual (P1); HNSW benches; peak-memory / concurrent WATCH expand; eng-quality P2s.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -539,7 +545,9 @@ Prioritized for next letter batch(es). **Batch CL shipped** (min-replicas FT.CRE
 | P2 | AOF load all-or-nothing on FT failure (BV review) | done (BW) |
 | P2 | FLUSHDB vs FT schema (BW: flush clears indices) | done (BX) |
 | P2 | Scratch-load swap if AOF/RDB load targets non-empty DB | done (CB) |
-| P2 | CB: `drain_all`/`replace_all` failure-atomic | done (CL drain-then-fill; exclusive-only) |
+| P2 | CB: `drain_all`/`replace_all` failure-atomic | done (CL); double-drain install open |
+| P2 | CL post-ship: strengthen min-replicas FT SEARCH/DROP/ALIAS tests | done (CM) |
+| P2 | CL post-ship: fill-only after external drain (no double drain) | done (CM) |
 | P2 | CB: `install_keyspace_counts` closed over KEYSPACE_CATEGORIES | done (CB) |
 | P2 | CB: optional alias-target validate on search `install` | done (CF debug_assert) |
 | P2 | CB post-ship: expand tests (memory, multi-DB, TTL, pubsub, seed, peak) | partial (CJ memory/merge/empty-AOF; rest open) |

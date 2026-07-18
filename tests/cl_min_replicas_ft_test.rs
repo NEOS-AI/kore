@@ -1,4 +1,4 @@
-//! Batch CL: min-replicas-to-write applies to FT.* mutators.
+//! Batch CL/CM: min-replicas-to-write applies to FT.* mutators (not SEARCH).
 
 use bytes::Bytes;
 use kore::commands::CommandHandler;
@@ -86,28 +86,38 @@ fn handle(handler: &mut CommandHandler, value: RespValue) -> RespValue {
     rt.block_on(async { handler.handle(value).await.unwrap() })
 }
 
-fn err_contains(resp: RespValue, needle: &str) -> bool {
+fn err_contains(resp: &RespValue, needle: &str) -> bool {
     match resp {
-        RespValue::Error(e) => String::from_utf8_lossy(&e).contains(needle),
+        RespValue::Error(e) => String::from_utf8_lossy(e).contains(needle),
         _ => false,
     }
 }
 
+fn is_ok(resp: &RespValue) -> bool {
+    matches!(resp, RespValue::SimpleString(ref s) if s.as_ref() == b"OK")
+}
+
 #[test]
-fn min_replicas_blocks_ft_create() {
+fn min_replicas_blocks_ft_mutators_not_search() {
     let dir = unique_dir("ft-min");
     let mgr = make_persistence(&dir);
     let cache = Cache::new_with_sweep(8, 1024 * 1024 * 10, 500 * 1024 * 1024, false);
     let mut h = CommandHandler::with_persistence(cache, make_config(&dir), Some(mgr.clone()));
 
-    assert!(matches!(
-        handle(
-            &mut h,
-            cmd(&["CONFIG", "SET", "min-replicas-to-write", "1"])
-        ),
-        RespValue::SimpleString(_)
-    ));
+    assert!(is_ok(&handle(
+        &mut h,
+        cmd(&["CONFIG", "SET", "min-replicas-to-write", "1"])
+    )));
 
+    // Zero good replicas: SEARCH is not a write (index missing is fine; not NOREPLICAS).
+    let search0 = handle(&mut h, cmd(&["FT.SEARCH", "idx", "*"]));
+    assert!(
+        !err_contains(&search0, "NOREPLICAS"),
+        "FT.SEARCH with 0 replicas must not be NOREPLICAS, got {:?}",
+        search0
+    );
+
+    // Mutators blocked
     let create = handle(
         &mut h,
         cmd(&[
@@ -122,40 +132,61 @@ fn min_replicas_blocks_ft_create() {
         ]),
     );
     assert!(
-        err_contains(create, "NOREPLICAS"),
+        err_contains(&create, "NOREPLICAS"),
         "FT.CREATE must respect min-replicas-to-write"
     );
 
     // Register a replica → FT.CREATE allowed
     let _feed = mgr.replication.register_replica();
-    assert!(matches!(
-        handle(
-            &mut h,
-            cmd(&[
-                "FT.CREATE",
-                "idx",
-                "PREFIX",
-                "1",
-                "doc:",
-                "SCHEMA",
-                "t",
-                "TEXT",
-            ])
-        ),
-        RespValue::SimpleString(_)
-    ));
+    assert!(is_ok(&handle(
+        &mut h,
+        cmd(&[
+            "FT.CREATE",
+            "idx",
+            "PREFIX",
+            "1",
+            "doc:",
+            "SCHEMA",
+            "t",
+            "TEXT",
+        ])
+    )));
+    assert!(is_ok(&handle(
+        &mut h,
+        cmd(&["FT.ALIASADD", "blog", "idx"])
+    )));
 
-    // FT.SEARCH is not a write
-    assert!(matches!(
-        handle(&mut h, cmd(&["CONFIG", "SET", "min-replicas-to-write", "1"])),
-        RespValue::SimpleString(_)
-    ));
-    // drop feed? if we need zero replicas again - unregister isn't simple
-    // With one feed still registered, search still works
+    // Raise bar so existing one replica is insufficient
+    assert!(is_ok(&handle(
+        &mut h,
+        cmd(&["CONFIG", "SET", "min-replicas-to-write", "2"])
+    )));
+
+    let drop = handle(&mut h, cmd(&["FT.DROPINDEX", "idx"]));
+    assert!(
+        err_contains(&drop, "NOREPLICAS"),
+        "FT.DROPINDEX must respect min-replicas, got {:?}",
+        drop
+    );
+    let alias_del = handle(&mut h, cmd(&["FT.ALIASDEL", "blog"]));
+    assert!(
+        err_contains(&alias_del, "NOREPLICAS"),
+        "FT.ALIASDEL must respect min-replicas, got {:?}",
+        alias_del
+    );
+    let alias_upd = handle(&mut h, cmd(&["FT.ALIASUPDATE", "blog", "idx"]));
+    assert!(
+        err_contains(&alias_upd, "NOREPLICAS"),
+        "FT.ALIASUPDATE must respect min-replicas, got {:?}",
+        alias_upd
+    );
+
+    // SEARCH still allowed under insufficient replicas
     let search = handle(&mut h, cmd(&["FT.SEARCH", "idx", "*"]));
     assert!(
-        !err_contains(search, "NOREPLICAS"),
-        "FT.SEARCH must not be gated by min-replicas"
+        !err_contains(&search, "NOREPLICAS"),
+        "FT.SEARCH must not be gated by min-replicas, got {:?}",
+        search
     );
 
     let _ = std::fs::remove_dir_all(&dir);

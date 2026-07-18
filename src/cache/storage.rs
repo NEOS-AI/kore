@@ -562,10 +562,10 @@ impl Cache {
         let (discard_indices, discard_aliases) = self.search_index_manager.take_all();
         let discard_counts = self.memory_tracker.take_keyspace_counts();
 
-        // Install maps first, then memory counters (autosweep must be paused).
-        self.map.replace_all(payload.map);
-        self.sorted_sets.replace_all(payload.zsets);
-        self.geo_sets.replace_all(payload.geos);
+        // Maps already drained into discard_* above — fill only (no second drain).
+        self.map.fill_all(payload.map);
+        self.sorted_sets.fill_all(payload.zsets);
+        self.geo_sets.fill_all(payload.geos);
         *self.hashes.write() = payload.hashes;
         *self.lists.write() = payload.lists;
         *self.sets.write() = payload.sets;
