@@ -1147,10 +1147,11 @@ fn map_ft_mutator_error(msg: String) -> Error {
 /// Replay AOF into a single cache. SELECT is ignored (all commands hit this cache).
 ///
 /// **Scratch-load (transactional):** commands are applied to an empty scratch
-/// keyspace. On `Ok`, the scratch keyspace is swapped into `cache` via
+/// keyspace (independent stats). On `Ok`, autosweep is paused, the target is
+/// flushed (AOF is a full snapshot replace), then scratch is swapped in via
 /// [`Cache::replace_keyspace_from`]. On `Err`, `cache` is left completely
 /// untouched (scratch is dropped). Requires exclusive access to `cache` for
-/// the commit swap (no concurrent client traffic / sweep during load).
+/// the commit swap (no concurrent client traffic during load).
 pub fn load_into_cache(cache: &Arc<Cache>, path: &Path) -> Result<usize> {
     let scratch = cache.empty_keyspace_like();
     let result = load_file_with(path, |argv| {
@@ -1162,7 +1163,11 @@ pub fn load_into_cache(cache: &Arc<Cache>, path: &Path) -> Result<usize> {
     });
     match result {
         Ok(n) => {
-            cache.replace_keyspace_from(&scratch);
+            cache.with_autosweep_paused(|| {
+                // Full replace: free target early to cut dual-residency peak.
+                cache.flush_all_including_search();
+                cache.replace_keyspace_from(&scratch);
+            });
             Ok(n)
         }
         Err(e) => Err(e),
@@ -1172,7 +1177,8 @@ pub fn load_into_cache(cache: &Arc<Cache>, path: &Path) -> Result<usize> {
 /// Replay AOF into multi-DB keyspaces. Handles SELECT and FLUSHALL across DBs.
 ///
 /// **Scratch-load (transactional):** replay targets an empty multi-DB scratch
-/// collection. On `Ok`, each DB keyspace is swapped into `databases` via
+/// collection. On `Ok`, autosweep is paused on all DBs, targets are flushed
+/// (AOF is a full snapshot replace), then each DB is swapped via
 /// [`Databases::replace_keyspaces_from`]. On `Err`, `databases` is left
 /// completely untouched. Requires exclusive access for the commit swap.
 pub fn load_into_databases(databases: &Databases, path: &Path) -> Result<usize> {
@@ -1209,7 +1215,10 @@ pub fn load_into_databases(databases: &Databases, path: &Path) -> Result<usize> 
     });
     match result {
         Ok(n) => {
-            databases.replace_keyspaces_from(&scratch);
+            databases.with_autosweep_paused_all(|| {
+                databases.flush_all_including_search();
+                databases.replace_keyspaces_from(&scratch);
+            });
             Ok(n)
         }
         Err(e) => Err(e),

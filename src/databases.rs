@@ -103,11 +103,55 @@ impl Databases {
     /// Move full keyspace state of every DB from `other` into `self`.
     ///
     /// **Exclusive access required** (see [`Cache::replace_keyspace_from`]).
+    /// Callers should pause autosweep on all DBs for the whole loop (see
+    /// [`with_autosweep_paused_all`]); public load wrappers do this.
     /// DB count is matched by index; extra DBs on either side are ignored.
     pub fn replace_keyspaces_from(&self, other: &Self) {
         let n = self.dbs.len().min(other.dbs.len());
         for i in 0..n {
             self.dbs[i].replace_keyspace_from(&other.dbs[i]);
+        }
+    }
+
+    /// Run `f` with autosweep disabled on every DB; restore each DB's previous
+    /// flag afterward (panic-safe). Used around multi-DB keyspace replace.
+    pub fn with_autosweep_paused_all<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let prev: Vec<bool> = self.dbs.iter().map(|db| db.autosweep_enabled()).collect();
+        for db in &self.dbs {
+            db.set_autosweep(false);
+        }
+        struct Restore<'a> {
+            dbs: &'a Databases,
+            prev: Vec<bool>,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                for (db, &was) in self.dbs.dbs.iter().zip(self.prev.iter()) {
+                    db.set_autosweep(was);
+                }
+            }
+        }
+        let _guard = Restore {
+            dbs: self,
+            prev,
+        };
+        f()
+    }
+
+    /// Enable or disable autosweep on every logical DB.
+    pub fn set_autosweep_all(&self, enabled: bool) {
+        for db in &self.dbs {
+            db.set_autosweep(enabled);
+        }
+    }
+
+    /// Spawn background sweep tasks on every DB (after startup load).
+    pub fn start_background_sweep_all(self: &Arc<Self>) {
+        for db in &self.dbs {
+            db.start_background_sweep();
         }
     }
 

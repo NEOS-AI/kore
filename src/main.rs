@@ -47,7 +47,9 @@ fn main() -> anyhow::Result<()> {
         info!("Starting Kore database server v{}", version);
         info!("Worker threads: {}", config.num_threads());
 
-        // Create multi-DB keyspaces (loadfactor drives initial per-shard HashMap capacity)
+        // Create multi-DB keyspaces (loadfactor drives initial per-shard HashMap capacity).
+        // start_sweep: false until after load_at_startup so expire cannot race
+        // scratch-load replace (Batch CC). Sweep tasks start below.
         let max_memory = config.max_memory();
         let max_entry_size = config.maxentrysize;
         let databases = Databases::create(
@@ -55,12 +57,13 @@ fn main() -> anyhow::Result<()> {
             config.shards,
             max_memory,
             max_entry_size,
-            true,
+            false,
             config.loadfactor,
         );
         let cache = databases.db0();
         for db in databases.iter() {
-            db.set_autosweep(config.autosweep);
+            // Keep autosweep off through startup load (task not running yet either).
+            db.set_autosweep(false);
             // maxmemory-policy: --evict=false forces noeviction
             if !config.evict {
                 db.set_eviction_policy(kore::cache::EvictionPolicy::NoEviction);
@@ -139,6 +142,10 @@ fn main() -> anyhow::Result<()> {
         if let Err(e) = persistence.load_at_startup(&databases) {
             warn!("Failed to load data at startup: {}", e);
         }
+
+        // Enable background expire only after startup load commit.
+        databases.set_autosweep_all(config.autosweep);
+        databases.start_background_sweep_all();
 
         // Announce this instance's listen port for REPLCONF / FAILOVER TO matching.
         persistence.replication.set_announce_port(config.port);

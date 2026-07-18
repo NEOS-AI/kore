@@ -369,24 +369,22 @@ pub struct MultiDbSnapshot {
 
 impl DbSnapshot {
     /// Capture current cache state (skip expired strings).
+    ///
+    /// **Non-mutating:** uses map/export peeks only — no LRU/LFU touch, no
+    /// lazy-delete of expired keys, no stats bumps. Safe for RDB save and for
+    /// scratch-load merge seed (`flush=false`) so a failed merge leaves the
+    /// live target completely untouched.
     pub fn from_cache(cache: &Cache) -> Result<Self> {
-        let now = now_unix_ms();
-        let mut strings = Vec::new();
-
-        for key in cache.map_keys_all() {
-            if let Ok(Some(entry)) = cache.load(&key, Default::default()) {
-                let expire_unix_ms = match entry.ttl_millis() {
-                    Some(ttl) if ttl > 0 => now + ttl,
-                    _ => -1,
-                };
-                strings.push(StringRecord {
-                    key: entry.key.clone(),
-                    value: entry.value.clone(),
-                    flags: entry.flags,
-                    expire_unix_ms,
-                });
-            }
-        }
+        let strings = cache
+            .export_strings()
+            .into_iter()
+            .map(|(key, value, flags, expire_unix_ms)| StringRecord {
+                key,
+                value,
+                flags,
+                expire_unix_ms,
+            })
+            .collect();
 
         let zsets = cache
             .export_zsets()
@@ -1127,24 +1125,35 @@ pub fn load_databases(databases: &Databases, path: &Path, flush: bool) -> Result
 /// **Scratch-load (transactional):** after a successful decode, the snapshot is
 /// applied to a scratch keyspace and swapped into `cache` only on `Ok`. On
 /// `Err` (including mid-`load_into` failures), `cache` is left completely
-/// untouched. Requires exclusive access to `cache` for the commit swap.
+/// untouched (including no seed-side mutation: merge seed uses non-mutating
+/// export). Commit pauses autosweep on the target for the whole replace.
 ///
-/// - `flush = true` (snapshot replace / FULLRESYNC): scratch starts empty, so
-///   a successful load replaces the entire keyspace (keys + FT schema).
-/// - `flush = false` (merge): scratch is seeded with a deep copy of the current
-///   keyspace (via encode/decode snapshot), then the RDB is merged into that
-///   copy before swap — so failure still preserves the live target.
+/// - `flush = true` (snapshot replace / FULLRESYNC): scratch starts empty; on
+///   success the target is flushed (including FT schema) **before** replace so
+///   peak dual-residency is shortened, then scratch is installed.
+/// - `flush = false` (merge): scratch is seeded with a non-mutating deep copy
+///   of the current keyspace, then the RDB is merged into that copy before
+///   swap — failure preserves the live target with no touch/lazy-expire side
+///   effects from seeding.
 pub fn load_bytes(cache: &Cache, data: &[u8], flush: bool) -> Result<usize> {
     let snap = MultiDbSnapshot::decode(data)?;
     let scratch = cache.empty_keyspace_like();
     if !flush {
         // Seed scratch with current keyspace so merge is transactional.
+        // from_cache is non-mutating (no touch / lazy-delete / stats).
         let seed = MultiDbSnapshot::from_cache(cache)?;
         seed.load_into_cache(&scratch)?;
     }
     match snap.load_into_cache(&scratch) {
         Ok(n) => {
-            cache.replace_keyspace_from(&scratch);
+            cache.with_autosweep_paused(|| {
+                // flush=true: drop live keyspace early so peak ≈ scratch only
+                // before install (Err path never reaches here).
+                if flush {
+                    cache.flush_all_including_search();
+                }
+                cache.replace_keyspace_from(&scratch);
+            });
             Ok(n)
         }
         Err(e) => Err(e),
@@ -1154,10 +1163,13 @@ pub fn load_bytes(cache: &Cache, data: &[u8], flush: bool) -> Result<usize> {
 /// Load RDB bytes into multi-DB keyspaces.
 ///
 /// **Scratch-load (transactional):** see [`load_bytes`]. On `Ok`, every DB
-/// keyspace is swapped from scratch; on `Err`, `databases` is untouched.
+/// keyspace is swapped from scratch under multi-DB autosweep pause; on `Err`,
+/// `databases` is untouched.
 ///
-/// - `flush = true`: empty scratch (snapshot replace of all DBs).
-/// - `flush = false`: scratch seeded from current multi-DB state, then merged.
+/// - `flush = true`: empty scratch; successful load flushes all target DBs
+///   (including FT) then replaces (peak-memory recovery for FULLRESYNC).
+/// - `flush = false`: scratch seeded from non-mutating multi-DB snapshot, then
+///   merged.
 pub fn load_databases_bytes(databases: &Databases, data: &[u8], flush: bool) -> Result<usize> {
     let snap = MultiDbSnapshot::decode(data)?;
     let scratch = databases.empty_like();
@@ -1167,7 +1179,12 @@ pub fn load_databases_bytes(databases: &Databases, data: &[u8], flush: bool) -> 
     }
     match snap.load_into_databases(&scratch) {
         Ok(n) => {
-            databases.replace_keyspaces_from(&scratch);
+            databases.with_autosweep_paused_all(|| {
+                if flush {
+                    databases.flush_all_including_search();
+                }
+                databases.replace_keyspaces_from(&scratch);
+            });
             Ok(n)
         }
         Err(e) => Err(e),

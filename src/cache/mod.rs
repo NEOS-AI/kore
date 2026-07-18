@@ -182,6 +182,30 @@ impl Cache {
         start_sweep: bool,
         loadfactor: f64,
     ) -> Arc<Self> {
+        Self::new_keyspace_sharing_with_stats(
+            shared,
+            num_shards,
+            max_memory,
+            max_entry_size,
+            start_sweep,
+            loadfactor,
+            Arc::clone(&shared.stats),
+        )
+    }
+
+    /// Like [`new_keyspace_sharing`], but with an explicit stats Arc.
+    ///
+    /// Logical multi-DB siblings pass `shared.stats`; scratch-load uses a fresh
+    /// `Stats` so RDB/AOF apply does not pollute live INFO counters.
+    fn new_keyspace_sharing_with_stats(
+        shared: &Self,
+        num_shards: usize,
+        max_memory: usize,
+        max_entry_size: usize,
+        start_sweep: bool,
+        loadfactor: f64,
+        stats: Arc<Stats>,
+    ) -> Arc<Self> {
         let memory_tracker = Arc::new(MemoryTracker::new(max_memory, 1024 * 1024));
         let cap = ((1024.0 / loadfactor.max(0.55)) as usize).max(16);
 
@@ -199,7 +223,7 @@ impl Cache {
             pubsub: Arc::clone(&shared.pubsub),
             search_index_manager: Arc::new(SearchIndexManager::new()),
             memory_tracker,
-            stats: Arc::clone(&shared.stats),
+            stats,
             slowlog: Arc::clone(&shared.slowlog),
             acl_log: Arc::clone(&shared.acl_log),
             max_memory: AtomicUsize::new(max_memory),
@@ -237,10 +261,7 @@ impl Cache {
         });
 
         if start_sweep {
-            let cache_clone = cache.clone();
-            tokio::spawn(async move {
-                cache_clone.background_sweep().await;
-            });
+            cache.start_background_sweep();
         }
 
         cache
@@ -249,12 +270,13 @@ impl Cache {
     /// Empty keyspace sibling for scratch-load (AOF/RDB).
     ///
     /// Same shard count / maxmemory / max-entry-size as `self`, shares pubsub +
-    /// connection stats / slowlog / acl_log (multi-DB sibling pattern), but has
-    /// independent maps, search manager, and zeroed memory. Background sweep is
-    /// **not** started — callers must use this only under exclusive access
-    /// (no concurrent client commands against the scratch).
+    /// slowlog / acl_log (multi-DB sibling pattern), but has **independent**
+    /// maps, search manager, zeroed memory, and a private `Stats` (so load apply
+    /// does not inflate live INFO). Background sweep is **not** started —
+    /// callers must use this only under exclusive access (no concurrent client
+    /// commands against the scratch). Autosweep is forced off.
     pub fn empty_keyspace_like(&self) -> Arc<Self> {
-        Self::new_keyspace_sharing(
+        let scratch = Self::new_keyspace_sharing_with_stats(
             self,
             self.map.num_shards(),
             self.max_memory.load(std::sync::atomic::Ordering::Relaxed),
@@ -262,7 +284,52 @@ impl Cache {
                 .load(std::sync::atomic::Ordering::Relaxed),
             false, // start_sweep: load-time exclusive use
             0.75,  // loadfactor only sizes initial shard capacity
-        )
+            Arc::new(Stats::new()),
+        );
+        scratch.set_autosweep(false);
+        scratch
+    }
+
+    /// Spawn the background active-expire task (idempotent only if callers
+    /// ensure a single spawn; used after startup load when create used
+    /// `start_sweep: false`).
+    pub fn start_background_sweep(self: &Arc<Self>) {
+        let cache_clone = self.clone();
+        tokio::spawn(async move {
+            cache_clone.background_sweep().await;
+        });
+    }
+
+    /// Current autosweep flag (background expire may still finish an in-flight
+    /// cycle after this flips to false).
+    pub fn autosweep_enabled(&self) -> bool {
+        self.autosweep_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Run `f` with autosweep disabled on this cache; restore previous flag
+    /// even if `f` panics. Used around keyspace replace commit so expire cannot
+    /// race map/counter install.
+    pub fn with_autosweep_paused<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let prev = self.autosweep_enabled();
+        self.set_autosweep(false);
+        struct Restore<'a> {
+            cache: &'a Cache,
+            prev: bool,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.cache.set_autosweep(self.prev);
+            }
+        }
+        let _guard = Restore {
+            cache: self,
+            prev,
+        };
+        f()
     }
 
     /// Current max memory limit in bytes.

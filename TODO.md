@@ -409,11 +409,33 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch CB)*: `Cache::empty_keyspace_like` / `replace_keyspace_from` move strings + sorted_sets + geo_sets + hashes/lists/sets/streams + typed_expires + watch_gens + search take/install + tracker keyspace counts + `memory_usage`; leave pubsub/stats/blockers/maxmemory. Scratch uses `start_sweep: false`; helpers document exclusive-access / load-time quiesce. `Databases::empty_like` / `replace_keyspaces_from` wrap per-DB swap.
 - [x] **`[P1]`** **Code review (CB):** keep `Cache.memory_usage` in sync with tracker on swap
   - *Done (Batch CB)*: `replace_keyspace_from` pairs tracker take/install with `memory_usage` store; no per-key `account` after `replace_all`. Drain scratch first, then drain target to discard + install (map-level mem::replace style).
-- [ ] **`[P2]`** **Code review (CB):** `drain_all` not fully failure-atomic across shards
-  - *Partial (Batch CB)*: pre-`reserve(self.len())` on `ShardedHashMap`/`ShardedKeyMap` `drain_all`; docs note exclusive access. Mid-panic after partial shard drain still drops drained entries (true OOM-abort policy remains open).
+- [x] **`[P0]`** **Code review (CB post-ship):** production load does not quiesce target `background_sweep` during `replace_keyspace_from`
+  - *Found*: helpers document exclusive access, but `main` may start DBs with `start_sweep: true` before `load_at_startup`; FULLRESYNC load can race replica autosweep. Between map install and later `install_keyspace_counts` / `memory_usage.store`, expire can deallocate then counters get overwritten with pre-expire scratch totals → ghost `used_memory`. Multi-map torn window mid-install.
+  - *Done (Batch CC)*: public AOF/RDB load commit paths wrap replace in `with_autosweep_paused` / `with_autosweep_paused_all`; `main` creates with `start_sweep: false`, applies autosweep + starts sweep tasks only after `load_at_startup`. Tests: `tests/cc_load_quiesce_and_seed_test.rs`.
+- [x] **`[P0]`** **Code review (CB second-pass):** `flush=true` / FULLRESYNC peak memory ~2× (regression vs wipe-then-load)
+  - *Found*: CB keeps live keyspace full while scratch fills; scratch has independent `MemoryTracker::new(max_memory)` so each side admits a full budget; process RSS not gated. During replace, discard locals + installed maps briefly hold old+new. Affects non-empty RDB load and replica `load_databases_bytes(..., true)`.
+  - *Done (Batch CC)*: on successful `flush=true` (and AOF full replace), flush target including search under quiesce **before** `replace_*`; `replace_keyspace_from` drops discard locals immediately after install. Err path never flushes target.
+- [x] **`[P0]`** **Code review (CB second-pass):** `flush=false` RDB seed mutates the live target before commit
+  - *Found*: merge seed uses `MultiDbSnapshot::from_cache` → `cache.load(..., Default)` with `touch: true` — updates LRU/LFU, lazy-deletes expired keys, bumps shared stats. On merge `Err`, target is not “completely untouched.” `from_databases` same issue.
+  - *Done (Batch CC)*: `Cache::export_strings` + `DbSnapshot::from_cache` non-mutating (skip expired, no touch/lazy-delete/stats); save + seed share the same path. Tests: failed merge keeps expired for sweep, live key, zero unexpected cmd_get/hits/evicted_expired.
+- [ ] **`[P1]`** **Code review (CB post-ship):** multi-DB `replace_keyspaces_from` is not atomic across DBs
+  - *Found*: commits one DB at a time; concurrent readers (FULLRESYNC) can see DB0 new + DB1 old; panic mid-loop leaves partial multi-DB commit.
+  - *Second-pass*: confirmed.
+  - *Partial (Batch CC)*: whole replace loop runs under multi-DB autosweep pause; true cross-DB atomic install / global load lock still open.
+- [x] **`[P1]`** **Code review (CB post-ship):** keyspace replace does not bump `watch_gens` (unlike FLUSHDB `touch_all_watch_keys`)
+  - *Found*: install uses scratch’s empty `watch_gens`; clients with WATCH gen `0` can still EXEC after full dataset replace. Harmless at exclusive startup; wrong if load runs with live WATCH holders.
+  - *Done (Batch CC)*: `replace_keyspace_from` collects pre-swap watch keys and bumps them after install. Test: EXEC null after load replace.
+- [x] **`[P1]`** **Code review (CB second-pass):** scratch shares `Stats` Arc with target (`new_keyspace_sharing`)
+  - *Found*: RDB/AOF apply on scratch increments shared `cmd_set`/`cmd_get`/OOM counters; failed loads never commit keyspace but permanently inflate INFO; success counts internal apply as client commands. PubSub category install itself is fine (KEYSPACE excludes PubSub).
+  - *Done (Batch CC)*: `empty_keyspace_like` uses independent `Stats::new()`; multi-DB siblings still share stats.
+- [ ] **`[P2]`** **Code review (CB post-ship):** expand CB tests — post-swap memory_tracker + `string_memory_usage`; multi-DB fail/success; typed TTL after swap; PubSub category non-clobber; empty-AOF success on non-empty target; peak-memory budget; seed non-mutation on failed merge
+  - *Partial (Batch CC)*: seed non-mutation + autosweep restore + WATCH + flush=true replace covered in `cc_load_*`; remaining expansion open.
+- [ ] **`[P2]`** **Code review (CB):** `drain_all` / `replace_all` not fully failure-atomic across shards
+  - *Partial (Batch CB)*: pre-`reserve(self.len())` on `ShardedHashMap`/`ShardedKeyMap` `drain_all`; docs note exclusive access. Mid-panic after partial shard drain still drops drained entries; install-half `replace_all` after target drain is the more dangerous path on the live DB (true OOM-abort policy remains open).
 - [x] **`[P2]`** **Code review (CB nit):** `install_keyspace_counts` not closed over `KEYSPACE_CATEGORIES`
   - *Done (Batch CB)*: install always writes fixed `KEYSPACE_CATEGORIES` slots (ignores fabricated category tags; PubSub cannot be clobbered).
 - [ ] **`[P2]`** **Code review (CB nit):** `SearchIndexManager::install` does not validate alias targets exist in indices (fine if only fed `take_all` output)
+- [ ] **`[P2]`** **Code review (CB second-pass nit):** `empty_keyspace_like` hardcodes `loadfactor: 0.75` (diverges from process create-time loadfactor; capacity churn only)
 
 ### Pub/Sub
 
@@ -445,11 +467,14 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batch CB done**: full keyspace scratch-load + swap for AOF/RDB public load entry points (pre-existing target survives `Err`; success commits via replace). Remaining CB nits: `drain_all` mid-panic shard loss (partial reserve done), optional alias-target validate on search `install`. **Next:** ACL `@search`; HNSW RDB round-trip; HNSW `ef_construction` AOF; BZ remaining nits (`flush=false` FT name-clash merge policy; raw `load_into` docs; tighten mid-fail assert).
+Prioritized for next letter batch(es). **Batch CC shipped** (load quiesce + non-mutating seed + flush=true peak recovery + WATCH bump + independent scratch Stats). **Next:** ACL `@search`; HNSW AOF/`ef_construction` + RDB round-trip tests; remaining CB/BZ nits (multi-DB atomic install, expand tests, loadfactor, raw `load_into`).
 
 | Pri | Item | Status |
 |-----|------|--------|
 | P0 | `FT.*` mutators in `is_write_command` (AOF / repl / READONLY) | done (BT) |
+| P0 | CB post-ship: quiesce target sweep during `replace_keyspace_from` | done (CC) |
+| P0 | CB second-pass: flush=true peak memory ~2× (independent trackers) | done (CC) |
+| P0 | CB second-pass: flush=false seed mutates live target (`load` touch/expire) | done (CC) |
 | P1 | Alias target resolve + real-name storage | done (BT) |
 | P1 | Atomic create/alias namespace critical section | done (BT) |
 | P1 | AOF rewrite emits `FT.CREATE` + aliases (BT review) | done (BU) |
@@ -457,6 +482,9 @@ Prioritized for next letter batch(es). **Batch CB done**: full keyspace scratch-
 | P1 | RDB load `flush=true` must wipe FT schema (BY×BX clash) | done (BZ) |
 | P1 | CB: full keyspace swap under quiesce (typed maps, expires, watch) | done (CB) |
 | P1 | CB: `Cache.memory_usage` + tracker paired install (no double-account) | done (CB) |
+| P1 | CB post-ship: multi-DB replace atomic / server-wide quiesce | partial (CC pause; install still per-DB) |
+| P1 | CB post-ship: bump `watch_gens` on keyspace replace | done (CC) |
+| P1 | CB second-pass: scratch independent Stats (no INFO pollution) | done (CC) |
 | P2 | FT RDB section | done (BY) |
 | P2 | RDB load wipe-on-FT-failure (mirror AOF BW) | done (BZ) |
 | P2 | RDB `flush=false` FT merge / name-clash semantics | open (Err preserves after CB) |
@@ -466,9 +494,11 @@ Prioritized for next letter batch(es). **Batch CB done**: full keyspace scratch-
 | P2 | AOF load all-or-nothing on FT failure (BV review) | done (BW) |
 | P2 | FLUSHDB vs FT schema (BW: flush clears indices) | done (BX) |
 | P2 | Scratch-load swap if AOF/RDB load targets non-empty DB | done (CB) |
-| P2 | CB: `drain_all` failure-atomic / reserve-before-drain | partial (reserve done) |
+| P2 | CB: `drain_all`/`replace_all` failure-atomic | partial (reserve done) |
 | P2 | CB: `install_keyspace_counts` closed over KEYSPACE_CATEGORIES | done (CB) |
 | P2 | CB: optional alias-target validate on search `install` | open |
+| P2 | CB post-ship: expand tests (memory, multi-DB, TTL, pubsub, seed, peak) | partial (CC seed/quiesce/WATCH) |
+| P2 | CB second-pass: empty_keyspace_like hardcodes loadfactor 0.75 | open |
 | P2 | `get_index` atomic resolve; min-replicas FT test | open |
 | P2 | VECTOR/NUMERIC rewrite tests | done (BX) |
 | P2 | HNSW RDB round-trip test | open |

@@ -481,9 +481,10 @@ impl Cache {
     /// Move full keyspace state from `other` into `self` (map-level swap).
     ///
     /// **Exclusive access required** on both caches for the whole call: no
-    /// concurrent client commands and no background sweep. Intended only for
-    /// AOF/RDB scratch-load commit after a successful decode/replay into
-    /// `other`.
+    /// concurrent client commands. Callers must also pause autosweep on `self`
+    /// (see [`Cache::with_autosweep_paused`] / public load wrappers) so expire
+    /// cannot race map/counter install. Intended only for AOF/RDB scratch-load
+    /// commit after a successful decode/replay into `other`.
     ///
     /// Swaps: string map, sorted_sets, geo_sets, hashes, lists, sets, streams,
     /// typed_expires, watch_gens, search indices/aliases, MemoryTracker
@@ -491,14 +492,21 @@ impl Cache {
     /// tracker take/install + `memory_usage` store (never per-key `account`
     /// after map replace).
     ///
+    /// Pre-swap WATCH keys on `self` are re-tracked and bumped after install so
+    /// live clients with WATCH fail EXEC (same idea as FLUSHDB).
+    ///
     /// Leaves **unchanged** on `self`: pubsub, connection stats, list/stream
     /// blockers, maxmemory / eviction config, slowlog, acl_log.
     ///
     /// After return, `self` holds `other`'s keyspace; `other` is empty (safe to
     /// drop). Drain-then-replace: scratch is fully drained first, then the
     /// target is drained into discard and filled — so a panic while preparing
-    /// scratch leaves `self` intact.
+    /// scratch leaves `self` intact. Discard locals are dropped immediately
+    /// after install to shorten the dual-residency window.
     pub fn replace_keyspace_from(&self, other: &Self) {
+        // Capture pre-swap WATCH keys before drain (for post-install bump).
+        let pre_watch_keys: Vec<Bytes> = self.watch_gens.lock().keys().cloned().collect();
+
         // 1. Drain scratch completely first (self still intact if this panics).
         let other_map = other.map.drain_all();
         let other_zsets = other.sorted_sets.drain_all();
@@ -514,18 +522,19 @@ impl Cache {
         let other_mem = other.memory_usage.swap(0, Ordering::Relaxed);
 
         // 2. Drain target into discard, then install scratch state.
-        let _discard_map = self.map.drain_all();
-        let _discard_zsets = self.sorted_sets.drain_all();
-        let _discard_geos = self.geo_sets.drain_all();
-        let _discard_hashes = std::mem::take(&mut *self.hashes.write());
-        let _discard_lists = std::mem::take(&mut *self.lists.write());
-        let _discard_sets = std::mem::take(&mut *self.sets.write());
-        let _discard_streams = std::mem::take(&mut *self.streams.write());
-        let _discard_expires = std::mem::take(&mut *self.typed_expires.write());
-        let _discard_watch = std::mem::take(&mut *self.watch_gens.lock());
-        let _ = self.search_index_manager.take_all();
-        let _ = self.memory_tracker.take_keyspace_counts();
+        let discard_map = self.map.drain_all();
+        let discard_zsets = self.sorted_sets.drain_all();
+        let discard_geos = self.geo_sets.drain_all();
+        let discard_hashes = std::mem::take(&mut *self.hashes.write());
+        let discard_lists = std::mem::take(&mut *self.lists.write());
+        let discard_sets = std::mem::take(&mut *self.sets.write());
+        let discard_streams = std::mem::take(&mut *self.streams.write());
+        let discard_expires = std::mem::take(&mut *self.typed_expires.write());
+        let discard_watch = std::mem::take(&mut *self.watch_gens.lock());
+        let (discard_indices, discard_aliases) = self.search_index_manager.take_all();
+        let discard_counts = self.memory_tracker.take_keyspace_counts();
 
+        // Install maps first, then memory counters (autosweep must be paused).
         self.map.replace_all(other_map);
         self.sorted_sets.replace_all(other_zsets);
         self.geo_sets.replace_all(other_geos);
@@ -539,6 +548,59 @@ impl Cache {
             .install(other_indices, other_aliases);
         self.memory_tracker.install_keyspace_counts(&other_counts);
         self.memory_usage.store(other_mem, Ordering::Relaxed);
+
+        // Free discarded target state ASAP (shorten ~2× peak window).
+        drop(discard_map);
+        drop(discard_zsets);
+        drop(discard_geos);
+        drop(discard_hashes);
+        drop(discard_lists);
+        drop(discard_sets);
+        drop(discard_streams);
+        drop(discard_expires);
+        drop(discard_watch);
+        drop(discard_indices);
+        drop(discard_aliases);
+        let _ = discard_counts;
+
+        // Bump pre-swap WATCH gens so live EXEC aborts after dataset replace.
+        if !pre_watch_keys.is_empty() {
+            let mut gens = self.watch_gens.lock();
+            for k in pre_watch_keys {
+                let g = gens.entry(k).or_insert(0);
+                *g = g.wrapping_add(1);
+            }
+        }
+    }
+
+    /// Non-mutating export of non-expired string entries for RDB snapshot /
+    /// scratch seed. Does **not** touch LRU/LFU, bump stats, or lazy-delete
+    /// expired keys (expired are simply skipped).
+    pub fn export_strings(&self) -> Vec<(Bytes, Bytes, u32, i64)> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let mut out = Vec::new();
+        for key in self.map.keys(None) {
+            let Some(entry) = self.map.get(&key) else {
+                continue;
+            };
+            if entry.is_expired() {
+                continue;
+            }
+            let expire_unix_ms = match entry.ttl_millis() {
+                Some(ttl) if ttl > 0 => now + ttl,
+                _ => -1,
+            };
+            out.push((
+                entry.key.clone(),
+                entry.value.clone(),
+                entry.flags,
+                expire_unix_ms,
+            ));
+        }
+        out
     }
 
     /// Clear all typed key maps / expires (not search schema).
