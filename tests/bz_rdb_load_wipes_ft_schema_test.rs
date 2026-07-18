@@ -337,9 +337,12 @@ fn rdb_load_mid_ft_failure_wipes_partial_state() {
         .expect_err("bad alias must fail RDB load");
     match err {
         kore::error::Error::InvalidArgument(msg) => {
+            let lower = msg.to_lowercase();
             assert!(
-                msg.contains("ALIAS") || msg.contains("alias") || msg.contains("missing") || !msg.is_empty(),
-                "unexpected error message: {msg}"
+                lower.contains("alias")
+                    || lower.contains("unknown index")
+                    || lower.contains("missing"),
+                "expected ALIASADD / unknown-index style error, got: {msg}"
             );
         }
         other => panic!("expected InvalidArgument, got {:?}", other),

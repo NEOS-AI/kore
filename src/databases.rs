@@ -103,13 +103,36 @@ impl Databases {
     /// Move full keyspace state of every DB from `other` into `self`.
     ///
     /// **Exclusive access required** (see [`Cache::replace_keyspace_from`]).
-    /// Callers should pause autosweep on all DBs for the whole loop (see
+    /// Callers should pause autosweep on all DBs for the whole call (see
     /// [`with_autosweep_paused_all`]); public load wrappers do this.
     /// DB count is matched by index; extra DBs on either side are ignored.
+    ///
+    /// # Consistency under concurrent readers
+    ///
+    /// This is **not** atomic across DBs from a concurrent reader's point of
+    /// view. Install is still per-DB: a client SELECT'ing across DBs (or a
+    /// FULLRESYNC observer) can see DB0 already replaced while DB1 is still
+    /// empty (after a prior `flush=true` wipe) or still holding old data.
+    /// True multi-DB consistency requires exclusive access — no concurrent
+    /// client readers for the duration of this call. A server-wide load
+    /// barrier / cross-DB atomic publish remains open (TODO).
+    ///
+    /// # Panic safety (partial staging)
+    ///
+    /// All source DBs are fully drained into staged payloads **before** any
+    /// target is mutated. A panic while preparing source DBs leaves every
+    /// target intact. A panic mid-install after DB *i* is committed still
+    /// leaves DBs `0..=i` new and `i+1..` old/empty — not fully atomic.
     pub fn replace_keyspaces_from(&self, other: &Self) {
         let n = self.dbs.len().min(other.dbs.len());
+        // Stage: drain every source first so a panic preparing later DBs does
+        // not leave earlier targets already swapped.
+        let mut staged = Vec::with_capacity(n);
         for i in 0..n {
-            self.dbs[i].replace_keyspace_from(&other.dbs[i]);
+            staged.push(other.dbs[i].take_keyspace_payload());
+        }
+        for (i, payload) in staged.into_iter().enumerate() {
+            self.dbs[i].install_keyspace_payload(payload);
         }
     }
 

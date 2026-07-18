@@ -1,13 +1,42 @@
 use crate::entry::{Entry, LoadOptions, SharedEntry, StoreOptions};
 use crate::error::{Error, Result};
+use crate::geospatial::GeoSet;
+use crate::hash_type::SharedHash;
 use crate::hashmap::EntryAction;
+use crate::list_type::SharedList;
 use crate::memory::MemoryCategory;
+use crate::search_index::SearchIndex;
+use crate::set_type::SharedSet;
+use crate::sorted_set::SharedSortedSet;
+use crate::stream_type::SharedStream;
 use bytes::Bytes;
+use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::Cache;
+
+/// Drained keyspace maps held between multi-DB stage and install.
+///
+/// Built by [`Cache::take_keyspace_payload`]; consumed by
+/// [`Cache::install_keyspace_payload`]. Not part of the public API.
+pub(crate) struct KeyspacePayload {
+    map: Vec<(Bytes, SharedEntry)>,
+    zsets: Vec<(Bytes, SharedSortedSet)>,
+    geos: Vec<(Bytes, Arc<RwLock<GeoSet>>)>,
+    hashes: HashMap<Bytes, SharedHash>,
+    lists: HashMap<Bytes, SharedList>,
+    sets: HashMap<Bytes, SharedSet>,
+    streams: HashMap<Bytes, SharedStream>,
+    expires: HashMap<Bytes, Instant>,
+    watch: HashMap<Bytes, u64>,
+    indices: HashMap<String, Arc<RwLock<SearchIndex>>>,
+    aliases: HashMap<String, String>,
+    counts: [(MemoryCategory, usize); 8],
+    mem: usize,
+}
 
 /// Redis-style key type across string / zset / geo / hash / list / set / stream namespaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -478,6 +507,101 @@ impl Cache {
         self.memory_tracker.reset();
     }
 
+    /// Drain this keyspace into a staged payload (maps left empty).
+    ///
+    /// Used by multi-DB replace so every source DB can be fully prepared before
+    /// any target is mutated — a panic while draining later DBs leaves all
+    /// targets intact. Single-DB [`replace_keyspace_from`] uses the same path.
+    pub(crate) fn take_keyspace_payload(&self) -> KeyspacePayload {
+        let map = self.map.drain_all();
+        let zsets = self.sorted_sets.drain_all();
+        let geos = self.geo_sets.drain_all();
+        let hashes = std::mem::take(&mut *self.hashes.write());
+        let lists = std::mem::take(&mut *self.lists.write());
+        let sets = std::mem::take(&mut *self.sets.write());
+        let streams = std::mem::take(&mut *self.streams.write());
+        let expires = std::mem::take(&mut *self.typed_expires.write());
+        let watch = std::mem::take(&mut *self.watch_gens.lock());
+        let (indices, aliases) = self.search_index_manager.take_all();
+        let counts = self.memory_tracker.take_keyspace_counts();
+        let mem = self.memory_usage.swap(0, Ordering::Relaxed);
+        KeyspacePayload {
+            map,
+            zsets,
+            geos,
+            hashes,
+            lists,
+            sets,
+            streams,
+            expires,
+            watch,
+            indices,
+            aliases,
+            counts,
+            mem,
+        }
+    }
+
+    /// Install a staged keyspace payload into `self`, discarding prior data.
+    ///
+    /// Pre-swap WATCH keys on `self` are re-tracked and bumped **atomically**
+    /// with watch map install. Autosweep must be paused for the whole call.
+    pub(crate) fn install_keyspace_payload(&self, payload: KeyspacePayload) {
+        let pre_watch_keys: Vec<Bytes> = self.watch_gens.lock().keys().cloned().collect();
+
+        // Drain target into discard, then install staged state.
+        let discard_map = self.map.drain_all();
+        let discard_zsets = self.sorted_sets.drain_all();
+        let discard_geos = self.geo_sets.drain_all();
+        let discard_hashes = std::mem::take(&mut *self.hashes.write());
+        let discard_lists = std::mem::take(&mut *self.lists.write());
+        let discard_sets = std::mem::take(&mut *self.sets.write());
+        let discard_streams = std::mem::take(&mut *self.streams.write());
+        let discard_expires = std::mem::take(&mut *self.typed_expires.write());
+        let discard_watch = std::mem::take(&mut *self.watch_gens.lock());
+        let (discard_indices, discard_aliases) = self.search_index_manager.take_all();
+        let discard_counts = self.memory_tracker.take_keyspace_counts();
+
+        // Install maps first, then memory counters (autosweep must be paused).
+        self.map.replace_all(payload.map);
+        self.sorted_sets.replace_all(payload.zsets);
+        self.geo_sets.replace_all(payload.geos);
+        *self.hashes.write() = payload.hashes;
+        *self.lists.write() = payload.lists;
+        *self.sets.write() = payload.sets;
+        *self.streams.write() = payload.streams;
+        *self.typed_expires.write() = payload.expires;
+        // Install scratch watch map and bump pre-swap keys under one lock so
+        // `watch_generation` cannot observe a clean empty map mid-replace.
+        {
+            let mut gens = self.watch_gens.lock();
+            *gens = payload.watch;
+            for k in pre_watch_keys {
+                let g = gens.entry(k).or_insert(0);
+                *g = g.wrapping_add(1);
+            }
+        }
+        self.search_index_manager
+            .install(payload.indices, payload.aliases);
+        self.memory_tracker
+            .install_keyspace_counts(&payload.counts);
+        self.memory_usage.store(payload.mem, Ordering::Relaxed);
+
+        // Free discarded target state ASAP (shorten ~2× peak window).
+        drop(discard_map);
+        drop(discard_zsets);
+        drop(discard_geos);
+        drop(discard_hashes);
+        drop(discard_lists);
+        drop(discard_sets);
+        drop(discard_streams);
+        drop(discard_expires);
+        drop(discard_watch);
+        drop(discard_indices);
+        drop(discard_aliases);
+        let _ = discard_counts;
+    }
+
     /// Move full keyspace state from `other` into `self` (map-level swap).
     ///
     /// **Exclusive access required** on both caches for the whole call: no
@@ -505,73 +629,8 @@ impl Cache {
     /// scratch leaves `self` intact. Discard locals are dropped immediately
     /// after install to shorten the dual-residency window.
     pub fn replace_keyspace_from(&self, other: &Self) {
-        // Capture pre-swap WATCH keys before drain (for atomic install+bump).
-        let pre_watch_keys: Vec<Bytes> = self.watch_gens.lock().keys().cloned().collect();
-
-        // 1. Drain scratch completely first (self still intact if this panics).
-        let other_map = other.map.drain_all();
-        let other_zsets = other.sorted_sets.drain_all();
-        let other_geos = other.geo_sets.drain_all();
-        let other_hashes = std::mem::take(&mut *other.hashes.write());
-        let other_lists = std::mem::take(&mut *other.lists.write());
-        let other_sets = std::mem::take(&mut *other.sets.write());
-        let other_streams = std::mem::take(&mut *other.streams.write());
-        let other_expires = std::mem::take(&mut *other.typed_expires.write());
-        let other_watch = std::mem::take(&mut *other.watch_gens.lock());
-        let (other_indices, other_aliases) = other.search_index_manager.take_all();
-        let other_counts = other.memory_tracker.take_keyspace_counts();
-        let other_mem = other.memory_usage.swap(0, Ordering::Relaxed);
-
-        // 2. Drain target into discard, then install scratch state.
-        let discard_map = self.map.drain_all();
-        let discard_zsets = self.sorted_sets.drain_all();
-        let discard_geos = self.geo_sets.drain_all();
-        let discard_hashes = std::mem::take(&mut *self.hashes.write());
-        let discard_lists = std::mem::take(&mut *self.lists.write());
-        let discard_sets = std::mem::take(&mut *self.sets.write());
-        let discard_streams = std::mem::take(&mut *self.streams.write());
-        let discard_expires = std::mem::take(&mut *self.typed_expires.write());
-        let discard_watch = std::mem::take(&mut *self.watch_gens.lock());
-        let (discard_indices, discard_aliases) = self.search_index_manager.take_all();
-        let discard_counts = self.memory_tracker.take_keyspace_counts();
-
-        // Install maps first, then memory counters (autosweep must be paused).
-        self.map.replace_all(other_map);
-        self.sorted_sets.replace_all(other_zsets);
-        self.geo_sets.replace_all(other_geos);
-        *self.hashes.write() = other_hashes;
-        *self.lists.write() = other_lists;
-        *self.sets.write() = other_sets;
-        *self.streams.write() = other_streams;
-        *self.typed_expires.write() = other_expires;
-        // Install scratch watch map and bump pre-swap keys under one lock so
-        // `watch_generation` cannot observe a clean empty map mid-replace.
-        {
-            let mut gens = self.watch_gens.lock();
-            *gens = other_watch;
-            for k in pre_watch_keys {
-                let g = gens.entry(k).or_insert(0);
-                *g = g.wrapping_add(1);
-            }
-        }
-        self.search_index_manager
-            .install(other_indices, other_aliases);
-        self.memory_tracker.install_keyspace_counts(&other_counts);
-        self.memory_usage.store(other_mem, Ordering::Relaxed);
-
-        // Free discarded target state ASAP (shorten ~2× peak window).
-        drop(discard_map);
-        drop(discard_zsets);
-        drop(discard_geos);
-        drop(discard_hashes);
-        drop(discard_lists);
-        drop(discard_sets);
-        drop(discard_streams);
-        drop(discard_expires);
-        drop(discard_watch);
-        drop(discard_indices);
-        drop(discard_aliases);
-        let _ = discard_counts;
+        let payload = other.take_keyspace_payload();
+        self.install_keyspace_payload(payload);
     }
 
     /// Non-mutating export of non-expired string entries for RDB snapshot /

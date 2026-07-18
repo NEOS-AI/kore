@@ -836,16 +836,40 @@ impl DbSnapshot {
         }
     }
 
-    /// Load snapshot into cache (does not flush first — caller decides).
+    /// Load snapshot into `cache` **in place** (does not flush first).
+    ///
+    /// # Non-transactional (raw API)
+    ///
+    /// On `Err` mid-apply, earlier indices/keys/aliases already written to
+    /// `cache` remain — this method is **not** all-or-nothing. Production
+    /// callers must use the public scratch-load wrappers instead:
+    /// [`load_bytes`], [`load_databases_bytes`], and AOF
+    /// [`crate::persistence::aof::load_into_cache`] /
+    /// [`crate::persistence::aof::load_into_databases`]. Those apply into a
+    /// scratch keyspace and only commit via `replace_keyspace_from` on `Ok`.
+    ///
+    /// # Search schema
     ///
     /// Search indices are created **before** key types so hash load can
     /// auto-index documents (same order idea as AOF: schema before HSET).
+    ///
+    /// **Merge name clash:** if an index name from this snapshot already
+    /// exists on `cache` (typical `flush=false` merge into a seeded scratch),
+    /// create is **skipped** and the existing definition is kept so seed
+    /// documents stay indexed. Aliases that already exist are likewise
+    /// skipped. Unknown-target alias errors still fail the load.
     pub fn load_into(&self, cache: &Cache) -> Result<usize> {
         let mut loaded = 0usize;
         let now = now_unix_ms();
 
-        // 1. Recreate search schema first.
+        // 1. Recreate search schema first (skip names already present on merge).
+        let existing_indices: std::collections::HashSet<String> =
+            cache.list_search_indices().into_iter().collect();
         for def in &self.search_indices {
+            if existing_indices.contains(&def.name) {
+                // Merge: keep seed index definition + its documents.
+                continue;
+            }
             cache
                 .create_search_index(def.clone())
                 .map_err(|e| Error::InvalidArgument(format!("RDB FT.CREATE: {}", e)))?;
@@ -937,7 +961,16 @@ impl DbSnapshot {
         }
 
         // 2. Aliases after keys (and after indices exist).
+        // Skip aliases already present (merge keeps seed mapping).
+        let existing_aliases: std::collections::HashSet<String> = cache
+            .list_search_aliases()
+            .into_iter()
+            .map(|(a, _)| a)
+            .collect();
         for (alias, index) in &self.search_aliases {
+            if existing_aliases.contains(alias) {
+                continue;
+            }
             cache
                 .alias_add(alias, index)
                 .map_err(|e| Error::InvalidArgument(format!("RDB FT.ALIASADD: {}", e)))?;
@@ -1036,7 +1069,11 @@ impl MultiDbSnapshot {
         Ok(Self { databases })
     }
 
-    /// Load into multi-DB keyspaces. Returns total keys loaded.
+    /// Load into multi-DB keyspaces in place. Returns total keys loaded.
+    ///
+    /// **Non-transactional:** on `Err`, earlier DBs/keys may already be
+    /// mutated. Prefer [`load_databases_bytes`] (scratch-load + swap).
+    /// See [`DbSnapshot::load_into`].
     pub fn load_into_databases(&self, databases: &Databases) -> Result<usize> {
         let mut total = 0usize;
         for (idx, snap) in &self.databases {
@@ -1049,7 +1086,10 @@ impl MultiDbSnapshot {
         Ok(total)
     }
 
-    /// Load DB 0 (or the first present DB) into a single cache.
+    /// Load DB 0 (or the first present DB) into a single cache in place.
+    ///
+    /// **Non-transactional:** on `Err`, partial state may remain on `cache`.
+    /// Prefer [`load_bytes`] (scratch-load + swap). See [`DbSnapshot::load_into`].
     pub fn load_into_cache(&self, cache: &Cache) -> Result<usize> {
         for (idx, snap) in &self.databases {
             if *idx == 0 {
@@ -1128,13 +1168,20 @@ pub fn load_databases(databases: &Databases, path: &Path, flush: bool) -> Result
 /// untouched (including no seed-side mutation: merge seed uses non-mutating
 /// export). Commit pauses autosweep on the target for the whole replace.
 ///
-/// - `flush = true` (snapshot replace / FULLRESYNC): scratch starts empty; on
-///   success the target is flushed (including FT schema) **before** replace so
-///   peak dual-residency is shortened, then scratch is installed.
-/// - `flush = false` (merge): scratch is seeded with a non-mutating deep copy
-///   of the current keyspace, then the RDB is merged into that copy before
-///   swap — failure preserves the live target with no touch/lazy-expire side
-///   effects from seeding.
+/// This is the **supported** load API. Raw [`DbSnapshot::load_into`] /
+/// [`MultiDbSnapshot::load_into_cache`] are non-transactional helpers used
+/// only on scratch inside this wrapper.
+///
+/// - `flush = true` (**snapshot replace** / FULLRESYNC): scratch starts empty;
+///   on success the target is flushed (including FT schema) **before** replace
+///   so peak dual-residency is shortened, then scratch is installed. FT schema
+///   from the RDB fully replaces the target's schema.
+/// - `flush = false` (**merge**): scratch is seeded with a non-mutating deep
+///   copy of the current keyspace, then the RDB is merged into that copy
+///   before swap — failure preserves the live target with no touch/lazy-expire
+///   side effects from seeding. FT indices/aliases whose names already exist
+///   on the seed are **kept** (RDB create/alias skipped for those names); new
+///   names from the RDB are added.
 pub fn load_bytes(cache: &Cache, data: &[u8], flush: bool) -> Result<usize> {
     let snap = MultiDbSnapshot::decode(data)?;
     let scratch = cache.empty_keyspace_like();
@@ -1168,10 +1215,15 @@ pub fn load_bytes(cache: &Cache, data: &[u8], flush: bool) -> Result<usize> {
 /// keyspace is swapped from scratch under multi-DB autosweep pause; on `Err`,
 /// `databases` is untouched.
 ///
-/// - `flush = true`: empty scratch; successful load flushes all target DBs
-///   (including FT) then replaces (peak-memory recovery for FULLRESYNC).
-/// - `flush = false`: scratch seeded from non-mutating multi-DB snapshot, then
-///   merged.
+/// Multi-DB install is staged (all sources drained before any target mutate)
+/// but **not** atomic to concurrent readers — see
+/// [`Databases::replace_keyspaces_from`].
+///
+/// - `flush = true` (**snapshot replace**): empty scratch; successful load
+///   flushes all target DBs (including FT) then replaces (peak-memory recovery
+///   for FULLRESYNC).
+/// - `flush = false` (**merge**): scratch seeded from non-mutating multi-DB
+///   snapshot, then merged (existing FT names kept; new names from RDB added).
 pub fn load_databases_bytes(databases: &Databases, data: &[u8], flush: bool) -> Result<usize> {
     let snap = MultiDbSnapshot::decode(data)?;
     let scratch = databases.empty_like();

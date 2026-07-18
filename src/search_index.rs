@@ -797,11 +797,20 @@ impl SearchIndexManager {
     }
 
     /// Install index + alias maps (replaces any existing state).
+    ///
+    /// Intended for `take_all` → swap paths. Debug builds assert every alias
+    /// target names an installed index (catch take/install pairing bugs).
     pub fn install(
         &self,
         indices: HashMap<String, Arc<RwLock<SearchIndex>>>,
         aliases: HashMap<String, String>,
     ) {
+        debug_assert!(
+            aliases
+                .values()
+                .all(|target| indices.contains_key(target)),
+            "SearchIndexManager::install: alias target missing from indices map"
+        );
         // Lock order: aliases then indices (matches create/drop/alias_*).
         let mut a = self.aliases.write();
         let mut i = self.indices.write();

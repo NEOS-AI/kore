@@ -99,6 +99,10 @@ pub struct Cache {
     /// Per-key generation counters for WATCH / optimistic locking.
     /// Only keys that have been WATCHed (or modified while watched) appear here.
     pub(super) watch_gens: Mutex<HashMap<Bytes, u64>>,
+    /// Create-time loadfactor used for initial per-shard HashMap capacity.
+    /// Preserved so scratch keyspaces (`empty_keyspace_like`) match the
+    /// process sizing policy rather than hardcoding 0.75.
+    pub(super) loadfactor: f64,
 }
 
 impl Cache {
@@ -161,6 +165,7 @@ impl Cache {
             lfu_log_factor: AtomicU8::new(crate::lfu::LFU_LOG_FACTOR_DEFAULT),
             lfu_decay_time: AtomicU8::new(crate::lfu::LFU_DECAY_TIME_DEFAULT),
             watch_gens: Mutex::new(HashMap::new()),
+            loadfactor,
         });
 
         if start_sweep {
@@ -259,6 +264,7 @@ impl Cache {
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
             watch_gens: Mutex::new(HashMap::new()),
+            loadfactor,
         });
 
         if start_sweep {
@@ -270,12 +276,13 @@ impl Cache {
 
     /// Empty keyspace sibling for scratch-load (AOF/RDB).
     ///
-    /// Same shard count / maxmemory / max-entry-size as `self`, shares pubsub +
-    /// slowlog / acl_log (multi-DB sibling pattern), but has **independent**
-    /// maps, search manager, zeroed memory, and a private `Stats` (so load apply
-    /// does not inflate live INFO). Background sweep is **not** started —
-    /// callers must use this only under exclusive access (no concurrent client
-    /// commands against the scratch). Autosweep is forced off.
+    /// Same shard count / maxmemory / max-entry-size / create-time loadfactor
+    /// as `self`, shares pubsub + slowlog / acl_log (multi-DB sibling pattern),
+    /// but has **independent** maps, search manager, zeroed memory, and a
+    /// private `Stats` (so load apply does not inflate live INFO). Background
+    /// sweep is **not** started — callers must use this only under exclusive
+    /// access (no concurrent client commands against the scratch). Autosweep
+    /// is forced off.
     pub fn empty_keyspace_like(&self) -> Arc<Self> {
         let scratch = Self::new_keyspace_sharing_with_stats(
             self,
@@ -284,7 +291,7 @@ impl Cache {
             self.max_entry_size
                 .load(std::sync::atomic::Ordering::Relaxed),
             false, // start_sweep: load-time exclusive use
-            0.75,  // loadfactor only sizes initial shard capacity
+            self.loadfactor,
             Arc::new(Stats::new()),
         );
         scratch.set_autosweep(false);
