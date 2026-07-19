@@ -7,8 +7,10 @@
 //! 4. both:   CLUSTER SETSLOT <s> NODE <dest-id>
 //!
 //! `CLUSTER RESHARD` runs steps 1–4 on the source for one slot or an inclusive
-//! range. Dual-end NODE is **best-effort** (not atomic across nodes). Partial
-//! failures leave honest status fields so operators can finish with SETSLOT.
+//! range. Dual-end NODE is **best-effort** (not atomic / no 2PC). After each
+//! side's NODE, ownership is re-checked and failed NODE is retried a few times
+//! (Batch DN). Partial failures leave honest status fields; operators can
+//! complete with `CLUSTER RESHARD FINISH` or manual SETSLOT.
 //!
 //! Supports string, hash, list, set, zset, geo, and stream keys. Dest writes use
 //! ASKING so IMPORTING slots accept the transfer. Complex types are recreated
@@ -21,12 +23,82 @@ use crate::entry::LoadOptions;
 use crate::protocol::{RespParser, RespValue};
 use crate::stream_type::{StreamId, StreamStateSnapshot};
 use bytes::Bytes;
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::{Mutex, MutexGuard};
 
 /// Default I/O timeout for migrate RESP commands.
 const MIGRATE_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Attempts per side for dual-end `SETSLOT NODE` (1 try + retries).
+const NODE_SET_ATTEMPTS: u32 = 3;
+
+/// Backoff between dual-end NODE retries (transient blips).
+const NODE_RETRY_DELAY: Duration = Duration::from_millis(40);
+
+/// Serializes tests that inject dest NODE failures (shared counter + port).
+static DEST_NODE_INJECT_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// Only dual-end NODE toward this dest port is affected (0 = disabled).
+static DEST_NODE_INJECT_PORT: AtomicU16 = AtomicU16::new(0);
+
+/// Remaining forced failures for dest dual-end `SETSLOT NODE` (test hook).
+static DEST_NODE_INJECT_FAILS: AtomicU32 = AtomicU32::new(0);
+
+/// Guard holding exclusive access to dest-NODE failure injection.
+///
+/// Injection is **port-scoped** so parallel RESHARD tests on other ports are
+/// unaffected. Drop clears port + counter.
+pub struct DestNodeInjectGuard {
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl DestNodeInjectGuard {
+    /// Force the next `n` dest `SETSLOT NODE` attempts toward `dest_port` to fail.
+    pub fn set_failures_for_port(&self, dest_port: u16, n: u32) {
+        DEST_NODE_INJECT_PORT.store(dest_port, Ordering::SeqCst);
+        DEST_NODE_INJECT_FAILS.store(n, Ordering::SeqCst);
+    }
+}
+
+impl Drop for DestNodeInjectGuard {
+    fn drop(&mut self) {
+        DEST_NODE_INJECT_PORT.store(0, Ordering::SeqCst);
+        DEST_NODE_INJECT_FAILS.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Acquire exclusive access for dest-NODE failure injection tests.
+pub async fn test_acquire_dest_node_inject() -> DestNodeInjectGuard {
+    DestNodeInjectGuard {
+        _lock: DEST_NODE_INJECT_LOCK.lock().await,
+    }
+}
+
+/// Set inject for any dest port (prefer the port-scoped guard in suites).
+pub fn test_inject_dest_node_failures(n: u32) {
+    DEST_NODE_INJECT_PORT.store(u16::MAX, Ordering::SeqCst);
+    DEST_NODE_INJECT_FAILS.store(n, Ordering::SeqCst);
+}
+
+/// Consume one injected failure if `dest_port` matches the active inject port.
+fn take_dest_node_inject_fail(dest_port: u16) -> bool {
+    let inject_port = DEST_NODE_INJECT_PORT.load(Ordering::SeqCst);
+    if inject_port == 0 || (inject_port != u16::MAX && inject_port != dest_port) {
+        return false;
+    }
+    DEST_NODE_INJECT_FAILS
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            if n > 0 {
+                Some(n - 1)
+            } else {
+                None
+            }
+        })
+        .is_ok()
+}
 
 /// Result of migrating keys for one slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -500,10 +572,12 @@ pub async fn migrate_slot_string_keys(
 /// 1. dest `SETSLOT IMPORTING <source-id>`
 /// 2. source `SETSLOT MIGRATING <dest-id>`
 /// 3. `MIGRATEKEYS` (all types)
-/// 4. source then dest `SETSLOT NODE <dest-id>` (best-effort dual-end; not atomic)
+/// 4. source then dest `SETSLOT NODE <dest-id>` (best-effort dual-end with verify+retry;
+///    still not atomic / no 2PC)
 ///
 /// On key-move failure the slot is left MIGRATING/IMPORTING for operator recovery.
-/// Dual-end NODE failures are reported in `ReshardSlotResult` rather than rolled back.
+/// Dual-end NODE failures are reported in `ReshardSlotResult` rather than rolled back;
+/// use [`finish_slot_node`] / `CLUSTER RESHARD FINISH` to complete NODE without re-migrating.
 pub async fn reshard_slots(
     cache: &Cache,
     cluster: &ClusterState,
@@ -653,32 +727,9 @@ async fn reshard_one_slot(
         }
     };
 
-    // Step 4a: source SETSLOT NODE <dest> (local, synchronous)
-    let source_node = match cluster.set_node(slot, dest_node_id) {
-        Ok(()) => "ok".to_string(),
-        Err(e) => e,
-    };
-
-    // Step 4b: dest SETSLOT NODE <dest> (remote, best-effort)
-    let dest_node = match connect_dest(dest_ip, dest_port).await {
-        Ok(mut stream) => match dest_setslot(
-            &mut stream,
-            &["CLUSTER", "SETSLOT", &slot_s, "NODE", dest_node_id],
-        )
-        .await
-        {
-            Ok(()) => "ok".to_string(),
-            Err(e) => e,
-        },
-        Err(e) => format!("connect:{}", e),
-    };
-
-    let status = match (source_node.as_str(), dest_node.as_str()) {
-        ("ok", "ok") => "complete".to_string(),
-        ("ok", _) => "partial_dest_node".to_string(),
-        (_, "ok") => "partial_source_node".to_string(),
-        _ => "partial_both_node".to_string(),
-    };
+    // Step 4: dual-end SETSLOT NODE with verify + retry (not atomic).
+    let (source_node, dest_node, status) =
+        dual_end_setslot_node(cluster, slot, dest_node_id, dest_ip, dest_port).await;
 
     Ok(ReshardSlotResult {
         slot,
@@ -688,6 +739,208 @@ async fn reshard_one_slot(
         dest_node,
         status,
     })
+}
+
+/// Complete dual-end `SETSLOT NODE` for one slot without migrating keys.
+///
+/// Operator recovery after `partial_*_node` from RESHARD (or manual SETSLOT half-done).
+/// Idempotent when both sides already own/claim `dest_node_id` for `slot`.
+pub async fn finish_slot_node(
+    cluster: &ClusterState,
+    slot: u16,
+    dest_node_id: &str,
+) -> Result<ReshardSlotResult, String> {
+    if slot >= SLOT_COUNT {
+        return Err("ERR Invalid or out of range slot".into());
+    }
+    if dest_node_id == cluster.my_id() {
+        return Err("ERR CLUSTER RESHARD FINISH destination cannot be myself".into());
+    }
+    let dest = cluster.get_node(dest_node_id).ok_or_else(|| {
+        format!(
+            "ERR CLUSTER RESHARD FINISH I don't know about node {}",
+            dest_node_id
+        )
+    })?;
+    if dest.fail {
+        return Err(format!(
+            "ERR CLUSTER RESHARD FINISH destination node {} is marked fail",
+            dest_node_id
+        ));
+    }
+
+    let (source_node, dest_node, status) =
+        dual_end_setslot_node(cluster, slot, dest_node_id, &dest.ip, dest.port).await;
+
+    Ok(ReshardSlotResult {
+        slot,
+        migrated: 0,
+        skipped: 0,
+        source_node,
+        dest_node,
+        status,
+    })
+}
+
+/// Summarize dual-end NODE outcomes into an operator-facing status string.
+fn summarize_dual_end_status(source_node: &str, dest_node: &str) -> String {
+    match (source_node, dest_node) {
+        ("ok", "ok") => "complete".to_string(),
+        ("ok", _) => "partial_dest_node".to_string(),
+        (_, "ok") => "partial_source_node".to_string(),
+        _ => "partial_both_node".to_string(),
+    }
+}
+
+/// Source + dest `SETSLOT NODE <dest>` with local/remote verify and short retries.
+///
+/// Still **not** atomic across nodes (no 2PC). Returns `(source_node, dest_node, status)`.
+async fn dual_end_setslot_node(
+    cluster: &ClusterState,
+    slot: u16,
+    dest_node_id: &str,
+    dest_ip: &str,
+    dest_port: u16,
+) -> (String, String, String) {
+    let source_node = apply_source_node_with_retry(cluster, slot, dest_node_id).await;
+    let dest_node =
+        apply_dest_node_with_retry(slot, dest_node_id, dest_ip, dest_port).await;
+    let status = summarize_dual_end_status(&source_node, &dest_node);
+    (source_node, dest_node, status)
+}
+
+/// Local `SETSLOT NODE` + ownership verify, with retries.
+async fn apply_source_node_with_retry(
+    cluster: &ClusterState,
+    slot: u16,
+    dest_node_id: &str,
+) -> String {
+    let mut last_err = String::from("source NODE not attempted");
+    for attempt in 0..NODE_SET_ATTEMPTS {
+        match cluster.set_node(slot, dest_node_id) {
+            Ok(()) => {
+                if source_owns_as(cluster, slot, dest_node_id) {
+                    return "ok".to_string();
+                }
+                last_err = "verify: local owner is not dest after SETSLOT NODE".into();
+            }
+            Err(e) => last_err = e,
+        }
+        if attempt + 1 < NODE_SET_ATTEMPTS {
+            tokio::time::sleep(NODE_RETRY_DELAY).await;
+        }
+    }
+    last_err
+}
+
+fn source_owns_as(cluster: &ClusterState, slot: u16, node_id: &str) -> bool {
+    cluster
+        .owner_of(slot)
+        .map(|n| n.id == node_id)
+        .unwrap_or(false)
+}
+
+/// Remote dest `SETSLOT NODE` + CLUSTER SLOTS verify, with retries.
+async fn apply_dest_node_with_retry(
+    slot: u16,
+    dest_node_id: &str,
+    dest_ip: &str,
+    dest_port: u16,
+) -> String {
+    let slot_s = slot.to_string();
+    let mut last_err = String::from("dest NODE not attempted");
+    for attempt in 0..NODE_SET_ATTEMPTS {
+        // Test injection: simulate transient (or permanent) dest NODE failures.
+        if take_dest_node_inject_fail(dest_port) {
+            last_err = "injected dest NODE failure".into();
+            if attempt + 1 < NODE_SET_ATTEMPTS {
+                tokio::time::sleep(NODE_RETRY_DELAY).await;
+            }
+            continue;
+        }
+
+        match connect_dest(dest_ip, dest_port).await {
+            Ok(mut stream) => {
+                match dest_setslot(
+                    &mut stream,
+                    &["CLUSTER", "SETSLOT", &slot_s, "NODE", dest_node_id],
+                )
+                .await
+                {
+                    Ok(()) => match verify_remote_slot_owner(&mut stream, slot, dest_node_id).await
+                    {
+                        Ok(()) => return "ok".to_string(),
+                        Err(e) => last_err = format!("verify:{}", e),
+                    },
+                    Err(e) => last_err = e,
+                }
+            }
+            Err(e) => last_err = format!("connect:{}", e),
+        }
+        if attempt + 1 < NODE_SET_ATTEMPTS {
+            tokio::time::sleep(NODE_RETRY_DELAY).await;
+        }
+    }
+    last_err
+}
+
+/// Confirm remote node reports `dest_node_id` as owner of `slot` via CLUSTER SLOTS.
+async fn verify_remote_slot_owner(
+    stream: &mut TcpStream,
+    slot: u16,
+    dest_node_id: &str,
+) -> Result<(), String> {
+    let args = vec![
+        RespValue::BulkString(Some(Bytes::from_static(b"CLUSTER"))),
+        RespValue::BulkString(Some(Bytes::from_static(b"SLOTS"))),
+    ];
+    let reply = resp_command_bytes(stream, &args, MIGRATE_IO_TIMEOUT).await?;
+    let owner = slot_owner_id_from_slots_reply(&reply, slot)
+        .ok_or_else(|| format!("slot {} missing from CLUSTER SLOTS", slot))?;
+    if owner == dest_node_id {
+        Ok(())
+    } else {
+        Err(format!(
+            "remote owner is {} want {}",
+            owner, dest_node_id
+        ))
+    }
+}
+
+/// Parse Redis-style CLUSTER SLOTS array and return owner id for `slot`.
+fn slot_owner_id_from_slots_reply(reply: &RespValue, slot: u16) -> Option<String> {
+    let ranges = match reply {
+        RespValue::Array(a) => a,
+        _ => return None,
+    };
+    for range in ranges {
+        let parts = match range {
+            RespValue::Array(p) => p,
+            _ => continue,
+        };
+        if parts.len() < 3 {
+            continue;
+        }
+        let start = match &parts[0] {
+            RespValue::Integer(n) if *n >= 0 => *n as u16,
+            _ => continue,
+        };
+        let end = match &parts[1] {
+            RespValue::Integer(n) if *n >= 0 => *n as u16,
+            _ => continue,
+        };
+        if slot < start || slot > end {
+            continue;
+        }
+        let node = match &parts[2] {
+            RespValue::Array(n) if n.len() >= 3 => n,
+            _ => continue,
+        };
+        if let RespValue::BulkString(Some(id)) = &node[2] {
+            return Some(String::from_utf8_lossy(id).into_owned());
+        }
+    }
+    None
 }
 
 fn strip_err_prefix(e: &str) -> &str {
@@ -789,6 +1042,67 @@ mod tests {
             }
             other => panic!("{:?}", other),
         }
+    }
+
+    #[test]
+    fn summarize_dual_end_status_matrix() {
+        assert_eq!(summarize_dual_end_status("ok", "ok"), "complete");
+        assert_eq!(
+            summarize_dual_end_status("ok", "connect:timeout"),
+            "partial_dest_node"
+        );
+        assert_eq!(
+            summarize_dual_end_status("Unknown node x", "ok"),
+            "partial_source_node"
+        );
+        assert_eq!(
+            summarize_dual_end_status("err", "err"),
+            "partial_both_node"
+        );
+    }
+
+    #[test]
+    fn slot_owner_id_from_slots_reply_finds_covering_range() {
+        let reply = RespValue::Array(vec![
+            RespValue::Array(vec![
+                RespValue::Integer(0),
+                RespValue::Integer(100),
+                RespValue::Array(vec![
+                    bulk_static(b"127.0.0.1"),
+                    RespValue::Integer(7000),
+                    bulk_owned("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+                ]),
+            ]),
+            RespValue::Array(vec![
+                RespValue::Integer(101),
+                RespValue::Integer(16383),
+                RespValue::Array(vec![
+                    bulk_static(b"127.0.0.1"),
+                    RespValue::Integer(7001),
+                    bulk_owned("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
+                ]),
+            ]),
+        ]);
+        assert_eq!(
+            slot_owner_id_from_slots_reply(&reply, 50).as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            slot_owner_id_from_slots_reply(&reply, 101).as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(slot_owner_id_from_slots_reply(&reply, 20000), None);
+    }
+
+    #[test]
+    fn source_node_retry_succeeds_when_dest_known() {
+        let cs = ClusterState::single_node("127.0.0.1", 1);
+        let peer = "cccccccccccccccccccccccccccccccccccccccc";
+        cs.add_node(peer, "127.0.0.1", 2);
+        // Synchronous path via set_node is enough; ownership verify uses owner_of.
+        cs.set_node(42, peer).unwrap();
+        assert!(source_owns_as(&cs, 42, peer));
+        assert!(!source_owns_as(&cs, 42, &cs.my_id()));
     }
 
     #[test]

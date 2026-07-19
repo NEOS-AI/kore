@@ -3,7 +3,9 @@
 use bytes::Bytes;
 use kore::entry::StoreOptions;
 use kore::protocol::{RespParser, RespValue};
-use kore::{key_hash_slot, keys_in_slot, Cache, ClusterState, Server};
+use kore::{
+    key_hash_slot, keys_in_slot, test_acquire_dest_node_inject, Cache, ClusterState, Server,
+};
 use kore::config::Config;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -993,4 +995,205 @@ async fn reshard_dest_down_reports_failed_connect() {
 
     let _ = shut_a_tx.send(true);
     let _ = ha.await;
+}
+
+/// Batch DN: one injected dest NODE failure is retried → still `complete`.
+#[tokio::test(flavor = "multi_thread")]
+async fn reshard_dest_node_retry_recovers_to_complete() {
+    let port_a = 16750u16;
+    let port_b = 16751u16;
+
+    let cs_a = ClusterState::single_node("127.0.0.1", port_a);
+    let cs_b = ClusterState::single_node("127.0.0.1", port_b);
+
+    let cache_a = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let cache_b = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+
+    let srv_a =
+        Server::new(cache_a, make_config(port_a, true)).with_cluster(Some(Arc::clone(&cs_a)));
+    let srv_b =
+        Server::new(cache_b, make_config(port_b, true)).with_cluster(Some(Arc::clone(&cs_b)));
+
+    let (shut_a_tx, shut_a_rx) = watch::channel(false);
+    let (shut_b_tx, shut_b_rx) = watch::channel(false);
+    let ha = tokio::spawn(async move {
+        let _ = srv_a.run_with_shutdown(shut_a_rx).await;
+    });
+    let hb = tokio::spawn(async move {
+        let _ = srv_b.run_with_shutdown(shut_b_rx).await;
+    });
+
+    wait_listen(port_a).await;
+    wait_listen(port_b).await;
+
+    let mut sa = TcpStream::connect(("127.0.0.1", port_a)).await.unwrap();
+    let mut sb = TcpStream::connect(("127.0.0.1", port_b)).await.unwrap();
+
+    assert!(is_ok(
+        &send_cmd(&mut sa, &["CLUSTER", "MEET", "127.0.0.1", &port_b.to_string()]).await
+    ));
+    assert!(is_ok(
+        &send_cmd(&mut sb, &["CLUSTER", "MEET", "127.0.0.1", &port_a.to_string()]).await
+    ));
+
+    let id_b = cs_a
+        .peer_snapshots()
+        .into_iter()
+        .find(|n| n.port == port_b)
+        .map(|n| n.id)
+        .expect("peer B");
+
+    let key = "{dnretry}.k";
+    let slot = key_hash_slot(key.as_bytes());
+    assert!(is_ok(
+        &send_cmd(&mut sa, &["SET", key, "retry-val"]).await
+    ));
+
+    let inj = test_acquire_dest_node_inject().await;
+    // First dest NODE attempt fails; verify+retry path should still complete.
+    inj.set_failures_for_port(port_b, 1);
+
+    let resp = send_cmd(
+        &mut sa,
+        &["CLUSTER", "RESHARD", &slot.to_string(), &id_b],
+    )
+    .await;
+    drop(inj);
+
+    let (got_slot, migrated, source_node, dest_node, status) = parse_reshard_slot(&resp);
+    assert_eq!(got_slot, slot);
+    assert_eq!(migrated, 1);
+    assert_eq!(source_node, "ok");
+    assert_eq!(dest_node, "ok");
+    assert_eq!(status, "complete");
+    assert!(!cs_a.owns_slot(slot));
+    assert!(cs_b.owns_slot(slot));
+    assert_eq!(
+        as_bulk(&send_cmd(&mut sb, &["GET", key]).await),
+        "retry-val"
+    );
+
+    let _ = shut_a_tx.send(true);
+    let _ = shut_b_tx.send(true);
+    let _ = ha.await;
+    let _ = hb.await;
+}
+
+/// Batch DN: exhausting dest NODE attempts → `partial_dest_node`; FINISH recovers.
+#[tokio::test(flavor = "multi_thread")]
+async fn reshard_partial_dest_node_then_finish_recovers() {
+    let port_a = 16752u16;
+    let port_b = 16753u16;
+
+    let cs_a = ClusterState::single_node("127.0.0.1", port_a);
+    let cs_b = ClusterState::single_node("127.0.0.1", port_b);
+
+    let cache_a = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let cache_b = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+
+    let srv_a =
+        Server::new(cache_a, make_config(port_a, true)).with_cluster(Some(Arc::clone(&cs_a)));
+    let srv_b =
+        Server::new(cache_b, make_config(port_b, true)).with_cluster(Some(Arc::clone(&cs_b)));
+
+    let (shut_a_tx, shut_a_rx) = watch::channel(false);
+    let (shut_b_tx, shut_b_rx) = watch::channel(false);
+    let ha = tokio::spawn(async move {
+        let _ = srv_a.run_with_shutdown(shut_a_rx).await;
+    });
+    let hb = tokio::spawn(async move {
+        let _ = srv_b.run_with_shutdown(shut_b_rx).await;
+    });
+
+    wait_listen(port_a).await;
+    wait_listen(port_b).await;
+
+    let mut sa = TcpStream::connect(("127.0.0.1", port_a)).await.unwrap();
+    let mut sb = TcpStream::connect(("127.0.0.1", port_b)).await.unwrap();
+
+    assert!(is_ok(
+        &send_cmd(&mut sa, &["CLUSTER", "MEET", "127.0.0.1", &port_b.to_string()]).await
+    ));
+    assert!(is_ok(
+        &send_cmd(&mut sb, &["CLUSTER", "MEET", "127.0.0.1", &port_a.to_string()]).await
+    ));
+
+    let id_b = cs_a
+        .peer_snapshots()
+        .into_iter()
+        .find(|n| n.port == port_b)
+        .map(|n| n.id)
+        .expect("peer B");
+
+    let key = "{dnpartial}.k";
+    let slot = key_hash_slot(key.as_bytes());
+    assert!(is_ok(
+        &send_cmd(&mut sa, &["SET", key, "partial-val"]).await
+    ));
+
+    {
+        let inj = test_acquire_dest_node_inject().await;
+        // More failures than NODE_SET_ATTEMPTS (3) → permanent partial_dest_node.
+        inj.set_failures_for_port(port_b, 8);
+        let resp = send_cmd(
+            &mut sa,
+            &["CLUSTER", "RESHARD", &slot.to_string(), &id_b],
+        )
+        .await;
+        let (got_slot, migrated, source_node, dest_node, status) = parse_reshard_slot(&resp);
+        assert_eq!(got_slot, slot);
+        assert_eq!(migrated, 1, "keys should still have moved");
+        assert_eq!(source_node, "ok");
+        assert_ne!(dest_node, "ok");
+        assert_eq!(status, "partial_dest_node");
+        // Source already reassigned; dest still thinks it does not own stably.
+        assert!(!cs_a.owns_slot(slot));
+        assert!(!cs_b.owns_slot(slot), "dest NODE never applied");
+        // Key is on dest (migrate succeeded) but dest may ASK/MOVED depending on state.
+        // After IMPORTING cleared only by NODE; without NODE dest may still import or not.
+        // FINISH should complete dual-end NODE without re-migrating.
+        drop(inj);
+    }
+
+    let finish = send_cmd(
+        &mut sa,
+        &["CLUSTER", "RESHARD", "FINISH", &slot.to_string(), &id_b],
+    )
+    .await;
+    let (got_slot, migrated, source_node, dest_node, status) = parse_reshard_slot(&finish);
+    assert_eq!(got_slot, slot);
+    assert_eq!(migrated, 0, "FINISH must not re-count key moves");
+    assert_eq!(source_node, "ok");
+    assert_eq!(dest_node, "ok");
+    assert_eq!(status, "complete");
+    assert!(cs_b.owns_slot(slot));
+    assert_eq!(
+        as_bulk(&send_cmd(&mut sb, &["GET", key]).await),
+        "partial-val"
+    );
+
+    // HELP lists FINISH recovery
+    match send_cmd(&mut sa, &["CLUSTER", "HELP"]).await {
+        RespValue::Array(lines) => {
+            let joined: String = lines
+                .iter()
+                .filter_map(|v| match v {
+                    RespValue::BulkString(Some(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                joined.contains("RESHARD FINISH"),
+                "HELP missing RESHARD FINISH: {}",
+                joined
+            );
+        }
+        other => panic!("HELP {:?}", other),
+    }
+
+    let _ = shut_a_tx.send(true);
+    let _ = shut_b_tx.send(true);
+    let _ = ha.await;
+    let _ = hb.await;
 }

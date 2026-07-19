@@ -2,7 +2,8 @@
 
 use super::CommandHandler;
 use crate::cluster::{
-    key_hash_slot, meet_peer, migrate_slot_keys, reshard_slots, ClusterState, SLOT_COUNT,
+    finish_slot_node, key_hash_slot, meet_peer, migrate_slot_keys, reshard_slots, ClusterState,
+    SLOT_COUNT,
 };
 use crate::error::Result;
 use crate::protocol::RespValue;
@@ -166,9 +167,12 @@ impl CommandHandler {
 
     /// CLUSTER RESHARD <slot> <dest-node-id>
     /// CLUSTER RESHARD <start-slot> <end-slot> <dest-node-id>
+    /// CLUSTER RESHARD FINISH <slot> <dest-node-id>
     ///
     /// Source-side orchestration of the thin reshard flow for one slot or an
-    /// inclusive range. Dual-end `SETSLOT NODE` is best-effort (not atomic).
+    /// inclusive range. Dual-end `SETSLOT NODE` is best-effort with verify+retry
+    /// (still not atomic / no 2PC). `FINISH` only runs dual-end NODE (no key move)
+    /// so operators can complete `partial_*_node` without re-migrating.
     /// Reply: array of per-slot field arrays (slot/migrated/skipped/source_node/
     /// dest_node/status). See `ReshardSlotResult`.
     async fn handle_cluster_reshard(
@@ -176,6 +180,32 @@ impl CommandHandler {
         cluster: &ClusterState,
         args: &[RespValue],
     ) -> Result<RespValue> {
+        // CLUSTER RESHARD FINISH <slot> <dest-node-id>
+        if !args.is_empty() {
+            if let Some(b) = args[0].as_bulk_string() {
+                let first = String::from_utf8_lossy(b).to_uppercase();
+                if first == "FINISH" {
+                    if args.len() != 3 {
+                        return Ok(RespValue::error(
+                            "ERR wrong number of arguments for 'cluster|reshard|finish' command",
+                        ));
+                    }
+                    let slot = match self.parse_integer(&args[1]) {
+                        Ok(s) if s >= 0 && s < SLOT_COUNT as i64 => s as u16,
+                        _ => return Ok(RespValue::error("ERR Invalid or out of range slot")),
+                    };
+                    let dest_id = match args[2].as_bulk_string() {
+                        Some(b) => String::from_utf8_lossy(b).into_owned(),
+                        None => return Ok(RespValue::error("ERR invalid dest node id")),
+                    };
+                    return match finish_slot_node(cluster, slot, &dest_id).await {
+                        Ok(r) => Ok(RespValue::Array(vec![r.to_resp_array()])),
+                        Err(e) => Ok(RespValue::error(e)),
+                    };
+                }
+            }
+        }
+
         let (start, end, dest_id) = match args.len() {
             2 => {
                 let slot = match self.parse_integer(&args[0]) {
@@ -418,7 +448,10 @@ fn cluster_help() -> RespValue {
         bulk_static(b"SETSLOT <slot> MIGRATING|IMPORTING|STABLE|NODE [node-id]"),
         bulk_static(b"MIGRATEKEYS <slot> <ip> <port> -- move keys in slot to dest"),
         bulk_static(
-            b"RESHARD <slot> <node-id> | <start> <end> <node-id> -- orchestrate migrate + dual-end NODE (best-effort)",
+            b"RESHARD <slot> <node-id> | <start> <end> <node-id> -- orchestrate migrate + dual-end NODE (verify+retry, not atomic)",
+        ),
+        bulk_static(
+            b"RESHARD FINISH <slot> <node-id> -- dual-end SETSLOT NODE only (recover partial_*_node)",
         ),
         bulk_static(b"MEET <ip> <port> -- introduce peer into the cluster"),
         bulk_static(b"REPLICATE <node-id> -- become replica of node"),
