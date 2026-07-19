@@ -29,14 +29,17 @@
 //! `RESHARD FINISH` or manual SETSLOT. Dest-first ordering is intentionally
 //! not used (low-risk residual; Redis client expectations favor source MOVED).
 //!
-//! **Redis `MIGRATE` (Batch DP):** key-level transfer reuses
+//! **Redis `MIGRATE` (Batch DP/DQ):** key-level transfer reuses
 //! [`snapshot_key`] / [`recreate_commands`] / ASKING / RESP I/O. Options:
 //! `COPY`, `REPLACE`, `AUTH`/`AUTH2`, multi-key via `KEYS`, `timeout` ms,
 //! `destination-db` (SELECT on dest). No DUMP/RESTORE wire format.
 //!
 //! Supports string, hash, list, set, zset, geo, and stream keys. Dest writes use
 //! ASKING so IMPORTING slots accept the transfer. Complex types are recreated
-//! with the same RESP commands as AOF rewrite (no DUMP/RESTORE).
+//! with the same RESP commands as AOF rewrite (no DUMP/RESTORE). Remaining TTL
+//! is transferred for all types (string `SET PX`; typed keys trailing `PEXPIRE`).
+//! Multi-key mid-batch failure after ≥1 success returns Redis-style `IOERR`
+//! including `migrated=` / `skipped=` counts (Batch DQ).
 
 use super::crc16::{key_hash_slot, SLOT_COUNT};
 use super::state::ClusterState;
@@ -254,17 +257,39 @@ impl MigrateSlotResult {
 }
 
 /// Snapshot of one key ready for RESP recreate on the destination.
+///
+/// `pttl` is remaining TTL in milliseconds (`-1` = none), matching
+/// [`Cache::ttl`] / MOVE-COPY dump semantics. Applied on dest via `SET PX`
+/// (string) or trailing `PEXPIRE` (typed keys).
 enum KeySnapshot {
     String {
         value: Bytes,
         pttl: i64,
     },
-    Hash(Vec<(Bytes, Bytes)>),
-    List(Vec<Bytes>),
-    Set(Vec<Bytes>),
-    ZSet(Vec<(Bytes, f64)>),
-    Geo(Vec<(Bytes, f64, f64)>),
-    Stream(StreamStateSnapshot),
+    Hash {
+        fields: Vec<(Bytes, Bytes)>,
+        pttl: i64,
+    },
+    List {
+        items: Vec<Bytes>,
+        pttl: i64,
+    },
+    Set {
+        members: Vec<Bytes>,
+        pttl: i64,
+    },
+    ZSet {
+        members: Vec<(Bytes, f64)>,
+        pttl: i64,
+    },
+    Geo {
+        members: Vec<(Bytes, f64, f64)>,
+        pttl: i64,
+    },
+    Stream {
+        state: StreamStateSnapshot,
+        pttl: i64,
+    },
 }
 
 /// Return all non-expired keys currently stored whose hash slot equals `slot`.
@@ -295,6 +320,11 @@ pub fn string_keys_in_slot(cache: &Cache, slot: u16) -> Vec<Bytes> {
 
 /// Snapshot a single key for migration. Returns `None` if the key is gone or empty.
 fn snapshot_key(cache: &Cache, key: &Bytes) -> Option<KeySnapshot> {
+    // Unified remaining TTL (string + typed_expires); -2 = missing/expired.
+    let pttl = cache.ttl(key);
+    if pttl == -2 {
+        return None;
+    }
     match cache.key_type(key) {
         KeyType::None => None,
         KeyType::String => {
@@ -310,7 +340,7 @@ fn snapshot_key(cache: &Cache, key: &Bytes) -> Option<KeySnapshot> {
                 .flatten()?;
             Some(KeySnapshot::String {
                 value: entry.value.clone(),
-                pttl: entry.ttl_millis().unwrap_or(-1),
+                pttl,
             })
         }
         KeyType::Hash => {
@@ -319,7 +349,7 @@ fn snapshot_key(cache: &Cache, key: &Bytes) -> Option<KeySnapshot> {
             if fields.is_empty() {
                 return None;
             }
-            Some(KeySnapshot::Hash(fields))
+            Some(KeySnapshot::Hash { fields, pttl })
         }
         KeyType::List => {
             let l = cache.get_list(key)?;
@@ -327,7 +357,7 @@ fn snapshot_key(cache: &Cache, key: &Bytes) -> Option<KeySnapshot> {
             if items.is_empty() {
                 return None;
             }
-            Some(KeySnapshot::List(items))
+            Some(KeySnapshot::List { items, pttl })
         }
         KeyType::Set => {
             let s = cache.get_set(key)?;
@@ -335,7 +365,7 @@ fn snapshot_key(cache: &Cache, key: &Bytes) -> Option<KeySnapshot> {
             if members.is_empty() {
                 return None;
             }
-            Some(KeySnapshot::Set(members))
+            Some(KeySnapshot::Set { members, pttl })
         }
         KeyType::ZSet => {
             let z = cache.get_sorted_set(key)?;
@@ -343,7 +373,7 @@ fn snapshot_key(cache: &Cache, key: &Bytes) -> Option<KeySnapshot> {
             if members.is_empty() {
                 return None;
             }
-            Some(KeySnapshot::ZSet(members))
+            Some(KeySnapshot::ZSet { members, pttl })
         }
         KeyType::Geo => {
             let g = cache.get_geo_set(key)?;
@@ -351,7 +381,7 @@ fn snapshot_key(cache: &Cache, key: &Bytes) -> Option<KeySnapshot> {
             if members.is_empty() {
                 return None;
             }
-            Some(KeySnapshot::Geo(members))
+            Some(KeySnapshot::Geo { members, pttl })
         }
         KeyType::Stream => {
             let s = cache.get_stream(key)?;
@@ -360,12 +390,26 @@ fn snapshot_key(cache: &Cache, key: &Bytes) -> Option<KeySnapshot> {
             if state.entries.is_empty() && state.groups.is_empty() {
                 return None;
             }
-            Some(KeySnapshot::Stream(state))
+            Some(KeySnapshot::Stream { state, pttl })
         }
     }
 }
 
+/// Append `PEXPIRE key pttl` when remaining TTL is positive (typed keys).
+fn push_pttl_cmd(cmds: &mut Vec<Vec<RespValue>>, key: &Bytes, pttl: i64) {
+    if pttl > 0 {
+        cmds.push(vec![
+            bulk_static(b"PEXPIRE"),
+            RespValue::BulkString(Some(key.clone())),
+            bulk_owned(pttl.to_string()),
+        ]);
+    }
+}
+
 /// Build the sequence of RESP command arrays needed to recreate `snap` at `key`.
+///
+/// String TTL uses `SET … PX`; other types recreate value then `PEXPIRE` so
+/// expire metadata matches AOF rewrite / MOVE-COPY dump semantics.
 fn recreate_commands(key: &Bytes, snap: &KeySnapshot) -> Vec<Vec<RespValue>> {
     match snap {
         KeySnapshot::String { value, pttl } => {
@@ -380,7 +424,7 @@ fn recreate_commands(key: &Bytes, snap: &KeySnapshot) -> Vec<Vec<RespValue>> {
             }
             vec![parts]
         }
-        KeySnapshot::Hash(fields) => {
+        KeySnapshot::Hash { fields, pttl } => {
             let mut parts = vec![
                 bulk_static(b"HSET"),
                 RespValue::BulkString(Some(key.clone())),
@@ -389,9 +433,11 @@ fn recreate_commands(key: &Bytes, snap: &KeySnapshot) -> Vec<Vec<RespValue>> {
                 parts.push(RespValue::BulkString(Some(f.clone())));
                 parts.push(RespValue::BulkString(Some(v.clone())));
             }
-            vec![parts]
+            let mut cmds = vec![parts];
+            push_pttl_cmd(&mut cmds, key, *pttl);
+            cmds
         }
-        KeySnapshot::List(items) => {
+        KeySnapshot::List { items, pttl } => {
             let mut parts = vec![
                 bulk_static(b"RPUSH"),
                 RespValue::BulkString(Some(key.clone())),
@@ -399,9 +445,11 @@ fn recreate_commands(key: &Bytes, snap: &KeySnapshot) -> Vec<Vec<RespValue>> {
             for e in items {
                 parts.push(RespValue::BulkString(Some(e.clone())));
             }
-            vec![parts]
+            let mut cmds = vec![parts];
+            push_pttl_cmd(&mut cmds, key, *pttl);
+            cmds
         }
-        KeySnapshot::Set(members) => {
+        KeySnapshot::Set { members, pttl } => {
             let mut parts = vec![
                 bulk_static(b"SADD"),
                 RespValue::BulkString(Some(key.clone())),
@@ -409,9 +457,11 @@ fn recreate_commands(key: &Bytes, snap: &KeySnapshot) -> Vec<Vec<RespValue>> {
             for m in members {
                 parts.push(RespValue::BulkString(Some(m.clone())));
             }
-            vec![parts]
+            let mut cmds = vec![parts];
+            push_pttl_cmd(&mut cmds, key, *pttl);
+            cmds
         }
-        KeySnapshot::ZSet(members) => {
+        KeySnapshot::ZSet { members, pttl } => {
             let mut parts = vec![
                 bulk_static(b"ZADD"),
                 RespValue::BulkString(Some(key.clone())),
@@ -420,9 +470,11 @@ fn recreate_commands(key: &Bytes, snap: &KeySnapshot) -> Vec<Vec<RespValue>> {
                 parts.push(bulk_owned(score_string(*score)));
                 parts.push(RespValue::BulkString(Some(m.clone())));
             }
-            vec![parts]
+            let mut cmds = vec![parts];
+            push_pttl_cmd(&mut cmds, key, *pttl);
+            cmds
         }
-        KeySnapshot::Geo(members) => {
+        KeySnapshot::Geo { members, pttl } => {
             let mut parts = vec![
                 bulk_static(b"GEOADD"),
                 RespValue::BulkString(Some(key.clone())),
@@ -432,9 +484,15 @@ fn recreate_commands(key: &Bytes, snap: &KeySnapshot) -> Vec<Vec<RespValue>> {
                 parts.push(bulk_owned(score_string(*lat)));
                 parts.push(RespValue::BulkString(Some(m.clone())));
             }
-            vec![parts]
+            let mut cmds = vec![parts];
+            push_pttl_cmd(&mut cmds, key, *pttl);
+            cmds
         }
-        KeySnapshot::Stream(state) => stream_recreate_commands(key, state),
+        KeySnapshot::Stream { state, pttl } => {
+            let mut cmds = stream_recreate_commands(key, state);
+            push_pttl_cmd(&mut cmds, key, *pttl);
+            cmds
+        }
     }
 }
 
@@ -731,9 +789,10 @@ async fn issue_asking(stream: &mut TcpStream, opts: &MigrateKeyOpts) -> Result<(
 /// Connect to dest, optionally AUTH + SELECT, and migrate `keys` via RESP recreate.
 ///
 /// Redis-compatible success replies are expressed as [`MigrateCommandResult`].
-/// On mid-batch failure after one or more keys succeeded, returns an error string
-/// (typically `IOERR` style); already-migrated keys stay on dest (and are gone
-/// from source unless `copy`).
+/// On mid-batch failure after one or more keys succeeded, returns an `IOERR`
+/// string that includes `migrated=` / `skipped=` counts (Batch DQ); already-migrated
+/// keys stay on dest (and are gone from source unless `copy`). Retry only leftover
+/// source keys.
 ///
 /// Keys that were successfully deleted from source (not `copy`) are returned in
 /// `deleted_keys` so the command handler can AOF/repl-propagate `DEL`.
@@ -857,36 +916,54 @@ pub async fn migrate_keys_to(
         }
     }
 
-    let mut any_migrated = false;
+    let mut migrated = 0usize;
+    let mut skipped = 0usize;
     let mut deleted_keys = Vec::new();
 
     for key in keys {
+        // Test inject: fail after N successful migrations (shared with MIGRATEKEYS).
+        let fail_after = MIGRATE_KEY_FAIL_AFTER.load(Ordering::SeqCst);
+        if fail_after != u32::MAX && (migrated as u32) >= fail_after {
+            if migrated > 0 {
+                return Err(format_partial_ioerr(&addr, "injected mid-batch failure", migrated, skipped));
+            }
+            return Err("ERR MIGRATE injected mid-batch failure".into());
+        }
+
         match migrate_one_key_on_stream(cache, &mut stream, key, opts).await {
             Ok(MigrateOneOutcome::Migrated) => {
-                any_migrated = true;
+                migrated += 1;
                 if !opts.copy {
                     deleted_keys.push(key.clone());
                 }
             }
-            Ok(MigrateOneOutcome::Missing) => {}
+            Ok(MigrateOneOutcome::Missing) => {
+                skipped += 1;
+            }
             Err(e) => {
                 // Redis uses IOERR when the link fails after partial progress.
-                if any_migrated {
-                    return Err(format!(
-                        "IOERR error or timeout transferring key to {} ({}). Partial keys may have moved.",
-                        addr, e
-                    ));
+                if migrated > 0 {
+                    return Err(format_partial_ioerr(&addr, &e, migrated, skipped));
                 }
                 return Err(e);
             }
         }
     }
 
-    if any_migrated {
+    if migrated > 0 {
         Ok((MigrateCommandResult::Ok, deleted_keys))
     } else {
         Ok((MigrateCommandResult::NoKey, deleted_keys))
     }
+}
+
+/// Redis-ish multi-key partial failure: IOERR + honest progress counts.
+fn format_partial_ioerr(addr: &str, detail: &str, migrated: usize, skipped: usize) -> String {
+    format!(
+        "IOERR error or timeout transferring key to {} ({}). \
+         Partial keys may have moved: migrated={} skipped={}.",
+        addr, detail, migrated, skipped
+    )
 }
 
 async fn connect_dest_with_timeout(
@@ -1646,9 +1723,10 @@ mod tests {
         h.write()
             .hset(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
         match snapshot_key(&cache, &k).unwrap() {
-            KeySnapshot::Hash(fields) => {
+            KeySnapshot::Hash { fields, pttl } => {
                 assert_eq!(fields.len(), 1);
                 assert_eq!(fields[0].0.as_ref(), b"f");
+                assert_eq!(pttl, -1);
             }
             _ => panic!("expected hash"),
         }
@@ -1658,8 +1736,65 @@ mod tests {
         l.write().rpush([Bytes::from_static(b"a")]);
         l.write().rpush([Bytes::from_static(b"b")]);
         match snapshot_key(&cache, &kl).unwrap() {
-            KeySnapshot::List(items) => assert_eq!(items.len(), 2),
+            KeySnapshot::List { items, pttl } => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(pttl, -1);
+            }
             _ => panic!("expected list"),
         }
+    }
+
+    #[test]
+    fn snapshot_and_recreate_preserve_typed_pttl() {
+        let cache = Cache::new_with_sweep(4, 1024 * 1024, 1024 * 1024, false);
+        let k = Bytes::from_static(b"{t}.ht");
+        let h = cache.get_or_create_hash(&k).unwrap();
+        h.write()
+            .hset(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
+        cache.expire(&k, 30_000).unwrap();
+
+        let snap = snapshot_key(&cache, &k).unwrap();
+        match &snap {
+            KeySnapshot::Hash { pttl, .. } => {
+                assert!(*pttl > 25_000 && *pttl <= 30_000, "pttl={}", pttl);
+            }
+            _ => panic!("expected hash"),
+        }
+        let cmds = recreate_commands(&k, &snap);
+        assert_eq!(cmds.len(), 2, "HSET + PEXPIRE");
+        let pexpire = &cmds[1];
+        assert_eq!(
+            pexpire[0].as_bulk_string().map(|b| b.as_ref()),
+            Some(b"PEXPIRE".as_slice())
+        );
+    }
+
+    #[test]
+    fn snapshot_string_pttl_uses_set_px() {
+        let cache = Cache::new_with_sweep(4, 1024 * 1024, 1024 * 1024, false);
+        let k = Bytes::from_static(b"s-ttl");
+        let mut opts = StoreOptions::default();
+        opts.ttl_ms = Some(12_000);
+        cache
+            .store(k.clone(), Bytes::from_static(b"v"), opts)
+            .unwrap();
+        let snap = snapshot_key(&cache, &k).unwrap();
+        let cmds = recreate_commands(&k, &snap);
+        assert_eq!(cmds.len(), 1);
+        let parts = &cmds[0];
+        assert!(
+            parts.iter().any(|p| p.as_bulk_string().map(|b| b.as_ref()) == Some(b"PX")),
+            "expected SET PX in {:?}",
+            parts
+        );
+    }
+
+    #[test]
+    fn format_partial_ioerr_includes_counts() {
+        let s = format_partial_ioerr("127.0.0.1:1", "boom", 2, 1);
+        assert!(s.starts_with("IOERR"), "{}", s);
+        assert!(s.contains("migrated=2"), "{}", s);
+        assert!(s.contains("skipped=1"), "{}", s);
+        assert!(s.contains("Partial keys may have moved"), "{}", s);
     }
 }

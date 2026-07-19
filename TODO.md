@@ -295,9 +295,14 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch DN)*: dual-end `SETSLOT NODE` **verify + retry** (up to 3 attempts/side, short backoff; local `owner_of` + remote `CLUSTER SLOTS` check). Shared path `finish_slot_node` + operator `CLUSTER RESHARD FINISH <slot> <dest-id>` completes NODE only (no key re-migrate) after `partial_*_node`. Still **not** atomic / no 2PC — statuses stay honest. Tests: happy path, inject-1 retry→complete, inject-exhaust→partial_dest_node then FINISH recovery.
   - *Done (Batch DO)*: `MigrateSlotError` carries partial `migrated`/`skipped`; RESHARD `failed_keys` surfaces real counts; retry = leftover source keys only (docs + e2e). Range aborts on any non-`complete` (incl. `partial_*_node`). FINISH soft-checks `keys_in_slot` → optional `warning` field (does not hard-block). Source-before-dest NODE client window documented in rustdoc (order unchanged).
   - *Done (Batch DP)*: Redis key-level `MIGRATE host port key dest-db timeout [COPY] [REPLACE] [AUTH password] [AUTH2 user pass] [KEYS k…]`. Shared `migrate_one_key_on_stream` / `migrate_keys_to` reuses snapshot + RESP recreate (no DUMP/RESTORE); ASKING probed (disabled on standalone dest); `COPY` / `REPLACE` / `BUSYKEY` / `NOKEY` / connect timeout; multi-key `KEYS`; dest `SELECT` for non-zero db; AOF/repl propagates source `DEL` (not the MIGRATE form). MIGRATEKEYS loop uses the same helper. Catalog + ACL `@write`/`@keyspace`/`@dangerous` + readonly replica gate. Tests: `tests/dp_migrate_test.rs` (+ existing MIGRATEKEYS suite green).
-  - *Gaps*: dual-end NODE still not atomic / no 2PC; no slot-stable epoch gossip of ownership; no full redis-cli-style interactive reshard planner; no multi-node quorum view of topology after reshard; source-before-dest NODE order residual (documented; dest-first experiment not done). MIGRATE: no Redis DUMP/RESTORE wire compatibility (recreate-only); multi-key partial failure is coarse `IOERR` (no per-key counts); TTL on non-string types not transferred (pre-existing recreate gap).
+  - *Done (Batch DQ)*: multi-key mid-batch `IOERR` includes `migrated=` / `skipped=` counts (shared inject with MIGRATEKEYS); recreate path transfers remaining TTL for all types (string `SET PX`; hash/list/set/zset/geo/stream trailing `PEXPIRE` via `Cache::ttl`). Tests: partial inject e2e + string/hash/list TTL.
+  - *Gaps*: dual-end NODE still not atomic / no 2PC; no slot-stable epoch gossip of ownership; no full redis-cli-style interactive reshard planner; no multi-node quorum view of topology after reshard; source-before-dest NODE order residual (documented; dest-first experiment not done). MIGRATE: no Redis DUMP/RESTORE wire compatibility (recreate-only); ASKING probe / REPLACE pre-DEL semantics documented in module rustdoc (Batch DP).
   - [x] **`[P2]`** **Code review (DM/DN post-ship):** `failed_keys` under-reports partial key moves
     - *Done (Batch DO)*: `migrate_slot_keys` → `Result<_, MigrateSlotError { partial, message }>`; `reshard_one_slot` maps partial into `ReshardSlotResult.migrated/skipped` under `failed_keys:*`. Retry re-runs MIGRATEKEYS/RESHARD for leftover keys only. Test: inject mid-slot fail after 1 success → `migrated: 1` + retry completes.
+  - [x] **`[P2]`** **Code review (DP post-ship):** multi-key partial failure reply is coarse `IOERR` (no counts)
+    - *Done (Batch DQ)*: `migrate_keys_to` IOERR after ≥1 success reports `migrated=` / `skipped=`; leftover keys stay on source for retry. Test: inject after 1 of 3 → counts + retry completes.
+  - [x] **`[P3]`** **Code review (DP post-ship):** non-string TTL not transferred on recreate
+    - *Done (Batch DQ)*: `KeySnapshot` carries `pttl` for all types; string uses `SET PX`; typed keys append `PEXPIRE`. Unit + e2e (string/hash/list).
   - [x] **`[P3]`** **Code review (DN post-ship):** source NODE before dest NODE creates client window
     - *Done (docs, Batch DO)*: module + `dual_end_setslot_node` rustdoc describe MOVED-to-IMPORTING window under `partial_dest_node`. Code order left source-first (Redis client expectations); dest-first / 2PC still open under gaps.
   - [x] **`[P3]`** **Code review (DM post-ship):** range RESHARD continues after `partial_*_node`
@@ -647,7 +652,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batches CZ–DP shipped** (… **DM** `CLUSTER RESHARD`; **DN** dual-end NODE verify+retry + FINISH; **DO** partial `failed_keys` + range abort-on-partial + FINISH warning; **DP** Redis key-level `MIGRATE` via shared recreate path — still not 2PC). **Open next:** true 2PC dual-end / epoch gossip / reshard planner; multi-DB true atomic install; string-only UI repaint residual; standing tests-for-phase P0.
+Prioritized for next letter batch(es). **Batches CZ–DQ shipped** (… **DM** `CLUSTER RESHARD`; **DN** dual-end NODE verify+retry + FINISH; **DO** partial `failed_keys` + range abort-on-partial + FINISH warning; **DP** Redis key-level `MIGRATE` via shared recreate path; **DQ** MIGRATE partial counts + typed TTL transfer — still not 2PC). **Open next:** true 2PC dual-end / epoch gossip / reshard planner; multi-DB true atomic install; string-only UI repaint residual; standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -726,8 +731,9 @@ Prioritized for next letter batch(es). **Batches CZ–DP shipped** (… **DM** `
 | P3 | DM post-ship: range RESHARD continues after partial_*_node | done (DO abort-on-partial) |
 | P3 | DN post-ship nit: RESHARD FINISH no key-placement check | done (DO soft warning) |
 | P1 | DP: Redis MIGRATE key-level (shared recreate + COPY/REPLACE/KEYS/AUTH) | done (DP) |
-| P2 | DP residual: multi-key partial failure reply coarse (IOERR only) | open |
-| P3 | DP residual: no DUMP/RESTORE wire; non-string TTL not transferred | open |
+| P2 | DP residual: multi-key partial failure reply coarse (IOERR only) | done (DQ) |
+| P3 | DP residual: non-string TTL not transferred on recreate | done (DQ) |
+| P3 | DP residual: no DUMP/RESTORE wire compatibility | open (recreate-only; accepted) |
 | P3 | DH post-ship nit: repaint test is string-contains only | open (residual; no browser harness) |
 | P3 | DF post-ship: HTTP MVP gaps shared with metrics | done (DJ; shared admin_http) |
 | P3 | DK post-ship: thin r@10 headroom / cross-arch flake risk | done (DL; r@10 0.95→0.93) |

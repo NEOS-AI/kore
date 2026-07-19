@@ -1,9 +1,9 @@
-//! Batch DP: Redis key-level MIGRATE (RESP recreate path).
+//! Batch DP/DQ: Redis key-level MIGRATE (RESP recreate path).
 
 use bytes::Bytes;
 use kore::config::Config;
 use kore::protocol::{RespParser, RespValue};
-use kore::{Cache, ClusterState, Server};
+use kore::{test_acquire_migrate_key_inject, Cache, ClusterState, Server};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -343,6 +343,9 @@ async fn migrate_connect_failure() {
 /// Multi-key KEYS form.
 #[tokio::test(flavor = "multi_thread")]
 async fn migrate_keys_option_multi() {
+    // Hold inject lock so parallel mid-batch inject tests cannot trip this path.
+    let _no_inject = test_acquire_migrate_key_inject().await;
+
     let pair = spawn_standalone_pair(16914, 16915).await;
     let mut sa = TcpStream::connect(("127.0.0.1", pair.port_a)).await.unwrap();
     let mut sb = TcpStream::connect(("127.0.0.1", pair.port_b)).await.unwrap();
@@ -373,6 +376,208 @@ async fn migrate_keys_option_multi() {
     );
     assert_eq!(as_bulk(&send_cmd(&mut sb, &["GET", "k1"]).await), "a");
     assert_eq!(as_bulk(&send_cmd(&mut sb, &["GET", "k2"]).await), "b");
+
+    shutdown(pair).await;
+}
+
+/// Batch DQ: multi-key mid-batch inject → IOERR reports migrated/skipped counts.
+#[tokio::test(flavor = "multi_thread")]
+async fn migrate_multi_key_partial_failure_reports_counts() {
+    let pair = spawn_standalone_pair(16918, 16919).await;
+    let mut sa = TcpStream::connect(("127.0.0.1", pair.port_a)).await.unwrap();
+    let mut sb = TcpStream::connect(("127.0.0.1", pair.port_b)).await.unwrap();
+
+    assert!(is_ok(&send_cmd(&mut sa, &["SET", "p1", "a"]).await));
+    assert!(is_ok(&send_cmd(&mut sa, &["SET", "p2", "b"]).await));
+    assert!(is_ok(&send_cmd(&mut sa, &["SET", "p3", "c"]).await));
+
+    let _inj = test_acquire_migrate_key_inject().await;
+    _inj.fail_after_successes(1);
+
+    let port_b = pair.port_b.to_string();
+    let err = as_err(
+        &send_cmd(
+            &mut sa,
+            &[
+                "MIGRATE",
+                "127.0.0.1",
+                &port_b,
+                "",
+                "0",
+                "2000",
+                "KEYS",
+                "p1",
+                "p2",
+                "p3",
+            ],
+        )
+        .await,
+    );
+    assert!(err.starts_with("IOERR"), "expected IOERR, got {}", err);
+    assert!(
+        err.contains("migrated=1"),
+        "expected migrated=1 in partial reply: {}",
+        err
+    );
+    assert!(
+        err.contains("skipped="),
+        "expected skipped= count in partial reply: {}",
+        err
+    );
+    assert!(
+        err.contains("Partial keys may have moved"),
+        "expected partial wording: {}",
+        err
+    );
+
+    // First key moved; later keys remain on source.
+    assert_eq!(
+        send_cmd(&mut sa, &["EXISTS", "p1"]).await,
+        RespValue::Integer(0)
+    );
+    assert_eq!(as_bulk(&send_cmd(&mut sb, &["GET", "p1"]).await), "a");
+    assert_eq!(as_bulk(&send_cmd(&mut sa, &["GET", "p2"]).await), "b");
+    assert_eq!(as_bulk(&send_cmd(&mut sa, &["GET", "p3"]).await), "c");
+
+    // Drop inject (guard end of scope) — retry leftovers completes.
+    drop(_inj);
+    assert!(is_ok(
+        &send_cmd(
+            &mut sa,
+            &[
+                "MIGRATE",
+                "127.0.0.1",
+                &port_b,
+                "",
+                "0",
+                "2000",
+                "KEYS",
+                "p2",
+                "p3",
+            ]
+        )
+        .await
+    ));
+    assert_eq!(
+        send_cmd(&mut sa, &["EXISTS", "p2", "p3"]).await,
+        RespValue::Integer(0)
+    );
+    assert_eq!(as_bulk(&send_cmd(&mut sb, &["GET", "p2"]).await), "b");
+    assert_eq!(as_bulk(&send_cmd(&mut sb, &["GET", "p3"]).await), "c");
+
+    shutdown(pair).await;
+}
+
+/// Batch DQ: string TTL transferred via SET PX.
+#[tokio::test(flavor = "multi_thread")]
+async fn migrate_string_with_ttl() {
+    let pair = spawn_standalone_pair(16920, 16921).await;
+    let mut sa = TcpStream::connect(("127.0.0.1", pair.port_a)).await.unwrap();
+    let mut sb = TcpStream::connect(("127.0.0.1", pair.port_b)).await.unwrap();
+
+    assert!(is_ok(
+        &send_cmd(&mut sa, &["SET", "sttl", "v", "PX", "60000"]).await
+    ));
+    let port_b = pair.port_b.to_string();
+    assert!(is_ok(
+        &send_cmd(
+            &mut sa,
+            &["MIGRATE", "127.0.0.1", &port_b, "sttl", "0", "2000"]
+        )
+        .await
+    ));
+
+    let pttl = match send_cmd(&mut sb, &["PTTL", "sttl"]).await {
+        RespValue::Integer(n) => n,
+        other => panic!("expected integer PTTL, got {:?}", other),
+    };
+    assert!(
+        pttl > 50_000 && pttl <= 60_000,
+        "dest PTTL out of range: {}",
+        pttl
+    );
+    assert_eq!(as_bulk(&send_cmd(&mut sb, &["GET", "sttl"]).await), "v");
+
+    shutdown(pair).await;
+}
+
+/// Batch DQ: hash typed TTL transferred via trailing PEXPIRE.
+#[tokio::test(flavor = "multi_thread")]
+async fn migrate_hash_with_ttl() {
+    let pair = spawn_standalone_pair(16922, 16923).await;
+    let mut sa = TcpStream::connect(("127.0.0.1", pair.port_a)).await.unwrap();
+    let mut sb = TcpStream::connect(("127.0.0.1", pair.port_b)).await.unwrap();
+
+    match send_cmd(&mut sa, &["HSET", "httl", "f", "1"]).await {
+        RespValue::Integer(n) => assert_eq!(n, 1),
+        other => panic!("HSET failed: {:?}", other),
+    }
+    assert_eq!(
+        send_cmd(&mut sa, &["PEXPIRE", "httl", "45000"]).await,
+        RespValue::Integer(1)
+    );
+
+    let port_b = pair.port_b.to_string();
+    assert!(is_ok(
+        &send_cmd(
+            &mut sa,
+            &["MIGRATE", "127.0.0.1", &port_b, "httl", "0", "2000"]
+        )
+        .await
+    ));
+
+    assert_eq!(
+        send_cmd(&mut sa, &["EXISTS", "httl"]).await,
+        RespValue::Integer(0)
+    );
+    assert_eq!(as_bulk(&send_cmd(&mut sb, &["HGET", "httl", "f"]).await), "1");
+    let pttl = match send_cmd(&mut sb, &["PTTL", "httl"]).await {
+        RespValue::Integer(n) => n,
+        other => panic!("expected integer PTTL, got {:?}", other),
+    };
+    assert!(
+        pttl > 35_000 && pttl <= 45_000,
+        "dest hash PTTL out of range: {}",
+        pttl
+    );
+
+    shutdown(pair).await;
+}
+
+/// Batch DQ: list typed TTL transferred.
+#[tokio::test(flavor = "multi_thread")]
+async fn migrate_list_with_ttl() {
+    let pair = spawn_standalone_pair(16924, 16925).await;
+    let mut sa = TcpStream::connect(("127.0.0.1", pair.port_a)).await.unwrap();
+    let mut sb = TcpStream::connect(("127.0.0.1", pair.port_b)).await.unwrap();
+
+    match send_cmd(&mut sa, &["RPUSH", "lttl", "a", "b"]).await {
+        RespValue::Integer(n) => assert_eq!(n, 2),
+        other => panic!("RPUSH failed: {:?}", other),
+    }
+    assert_eq!(
+        send_cmd(&mut sa, &["PEXPIRE", "lttl", "40000"]).await,
+        RespValue::Integer(1)
+    );
+
+    let port_b = pair.port_b.to_string();
+    assert!(is_ok(
+        &send_cmd(
+            &mut sa,
+            &["MIGRATE", "127.0.0.1", &port_b, "lttl", "0", "2000"]
+        )
+        .await
+    ));
+
+    let pttl = match send_cmd(&mut sb, &["PTTL", "lttl"]).await {
+        RespValue::Integer(n) => n,
+        other => panic!("expected integer PTTL, got {:?}", other),
+    };
+    assert!(
+        pttl > 30_000 && pttl <= 40_000,
+        "dest list PTTL out of range: {}",
+        pttl
+    );
 
     shutdown(pair).await;
 }
