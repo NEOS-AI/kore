@@ -542,11 +542,25 @@ impl Cache {
         }
     }
 
-    /// Install a staged keyspace payload into `self`, discarding prior data.
+    /// Install a staged keyspace payload into `self`, returning the prior state.
     ///
     /// Pre-swap WATCH keys on `self` are re-tracked and bumped **atomically**
     /// with watch map install. Autosweep must be paused for the whole call.
-    pub(crate) fn install_keyspace_payload(&self, payload: KeyspacePayload) {
+    ///
+    /// The returned payload is the drained pre-install keyspace. Single-DB
+    /// callers may drop it immediately; multi-DB
+    /// [`Databases::replace_keyspaces_from`] retains discards until every DB
+    /// is installed so a panic mid-loop can reinstall olds (Batch DS).
+    ///
+    /// # Residual
+    ///
+    /// A panic **inside** this method (after drain, mid-fill) still leaves a
+    /// single-DB multi-map tear; discards are only returned after fill
+    /// completes. Command path relies on `-LOADING` for that window.
+    pub(crate) fn install_keyspace_payload_retaining_discard(
+        &self,
+        payload: KeyspacePayload,
+    ) -> KeyspacePayload {
         let pre_watch_keys: Vec<Bytes> = self.watch_gens.lock().keys().cloned().collect();
 
         // Drain target into discard, then install staged state.
@@ -561,6 +575,7 @@ impl Cache {
         let discard_watch = std::mem::take(&mut *self.watch_gens.lock());
         let (discard_indices, discard_aliases) = self.search_index_manager.take_all();
         let discard_counts = self.memory_tracker.take_keyspace_counts();
+        let discard_mem = self.memory_usage.load(Ordering::Relaxed);
 
         // Maps already drained into discard_* above — fill only (no second drain).
         self.map.fill_all(payload.map);
@@ -587,19 +602,29 @@ impl Cache {
             .install_keyspace_counts(&payload.counts);
         self.memory_usage.store(payload.mem, Ordering::Relaxed);
 
-        // Free discarded target state ASAP (shorten ~2× peak window).
-        drop(discard_map);
-        drop(discard_zsets);
-        drop(discard_geos);
-        drop(discard_hashes);
-        drop(discard_lists);
-        drop(discard_sets);
-        drop(discard_streams);
-        drop(discard_expires);
-        drop(discard_watch);
-        drop(discard_indices);
-        drop(discard_aliases);
-        let _ = discard_counts;
+        KeyspacePayload {
+            map: discard_map,
+            zsets: discard_zsets,
+            geos: discard_geos,
+            hashes: discard_hashes,
+            lists: discard_lists,
+            sets: discard_sets,
+            streams: discard_streams,
+            expires: discard_expires,
+            watch: discard_watch,
+            indices: discard_indices,
+            aliases: discard_aliases,
+            counts: discard_counts,
+            mem: discard_mem,
+        }
+    }
+
+    /// Install a staged keyspace payload into `self`, discarding prior data.
+    ///
+    /// See [`Self::install_keyspace_payload_retaining_discard`]. Drops the
+    /// prior state immediately to shorten the dual-residency window.
+    pub(crate) fn install_keyspace_payload(&self, payload: KeyspacePayload) {
+        let _discard = self.install_keyspace_payload_retaining_discard(payload);
     }
 
     /// Move full keyspace state from `other` into `self` (map-level swap).

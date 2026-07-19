@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 pub use storage::KeyType;
+pub(crate) use storage::KeyspacePayload;
 pub use eviction::EvictionPolicy;
 
 /// The main cache structure

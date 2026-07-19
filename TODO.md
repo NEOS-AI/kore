@@ -303,6 +303,9 @@ Also tracked in `docs/roadmap.md`.
     - *Done (Batch DQ)*: `migrate_keys_to` IOERR after ≥1 success reports `migrated=` / `skipped=`; leftover keys stay on source for retry. Test: inject after 1 of 3 → counts + retry completes.
   - [x] **`[P3]`** **Code review (DP post-ship):** non-string TTL not transferred on recreate
     - *Done (Batch DQ)*: `KeySnapshot` carries `pttl` for all types; string uses `SET PX`; typed keys append `PEXPIRE`. Unit + e2e (string/hash/list).
+  - [ ] **`[P3]`** **Code review (DQ post-ship nit):** migrate TTL is remaining-ms snapshot, not absolute
+    - *Found*: `Cache::ttl` → remaining ms at snapshot time; dest applies `PX`/`PEXPIRE` later so effective lifetime can shrink by RTT/processing. Absolute `PEXPIREAT` would preserve end time better under slow links.
+    - *Next*: optional switch to unix-ms absolute expire on the wire if Redis clients care; document current remaining-ms behavior.
   - [x] **`[P3]`** **Code review (DN post-ship):** source NODE before dest NODE creates client window
     - *Done (docs, Batch DO)*: module + `dual_end_setslot_node` rustdoc describe MOVED-to-IMPORTING window under `partial_dest_node`. Code order left source-first (Redis client expectations); dest-first / 2PC still open under gaps.
   - [x] **`[P3]`** **Code review (DM post-ship):** range RESHARD continues after `partial_*_node`
@@ -579,7 +582,18 @@ Also tracked in `docs/roadmap.md`.
   - *Found*: commits one DB at a time; concurrent readers (FULLRESYNC) can see DB0 new + DB1 old; panic mid-loop leaves partial multi-DB commit.
   - *Mitigated (CC–CK)*: staged drain; no multi-DB pre-flush; `load_generation` / `load_in_progress`; Redis-style **`-LOADING`** for data-plane commands during replace; INFO `loading:`.
   - *Done (Batch DR — Option B lock-step)*: after staging, install **all** DBs under one `keyspace_epoch_lock` write; multi-DB exporters use `with_stable_keyspace_view` (epoch read) — `MultiDbSnapshot::from_databases` wired; `load_generation` single end publish (frozen mid-install). Tests: `tests/dr_multidb_atomic_install_test.rs` (exclusion, concurrent non-torn export, raw-Arc residual, gen freeze).
-  - *Residual*: panic mid-install still partial commit; raw `Arc<Cache>` without epoch lock can still observe mid-loop tear; single-DB mid-`install_keyspace_payload` map tear for allowlisted probes. Not Arc-swap of the DB vector (Option C).
+  - [x] **`[P2]`** **Code review (DR post-ship):** panic mid-install still leaves partial multi-DB commit
+    - *Found*: epoch write covers the install loop, but no rollback of already-installed DBs on panic. Drop guard clears `load_in_progress` + bumps gen — survivors see incomplete multi-DB dataset as “loaded.”
+    - *Done (Batch DS)*: `install_keyspace_payload_retaining_discard` returns prior maps; install loop keeps discards; `InstallRollback` Drop reinstalls olds for fully-swapped DBs while epoch write still held. Tests: `panic_mid_install_rolls_back_already_installed_dbs`. Residual: panic **inside** single-DB multi-map fill (after drain, before return) is not rolled back — Option C Arc-swap for true all-or-nothing single-DB.
+  - [x] **`[P2]`** **Code review (DR post-ship):** raw `Arc<Cache>` multi-DB walk still torn mid-install
+    - *Found*: command path gated by LOADING; multi-DB exporters use epoch read. Residual: any internal path that holds per-DB `Arc<Cache>` and walks DBs without `with_stable_keyspace_view` can still see DB0-new + DB1-old (test `raw_per_db_access_can_see_mid_loop_tear` documents this).
+    - *Done (Batch DS audit)*: AOF `rewrite_databases` now under `with_stable_keyspace_view` (was torn). RDB `from_databases` already safe. Documented: `Databases::iter` rustdoc; INFO blocked_clients / CONFIG multi-DB walks are non-keyspace (no epoch). Metrics single-cache. Residual raw mid-loop tear still true for unprivileged raw Arc walks during install (documented by existing DR test); exporters must use epoch read.
+  - [ ] **`[P3]`** **Code review (DR/DS residual):** single-DB mid-`install_keyspace_payload` tear
+    - *Found*: even under epoch write, one DB’s install is multi-map sequential (strings then typed…). Allowlisted probes on a single selected DB during LOADING can still see partial single-DB maps if they bypass LOADING (they should not). Panic mid-fill also skips multi-DB discard rollback (discard only returned after fill completes).
+    - *Next*: keep LOADING as the barrier; optional single-DB Arc-swap / all-or-nothing map install only if privileged paths grow.
+  - [x] **`[P3]`** **Code review (DR post-ship nit):** production test hook `after_install_db`
+    - *Found*: `Mutex<Option<Arc<dyn Fn(usize)>>>` on `Databases` for DR tests. Harmless when None; extra field on every process.
+    - *Done (Batch DS docs)*: keep on type — `tests/` integration tests cannot see lib `cfg(test)`; feature flag would force CI `--features`. Rustdoc states production always `None`.
 - [x] **`[P2]`** **Code review (CP post-ship):** LOADING allowlist still runs `PSYNC`/`SYNC`/`CONFIG` during replace
   - *Found*: `loading_denied` allowed `INFO`/`ROLE`/`REPLCONF`/`PSYNC`/`SYNC`/`CLIENT`/`CONFIG`/`MODULE` (and auth/admin probes). Full sync snapshots live multi-DB maps and can observe mid-`install_keyspace_payload` torn state (strings filled, typed maps empty, counters not yet installed). Data plane is correctly gated.
   - *Done (Batch CR)*: deny `SYNC`/`PSYNC` during `load_in_progress` (`-LOADING`); keep allowlist for connection/discovery/repl handshake (`AUTH`/`HELLO`/`PING`/`ECHO`/`QUIT`/`RESET`/`INFO`/`COMMAND`/`ROLE`/`REPLCONF`/`CLIENT`/`CONFIG`/`MODULE`). `CONFIG` left allowed (ops/live params; no keyspace snapshot). Docs: `docs/locking.md` Keyspace replace. Tests: `tests/ck_loading_gate_test.rs`.
@@ -653,7 +667,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batches CZ–DR shipped** (… **DQ** MIGRATE partial counts + typed TTL; **DR** multi-DB lock-step install / epoch barrier). **Open next:** true 2PC dual-end / epoch gossip / reshard planner; multi-DB panic rollback / Arc-swap (DR residual); string-only UI repaint residual; standing tests-for-phase P0.
+Prioritized for next letter batch(es). **Batches CZ–DR shipped** (… **DQ** MIGRATE partial counts + typed TTL; **DR** multi-DB lock-step install / epoch barrier). **Open next (after DQ/DR code review):** DR panic mid-install rollback; audit raw multi-DB walks; single-DB mid-payload residual; DQ absolute expire vs remaining-ms; cluster 2PC / epoch gossip / planner; string-only UI repaint residual; standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -734,6 +748,11 @@ Prioritized for next letter batch(es). **Batches CZ–DR shipped** (… **DQ** M
 | P1 | DP: Redis MIGRATE key-level (shared recreate + COPY/REPLACE/KEYS/AUTH) | done (DP) |
 | P2 | DP residual: multi-key partial failure reply coarse (IOERR only) | done (DQ) |
 | P3 | DP residual: non-string TTL not transferred on recreate | done (DQ) |
+| P2 | DR post-ship: panic mid-install partial multi-DB commit | done (DS; mid-fill single-DB residual) |
+| P2 | DR post-ship: raw Arc multi-DB walk still torn mid-install | done (DS AOF epoch + audit; raw residual documented) |
+| P3 | DR/DS residual: single-DB mid-payload map tear | open |
+| P3 | DR post-ship nit: after_install_db test hook in prod type | done (DS docs; keep for tests/) |
+| P3 | DQ post-ship nit: migrate TTL remaining-ms not absolute | open |
 | P3 | DP residual: no DUMP/RESTORE wire compatibility | open (recreate-only; accepted) |
 | P3 | DH post-ship nit: repaint test is string-contains only | open (residual; no browser harness) |
 | P3 | DF post-ship: HTTP MVP gaps shared with metrics | done (DJ; shared admin_http) |

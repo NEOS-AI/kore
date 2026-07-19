@@ -3,7 +3,7 @@
 //! Each logical DB is an independent `Cache` keyspace. Pub/Sub and connection
 //! stats are shared via DB 0 (Redis semantics: pub/sub is not DB-scoped).
 
-use crate::cache::Cache;
+use crate::cache::{Cache, KeyspacePayload};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -35,7 +35,12 @@ pub struct Databases {
     /// [`Self::replace_keyspaces_from`] (0-based DB index). Held **under** the
     /// epoch write lock — hooks must not call [`Self::with_stable_keyspace_view`]
     /// (would deadlock). Use [`Self::try_with_stable_keyspace_view`] to observe
-    /// exclusion. Production leaves this `None`.
+    /// exclusion.
+    ///
+    /// **Production always leaves this `None`.** Kept on the type (not
+    /// `#[cfg(test)]`) because integration tests under `tests/` link the
+    /// library without `cfg(test)` on the crate; a `test-hooks` feature would
+    /// also force CI to pass `--features`. Harmless when unset (empty mutex).
     after_install_db: parking_lot::Mutex<Option<Arc<dyn Fn(usize) + Send + Sync>>>,
 }
 
@@ -106,6 +111,12 @@ impl Databases {
         self.dbs[0].clone()
     }
 
+    /// Iterate logical DBs. **Not** a multi-DB consistent snapshot by itself —
+    /// concurrent [`replace_keyspaces_from`] can make a raw walk see DB0-new +
+    /// DB1-old. Multi-DB keyspace exporters must wrap the walk in
+    /// [`Self::with_stable_keyspace_view`] (see RDB `from_databases`, AOF
+    /// `rewrite_databases`). Config / blocker / stats walks that do not sample
+    /// key contents are fine without the epoch lock.
     pub fn iter(&self) -> impl Iterator<Item = &Arc<Cache>> {
         self.dbs.iter()
     }
@@ -228,36 +239,45 @@ impl Databases {
     /// DB count is matched by index; extra DBs on either side are ignored.
     ///
     /// Sets [`load_in_progress`] for the duration. Bumps [`load_generation`]
-    /// once when the call finishes (not mid-install).
+    /// once when the call finishes (success **or** panic via drop guard).
     ///
     /// # Consistency under concurrent readers
     ///
     /// **Lock-step install (Batch DR):** after staging every source payload,
     /// all target DBs are installed under a single `keyspace_epoch_lock`
     /// write section. Multi-DB observers that take
-    /// [`Self::with_stable_keyspace_view`] (e.g. RDB `from_databases` / SAVE)
-    /// either finish before that section or block until **all** DBs are new —
-    /// they never sample DB0-new + DB1-old.
+    /// [`Self::with_stable_keyspace_view`] (e.g. RDB `from_databases` / SAVE,
+    /// AOF `rewrite_databases`) either finish before that section or block
+    /// until **all** DBs are new — they never sample DB0-new + DB1-old.
     ///
     /// Public command path still returns **`-LOADING`** while
     /// [`load_in_progress`] is true (data plane + SYNC/PSYNC). Peak dual-
-    /// residency during stage is ~old multi-DB + full staged scratch (~2×).
+    /// residency during stage is ~old multi-DB + full staged scratch (~2×);
+    /// during install, discarded olds of already-installed DBs are retained
+    /// until the loop commits (extra peak for panic rollback — Batch DS).
+    ///
+    /// # Panic safety
+    ///
+    /// - **Staging:** all source DBs are fully drained into staged payloads
+    ///   **before** any target is mutated. A panic while preparing source DBs
+    ///   leaves every target intact.
+    /// - **Install loop (Batch DS):** each DB install retains the prior
+    ///   payload. If install panics after DB *i* is fully swapped (e.g. test
+    ///   hook, later DB install), a drop guard **reinstalls** olds for
+    ///   `0..=i` while still holding the epoch write lock. Survivors then see
+    ///   the pre-replace multi-DB dataset (plus a bumped [`load_generation`]).
     ///
     /// # Residuals
     ///
-    /// - **Panic mid-install** still leaves DBs `0..=i` new and `i+1..` old
-    ///   (no rollback of already-installed DBs).
+    /// - **Panic mid-single-DB `install_keyspace_payload_*`** (after drain,
+    ///   mid multi-map fill) is not rolled back — that DB stays torn. True
+    ///   all-or-nothing single-DB install needs Arc-swap of maps (Option C).
     /// - **Raw per-DB `Arc<Cache>` access** that bypasses the epoch lock and
-    ///   the command gate can still observe a mid-loop multi-DB tear (and
-    ///   mid-`install_keyspace_payload` single-DB map tear). Privileged
-    ///   allowlisted commands (e.g. INFO key counts on the selected DB) are
-    ///   not multi-DB exporters; document if expanded.
-    ///
-    /// # Panic safety (partial staging)
-    ///
-    /// All source DBs are fully drained into staged payloads **before** any
-    /// target is mutated. A panic while preparing source DBs leaves every
-    /// target intact.
+    ///   the command gate can still observe a mid-loop multi-DB tear while
+    ///   install is in progress (and mid-payload single-DB map tear).
+    ///   Privileged allowlisted commands that only touch the selected DB or
+    ///   non-keyspace metadata (e.g. blocked-client counts) are not multi-DB
+    ///   exporters; document if expanded.
     pub fn replace_keyspaces_from(&self, other: &Self) {
         self.load_in_progress.store(true, Ordering::Release);
         struct LoadFlag<'a>(&'a Databases);
@@ -280,15 +300,49 @@ impl Databases {
             staged.push(other.dbs[i].take_keyspace_payload());
         }
 
-        // Lock-step install: one exclusive section for every DB.
+        // Lock-step install: one exclusive section for every DB. Retain
+        // discarded olds so a panic mid-loop can restore already-swapped DBs
+        // before the epoch write is released (Drop order: rollback then epoch).
         {
             let _epoch: RwLockWriteGuard<'_, ()> = self.keyspace_epoch_lock.write();
+
+            /// Restores already-installed DBs from retained discards on panic.
+            ///
+            /// Declared after `_epoch` so it drops first while the write lock
+            /// is still held — rollback never races multi-DB exporters.
+            struct InstallRollback<'a> {
+                dbs: &'a Databases,
+                /// `(db_index, pre-install payload)` for DBs fully installed.
+                installed: Vec<(usize, KeyspacePayload)>,
+                committed: bool,
+            }
+            impl Drop for InstallRollback<'_> {
+                fn drop(&mut self) {
+                    if self.committed {
+                        return;
+                    }
+                    // Reverse order is fine; whole restore is under epoch write.
+                    while let Some((i, old)) = self.installed.pop() {
+                        // Drop the half-new maps; reinstall pre-replace state.
+                        self.dbs.dbs[i].install_keyspace_payload(old);
+                    }
+                }
+            }
+
+            let mut rollback = InstallRollback {
+                dbs: self,
+                installed: Vec::with_capacity(n),
+                committed: false,
+            };
             for (i, payload) in staged.into_iter().enumerate() {
-                self.dbs[i].install_keyspace_payload(payload);
+                let old = self.dbs[i].install_keyspace_payload_retaining_discard(payload);
+                rollback.installed.push((i, old));
                 if let Some(ref hook) = *self.after_install_db.lock() {
                     hook(i);
                 }
             }
+            rollback.committed = true;
+            // Drop retained discards after successful commit (shorten dual-residency).
         }
     }
 

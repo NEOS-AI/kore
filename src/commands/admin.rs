@@ -987,6 +987,8 @@ impl CommandHandler {
             .stats
             .active_connections
             .load(Ordering::Relaxed);
+        // Blocker counts only (not keyspace contents). Epoch read not required —
+        // mid-install multi-DB key tear does not apply to list/stream waiters.
         let mut blocked = 0usize;
         for db in self.databases.iter() {
             blocked += db.list_blockers.blocked_clients();

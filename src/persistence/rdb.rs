@@ -1267,15 +1267,16 @@ pub fn load_bytes(cache: &Cache, data: &[u8], flush: bool) -> Result<usize> {
 /// Multi-DB install is staged (all sources drained before any target mutate)
 /// then installed under a single keyspace-epoch write lock — multi-DB exporters
 /// that use [`MultiDbSnapshot::from_databases`] / [`Databases::with_stable_keyspace_view`]
-/// never observe DB0-new + DB1-old. Command-path readers still see `-LOADING`.
-/// See [`Databases::replace_keyspaces_from`] for panic / raw-`Arc<Cache>` residuals.
+/// (also AOF `rewrite_databases`) never observe DB0-new + DB1-old. Command-path
+/// readers still see `-LOADING`. Panic mid-install rolls back fully-swapped DBs
+/// (Batch DS); see [`Databases::replace_keyspaces_from`] for residuals.
 ///
 /// - `flush = true` (**snapshot replace**): empty scratch; on success each
 ///   target DB is swapped from scratch via [`Databases::replace_keyspaces_from`]
-///   (full keyspace replace per DB — **no** pre-flush of all DBs). That way a
-///   mid-install panic leaves remaining DBs with their **pre-load** data
-///   instead of empty. Single-DB [`load_bytes`] still pre-flushes for peak
-///   memory on FULLRESYNC of one cache.
+///   (full keyspace replace per DB — **no** pre-flush of all DBs). A mid-install
+///   panic after some DBs swap restores those DBs to pre-load data via retained
+///   discards. Single-DB [`load_bytes`] still pre-flushes for peak memory on
+///   FULLRESYNC of one cache.
 /// - `flush = false` (**merge**): scratch seeded from non-mutating multi-DB
 ///   snapshot, then merged (existing FT names kept only when schema/target
 ///   equal; clash otherwise fails — see [`DbSnapshot::load_into`]).

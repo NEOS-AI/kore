@@ -35,16 +35,26 @@ Never invert these (deadlock risk):
 - Multi-DB replace stages **all** source payloads first, then installs every DB
   under one **`keyspace_epoch_lock` write** section (lock-step install).
   - Multi-DB exporters must use **`Databases::with_stable_keyspace_view`**
-    (epoch **read**) — `MultiDbSnapshot::from_databases` does this — so they
-    never sample DB0-new + DB1-old mid-install.
+    (epoch **read**) — `MultiDbSnapshot::from_databases` and AOF
+    `rewrite_databases` do this — so they never sample DB0-new + DB1-old
+    mid-install.
   - Command path returns **`-LOADING`** while `Databases::load_in_progress()`
     is true (data plane + `SYNC`/`PSYNC`).
   - `load_generation` publishes **once at end** of replace (frozen mid-install).
+  - **Panic rollback (Batch DS):** each DB install retains the discarded old
+    payload; if the install loop panics after DB *i* is fully swapped, a drop
+    guard reinstalls olds for `0..=i` while the epoch write is still held.
+    Peak dual-residency is slightly higher during install (olds retained until
+    commit). Staging-only panic still leaves all targets intact.
 - **Residuals**
-  - Panic mid-install still leaves a partial multi-DB commit (no rollback).
+  - Panic **inside** a single DB’s multi-map fill (after drain, before install
+    returns) is not rolled back — that one DB can stay torn. Full Arc-swap of
+    whole DB vector (Option C) would change that.
   - Raw `Arc<Cache>` access that skips the epoch lock can still observe a
-    mid-loop multi-DB tear (and mid-payload single-DB map tear). Command path
-    is gated; do not walk all DBs without the epoch read lock.
+    mid-loop multi-DB tear (and mid-payload single-DB map tear) **while install
+    is running**. Command path is gated; do not walk all DBs’ keyspace without
+    the epoch read lock. Non-keyspace multi-DB walks (blocked clients, CONFIG
+    propagation) are fine without it.
 - **LOADING allowlist** (connection / discovery / repl handshake only — no
   keyspace snapshot): `AUTH`, `HELLO`, `PING`, `ECHO`, `QUIT`, `RESET`, `INFO`,
   `COMMAND`, `ROLE`, `REPLCONF`, `CLIENT`, `CONFIG`, `MODULE`.

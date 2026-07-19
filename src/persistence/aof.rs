@@ -365,29 +365,39 @@ pub fn rewrite(cache: &Cache, path: &Path) -> Result<()> {
 /// Rewrite AOF from all non-empty logical databases, emitting SELECT between them.
 ///
 /// A DB is non-empty if it has keyspace data **or** search indices/aliases.
+///
+/// Snapshot + search schema encode run under
+/// [`Databases::with_stable_keyspace_view`] so a concurrent multi-DB keyspace
+/// install cannot produce a torn AOF (DB0-new + DB1-old). Matches RDB
+/// [`crate::persistence::rdb::MultiDbSnapshot::from_databases`].
 pub fn rewrite_databases(databases: &Databases, path: &Path) -> Result<()> {
-    let mut non_empty: Vec<(usize, Arc<Cache>, DbSnapshot)> = Vec::new();
-    for (idx, cache) in databases.iter().enumerate() {
-        let snap = DbSnapshot::from_cache(cache)?;
-        if !snap.is_empty() || cache.has_search_state() {
-            non_empty.push((idx, cache.clone(), snap));
+    let buf = databases.with_stable_keyspace_view(|| {
+        let mut non_empty: Vec<(usize, Arc<Cache>, DbSnapshot)> = Vec::new();
+        for (idx, cache) in databases.iter().enumerate() {
+            let snap = DbSnapshot::from_cache(cache)?;
+            if !snap.is_empty() || cache.has_search_state() {
+                non_empty.push((idx, cache.clone(), snap));
+            }
         }
-    }
 
-    let mut buf = Vec::with_capacity(4096);
-    let multi = non_empty.len() > 1;
-    for (idx, cache, snap) in &non_empty {
-        // Emit SELECT for every DB when multiple are non-empty, and for any
-        // non-zero single DB so load restores the correct keyspace.
-        if multi || *idx != 0 {
-            let args = vec![
-                Bytes::from_static(b"SELECT"),
-                Bytes::from(idx.to_string()),
-            ];
-            buf.extend_from_slice(&encode_command(&args));
+        let mut buf = Vec::with_capacity(4096);
+        let multi = non_empty.len() > 1;
+        for (idx, cache, snap) in &non_empty {
+            // Emit SELECT for every DB when multiple are non-empty, and for any
+            // non-zero single DB so load restores the correct keyspace.
+            if multi || *idx != 0 {
+                let args = vec![
+                    Bytes::from_static(b"SELECT"),
+                    Bytes::from(idx.to_string()),
+                ];
+                buf.extend_from_slice(&encode_command(&args));
+            }
+            // Search CREATE/ALIAS still read the live Cache — must stay under
+            // the epoch read held by this closure.
+            encode_db_commands(cache, snap, &mut buf);
         }
-        encode_db_commands(cache, snap, &mut buf);
-    }
+        Ok::<Vec<u8>, crate::error::Error>(buf)
+    })?;
 
     write_aof_buffer(&buf, path)
 }
@@ -1262,8 +1272,8 @@ pub fn load_into_cache(cache: &Arc<Cache>, path: &Path) -> Result<usize> {
 /// collection. On `Ok`, autosweep is paused on all DBs, WATCH gens are
 /// bumped, then each DB is swapped via [`Databases::replace_keyspaces_from`]
 /// (lock-step multi-DB install under the keyspace epoch write lock; no multi-DB
-/// pre-flush; mid-install panic leaves remaining DBs with pre-load data). Peak
-/// dual-residency during stage is ~old multi-DB + scratch. On `Err`,
+/// pre-flush; panic mid-install rolls back already-installed DBs — Batch DS).
+/// Peak dual-residency during stage is ~old multi-DB + scratch. On `Err`,
 /// `databases` is left completely untouched. Multi-DB exporters take the epoch
 /// read lock; command path sees `-LOADING` during commit.
 pub fn load_into_databases(databases: &Databases, path: &Path) -> Result<usize> {
@@ -1302,8 +1312,8 @@ pub fn load_into_databases(databases: &Databases, path: &Path) -> Result<usize> 
         Ok(n) => {
             databases.with_autosweep_paused_all(|| {
                 // Dirty WATCH before replace. No multi-DB pre-flush: each DB is
-                // fully swapped by replace_keyspaces_from (mid-install panic
-                // leaves remaining DBs with pre-load data).
+                // fully swapped by replace_keyspaces_from (panic mid-install
+                // rolls back already-installed DBs via retained discards).
                 for db in databases.iter() {
                     db.touch_all_watch_keys();
                 }
