@@ -473,7 +473,7 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch CW, path branch)*: NN-path reconnect unit test with ≥4 former neighbors + `max_m=2` (`n-1 > max_m`). Test: `hnsw_bridge_remove_path_branch_reconnects` (BFS + farthest-leaf `search`).
 - [x] **`[P2]`** HNSW recall@k / throughput numbers vs FLAT
   - *Done (Batch CV, unit gate + N=300 micro)*: `hnsw_recall_at_k_vs_flat_and_throughput` — N=300 dim=16 Cosine, Q=40, fixed seed; mean recall@1 ≥ 0.90 / recall@10 ≥ 0.80 vs FLAT; indicative wall times in `docs/benchmarks.md` (FLAT still cheaper at this N; recall perfect on seed).
-  - *Residual (CV post-ship)*: soft thresholds vs observed 1.0; single-shot not median-of-3; no post-delete churn; not a large-N ANN win claim.
+  - *Done (Batch DK, CV post-ship)*: tightened always-on gate (M=8/ef=32; recall@1 ≥ 0.975 / @10 ≥ 0.95); optional `#[ignore]` larger-N median-of-3 bench N=5000; docs label single-shot vs median. Residual: no post-delete churn in recall suite.
 - [x] **`[P2]`** **Code review (CU post-ship):** NN-path bridge reconnect branch untested
   - *Found*: star multi-way test uses 3 survivors + `max_m=2` → `n-1 ≤ max_m` full clique, not the `else` nearest-neighbor path. Path construction / force-keep degree≤2 can regress green.
   - *Done (Batch CW)*: `hnsw_bridge_remove_path_branch_reconnects` — 4-leaf star, M=1/`max_m=2`, BFS all survivors + `search(self, k=1)` for farthest leaf `d`.
@@ -491,9 +491,10 @@ Also tracked in `docs/roadmap.md`.
   - *Found*: every remove full-scans layer neighbors for reverse edges, then `unlink_node` scans again. Correct but costly as N grows.
   - *Done (Batch CY)*: `unlink_collecting_undirected_former` fuses undirected snapshot + strip + drop in one reverse pass (no full reverse adjacency index).
   - *Residual (CY post-ship)*: still **O(E_layer)** once (not O(N)+deg); reverse index only if delete-heavy workloads need better asymptotics.
-- [ ] **`[P3]`** **Code review (CV post-ship):** tighten recall gate / larger-N throughput
+- [x] **`[P3]`** **Code review (CV post-ship):** tighten recall gate / larger-N throughput
   - *Found*: thresholds 0.90/0.80 leave headroom on easy N/M/ef; throughput is single-shot N=300 where HNSW loses to FLAT.
-  - *Next*: raise gates or harder config; optional `#[ignore]`/`--release` larger-N bench; label table single-shot.
+  - *Done (Batch DK)*: always-on gate uses harder M=8/ef=32 + raised floors recall@1 ≥ 0.975 / @10 ≥ 0.95 (fixed seed `0xC0FFEE42`; observed ≈1.00/0.985). Optional `#[ignore]` `hnsw_recall_larger_n_median_throughput` — N=5000 M=16/ef=100, median-of-3 search timings, soft floors 0.95/0.90; run with `cargo test --release --lib hnsw_recall_larger_n_median_throughput -- --ignored --nocapture`. `docs/benchmarks.md` labels single-shot vs median-of-3; no portable large-N win claim without host re-measure.
+  - *Residual*: no post-delete churn in recall suite; string-only deadlock UI repaint test still open.
 - [x] **`[P2]`** **Code review (CP post-ship):** HNSW search does not use the graph
   - *Found*: `search` full-scanned `self.vectors`; `ef_search` unused; `add` could connect self as neighbor.
   - *Done (Batch CQ)*: graph SEARCH-LAYER + self-exclude on connect; discriminating edge-walk test.
@@ -620,7 +621,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batches CZ–DI shipped** (… DH full table repaint; DI noscript-only meta-refresh + numeric cell coerce). **Open next:** string-only repaint test residual; deferred DF P3 HTTP MVP gaps; optional larger-N HNSW recall; standing tests-for-phase P0.
+Prioritized for next letter batch(es). **Batches CZ–DK shipped** (… DI noscript-only meta-refresh + numeric cell coerce; DJ shared admin_http 405/request-line; DK HNSW tighter recall + ignored larger-N median bench). **Open next:** string-only repaint test residual (no browser harness); multi-DB true atomic install redesign; cluster automatic reshard; standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -673,7 +674,7 @@ Prioritized for next letter batch(es). **Batches CZ–DI shipped** (… DH full 
 | P3 | CW post-ship: path-branch test degree-saturating decoys | done (CY; adjacency-assert residual) |
 | P3 | CU post-ship: fuse reverse-scan + unlink / reverse index | done (CY one O(E) pass; no reverse index) |
 | P2 | HNSW recall@k / throughput numbers vs FLAT | done (CV unit gate + N=300 micro) |
-| P3 | CV post-ship: tighter recall / larger-N throughput bench | open |
+| P3 | CV post-ship: tighter recall / larger-N throughput bench | done (DK) |
 | P2 | Optional structured JSON logging | done (CX MVP) |
 | P3 | CX post-ship: EnvFilter / JSON smoke / boot-only docs | done (CY; smoke/EnvFilter residual) |
 | P2 | CZ victim strategies (Youngest/Oldest/FewestLocks) | done (CZ + DB Redlock wiring) |

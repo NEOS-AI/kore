@@ -19,7 +19,7 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] HNSW undirected former snapshot + multi-way spanning bridge reconnect (Batch CU)
 - [x] HNSW NN-path bridge branch test + must_keep prune safety (Batch CW)
 - [x] HNSW recall@k unit gate + N=300 indicative micro (Batch CV; not large-N ANN win)
-- [ ] Optional larger-N HNSW throughput / tighter recall (CV post-ship; see TODO.md)
+- [x] HNSW tighter recall gate + optional larger-N median bench (Batch DK; `#[ignore]` N=5000)
 
 ## Plans
 
@@ -31,7 +31,7 @@ Tracked in detail in root `TODO.md`. High level:
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원
     - [x] 커스텀 희생자 선택 전략
-    - [x] 웹 UI 모니터링 (Batch DF–DI; residual: string-only repaint test + HTTP MVP gaps — see TODO.md)
+    - [x] 웹 UI 모니터링 (Batch DF–DJ; residual: string-only repaint test — see TODO.md)
 - [x] Export data to file
     - [x] Export to 'RDB' file (Kore `KORDB` format; `SAVE` / `BGSAVE`)
     - [x] Export to 'AOF' file (RESP log; `BGREWRITEAOF`)

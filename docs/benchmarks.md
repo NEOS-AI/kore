@@ -135,10 +135,19 @@ comparison:
 3. Report: dataset size (N, dim), recall@k vs FLAT ground truth, and wall time
    for the query set (build excluded). CI does **not** gate on absolute ms.
 4. In-tree gates (unit tests in `src/vector_search.rs`):
-   - `hnsw_recall_at_k_vs_flat_and_throughput` (**Batch CV**): N=300 unit vectors,
-     dim=16, Cosine, Q=40 queries, fixed `StdRng` seed `0xC0FFEE42`; HNSW
-     M=16 / ef=100; asserts mean recall@1 ≥ 0.90 and recall@10 ≥ 0.80; prints
-     FLAT vs HNSW wall time (`eprintln!`, see `--nocapture`)
+   - `hnsw_recall_at_k_vs_flat_and_throughput` (**Batch CV + DK**): always-on
+     CI gate. N=300 unit vectors, dim=16, Cosine, Q=40, fixed seed
+     `0xC0FFEE42`; HNSW **M=8 / ef=32** (DK tightened from CV M=16/ef=100 so
+     recall@10 is load-bearing); asserts mean recall@1 ≥ **0.975** and
+     recall@10 ≥ **0.95**; prints **single-shot** FLAT vs HNSW wall time
+     (`eprintln!`, see `--nocapture`). Fast enough for debug CI.
+   - `hnsw_recall_larger_n_median_throughput` (**Batch DK**, `#[ignore]`): N=5000,
+     dim=16, Cosine, Q=40, seed `0xD1A6E501`; HNSW M=16 / ef=100; soft recall
+     floors ≥ 0.95 / 0.90; prints **median-of-3** search wall times (build
+     excluded). Not in default `cargo test`. Prefer release:
+     ```bash
+     cargo test --release --lib hnsw_recall_larger_n_median_throughput -- --ignored --nocapture
+     ```
    - `hnsw_top1_matches_flat_on_small_set` (tiny N; graph search should still match FLAT)
    - `hnsw_search_follows_edges_not_full_scan` (fails if search ignores edges)
    - `hnsw_add_excludes_self_from_neighbors`
@@ -149,7 +158,7 @@ comparison:
    - `hnsw_bridge_remove_asymmetric_incoming_reconnects` / `hnsw_bridge_remove_star_multiway_reconnects` (Batch CU)
    - `hnsw_m1_hub_churn_preserves_reachability` (Batch CT smoke)
 
-**Implementation note (Batch CQ + CS + CT + CU + CV):** `HNSWIndex::search` walks neighbor
+**Implementation note (Batch CQ + CS + CT + CU + CV + DK):** `HNSWIndex::search` walks neighbor
 edges (SEARCH-LAYER) with candidate list size `ef_search` (defaults to
 `ef_construction`). Insert still assigns all nodes to **layer 0** only
 (multi-layer assignment simplified). Layer-0 prune uses `M_max ≈ 2M` and
@@ -166,11 +175,16 @@ rewires via remove + re-insert (inherits bridge repair). Approximate ANN; use
 FLAT for exact recall baselines. Brute-force over `vectors` remains only as a
 defensive fallback when the entry-point vector is missing.
 
-### Indicative micro-results (Batch CV)
+### Indicative micro-results (Batch DK)
 
 **Disclaimer:** single-host, indicative only — not a cross-machine claim and not
-a CI gate. Absolute ms vary with CPU; use **relative** FLAT/HNSW ratios and
-recall@k. Re-run:
+a CI gate on absolute ms. Absolute ms vary with CPU; use **relative** FLAT/HNSW
+ratios and recall@k. Timing method is labeled per table (**single-shot** vs
+**median-of-3**).
+
+#### Always-on unit gate (N=300, single-shot)
+
+Re-run:
 
 ```bash
 cargo test --release --lib hnsw_recall_at_k_vs_flat_and_throughput -- --nocapture
@@ -178,20 +192,47 @@ cargo test --release --lib hnsw_recall_at_k_vs_flat_and_throughput -- --nocaptur
 
 | Field | Value |
 |-------|--------|
-| Date | 2026-07-18 |
-| Host | single-host dev (Apple Silicon / macOS); release profile |
+| Date | 2026-07-19 |
+| Host | single-host dev (Apple Silicon / macOS); release preferred for ms |
+| Timing | **single-shot** query-set wall (build excluded) |
 | N / dim / metric | 300 / 16 / Cosine (unit vectors) |
 | Queries | Q=40 random unit queries; seed `0xC0FFEE42` |
-| HNSW M / ef | 16 / 100 (`ef_search` = `ef_construction`) |
-| mean recall@1 vs FLAT | **1.00** (gate ≥ 0.90) |
-| mean recall@10 vs FLAT | **1.00** (gate ≥ 0.80) |
-| Query set wall (k=10) FLAT / HNSW | ~0.80 ms / ~4.1 ms (HNSW ≈ **0.20×** FLAT) |
+| HNSW M / ef | 8 / 32 (`ef_search` = `ef_construction`) |
+| mean recall@1 vs FLAT | **1.00** (gate ≥ 0.975) |
+| mean recall@10 vs FLAT | **≈0.985** (gate ≥ 0.95) |
+| Query set wall (k=10) FLAT / HNSW | host-dependent; typically HNSW slower at this N |
 
-**Interpretation:** at this small N, brute-force FLAT is cheaper than graph
-walk (HNSW overhead dominates). The test is a **recall correctness + relative
-timing** smoke, not a claim that HNSW wins at N=300. Expect HNSW to pull ahead
-only as N grows (not covered by the unit-test budget). Re-print live numbers
-from the unit test output on any host.
+**Interpretation:** at N=300 with this M/ef, brute-force FLAT is usually cheaper
+than graph walk (HNSW overhead dominates). The always-on test is a **load-bearing
+recall correctness** smoke plus **single-shot** relative timing — not a claim that
+HNSW wins at N=300.
+
+#### Optional larger-N bench (N=5000, median-of-3, `#[ignore]`)
+
+Re-run (prefer release; not in default CI):
+
+```bash
+cargo test --release --lib hnsw_recall_larger_n_median_throughput -- --ignored --nocapture
+```
+
+| Field | Value |
+|-------|--------|
+| Date | 2026-07-19 |
+| Host | single-host dev (Apple Silicon / macOS); **release** profile recommended |
+| Timing | **median-of-3** query-set wall (build excluded; build printed separately) |
+| N / dim / metric | 5000 / 16 / Cosine (unit vectors) |
+| Queries | Q=40 random unit queries; seed `0xD1A6E501` |
+| HNSW M / ef | 16 / 100 |
+| mean recall@1 / @10 vs FLAT | **1.00** / **1.00** (soft floors ≥ 0.95 / 0.90) |
+| Query set wall (k=10) FLAT / HNSW | ~13.1 ms / ~8.2 ms (HNSW ≈ **1.61×** FLAT; one release host) |
+| Build wall (one-shot) | ~1.0 s (indicative; not gated) |
+
+**Interpretation:** at N=5000 on this host/release profile, HNSW search wall time
+beats FLAT while keeping perfect recall vs FLAT on the fixed seed. Numbers are
+**indicative median-of-3 on one host** — re-measure before claiming a portable
+speedup. Debug builds inflate absolute ms and can change ratios; prefer
+`--release` when comparing throughput. The always-on N=300 gate still shows
+FLAT cheaper (graph overhead dominates at small N).
 
 ## Load dual-residency peak (scratch-load)
 
