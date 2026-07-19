@@ -380,9 +380,8 @@ Also tracked in `docs/roadmap.md`.
     - *Done (Batch DG)*: `--enable-deadlock-detection`, `--deadlock-max-wait-ms`, `--deadlock-auto-resolve`, `--deadlock-victim-strategy`; UI port still auto-attaches for back-compat but params come from flags; JSON surfaces `config.{max_wait_time_ms,auto_resolve,victim_strategy}`.
   - [x] **`[P3]`** **Code review (DF post-ship):** no `from_config` wiring test for UI auto-enable
     - *Done (Batch DG)*: `tests/redlock_wiring_test.rs` — off-by-default, enable flag + params, UI-port auto-attach, port=0+off → no detector.
-  - [ ] **`[P3]`** **Code review (DF post-ship):** JS poll only updates status badge
-    - *Found*: 5s `fetch('/api/deadlock')` rewrites `.badge` class/text only; held/wait tables rely on full meta-refresh. If meta-refresh is blocked, tables go stale while badge updates.
-    - *Next*: repaint tables from JSON or drop dual refresh paths; document meta-refresh dependency.
+  - [x] **`[P3]`** **Code review (DF post-ship):** JS poll only updates status badge
+    - *Done (Batch DH)*: 5s `fetch('/api/deadlock')` repaints badge, stats, cycle box, held/wait/orphan tables from JSON (HTML-escaped); meta-refresh kept as soft full-page fallback; unit test `html_poll_js_repaints_tables_stats_and_cycle`; docs.
   - [ ] **`[P3]`** **Code review (DF post-ship):** HTTP MVP gaps shared with metrics server
     - *Found*: single 4KiB read (no full header parse); non-GET → 404 not 405; test binds `127.0.0.1:0` then rebinds same port (TOCTOU flake risk under load). Acceptable for localhost admin MVP.
     - *Next*: only if hardening admin HTTP generally (shared helper with metrics).
@@ -614,7 +613,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batches CZ–DG shipped** (victim strategies; async/monitor; Redlock auto-resolve; cross-process snapshot; Lock Drop safety + merge re-link; atomic release + no self-waits + local acquire re-link; Web UI + atomic snapshot/CLI params). **Open next:** standing tests-for-phase P0; deferred DF P3 (JS full repaint; HTTP MVP gaps); optional larger-N HNSW recall.
+Prioritized for next letter batch(es). **Batches CZ–DH shipped** (victim strategies; async/monitor; Redlock auto-resolve; cross-process snapshot; Lock Drop safety + merge re-link; atomic release + no self-waits + local acquire re-link; Web UI + atomic snapshot/CLI params; JS full table repaint). **Open next:** standing tests-for-phase P0; deferred DF P3 HTTP MVP gaps; optional larger-N HNSW recall.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -685,7 +684,7 @@ Prioritized for next letter batch(es). **Batches CZ–DG shipped** (victim strat
 | P2 | DF post-ship: atomic UI snapshot + cleanup-on-poll docs | done (DG) |
 | P2 | DF post-ship: deadlock CLI params (enable/max-wait/auto-resolve/strategy) | done (DG) |
 | P3 | DF post-ship: from_config UI/detection wiring tests | done (DG) |
-| P3 | DF post-ship: JS poll only updates badge | open |
+| P3 | DF post-ship: JS poll only updates badge | done (DH; full table/stats/cycle repaint) |
 | P3 | DF post-ship: HTTP MVP gaps shared with metrics | open |
 | P2 | CP post-ship: LOADING allowlist PSYNC/SYNC mid-install visibility | done (CR) |
 | P2 | CC post-ship: typed export skip expired keys (no revive without TTL) | done (CD) |

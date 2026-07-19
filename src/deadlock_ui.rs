@@ -385,45 +385,106 @@ pub fn render_html(snap: &DeadlockUiSnapshot) -> String {
 </head>
 <body>
   <h1>Kore Deadlock Monitor</h1>
-  <p class="sub">Localhost-only admin UI · auto-refresh 5s · <a href="/api/deadlock">JSON API</a></p>
+  <p class="sub">Localhost-only admin UI · live JSON poll 5s (tables + badge) · meta-refresh fallback · <a href="/api/deadlock">JSON API</a></p>
   <p>Status: <span class="badge {status_class}">{status_label}</span>
-    {enabled_note}
+    <span id="enabled-note" class="empty"{enabled_note_style}> — no deadlock detector attached (enable Redlock deadlock detection)</span>
   </p>
   <div class="stats">
-    <div class="stat"><div class="n">{held}</div><div class="l">Held locks</div></div>
-    <div class="stat"><div class="n">{waiting}</div><div class="l">Waiting clients</div></div>
-    <div class="stat"><div class="n">{edges}</div><div class="l">Wait-graph edges</div></div>
+    <div class="stat"><div class="n" id="stat-held">{held}</div><div class="l">Held locks</div></div>
+    <div class="stat"><div class="n" id="stat-waiting">{waiting}</div><div class="l">Waiting clients</div></div>
+    <div class="stat"><div class="n" id="stat-edges">{edges}</div><div class="l">Wait-graph edges</div></div>
   </div>
   <h2>Deadlock cycle</h2>
-  <div class="box">Clients: {cycle}<br>Resources: {resources}</div>
+  <div class="box">Clients: <span id="cycle-clients">{cycle}</span><br>Resources: <span id="cycle-resources">{resources}</span></div>
   <h2>Held locks</h2>
   <table>
     <thead><tr><th>Resource</th><th>Client</th><th>TTL (ms)</th><th>Held for (ms)</th></tr></thead>
-    <tbody>{held_rows}</tbody>
+    <tbody id="held-body">{held_rows}</tbody>
   </table>
   <h2>Wait edges</h2>
   <table>
     <thead><tr><th>Waiter</th><th>Holder</th><th>Resource</th><th>Wait elapsed (ms)</th></tr></thead>
-    <tbody>{wait_rows}</tbody>
+    <tbody id="wait-body">{wait_rows}</tbody>
   </table>
   <h2>Orphan waits</h2>
   <table>
     <thead><tr><th>Waiter</th><th>Resource</th><th>Wait elapsed (ms)</th></tr></thead>
-    <tbody>{orphan_rows}</tbody>
+    <tbody id="orphan-body">{orphan_rows}</tbody>
   </table>
   <footer>
     Endpoints: <code>GET /</code>, <code>GET /deadlock</code>, <code>GET /api/deadlock</code>, <code>GET /deadlock.json</code>.
-    No auth — bind is 127.0.0.1 only.
+    No auth — bind is 127.0.0.1 only. Live updates use JSON poll; meta-refresh is a soft full-page fallback.
   </footer>
   <script>
-    // Lightweight poll: if meta refresh is blocked, still update status badge via fetch.
+    // Live poll: JSON is the source of truth for badge, stats, cycle, and tables.
+    // Meta-refresh is a soft full-page fallback when JS is disabled/blocked.
     setInterval(function() {{
       fetch('/api/deadlock').then(function(r) {{ return r.json(); }}).then(function(j) {{
+        function esc(s) {{
+          return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+        }}
+        function emptyRow(cols) {{
+          return '<tr><td colspan="' + cols + '" class="empty">(none)</td></tr>';
+        }}
         var el = document.querySelector('.badge');
-        if (!el) return;
-        var s = j.status || 'disabled';
-        el.textContent = s.toUpperCase();
-        el.className = 'badge ' + (s === 'deadlock' ? 'deadlock' : (s === 'ok' ? 'ok' : 'disabled'));
+        if (el) {{
+          var s = j.status || 'disabled';
+          el.textContent = s.toUpperCase();
+          el.className = 'badge ' + (s === 'deadlock' ? 'deadlock' : (s === 'ok' ? 'ok' : 'disabled'));
+        }}
+        var note = document.getElementById('enabled-note');
+        if (note) {{
+          note.style.display = j.enabled ? 'none' : '';
+        }}
+        var sn = document.getElementById('stat-held');
+        if (sn && j.stats) sn.textContent = j.stats.held_locks_count;
+        var sw = document.getElementById('stat-waiting');
+        if (sw && j.stats) sw.textContent = j.stats.waiting_clients_count;
+        var se = document.getElementById('stat-edges');
+        if (se && j.stats) se.textContent = j.stats.wait_graph_edges;
+        var cycleEl = document.getElementById('cycle-clients');
+        if (cycleEl) {{
+          cycleEl.innerHTML = (j.cycle && j.cycle.length)
+            ? j.cycle.map(esc).join(' → ')
+            : '<span class="empty">(none)</span>';
+        }}
+        var resEl = document.getElementById('cycle-resources');
+        if (resEl) {{
+          resEl.innerHTML = (j.resources && j.resources.length)
+            ? j.resources.map(esc).join(', ')
+            : '<span class="empty">(none)</span>';
+        }}
+        var heldBody = document.getElementById('held-body');
+        if (heldBody) {{
+          var held = j.held || [];
+          if (!held.length) heldBody.innerHTML = emptyRow(4);
+          else heldBody.innerHTML = held.map(function(h) {{
+            return '<tr><td>' + esc(h.resource) + '</td><td>' + esc(h.client_id) + '</td><td>'
+              + h.ttl_ms + '</td><td>' + h.held_for_ms + '</td></tr>';
+          }}).join('');
+        }}
+        var waitBody = document.getElementById('wait-body');
+        if (waitBody) {{
+          var waits = j.waits || [];
+          if (!waits.length) waitBody.innerHTML = emptyRow(4);
+          else waitBody.innerHTML = waits.map(function(w) {{
+            return '<tr><td>' + esc(w.waiter) + '</td><td>' + esc(w.holder) + '</td><td>'
+              + esc(w.resource) + '</td><td>' + w.wait_elapsed_ms + '</td></tr>';
+          }}).join('');
+        }}
+        var orphanBody = document.getElementById('orphan-body');
+        if (orphanBody) {{
+          var orphans = j.orphan_waits || [];
+          if (!orphans.length) orphanBody.innerHTML = emptyRow(3);
+          else orphanBody.innerHTML = orphans.map(function(o) {{
+            return '<tr><td>' + esc(o.waiter) + '</td><td>' + esc(o.resource) + '</td><td>'
+              + o.wait_elapsed_ms + '</td></tr>';
+          }}).join('');
+        }}
       }}).catch(function(){{}});
     }}, 5000);
   </script>
@@ -432,10 +493,10 @@ pub fn render_html(snap: &DeadlockUiSnapshot) -> String {
 "#,
         status_class = status_class,
         status_label = status_label,
-        enabled_note = if snap.enabled {
-            ""
+        enabled_note_style = if snap.enabled {
+            r#" style="display:none""#
         } else {
-            r#"<span class="empty"> — no deadlock detector attached (enable Redlock deadlock detection)</span>"#
+            ""
         },
         held = snap.held_locks_count,
         waiting = snap.waiting_clients_count,
@@ -660,6 +721,71 @@ mod tests {
         let snap = DeadlockUiSnapshot::from_detector_with_cleanup(&det, false);
         assert!(snap.enabled);
         assert!(!snap.cleanup_on_collect);
+    }
+
+    /// Batch DH: JS poll must repaint tables/stats/cycle from JSON, not only the badge.
+    /// (Browser not available in unit tests — assert DOM hooks + repaint logic are embedded.)
+    #[test]
+    fn html_poll_js_repaints_tables_stats_and_cycle() {
+        let snap = DeadlockUiSnapshot::disabled();
+        let h = render_html(&snap);
+
+        // Stable element ids the live poll script targets
+        for id in [
+            "id=\"held-body\"",
+            "id=\"wait-body\"",
+            "id=\"orphan-body\"",
+            "id=\"stat-held\"",
+            "id=\"stat-waiting\"",
+            "id=\"stat-edges\"",
+            "id=\"cycle-clients\"",
+            "id=\"cycle-resources\"",
+            "id=\"enabled-note\"",
+        ] {
+            assert!(h.contains(id), "html missing {id}");
+        }
+
+        // Script paints from JSON fields (not badge-only)
+        assert!(h.contains("getElementById('held-body')"), "missing held-body paint");
+        assert!(h.contains("getElementById('wait-body')"), "missing wait-body paint");
+        assert!(
+            h.contains("getElementById('orphan-body')"),
+            "missing orphan-body paint"
+        );
+        assert!(h.contains("j.held"), "JS should read j.held");
+        assert!(h.contains("j.waits"), "JS should read j.waits");
+        assert!(h.contains("j.orphan_waits"), "JS should read j.orphan_waits");
+        assert!(h.contains("j.stats"), "JS should read j.stats");
+        assert!(h.contains("j.cycle"), "JS should read j.cycle");
+        assert!(h.contains("j.resources"), "JS should read j.resources");
+        assert!(h.contains("h.client_id"), "held row uses JSON client_id");
+        assert!(h.contains("w.wait_elapsed_ms"), "wait row uses wait_elapsed_ms");
+        assert!(h.contains("function esc(s)"), "JS must HTML-escape cell text");
+
+        // Meta-refresh remains as soft full-page fallback
+        assert!(
+            h.contains("http-equiv=\"refresh\""),
+            "meta-refresh fallback missing"
+        );
+        assert!(
+            h.contains("live JSON poll") || h.contains("source of truth"),
+            "docs blurb should mention JSON live poll"
+        );
+
+        // Enabled detector: disabled-note hidden on first paint
+        let det = DeadlockDetector::new(30_000, false);
+        plant_cycle(&det);
+        let h2 = render_html(&DeadlockUiSnapshot::from_detector(&det));
+        assert!(
+            h2.contains(r#"id="enabled-note" class="empty" style="display:none""#),
+            "enabled snapshot should hide note: {}",
+            &h2[h2.find("enabled-note").unwrap_or(0)..]
+                .chars()
+                .take(80)
+                .collect::<String>()
+        );
+        assert!(h2.contains("id=\"held-body\""), "cycle html still has hooks");
+        assert!(h2.contains("client-1"), "server-rendered held/wait rows present");
     }
 
     #[tokio::test(flavor = "multi_thread")]

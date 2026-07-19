@@ -734,8 +734,21 @@ Each HTML/JSON poll builds a [`DeadlockUiSnapshot`] via
 
 | Method / path | Response |
 |---------------|----------|
-| `GET /` or `GET /deadlock` | Self-contained HTML dashboard (meta-refresh 5s + light JS poll) |
+| `GET /` or `GET /deadlock` | Self-contained HTML dashboard (live JSON poll 5s + meta-refresh fallback) |
 | `GET /api/deadlock` or `GET /deadlock.json` | JSON snapshot of held locks, wait edges, orphan waits, cycle, stats, config |
+
+### Live refresh (JSON is source of truth)
+
+The dashboard embeds a 5s `fetch('/api/deadlock')` poll that repaints:
+
+- status badge (`ok` / `deadlock` / `disabled`)
+- stat counters (held locks, waiting clients, wait-graph edges)
+- deadlock cycle clients + resources
+- held-locks, wait-edges, and orphan-waits tables
+
+So the UI stays live even when the browser blocks HTML meta-refresh. A
+`<meta http-equiv="refresh" content="5">` full-page reload remains as a **soft
+fallback** when JavaScript is disabled or the poll fails.
 
 Example JSON shape:
 
@@ -894,6 +907,8 @@ Available tests:
 - Unit/integration tests in `src/deadlock_ui.rs`:
   - `json_disabled_state` / `json_and_html_show_planted_cycle` / `json_escape_quotes`
   - `json_surfaces_detector_config` / `pure_read_collect_skips_cleanup_flag`
+  - `html_poll_js_repaints_tables_stats_and_cycle` — embedded JS targets table
+    / stats / cycle ids from JSON (not badge-only); meta-refresh still present
   - `http_ui_and_json_endpoints` — HTTP 200 on `/`, `/deadlock`, `/api/deadlock`,
     `/deadlock.json`; planted cycle visible; disabled detector honest
 - Unit tests in `src/deadlock.rs`: `test_collect_consistent_view_*`,
