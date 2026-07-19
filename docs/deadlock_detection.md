@@ -736,6 +736,12 @@ Each HTML/JSON poll builds a [`DeadlockUiSnapshot`] via
 |---------------|----------|
 | `GET /` or `GET /deadlock` | Self-contained HTML dashboard (live JSON poll 5s; noscript meta-refresh fallback) |
 | `GET /api/deadlock` or `GET /deadlock.json` | JSON snapshot of held locks, wait edges, orphan waits, cycle, stats, config |
+| Non-`GET` on a known path above | `405 Method Not Allowed` with `Allow: GET` |
+| Any other path | `404 Not Found` |
+
+Request handling is shared with the Prometheus metrics scrape server (`admin_http`):
+request line is read until the first `\r\n` (capped at 8 KiB). Only `GET` is
+supported — no auth, TLS, or body parsing (localhost admin MVP).
 
 ### Live refresh (JSON is source of truth)
 
@@ -921,7 +927,8 @@ Available tests:
     / stats / cycle ids from JSON (not badge-only); numeric cells use `num()`;
     meta-refresh is inside `<noscript>` only (no dual refresh when JS works)
   - `http_ui_and_json_endpoints` — HTTP 200 on `/`, `/deadlock`, `/api/deadlock`,
-    `/deadlock.json`; planted cycle visible; disabled detector honest
+    `/deadlock.json`; 405 on non-GET known paths; 404 on unknown paths; planted
+    cycle visible; disabled detector honest; binds `127.0.0.1:0` once (no rebind)
 - Unit tests in `src/deadlock.rs`: `test_collect_consistent_view_*`,
   `test_victim_strategy_from_str`
 - Wiring tests in `tests/redlock_wiring_test.rs`:

@@ -27,6 +27,7 @@ pub mod search_index;
 pub mod query_engine;
 pub mod vector_search;
 pub mod persistence;
+pub mod admin_http;
 pub mod metrics;
 pub mod deadlock_ui;
 pub mod scripting;
@@ -69,7 +70,7 @@ pub use deadlock::{
 };
 pub use deadlock_ui::{
     render_html as render_deadlock_html, render_json as render_deadlock_json,
-    run_deadlock_ui_server, DeadlockUiSnapshot,
+    run_deadlock_ui_server, run_deadlock_ui_server_on_listener, DeadlockUiSnapshot,
 };
 pub use fair_queue::{FairQueue, QueuedClient, FairQueueStats};
 pub use pubsub::{

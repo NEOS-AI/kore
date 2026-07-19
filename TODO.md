@@ -389,9 +389,9 @@ Also tracked in `docs/roadmap.md`.
   - [ ] **`[P3]`** **Code review (DH post-ship nit):** repaint test is string-contains only
     - *Found*: `html_poll_js_repaints_tables_stats_and_cycle` asserts embedded JS source and DOM ids; does not execute the poll or assert rendered row HTML after a fake JSON payload. Acceptable without a browser; residual if DOM fidelity regressions matter.
     - *Next*: optional tiny pure-JS extract + node/quickjs test, or keep as string-contract only. (Batch DI left as residual — no browser harness.)
-  - [ ] **`[P3]`** **Code review (DF post-ship):** HTTP MVP gaps shared with metrics server
+  - [x] **`[P3]`** **Code review (DF post-ship):** HTTP MVP gaps shared with metrics server
     - *Found*: single 4KiB read (no full header parse); non-GET → 404 not 405; test binds `127.0.0.1:0` then rebinds same port (TOCTOU flake risk under load). Acceptable for localhost admin MVP. Same 4KiB pattern in `metrics::run_metrics_server`.
-    - *Next*: only if hardening admin HTTP generally (shared helper with metrics).
+    - *Done (Batch DJ)*: shared `src/admin_http.rs` — request-line read until `\r\n` (8 KiB cap), method/path parse, 405+`Allow: GET` on known paths for non-GET, 404 unknown path; used by deadlock UI + metrics. Tests bind listener once (`*_on_listener` + `127.0.0.1:0`). Residual: no full header/body parse, no auth/TLS (out of scope).
 
 ### Search & vectors
 
@@ -695,7 +695,7 @@ Prioritized for next letter batch(es). **Batches CZ–DI shipped** (… DH full 
 | P3 | DH post-ship: dual meta+JSON refresh when JS enabled | done (DI; meta in `<noscript>`) |
 | P3 | DH post-ship nit: coerce/escape numeric JS table cells | done (DI; `num()` / Number) |
 | P3 | DH post-ship nit: repaint test is string-contains only | open (residual; no browser harness) |
-| P3 | DF post-ship: HTTP MVP gaps shared with metrics | open |
+| P3 | DF post-ship: HTTP MVP gaps shared with metrics | done (DJ; shared admin_http) |
 | P2 | CP post-ship: LOADING allowlist PSYNC/SYNC mid-install visibility | done (CR) |
 | P2 | CC post-ship: typed export skip expired keys (no revive without TTL) | done (CD) |
 | P2 | CC nit: unify start_background_sweep create paths | done (CD) |

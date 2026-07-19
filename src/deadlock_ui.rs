@@ -2,10 +2,14 @@
 //!
 //! Serves a self-contained HTML dashboard and a JSON API for the wait-for graph.
 //! Bind is localhost-only; no authentication (MVP — do not expose beyond loopback).
+//! Request-line parsing / 405/404 responses share [`crate::admin_http`].
 
+use crate::admin_http::{
+    parse_request_line, read_request_line, write_400, write_404, write_405_get_only, write_response,
+};
 use crate::deadlock::{DeadlockDetector, DeadlockStatus};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -514,18 +518,6 @@ pub fn render_html(snap: &DeadlockUiSnapshot) -> String {
     )
 }
 
-/// Match request target path exactly (ignoring query string / HTTP version).
-fn request_path(first_line: &str) -> Option<&str> {
-    // "GET /path?x=1 HTTP/1.1" or "GET /path"
-    let rest = first_line.strip_prefix("GET ")?;
-    let target = rest.split_whitespace().next().unwrap_or("");
-    Some(target.split('?').next().unwrap_or(target))
-}
-
-fn path_is(first_line: &str, path: &str) -> bool {
-    request_path(first_line) == Some(path)
-}
-
 fn collect_snap(detector: Option<&Arc<DeadlockDetector>>) -> DeadlockUiSnapshot {
     match detector {
         Some(d) => DeadlockUiSnapshot::from_detector(d),
@@ -533,20 +525,44 @@ fn collect_snap(detector: Option<&Arc<DeadlockDetector>>) -> DeadlockUiSnapshot 
     }
 }
 
+fn is_json_path(path: &str) -> bool {
+    path == "/api/deadlock" || path == "/deadlock.json"
+}
+
+fn is_html_path(path: &str) -> bool {
+    path == "/" || path == "/deadlock" || path == "/index.html"
+}
+
+fn is_known_path(path: &str) -> bool {
+    is_json_path(path) || is_html_path(path)
+}
+
 /// Spawn a minimal HTTP server on `127.0.0.1:port` for deadlock monitoring.
 ///
-/// Routes:
+/// Routes (GET only; non-GET on known paths → 405):
 /// - `GET /` and `GET /deadlock` — HTML dashboard
 /// - `GET /api/deadlock` and `GET /deadlock.json` — JSON snapshot
 ///
 /// Serves until `shutdown` becomes true. Localhost-only; no authentication.
+/// For tests, prefer [`run_deadlock_ui_server_on_listener`] with a pre-bound
+/// `127.0.0.1:0` listener to avoid probe-bind-then-rebind races.
 pub async fn run_deadlock_ui_server(
     port: u16,
     detector: Option<Arc<DeadlockDetector>>,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(&addr).await?;
+    run_deadlock_ui_server_on_listener(listener, detector, shutdown).await
+}
+
+/// Same as [`run_deadlock_ui_server`] but uses an already-bound listener
+/// (tests: bind `127.0.0.1:0`, read `local_addr().port()`, pass the listener).
+pub async fn run_deadlock_ui_server_on_listener(
+    listener: TcpListener,
+    detector: Option<Arc<DeadlockDetector>>,
+    mut shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let bound = listener.local_addr()?;
     info!(
         "Deadlock UI listening on http://{}/ (JSON: /api/deadlock)",
@@ -585,63 +601,46 @@ async fn handle_conn(
     stream: &mut tokio::net::TcpStream,
     detector: Option<&Arc<DeadlockDetector>>,
 ) -> anyhow::Result<()> {
-    let mut buf = vec![0u8; 4096];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
+    let Some(first_line) = read_request_line(stream).await? else {
         return Ok(());
-    }
-    let req = String::from_utf8_lossy(&buf[..n]);
-    let first_line = req.lines().next().unwrap_or("");
+    };
+    let Some(req) = parse_request_line(&first_line) else {
+        write_400(stream).await?;
+        let _ = stream.shutdown().await;
+        return Ok(());
+    };
 
-    let is_json = path_is(first_line, "/api/deadlock") || path_is(first_line, "/deadlock.json");
-    let is_html = path_is(first_line, "/")
-        || path_is(first_line, "/deadlock")
-        || path_is(first_line, "/index.html");
-
-    if is_json {
+    let known = is_known_path(&req.path);
+    if known && !req.is_get() {
+        write_405_get_only(stream).await?;
+    } else if req.is_get() && is_json_path(&req.path) {
         let snap = collect_snap(detector);
         let body = render_json(&snap);
-        write_response(stream, 200, "OK", "application/json; charset=utf-8", &body).await?;
-    } else if is_html {
-        let snap = collect_snap(detector);
-        let body = render_html(&snap);
-        write_response(stream, 200, "OK", "text/html; charset=utf-8", &body).await?;
-    } else {
         write_response(
             stream,
-            404,
-            "Not Found",
-            "text/plain; charset=utf-8",
-            "not found\n",
+            200,
+            "OK",
+            "application/json; charset=utf-8",
+            &body,
+            &[("Cache-Control", "no-store")],
         )
         .await?;
+    } else if req.is_get() && is_html_path(&req.path) {
+        let snap = collect_snap(detector);
+        let body = render_html(&snap);
+        write_response(
+            stream,
+            200,
+            "OK",
+            "text/html; charset=utf-8",
+            &body,
+            &[("Cache-Control", "no-store")],
+        )
+        .await?;
+    } else {
+        write_404(stream).await?;
     }
     let _ = stream.shutdown().await;
-    Ok(())
-}
-
-async fn write_response(
-    stream: &mut tokio::net::TcpStream,
-    code: u16,
-    reason: &str,
-    content_type: &str,
-    body: &str,
-) -> anyhow::Result<()> {
-    let resp = format!(
-        "HTTP/1.1 {} {}\r\n\
-         Content-Type: {}\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         Cache-Control: no-store\r\n\
-         \r\n\
-         {}",
-        code,
-        reason,
-        content_type,
-        body.len(),
-        body
-    );
-    stream.write_all(resp.as_bytes()).await?;
     Ok(())
 }
 
@@ -817,43 +816,15 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn http_ui_and_json_endpoints() {
+    async fn http_exchange(port: u16, request_line: &str) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpStream;
-        use tokio::sync::watch;
-        use tokio::time::{sleep, timeout, Duration};
+        use tokio::time::{timeout, Duration};
 
-        let det = Arc::new(DeadlockDetector::new(30_000, false));
-        plant_cycle(&det);
-
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let d = det.clone();
-        let server = tokio::spawn(async move {
-            run_deadlock_ui_server(port, Some(d), shutdown_rx)
-                .await
-                .unwrap();
-        });
-
-        let mut connected = false;
-        for _ in 0..50 {
-            if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-                connected = true;
-                break;
-            }
-            sleep(Duration::from_millis(20)).await;
-        }
-        assert!(connected, "deadlock UI did not start on {}", port);
-
-        // JSON
         let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let req = format!(
-            "GET /api/deadlock HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
-            port
+            "{}\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            request_line, port
         );
         stream.write_all(req.as_bytes()).await.unwrap();
         let mut buf = Vec::new();
@@ -861,74 +832,81 @@ mod tests {
             .await
             .expect("timeout")
             .unwrap();
-        let resp = String::from_utf8_lossy(&buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_ui_and_json_endpoints() {
+        use tokio::sync::watch;
+        use tokio::time::{timeout, Duration};
+
+        let det = Arc::new(DeadlockDetector::new(30_000, false));
+        plant_cycle(&det);
+
+        // Bind once and hand the listener to the server (no probe-then-rebind TOCTOU).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let d = det.clone();
+        let server = tokio::spawn(async move {
+            run_deadlock_ui_server_on_listener(listener, Some(d), shutdown_rx)
+                .await
+                .unwrap();
+        });
+
+        // JSON
+        let resp = http_exchange(port, "GET /api/deadlock HTTP/1.1").await;
         assert!(resp.starts_with("HTTP/1.1 200"), "resp={}", resp);
         assert!(resp.contains("\"status\": \"deadlock\""), "resp={}", resp);
         assert!(resp.contains("client-1"), "resp={}", resp);
 
         // HTML
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let req = format!(
-            "GET / HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
-            port
-        );
-        stream.write_all(req.as_bytes()).await.unwrap();
-        let mut buf = Vec::new();
-        timeout(Duration::from_secs(3), stream.read_to_end(&mut buf))
-            .await
-            .expect("timeout")
-            .unwrap();
-        let resp = String::from_utf8_lossy(&buf);
+        let resp = http_exchange(port, "GET / HTTP/1.1").await;
         assert!(resp.starts_with("HTTP/1.1 200"), "resp={}", resp);
         assert!(resp.contains("DEADLOCK"), "resp={}", resp);
         assert!(resp.contains("text/html"), "resp={}", resp);
 
         // /deadlock alias
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let req = format!(
-            "GET /deadlock HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
-            port
-        );
-        stream.write_all(req.as_bytes()).await.unwrap();
-        let mut buf = Vec::new();
-        timeout(Duration::from_secs(3), stream.read_to_end(&mut buf))
-            .await
-            .expect("timeout")
-            .unwrap();
-        let resp = String::from_utf8_lossy(&buf);
+        let resp = http_exchange(port, "GET /deadlock HTTP/1.1").await;
         assert!(resp.starts_with("HTTP/1.1 200"), "resp={}", resp);
 
+        // Non-GET on known path → 405 + Allow: GET
+        let resp = http_exchange(port, "POST /api/deadlock HTTP/1.1").await;
+        assert!(resp.starts_with("HTTP/1.1 405"), "resp={}", resp);
+        assert!(
+            resp.to_ascii_lowercase().contains("allow: get"),
+            "missing Allow: GET: {}",
+            resp
+        );
+
+        // PUT on HTML path → 405
+        let resp = http_exchange(port, "PUT / HTTP/1.1").await;
+        assert!(resp.starts_with("HTTP/1.1 405"), "resp={}", resp);
+
+        // Unknown path → 404 (even for GET)
+        let resp = http_exchange(port, "GET /nope HTTP/1.1").await;
+        assert!(resp.starts_with("HTTP/1.1 404"), "resp={}", resp);
+
+        // Unknown path with POST still 404 (not 405)
+        let resp = http_exchange(port, "POST /nope HTTP/1.1").await;
+        assert!(resp.starts_with("HTTP/1.1 404"), "resp={}", resp);
+
         // disabled detector
-        let probe2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port2 = probe2.local_addr().unwrap().port();
-        drop(probe2);
+        let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port2 = listener2.local_addr().unwrap().port();
         let (stx2, srx2) = watch::channel(false);
         let server2 = tokio::spawn(async move {
-            run_deadlock_ui_server(port2, None, srx2).await.unwrap();
+            run_deadlock_ui_server_on_listener(listener2, None, srx2)
+                .await
+                .unwrap();
         });
-        for _ in 0..50 {
-            if TcpStream::connect(("127.0.0.1", port2)).await.is_ok() {
-                break;
-            }
-            sleep(Duration::from_millis(20)).await;
-        }
-        let mut stream = TcpStream::connect(("127.0.0.1", port2)).await.unwrap();
-        let req = format!(
-            "GET /deadlock.json HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
-            port2
-        );
-        stream.write_all(req.as_bytes()).await.unwrap();
-        let mut buf = Vec::new();
-        timeout(Duration::from_secs(3), stream.read_to_end(&mut buf))
-            .await
-            .unwrap()
-            .unwrap();
-        let resp = String::from_utf8_lossy(&buf);
+        let resp = http_exchange(port2, "GET /deadlock.json HTTP/1.1").await;
         assert!(resp.contains("\"status\": \"disabled\""), "resp={}", resp);
 
         let _ = shutdown_tx.send(true);
         let _ = stx2.send(true);
-        let _ = server.await;
-        let _ = server2.await;
+        let _ = timeout(Duration::from_secs(2), server).await;
+        let _ = timeout(Duration::from_secs(2), server2).await;
     }
 }

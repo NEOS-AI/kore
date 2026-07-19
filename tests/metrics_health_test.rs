@@ -3,7 +3,9 @@
 use bytes::Bytes;
 use kore::commands::CommandHandler;
 use kore::config::Config;
-use kore::metrics::{collect_snapshot, render_prometheus, run_metrics_server, MetricsSnapshot};
+use kore::metrics::{
+    collect_snapshot, render_prometheus, run_metrics_server_on_listener, MetricsSnapshot,
+};
 use kore::persistence::{PersistenceConfig, PersistenceManager};
 use kore::protocol::RespValue;
 use kore::Cache;
@@ -13,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{timeout, Duration};
 
 fn make_cache() -> Arc<Cache> {
     Cache::new_with_sweep(16, 1024 * 1024 * 50, 500 * 1024 * 1024, false)
@@ -226,6 +228,21 @@ fn prometheus_text_contains_core_series() {
     assert!(text.contains("kore_replica_link_up -1\n"));
 }
 
+async fn metrics_http_exchange(port: u16, request_line: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let req = format!(
+        "{}\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        request_line, port
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    timeout(Duration::from_secs(3), stream.read_to_end(&mut buf))
+        .await
+        .expect("timeout reading metrics")
+        .expect("read metrics");
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn metrics_http_endpoint_integration() {
     let cache = make_cache();
@@ -237,43 +254,18 @@ async fn metrics_http_endpoint_integration() {
     let databases = kore::Databases::single(cache);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // Bind port 0 via temporary listener to pick a free port, then re-bind in server.
-    // run_metrics_server takes an explicit port — pick a high ephemeral-ish port.
-    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = probe.local_addr().unwrap().port();
-    drop(probe);
+    // Bind once and hand the listener to the server (no probe-then-rebind TOCTOU).
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
 
     let dbs = databases.clone();
     let server = tokio::spawn(async move {
-        run_metrics_server(port, dbs, None, shutdown_rx)
+        run_metrics_server_on_listener(listener, dbs, None, shutdown_rx)
             .await
             .unwrap();
     });
 
-    // Wait for listener
-    let mut connected = false;
-    for _ in 0..50 {
-        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-            connected = true;
-            break;
-        }
-        sleep(Duration::from_millis(20)).await;
-    }
-    assert!(connected, "metrics server did not start on port {}", port);
-
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-    let req = format!(
-        "GET /metrics HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
-        port
-    );
-    stream.write_all(req.as_bytes()).await.unwrap();
-
-    let mut buf = Vec::new();
-    timeout(Duration::from_secs(3), stream.read_to_end(&mut buf))
-        .await
-        .expect("timeout reading metrics")
-        .expect("read metrics");
-    let resp = String::from_utf8_lossy(&buf);
+    let resp = metrics_http_exchange(port, "GET /metrics HTTP/1.1").await;
     assert!(
         resp.starts_with("HTTP/1.1 200"),
         "expected 200: {}",
@@ -283,6 +275,27 @@ async fn metrics_http_endpoint_integration() {
     assert!(resp.contains("kore_commands_processed_total"));
     assert!(resp.contains("kore_keyspace_hits_total"));
     assert!(resp.contains("kore_used_memory_bytes"));
+
+    // Non-GET on known path → 405 + Allow: GET
+    let resp = metrics_http_exchange(port, "POST /metrics HTTP/1.1").await;
+    assert!(
+        resp.starts_with("HTTP/1.1 405"),
+        "expected 405: {}",
+        &resp[..resp.len().min(200)]
+    );
+    assert!(
+        resp.to_ascii_lowercase().contains("allow: get"),
+        "missing Allow: GET: {}",
+        resp
+    );
+
+    // Unknown path → 404
+    let resp = metrics_http_exchange(port, "GET /nope HTTP/1.1").await;
+    assert!(
+        resp.starts_with("HTTP/1.1 404"),
+        "expected 404: {}",
+        &resp[..resp.len().min(200)]
+    );
 
     // Also verify collect_snapshot sees seeded stats
     let snap = collect_snapshot(&databases.db0(), None);

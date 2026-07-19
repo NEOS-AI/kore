@@ -1,12 +1,18 @@
 //! Prometheus-style metrics and readiness helpers (hand-rolled, no extra crates).
+//!
+//! HTTP scrape endpoint shares request-line / response helpers with the deadlock UI
+//! via [`crate::admin_http`].
 
+use crate::admin_http::{
+    parse_request_line, read_request_line, write_400, write_404, write_405_get_only, write_response,
+};
 use crate::cache::Cache;
 use crate::databases::Databases;
 use crate::persistence::PersistenceManager;
 use crate::stats::Stats;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -269,15 +275,27 @@ pub fn snapshot_from_stats(stats: &Stats, used_memory: u64, maxmemory: u64) -> M
 }
 
 /// Spawn a minimal HTTP server on `127.0.0.1:port` serving GET /metrics.
-/// Returns immediately after binding; serves until `shutdown` is true.
+/// Serves until `shutdown` is true. Non-GET on `/metrics` → 405; unknown path → 404.
+/// For tests, prefer [`run_metrics_server_on_listener`] with a pre-bound `127.0.0.1:0` listener.
 pub async fn run_metrics_server(
     port: u16,
     databases: Arc<Databases>,
     persistence: Option<Arc<PersistenceManager>>,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(&addr).await?;
+    run_metrics_server_on_listener(listener, databases, persistence, shutdown).await
+}
+
+/// Same as [`run_metrics_server`] but uses an already-bound listener
+/// (tests: bind `127.0.0.1:0`, read `local_addr().port()`, pass the listener).
+pub async fn run_metrics_server_on_listener(
+    listener: TcpListener,
+    databases: Arc<Databases>,
+    persistence: Option<Arc<PersistenceManager>>,
+    mut shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let bound = listener.local_addr()?;
     info!("Prometheus metrics listening on http://{}/metrics", bound);
 
@@ -295,7 +313,13 @@ pub async fn run_metrics_server(
                         let databases = databases.clone();
                         let persistence = persistence.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_metrics_conn(&mut stream, &databases, persistence.as_deref()).await {
+                            if let Err(e) = handle_metrics_conn(
+                                &mut stream,
+                                &databases,
+                                persistence.as_deref(),
+                            )
+                            .await
+                            {
                                 warn!("metrics connection error: {}", e);
                             }
                         });
@@ -315,46 +339,32 @@ async fn handle_metrics_conn(
     databases: &Databases,
     persistence: Option<&PersistenceManager>,
 ) -> anyhow::Result<()> {
-    let mut buf = vec![0u8; 4096];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
+    let Some(first_line) = read_request_line(stream).await? else {
         return Ok(());
-    }
-    let req = String::from_utf8_lossy(&buf[..n]);
-    let first_line = req.lines().next().unwrap_or("");
-    let is_metrics = first_line.starts_with("GET /metrics ")
-        || first_line.starts_with("GET /metrics\r")
-        || first_line == "GET /metrics"
-        || first_line.starts_with("GET /metrics?");
+    };
+    let Some(req) = parse_request_line(&first_line) else {
+        write_400(stream).await?;
+        let _ = stream.shutdown().await;
+        return Ok(());
+    };
 
-    if is_metrics {
+    if req.path == "/metrics" && !req.is_get() {
+        write_405_get_only(stream).await?;
+    } else if req.is_get() && req.path == "/metrics" {
         let cache = databases.db0();
         let snap = collect_snapshot(&cache, persistence);
         let body = render_prometheus(&snap);
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\n\
-             Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\
-             \r\n\
-             {}",
-            body.len(),
-            body
-        );
-        stream.write_all(resp.as_bytes()).await?;
+        write_response(
+            stream,
+            200,
+            "OK",
+            "text/plain; version=0.0.4; charset=utf-8",
+            &body,
+            &[],
+        )
+        .await?;
     } else {
-        let body = "not found\n";
-        let resp = format!(
-            "HTTP/1.1 404 Not Found\r\n\
-             Content-Type: text/plain; charset=utf-8\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\
-             \r\n\
-             {}",
-            body.len(),
-            body
-        );
-        stream.write_all(resp.as_bytes()).await?;
+        write_404(stream).await?;
     }
     let _ = stream.shutdown().await;
     Ok(())
