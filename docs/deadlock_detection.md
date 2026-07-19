@@ -734,7 +734,7 @@ Each HTML/JSON poll builds a [`DeadlockUiSnapshot`] via
 
 | Method / path | Response |
 |---------------|----------|
-| `GET /` or `GET /deadlock` | Self-contained HTML dashboard (live JSON poll 5s + meta-refresh fallback) |
+| `GET /` or `GET /deadlock` | Self-contained HTML dashboard (live JSON poll 5s; noscript meta-refresh fallback) |
 | `GET /api/deadlock` or `GET /deadlock.json` | JSON snapshot of held locks, wait edges, orphan waits, cycle, stats, config |
 
 ### Live refresh (JSON is source of truth)
@@ -746,9 +746,19 @@ The dashboard embeds a 5s `fetch('/api/deadlock')` poll that repaints:
 - deadlock cycle clients + resources
 - held-locks, wait-edges, and orphan-waits tables
 
-So the UI stays live even when the browser blocks HTML meta-refresh. A
-`<meta http-equiv="refresh" content="5">` full-page reload remains as a **soft
-fallback** when JavaScript is disabled or the poll fails.
+Numeric table cells (`ttl_ms`, `held_for_ms`, `wait_elapsed_ms`) are coerced with
+`Number(...)` before insertion so a non-numeric payload cannot inject markup.
+
+With JavaScript enabled, **only** the JSON poll refreshes the page — no full HTML
+reload. Full-page refresh is a **noscript-only** fallback:
+
+```html
+<noscript><meta http-equiv="refresh" content="5"></noscript>
+```
+
+When JS is disabled, the browser applies meta-refresh and re-fetches the full HTML
+dashboard every 5s. When JS runs, `<noscript>` content is ignored, so detector
+cleanup is not driven twice per interval by dual meta+JSON paths.
 
 Example JSON shape:
 
@@ -908,7 +918,8 @@ Available tests:
   - `json_disabled_state` / `json_and_html_show_planted_cycle` / `json_escape_quotes`
   - `json_surfaces_detector_config` / `pure_read_collect_skips_cleanup_flag`
   - `html_poll_js_repaints_tables_stats_and_cycle` — embedded JS targets table
-    / stats / cycle ids from JSON (not badge-only); meta-refresh still present
+    / stats / cycle ids from JSON (not badge-only); numeric cells use `num()`;
+    meta-refresh is inside `<noscript>` only (no dual refresh when JS works)
   - `http_ui_and_json_endpoints` — HTTP 200 on `/`, `/deadlock`, `/api/deadlock`,
     `/deadlock.json`; planted cycle visible; disabled detector honest
 - Unit tests in `src/deadlock.rs`: `test_collect_consistent_view_*`,

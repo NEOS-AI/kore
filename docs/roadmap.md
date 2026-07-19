@@ -27,11 +27,11 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Cluster gossip / membership + thin failover (RESP MEET/PING, single-observer fail, replica claim slots)
 - [x] Cluster thin slot reshard (`CLUSTER MIGRATEKEYS` multi-type keys + SETSLOT operator flow)
 - [ ] Cluster automatic reshard / full multi-type MIGRATE orchestration
-- [ ] 데드락 감지 고급 기능
-    - [ ] 크로스 프로세스 감지
+- [x] 데드락 감지 고급 기능
+    - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원
     - [x] 커스텀 희생자 선택 전략
-    - [ ] 웹 UI 모니터링
+    - [x] 웹 UI 모니터링 (Batch DF–DI; residual: string-only repaint test + HTTP MVP gaps — see TODO.md)
 - [x] Export data to file
     - [x] Export to 'RDB' file (Kore `KORDB` format; `SAVE` / `BGSAVE`)
     - [x] Export to 'AOF' file (RESP log; `BGREWRITEAOF`)

@@ -382,8 +382,15 @@ Also tracked in `docs/roadmap.md`.
     - *Done (Batch DG)*: `tests/redlock_wiring_test.rs` — off-by-default, enable flag + params, UI-port auto-attach, port=0+off → no detector.
   - [x] **`[P3]`** **Code review (DF post-ship):** JS poll only updates status badge
     - *Done (Batch DH)*: 5s `fetch('/api/deadlock')` repaints badge, stats, cycle box, held/wait/orphan tables from JSON (HTML-escaped); meta-refresh kept as soft full-page fallback; unit test `html_poll_js_repaints_tables_stats_and_cycle`; docs.
+  - [x] **`[P3]`** **Code review (DH post-ship):** dual refresh still full-reloads when JS works
+    - *Done (Batch DI)*: wrap `<meta http-equiv="refresh" content="5">` in `<noscript>` so JSON poll is the only path when JS runs; full-page reload remains for no-JS; unit test asserts refresh sits inside noscript; docs updated.
+  - [x] **`[P3]`** **Code review (DH post-ship nit):** JS numeric table cells not coerced
+    - *Done (Batch DI)*: poll script `num(x)` = `Number(x)` with finite fallback `0` for `ttl_ms` / `held_for_ms` / `wait_elapsed_ms` (held/wait/orphan rows).
+  - [ ] **`[P3]`** **Code review (DH post-ship nit):** repaint test is string-contains only
+    - *Found*: `html_poll_js_repaints_tables_stats_and_cycle` asserts embedded JS source and DOM ids; does not execute the poll or assert rendered row HTML after a fake JSON payload. Acceptable without a browser; residual if DOM fidelity regressions matter.
+    - *Next*: optional tiny pure-JS extract + node/quickjs test, or keep as string-contract only. (Batch DI left as residual — no browser harness.)
   - [ ] **`[P3]`** **Code review (DF post-ship):** HTTP MVP gaps shared with metrics server
-    - *Found*: single 4KiB read (no full header parse); non-GET → 404 not 405; test binds `127.0.0.1:0` then rebinds same port (TOCTOU flake risk under load). Acceptable for localhost admin MVP.
+    - *Found*: single 4KiB read (no full header parse); non-GET → 404 not 405; test binds `127.0.0.1:0` then rebinds same port (TOCTOU flake risk under load). Acceptable for localhost admin MVP. Same 4KiB pattern in `metrics::run_metrics_server`.
     - *Next*: only if hardening admin HTTP generally (shared helper with metrics).
 
 ### Search & vectors
@@ -613,7 +620,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batches CZ–DH shipped** (victim strategies; async/monitor; Redlock auto-resolve; cross-process snapshot; Lock Drop safety + merge re-link; atomic release + no self-waits + local acquire re-link; Web UI + atomic snapshot/CLI params; JS full table repaint). **Open next:** standing tests-for-phase P0; deferred DF P3 HTTP MVP gaps; optional larger-N HNSW recall.
+Prioritized for next letter batch(es). **Batches CZ–DI shipped** (… DH full table repaint; DI noscript-only meta-refresh + numeric cell coerce). **Open next:** string-only repaint test residual; deferred DF P3 HTTP MVP gaps; optional larger-N HNSW recall; standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -685,6 +692,9 @@ Prioritized for next letter batch(es). **Batches CZ–DH shipped** (victim strat
 | P2 | DF post-ship: deadlock CLI params (enable/max-wait/auto-resolve/strategy) | done (DG) |
 | P3 | DF post-ship: from_config UI/detection wiring tests | done (DG) |
 | P3 | DF post-ship: JS poll only updates badge | done (DH; full table/stats/cycle repaint) |
+| P3 | DH post-ship: dual meta+JSON refresh when JS enabled | done (DI; meta in `<noscript>`) |
+| P3 | DH post-ship nit: coerce/escape numeric JS table cells | done (DI; `num()` / Number) |
+| P3 | DH post-ship nit: repaint test is string-contains only | open (residual; no browser harness) |
 | P3 | DF post-ship: HTTP MVP gaps shared with metrics | open |
 | P2 | CP post-ship: LOADING allowlist PSYNC/SYNC mid-install visibility | done (CR) |
 | P2 | CC post-ship: typed export skip expired keys (no revive without TTL) | done (CD) |

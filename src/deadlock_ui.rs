@@ -356,7 +356,7 @@ pub fn render_html(snap: &DeadlockUiSnapshot) -> String {
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="refresh" content="5">
+<noscript><meta http-equiv="refresh" content="5"></noscript>
 <title>Kore Deadlock Monitor</title>
 <style>
   :root {{ font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; color: #e8e8e8; background: #12141a; }}
@@ -385,7 +385,7 @@ pub fn render_html(snap: &DeadlockUiSnapshot) -> String {
 </head>
 <body>
   <h1>Kore Deadlock Monitor</h1>
-  <p class="sub">Localhost-only admin UI · live JSON poll 5s (tables + badge) · meta-refresh fallback · <a href="/api/deadlock">JSON API</a></p>
+  <p class="sub">Localhost-only admin UI · live JSON poll 5s (tables + badge) · noscript meta-refresh fallback · <a href="/api/deadlock">JSON API</a></p>
   <p>Status: <span class="badge {status_class}">{status_label}</span>
     <span id="enabled-note" class="empty"{enabled_note_style}> — no deadlock detector attached (enable Redlock deadlock detection)</span>
   </p>
@@ -413,11 +413,11 @@ pub fn render_html(snap: &DeadlockUiSnapshot) -> String {
   </table>
   <footer>
     Endpoints: <code>GET /</code>, <code>GET /deadlock</code>, <code>GET /api/deadlock</code>, <code>GET /deadlock.json</code>.
-    No auth — bind is 127.0.0.1 only. Live updates use JSON poll; meta-refresh is a soft full-page fallback.
+    No auth — bind is 127.0.0.1 only. Live updates use JSON poll; meta-refresh is noscript-only (no dual refresh when JS runs).
   </footer>
   <script>
     // Live poll: JSON is the source of truth for badge, stats, cycle, and tables.
-    // Meta-refresh is a soft full-page fallback when JS is disabled/blocked.
+    // Meta-refresh lives inside <noscript> so it only full-reloads when JS is off.
     setInterval(function() {{
       fetch('/api/deadlock').then(function(r) {{ return r.json(); }}).then(function(j) {{
         function esc(s) {{
@@ -426,6 +426,11 @@ pub fn render_html(snap: &DeadlockUiSnapshot) -> String {
             .replace(/</g, '&lt;')
             .replace(/>/g, '&gt;')
             .replace(/"/g, '&quot;');
+        }}
+        // Coerce numeric cells so a non-number cannot inject HTML via string concat.
+        function num(x) {{
+          var n = Number(x);
+          return isFinite(n) ? n : 0;
         }}
         function emptyRow(cols) {{
           return '<tr><td colspan="' + cols + '" class="empty">(none)</td></tr>';
@@ -464,7 +469,7 @@ pub fn render_html(snap: &DeadlockUiSnapshot) -> String {
           if (!held.length) heldBody.innerHTML = emptyRow(4);
           else heldBody.innerHTML = held.map(function(h) {{
             return '<tr><td>' + esc(h.resource) + '</td><td>' + esc(h.client_id) + '</td><td>'
-              + h.ttl_ms + '</td><td>' + h.held_for_ms + '</td></tr>';
+              + num(h.ttl_ms) + '</td><td>' + num(h.held_for_ms) + '</td></tr>';
           }}).join('');
         }}
         var waitBody = document.getElementById('wait-body');
@@ -473,7 +478,7 @@ pub fn render_html(snap: &DeadlockUiSnapshot) -> String {
           if (!waits.length) waitBody.innerHTML = emptyRow(4);
           else waitBody.innerHTML = waits.map(function(w) {{
             return '<tr><td>' + esc(w.waiter) + '</td><td>' + esc(w.holder) + '</td><td>'
-              + esc(w.resource) + '</td><td>' + w.wait_elapsed_ms + '</td></tr>';
+              + esc(w.resource) + '</td><td>' + num(w.wait_elapsed_ms) + '</td></tr>';
           }}).join('');
         }}
         var orphanBody = document.getElementById('orphan-body');
@@ -482,7 +487,7 @@ pub fn render_html(snap: &DeadlockUiSnapshot) -> String {
           if (!orphans.length) orphanBody.innerHTML = emptyRow(3);
           else orphanBody.innerHTML = orphans.map(function(o) {{
             return '<tr><td>' + esc(o.waiter) + '</td><td>' + esc(o.resource) + '</td><td>'
-              + o.wait_elapsed_ms + '</td></tr>';
+              + num(o.wait_elapsed_ms) + '</td></tr>';
           }}).join('');
         }}
       }}).catch(function(){{}});
@@ -723,7 +728,7 @@ mod tests {
         assert!(!snap.cleanup_on_collect);
     }
 
-    /// Batch DH: JS poll must repaint tables/stats/cycle from JSON, not only the badge.
+    /// Batch DH/DI: JS poll must repaint tables/stats/cycle from JSON, not only the badge.
     /// (Browser not available in unit tests — assert DOM hooks + repaint logic are embedded.)
     #[test]
     fn html_poll_js_repaints_tables_stats_and_cycle() {
@@ -761,11 +766,30 @@ mod tests {
         assert!(h.contains("h.client_id"), "held row uses JSON client_id");
         assert!(h.contains("w.wait_elapsed_ms"), "wait row uses wait_elapsed_ms");
         assert!(h.contains("function esc(s)"), "JS must HTML-escape cell text");
+        // Batch DI: numeric cells coerced (not raw string concat)
+        assert!(h.contains("function num(x)"), "JS must coerce numeric cells");
+        assert!(h.contains("num(h.ttl_ms)"), "held ttl uses num()");
+        assert!(h.contains("num(h.held_for_ms)"), "held_for uses num()");
+        assert!(h.contains("num(w.wait_elapsed_ms)"), "wait elapsed uses num()");
+        assert!(h.contains("num(o.wait_elapsed_ms)"), "orphan elapsed uses num()");
 
-        // Meta-refresh remains as soft full-page fallback
+        // Batch DI: meta-refresh only inside <noscript> so JS path is poll-only
+        let noscript_pos = h
+            .find("<noscript>")
+            .expect("meta-refresh must be wrapped in <noscript>");
+        let refresh_pos = h
+            .find("http-equiv=\"refresh\"")
+            .expect("meta-refresh fallback missing");
+        let noscript_end = h
+            .find("</noscript>")
+            .expect("noscript close tag missing");
         assert!(
-            h.contains("http-equiv=\"refresh\""),
-            "meta-refresh fallback missing"
+            refresh_pos > noscript_pos && refresh_pos < noscript_end,
+            "meta-refresh must sit inside <noscript>…</noscript>"
+        );
+        assert!(
+            !h[..noscript_pos].contains("http-equiv=\"refresh\""),
+            "must not have always-on meta-refresh outside noscript"
         );
         assert!(
             h.contains("live JSON poll") || h.contains("source of truth"),
@@ -786,6 +810,11 @@ mod tests {
         );
         assert!(h2.contains("id=\"held-body\""), "cycle html still has hooks");
         assert!(h2.contains("client-1"), "server-rendered held/wait rows present");
+        // noscript contract holds for enabled snapshots too
+        assert!(
+            h2.contains("<noscript><meta http-equiv=\"refresh\" content=\"5\"></noscript>"),
+            "enabled html should keep noscript-only meta-refresh"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
