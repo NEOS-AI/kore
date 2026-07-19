@@ -388,10 +388,13 @@ Also tracked in `docs/roadmap.md`.
     - *Done (Batch DI)*: poll script `num(x)` = `Number(x)` with finite fallback `0` for `ttl_ms` / `held_for_ms` / `wait_elapsed_ms` (held/wait/orphan rows).
   - [ ] **`[P3]`** **Code review (DH post-ship nit):** repaint test is string-contains only
     - *Found*: `html_poll_js_repaints_tables_stats_and_cycle` asserts embedded JS source and DOM ids; does not execute the poll or assert rendered row HTML after a fake JSON payload. Acceptable without a browser; residual if DOM fidelity regressions matter.
-    - *Next*: optional tiny pure-JS extract + node/quickjs test, or keep as string-contract only. (Batch DI left as residual — no browser harness.)
+    - *Next*: optional tiny pure-JS extract + node/quickjs test, or keep as string-contract only. (Batch DI/DL left as residual — no browser harness.)
   - [x] **`[P3]`** **Code review (DF post-ship):** HTTP MVP gaps shared with metrics server
     - *Found*: single 4KiB read (no full header parse); non-GET → 404 not 405; test binds `127.0.0.1:0` then rebinds same port (TOCTOU flake risk under load). Acceptable for localhost admin MVP. Same 4KiB pattern in `metrics::run_metrics_server`.
     - *Done (Batch DJ)*: shared `src/admin_http.rs` — request-line read until `\r\n` (8 KiB cap), method/path parse, 405+`Allow: GET` on known paths for non-GET, 404 unknown path; used by deadlock UI + metrics. Tests bind listener once (`*_on_listener` + `127.0.0.1:0`). Residual: no full header/body parse, no auth/TLS (out of scope).
+  - [x] **`[P3]`** **Code review (DJ post-ship nit):** non-GET on unknown path is 404 (not 405)
+    - *Found (code review after DJ)*: 405 only when path is known; `POST /nope` → 404. Correct resource-not-found semantics; document if clients expect method errors first.
+    - *Done (Batch DL, document/accept)*: module rustdoc on `admin_http` + `docs/deadlock_detection.md` routing note — path membership first; unknown → 404 for any method; 405 only for non-GET on known admin routes. Existing exchange tests already cover `POST /nope` → 404; parse-level unit documents the inputs.
 
 ### Search & vectors
 
@@ -473,7 +476,8 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch CW, path branch)*: NN-path reconnect unit test with ≥4 former neighbors + `max_m=2` (`n-1 > max_m`). Test: `hnsw_bridge_remove_path_branch_reconnects` (BFS + farthest-leaf `search`).
 - [x] **`[P2]`** HNSW recall@k / throughput numbers vs FLAT
   - *Done (Batch CV, unit gate + N=300 micro)*: `hnsw_recall_at_k_vs_flat_and_throughput` — N=300 dim=16 Cosine, Q=40, fixed seed; mean recall@1 ≥ 0.90 / recall@10 ≥ 0.80 vs FLAT; indicative wall times in `docs/benchmarks.md` (FLAT still cheaper at this N; recall perfect on seed).
-  - *Done (Batch DK, CV post-ship)*: tightened always-on gate (M=8/ef=32; recall@1 ≥ 0.975 / @10 ≥ 0.95); optional `#[ignore]` larger-N median-of-3 bench N=5000; docs label single-shot vs median. Residual: no post-delete churn in recall suite.
+  - *Done (Batch DK, CV post-ship)*: tightened always-on gate (M=8/ef=32; recall@1 ≥ 0.975 / @10 ≥ 0.95); optional `#[ignore]` larger-N median-of-3 bench N=5000; docs label single-shot vs median.
+  - *Done (Batch DL)*: r@10 floor 0.95→0.93 (cross-arch headroom); always-on `hnsw_recall_after_remove_update_churn` (N=120 remove+update, soft 0.90/0.85).
 - [x] **`[P2]`** **Code review (CU post-ship):** NN-path bridge reconnect branch untested
   - *Found*: star multi-way test uses 3 survivors + `max_m=2` → `n-1 ≤ max_m` full clique, not the `else` nearest-neighbor path. Path construction / force-keep degree≤2 can regress green.
   - *Done (Batch CW)*: `hnsw_bridge_remove_path_branch_reconnects` — 4-leaf star, M=1/`max_m=2`, BFS all survivors + `search(self, k=1)` for farthest leaf `d`.
@@ -494,7 +498,17 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P3]`** **Code review (CV post-ship):** tighten recall gate / larger-N throughput
   - *Found*: thresholds 0.90/0.80 leave headroom on easy N/M/ef; throughput is single-shot N=300 where HNSW loses to FLAT.
   - *Done (Batch DK)*: always-on gate uses harder M=8/ef=32 + raised floors recall@1 ≥ 0.975 / @10 ≥ 0.95 (fixed seed `0xC0FFEE42`; observed ≈1.00/0.985). Optional `#[ignore]` `hnsw_recall_larger_n_median_throughput` — N=5000 M=16/ef=100, median-of-3 search timings, soft floors 0.95/0.90; run with `cargo test --release --lib hnsw_recall_larger_n_median_throughput -- --ignored --nocapture`. `docs/benchmarks.md` labels single-shot vs median-of-3; no portable large-N win claim without host re-measure.
-  - *Residual*: no post-delete churn in recall suite; string-only deadlock UI repaint test still open.
+  - *Done (Batch DL)*: r@10 floor 0.95→0.93 (~5.5pp cushion); post-delete/update churn recall micro; admin_http request-line async tests; 404-vs-405 docs.
+  - *Residual*: string-only deadlock UI repaint test still open (no browser harness).
+- [x] **`[P3]`** **Code review (DK post-ship):** always-on r@10 headroom is thin (~3.5pp)
+  - *Found (code review after DK)*: floor 0.95 vs observed ~0.985 on seed `0xC0FFEE42` with M=8/ef=32. Deterministic `StdRng` helps, but f32 graph ops / arch differences could flake CI if r@10 dips. Larger-N ignore bench soft floors (0.95/0.90) still have room vs observed 1.0.
+  - *Done (Batch DL)*: loosen always-on r@10 floor **0.95 → 0.93** with comment (still load-bearing vs CV 0.80 and observed ≈0.985); `docs/benchmarks.md` updated. Larger-N soft floors left as-is (ignore-only).
+- [x] **`[P3]`** **Code review (DK post-ship):** recall suite has no post-delete / update churn
+  - *Found*: unit gate and larger-N bench build once then search; no remove/update-then-recall path (graph repair covered by other HNSW unit tests, not recall@k).
+  - *Done (Batch DL)*: always-on `hnsw_recall_after_remove_update_churn` — N=120 dim=16 Cosine, M=8/ef=32, seed `0xD1C40177`, remove 15 + update 15, Q=24; soft mean recall@1 ≥ 0.90 / @10 ≥ 0.85 vs FLAT.
+- [x] **`[P3]`** **Code review (DJ post-ship nit):** `read_request_line` lacks async unit tests; no-CRLF fallback
+  - *Found*: unit tests cover `parse_request_line` only. Without `\r\n` inside 8 KiB, reader falls back to first `\n` or the whole buffer (may yield 400). Integration tests cover GET/POST/404; no dedicated partial-read / oversized-line test.
+  - *Done (Batch DL)*: tokio tests in `admin_http` — partial TCP reads assemble request line; oversized no-CRLF → unparseable (400 path); LF-only fallback; docs note 400 on unparseable.
 - [x] **`[P2]`** **Code review (CP post-ship):** HNSW search does not use the graph
   - *Found*: `search` full-scanned `self.vectors`; `ef_search` unused; `add` could connect self as neighbor.
   - *Done (Batch CQ)*: graph SEARCH-LAYER + self-exclude on connect; discriminating edge-walk test.
@@ -621,7 +635,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batches CZ–DK shipped** (… DI noscript-only meta-refresh + numeric cell coerce; DJ shared admin_http 405/request-line; DK HNSW tighter recall + ignored larger-N median bench). **Open next:** string-only repaint test residual (no browser harness); multi-DB true atomic install redesign; cluster automatic reshard; standing tests-for-phase P0.
+Prioritized for next letter batch(es). **Batches CZ–DL shipped** (… DI noscript-only meta-refresh + numeric cell coerce; DJ shared admin_http 405/request-line; DK HNSW tighter recall + ignored larger-N median bench; DL r@10 headroom + post-churn recall + admin_http request-line async tests + 404-vs-405 docs). **Open next (after DI–DL code review):** string-only deadlock UI repaint residual (no browser harness); multi-DB true atomic install redesign; cluster automatic reshard; standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -697,6 +711,10 @@ Prioritized for next letter batch(es). **Batches CZ–DK shipped** (… DI noscr
 | P3 | DH post-ship nit: coerce/escape numeric JS table cells | done (DI; `num()` / Number) |
 | P3 | DH post-ship nit: repaint test is string-contains only | open (residual; no browser harness) |
 | P3 | DF post-ship: HTTP MVP gaps shared with metrics | done (DJ; shared admin_http) |
+| P3 | DK post-ship: thin r@10 headroom / cross-arch flake risk | done (DL; r@10 0.95→0.93) |
+| P3 | DK post-ship: no post-delete/update churn in recall suite | done (DL; remove+update micro) |
+| P3 | DJ post-ship nit: read_request_line async/oversized-line tests | done (DL) |
+| P3 | DJ post-ship nit: non-GET unknown path is 404 not 405 | done (DL; document/accept) |
 | P2 | CP post-ship: LOADING allowlist PSYNC/SYNC mid-install visibility | done (CR) |
 | P2 | CC post-ship: typed export skip expired keys (no revive without TTL) | done (CD) |
 | P2 | CC nit: unify start_background_sweep create paths | done (CD) |

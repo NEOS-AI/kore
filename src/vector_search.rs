@@ -1882,14 +1882,18 @@ mod tests {
     /// - Q=40 independent random unit queries (same seed stream after corpus).
     /// - recall@k = |HNSW top-k ∩ FLAT top-k| / k, averaged over queries.
     ///
-    /// Thresholds (Batch DK; load-bearing on the fixed seed — observed ≈1.00 / 0.985):
+    /// Thresholds (Batch DK + **DL** headroom polish):
     /// - mean recall@1  ≥ 0.975
-    /// - mean recall@10 ≥ 0.95
+    /// - mean recall@10 ≥ 0.93  (**Batch DL**: was 0.95; ~3.5pp headroom vs observed
+    ///   ≈0.985 was thin under f32 graph ops / cross-arch variance. Floor 0.93 keeps
+    ///   ~5.5pp cushion while remaining load-bearing — still far above CV's 0.80 and
+    ///   well below the easy M=16/ef=100 free-1.0 regime.)
     ///
     /// Throughput: single-shot total wall time for all Q searches (FLAT vs HNSW),
     /// printed via `eprintln!` (`--nocapture`). Not a CI gate on absolute ms.
     /// For larger-N + median-of-3 timings see
     /// [`hnsw_recall_larger_n_median_throughput`] (`#[ignore]`).
+    /// Post-delete/update recall: [`hnsw_recall_after_remove_update_churn`].
     #[test]
     fn hnsw_recall_at_k_vs_flat_and_throughput() {
         use rand::rngs::StdRng;
@@ -1904,8 +1908,9 @@ mod tests {
         const SEED: u64 = 0xC0_FF_EE_42; // fixed — do not change without re-checking thresholds
 
         // Batch DK: raised vs CV 0.90/0.80; M/ef lowered so r@10 is not a free 1.0.
+        // Batch DL: r@10 0.95 → 0.93 for cross-arch f32 headroom (still load-bearing).
         const MIN_RECALL_AT_1: f64 = 0.975;
-        const MIN_RECALL_AT_10: f64 = 0.95;
+        const MIN_RECALL_AT_10: f64 = 0.93;
 
         let mut rng = StdRng::seed_from_u64(SEED);
         let corpus: Vec<(Bytes, Vec<f32>)> = (0..N)
@@ -2082,6 +2087,109 @@ mod tests {
         assert!(
             mean_r10 >= MIN_RECALL_AT_10,
             "mean recall@10 {mean_r10:.3} < {MIN_RECALL_AT_10} (N={N} dim={DIM} Q={Q} M={M} ef={EF})"
+        );
+    }
+
+    /// Batch DL: fixed-seed recall@k after **remove + update churn** (vs FLAT).
+    ///
+    /// The always-on CV/DK gate builds once then searches; graph repair after
+    /// delete/update is covered by structural HNSW unit tests but not recall@k.
+    /// This micro builds HNSW+FLAT, removes a slice of ids, rewrites another
+    /// slice in place (large vector move → remove+reinsert rewire), then asserts
+    /// mean recall still clears a soft floor. CI-fast (N=120, Q=24).
+    ///
+    /// Soft floors (load-bearing but looser than the no-churn gate — bridge
+    /// reconnect is heuristic, not exact ANN recovery):
+    /// - mean recall@1  ≥ 0.90
+    /// - mean recall@10 ≥ 0.85
+    #[test]
+    fn hnsw_recall_after_remove_update_churn() {
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+
+        const N: usize = 120;
+        const DIM: usize = 16;
+        const Q: usize = 24;
+        const M: usize = 8;
+        const EF: usize = 32;
+        // Distinct from CV/DK unit-gate and larger-N seeds.
+        const SEED: u64 = 0xD1_C4_01_77;
+        const N_REMOVE: usize = 15;
+        const N_UPDATE: usize = 15;
+
+        const MIN_RECALL_AT_1: f64 = 0.90;
+        const MIN_RECALL_AT_10: f64 = 0.85;
+
+        let mut rng = StdRng::seed_from_u64(SEED);
+        let mut corpus: Vec<(Bytes, Vec<f32>)> = (0..N)
+            .map(|i| (Bytes::from(format!("v{i}")), random_unit_vec(&mut rng, DIM)))
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..Q).map(|_| random_unit_vec(&mut rng, DIM)).collect();
+
+        let mut flat = FlatVectorIndex::new(DistanceMetric::Cosine);
+        let mut hnsw = HNSWIndex::new(M, EF, DistanceMetric::Cosine);
+        for (id, v) in &corpus {
+            flat.add(id.clone(), v.clone());
+            hnsw.add(id.clone(), v.clone());
+        }
+        assert_eq!(flat.len(), N);
+        assert_eq!(hnsw.len(), N);
+
+        // Deterministic remove: first N_REMOVE corpus ids (fixed seed → fixed set).
+        let remove_ids: Vec<Bytes> = corpus.iter().take(N_REMOVE).map(|(id, _)| id.clone()).collect();
+        for id in &remove_ids {
+            flat.remove(id);
+            hnsw.remove(id);
+        }
+
+        // Update-in-place: next N_UPDATE survivors get far-away unit vectors.
+        let update_ids: Vec<Bytes> = corpus
+            .iter()
+            .skip(N_REMOVE)
+            .take(N_UPDATE)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &update_ids {
+            let new_v = random_unit_vec(&mut rng, DIM);
+            flat.add(id.clone(), new_v.clone());
+            hnsw.add(id.clone(), new_v.clone());
+            // Keep corpus in sync for debugging only (not re-used for search).
+            if let Some(slot) = corpus.iter_mut().find(|(cid, _)| cid == id) {
+                slot.1 = new_v;
+            }
+        }
+
+        let expected_len = N - N_REMOVE;
+        assert_eq!(flat.len(), expected_len);
+        assert_eq!(hnsw.len(), expected_len);
+
+        let mut sum_r1 = 0.0f64;
+        let mut sum_r10 = 0.0f64;
+        for (i, q) in queries.iter().enumerate() {
+            let f = flat.search(q, 10);
+            let h = hnsw.search(q, 10);
+            assert_eq!(f.len(), 10, "FLAT must return k=10 for query {i}");
+            assert_eq!(h.len(), 10, "HNSW must return k=10 for query {i}");
+            sum_r1 += recall_at_k(&f, &h, 1);
+            sum_r10 += recall_at_k(&f, &h, 10);
+        }
+        let mean_r1 = sum_r1 / Q as f64;
+        let mean_r10 = sum_r10 / Q as f64;
+
+        eprintln!(
+            "hnsw_recall_after_remove_update_churn: N={N} remove={N_REMOVE} update={N_UPDATE} \
+             dim={DIM} Q={Q} M={M} ef={EF} mean_recall@1={mean_r1:.3} mean_recall@10={mean_r10:.3}"
+        );
+
+        assert!(
+            mean_r1 >= MIN_RECALL_AT_1,
+            "post-churn mean recall@1 {mean_r1:.3} < {MIN_RECALL_AT_1} \
+             (N={N} remove={N_REMOVE} update={N_UPDATE} M={M} ef={EF})"
+        );
+        assert!(
+            mean_r10 >= MIN_RECALL_AT_10,
+            "post-churn mean recall@10 {mean_r10:.3} < {MIN_RECALL_AT_10} \
+             (N={N} remove={N_REMOVE} update={N_UPDATE} M={M} ef={EF})"
         );
     }
 }

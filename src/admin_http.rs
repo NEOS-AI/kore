@@ -2,6 +2,10 @@
 //!
 //! Minimal HTTP/1.1 request-line parsing and response writing — not a full stack.
 //! No auth, TLS, pipelining, or body handling; callers close the connection after one response.
+//!
+//! **Routing convention (accepted):** non-`GET` on a **known** path → `405` +
+//! `Allow: GET`; any method on an **unknown** path → `404` (path membership
+//! first). `POST /nope` is therefore 404, not 405.
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -150,6 +154,8 @@ pub async fn write_400(stream: &mut TcpStream) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
 
     #[test]
     fn parse_get_path_and_query() {
@@ -183,5 +189,122 @@ mod tests {
     fn parse_rejects_empty() {
         assert!(parse_request_line("").is_none());
         assert!(parse_request_line("GET").is_none());
+    }
+
+    /// Batch DL: assemble the request line across multiple TCP reads (partial
+    /// chunks before the first `\r\n`).
+    #[tokio::test]
+    async fn read_request_line_across_partial_reads() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            // Deliberately split before CRLF so the server must loop on read.
+            stream.write_all(b"GET /metrics").await.unwrap();
+            stream.flush().await.unwrap();
+            tokio::task::yield_now().await;
+            stream.write_all(b" HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+            stream.flush().await.unwrap();
+            // Keep the connection open until the server finishes reading the line.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+
+        let (mut server, _) = listener.accept().await.unwrap();
+        let line = read_request_line(&mut server)
+            .await
+            .unwrap()
+            .expect("request line");
+        assert_eq!(line, "GET /metrics HTTP/1.1");
+        let req = parse_request_line(&line).unwrap();
+        assert!(req.is_get());
+        assert_eq!(req.path, "/metrics");
+        let _ = client.await;
+    }
+
+    /// Batch DL: a line longer than [`MAX_REQUEST_BUF`] with no CRLF returns the
+    /// buffered prefix; callers that `parse_request_line` garbage → 400 path.
+    #[tokio::test]
+    async fn read_request_line_oversized_no_crlf_yields_unparseable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            // > 8 KiB of non-HTTP noise, no CRLF anywhere.
+            let blob = vec![b'A'; MAX_REQUEST_BUF + 512];
+            let _ = stream.write_all(&blob).await;
+            let _ = stream.flush().await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+
+        let (mut server, _) = listener.accept().await.unwrap();
+        let line = read_request_line(&mut server)
+            .await
+            .unwrap()
+            .expect("oversize fallback returns buffer");
+        // Reader stops at the cap; no CRLF/LF → whole filled buffer.
+        assert!(
+            line.len() <= MAX_REQUEST_BUF,
+            "line len {} exceeds cap",
+            line.len()
+        );
+        assert!(
+            line.len() >= MAX_REQUEST_BUF / 2,
+            "expected a large filled buffer, got {}",
+            line.len()
+        );
+        // No spaces → not a valid "METHOD path" request line → 400 at call sites.
+        assert!(
+            parse_request_line(&line).is_none(),
+            "oversize garbage must not parse as a request line"
+        );
+        let _ = client.await;
+    }
+
+    /// Batch DL: bare LF (no CR) is accepted as a line terminator fallback.
+    #[tokio::test]
+    async fn read_request_line_lf_only_fallback() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(b"GET /deadlock HTTP/1.1\nHost: x\n\n")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+
+        let (mut server, _) = listener.accept().await.unwrap();
+        // With CRLF absent, the reader fills until EOF or cap then takes first LF.
+        // Here the client may deliver the whole request in one write, so find_crlf
+        // fails and the LF fallback applies once the peer closes or we hit cap —
+        // force EOF by dropping the client after a short sleep in the task above.
+        // Wait for the client task (which sleeps then drops → EOF).
+        let client_handle = client;
+        // Give the client a moment to write, then if still open the sleep ends and
+        // the stream drops → read loop breaks on n==0 and LF fallback fires.
+        let line = read_request_line(&mut server)
+            .await
+            .unwrap()
+            .expect("lf-terminated line");
+        assert_eq!(line, "GET /deadlock HTTP/1.1");
+        let _ = client_handle.await;
+    }
+
+    /// Documented routing: non-GET on an **unknown** path is 404 (resource not
+    /// found), not 405. 405 is reserved for non-GET on **known** admin paths.
+    /// (Call-site tests in deadlock_ui / metrics cover the full HTTP exchange;
+    /// this asserts the parse-level inputs used by that routing.)
+    #[test]
+    fn unknown_path_non_get_is_resource_not_found_semantics() {
+        let r = parse_request_line("POST /nope HTTP/1.1").unwrap();
+        assert!(!r.is_get());
+        assert_eq!(r.path, "/nope");
+        // Routers treat path membership first: unknown → 404 regardless of method.
+        // Known paths (/metrics, /api/deadlock, …) with non-GET → 405.
     }
 }

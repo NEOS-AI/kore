@@ -737,11 +737,18 @@ Each HTML/JSON poll builds a [`DeadlockUiSnapshot`] via
 | `GET /` or `GET /deadlock` | Self-contained HTML dashboard (live JSON poll 5s; noscript meta-refresh fallback) |
 | `GET /api/deadlock` or `GET /deadlock.json` | JSON snapshot of held locks, wait edges, orphan waits, cycle, stats, config |
 | Non-`GET` on a known path above | `405 Method Not Allowed` with `Allow: GET` |
-| Any other path | `404 Not Found` |
+| Any other path (any method) | `404 Not Found` |
+
+**Routing note (accepted):** path membership is checked **before** method.
+`POST /nope` (unknown path) is **404**, not 405 — the resource does not exist.
+405 applies only when the path is a known admin route but the method is not
+`GET`. Clients that expect method errors first will see 404 on typos.
 
 Request handling is shared with the Prometheus metrics scrape server (`admin_http`):
-request line is read until the first `\r\n` (capped at 8 KiB). Only `GET` is
-supported — no auth, TLS, or body parsing (localhost admin MVP).
+request line is read until the first `\r\n` (capped at 8 KiB; partial TCP reads
+are assembled). Oversized / unparseable request lines yield `400 Bad Request`.
+Only `GET` is supported on known paths — no auth, TLS, or body parsing
+(localhost admin MVP).
 
 ### Live refresh (JSON is source of truth)
 

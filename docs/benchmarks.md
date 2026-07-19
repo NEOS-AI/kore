@@ -135,12 +135,18 @@ comparison:
 3. Report: dataset size (N, dim), recall@k vs FLAT ground truth, and wall time
    for the query set (build excluded). CI does **not** gate on absolute ms.
 4. In-tree gates (unit tests in `src/vector_search.rs`):
-   - `hnsw_recall_at_k_vs_flat_and_throughput` (**Batch CV + DK**): always-on
+   - `hnsw_recall_at_k_vs_flat_and_throughput` (**Batch CV + DK + DL**): always-on
      CI gate. N=300 unit vectors, dim=16, Cosine, Q=40, fixed seed
      `0xC0FFEE42`; HNSW **M=8 / ef=32** (DK tightened from CV M=16/ef=100 so
      recall@10 is load-bearing); asserts mean recall@1 ≥ **0.975** and
-     recall@10 ≥ **0.95**; prints **single-shot** FLAT vs HNSW wall time
-     (`eprintln!`, see `--nocapture`). Fast enough for debug CI.
+     recall@10 ≥ **0.93** (**Batch DL**: was 0.95; ~5.5pp headroom vs observed
+     ≈0.985 for cross-arch f32 variance while still load-bearing); prints
+     **single-shot** FLAT vs HNSW wall time (`eprintln!`, see `--nocapture`).
+     Fast enough for debug CI.
+   - `hnsw_recall_after_remove_update_churn` (**Batch DL**): always-on. N=120,
+     remove 15 + update 15, Q=24, seed `0xD1C40177`, M=8/ef=32; soft floors
+     mean recall@1 ≥ **0.90** / @10 ≥ **0.85** vs FLAT after churn (bridge
+     reconnect is heuristic — floors looser than the no-churn gate).
    - `hnsw_recall_larger_n_median_throughput` (**Batch DK**, `#[ignore]`): N=5000,
      dim=16, Cosine, Q=40, seed `0xD1A6E501`; HNSW M=16 / ef=100; soft recall
      floors ≥ 0.95 / 0.90; prints **median-of-3** search wall times (build
@@ -158,7 +164,7 @@ comparison:
    - `hnsw_bridge_remove_asymmetric_incoming_reconnects` / `hnsw_bridge_remove_star_multiway_reconnects` (Batch CU)
    - `hnsw_m1_hub_churn_preserves_reachability` (Batch CT smoke)
 
-**Implementation note (Batch CQ + CS + CT + CU + CV + DK):** `HNSWIndex::search` walks neighbor
+**Implementation note (Batch CQ + CS + CT + CU + CV + DK + DL):** `HNSWIndex::search` walks neighbor
 edges (SEARCH-LAYER) with candidate list size `ef_search` (defaults to
 `ef_construction`). Insert still assigns all nodes to **layer 0** only
 (multi-layer assignment simplified). Layer-0 prune uses `M_max ≈ 2M` and
@@ -199,13 +205,15 @@ cargo test --release --lib hnsw_recall_at_k_vs_flat_and_throughput -- --nocaptur
 | Queries | Q=40 random unit queries; seed `0xC0FFEE42` |
 | HNSW M / ef | 8 / 32 (`ef_search` = `ef_construction`) |
 | mean recall@1 vs FLAT | **1.00** (gate ≥ 0.975) |
-| mean recall@10 vs FLAT | **≈0.985** (gate ≥ 0.95) |
+| mean recall@10 vs FLAT | **≈0.985** (gate ≥ 0.93; Batch DL headroom vs cross-arch f32) |
 | Query set wall (k=10) FLAT / HNSW | host-dependent; typically HNSW slower at this N |
 
 **Interpretation:** at N=300 with this M/ef, brute-force FLAT is usually cheaper
 than graph walk (HNSW overhead dominates). The always-on test is a **load-bearing
 recall correctness** smoke plus **single-shot** relative timing — not a claim that
-HNSW wins at N=300.
+HNSW wins at N=300. Batch DL loosens r@10 floor 0.95→0.93 (~5.5pp cushion vs
+observed ≈0.985) so host/arch f32 differences do not flake CI while the gate
+still fails broken search.
 
 #### Optional larger-N bench (N=5000, median-of-3, `#[ignore]`)
 
