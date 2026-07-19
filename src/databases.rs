@@ -4,6 +4,7 @@
 //! stats are shared via DB 0 (Redis semantics: pub/sub is not DB-scoped).
 
 use crate::cache::Cache;
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -13,12 +14,29 @@ pub const DEFAULT_DATABASES: usize = 16;
 /// Collection of logical databases.
 pub struct Databases {
     dbs: Vec<Arc<Cache>>,
-    /// Bumped at the start and end of multi-DB keyspace replace (load commit).
-    /// Observers can sample this to detect a completed load; it does **not**
-    /// by itself prevent torn multi-DB reads mid-install.
+    /// Bumped once when a multi-DB keyspace replace **finishes** (success or
+    /// panic via drop guard). Frozen for the whole install so observers cannot
+    /// treat a mid-loop gen as a published epoch. Pair with
+    /// [`Self::load_in_progress`] / [`Self::with_stable_keyspace_view`].
     load_generation: AtomicU64,
     /// True while [`Self::replace_keyspaces_from`] is running.
     load_in_progress: AtomicBool,
+    /// Multi-DB keyspace epoch lock.
+    ///
+    /// - **Write**: held for the whole multi-DB install loop (after staging).
+    /// - **Read**: held by multi-DB exporters / consistent multi-DB observers
+    ///   ([`Self::with_stable_keyspace_view`]) so they never sample DB0-new +
+    ///   DB1-old mid-install.
+    ///
+    /// Does **not** block per-DB command paths that already hold `Arc<Cache>`
+    /// (those are gated by `-LOADING` on the public command path).
+    keyspace_epoch_lock: RwLock<()>,
+    /// Optional probe invoked after each DB is installed during
+    /// [`Self::replace_keyspaces_from`] (0-based DB index). Held **under** the
+    /// epoch write lock — hooks must not call [`Self::with_stable_keyspace_view`]
+    /// (would deadlock). Use [`Self::try_with_stable_keyspace_view`] to observe
+    /// exclusion. Production leaves this `None`.
+    after_install_db: parking_lot::Mutex<Option<Arc<dyn Fn(usize) + Send + Sync>>>,
 }
 
 impl Databases {
@@ -28,6 +46,8 @@ impl Databases {
             dbs: vec![cache],
             load_generation: AtomicU64::new(0),
             load_in_progress: AtomicBool::new(false),
+            keyspace_epoch_lock: RwLock::new(()),
+            after_install_db: parking_lot::Mutex::new(None),
         })
     }
 
@@ -64,6 +84,8 @@ impl Databases {
             dbs,
             load_generation: AtomicU64::new(0),
             load_in_progress: AtomicBool::new(false),
+            keyspace_epoch_lock: RwLock::new(()),
+            after_install_db: parking_lot::Mutex::new(None),
         })
     }
 
@@ -116,14 +138,16 @@ impl Databases {
             dbs,
             load_generation: AtomicU64::new(0),
             load_in_progress: AtomicBool::new(false),
+            keyspace_epoch_lock: RwLock::new(()),
+            after_install_db: parking_lot::Mutex::new(None),
         })
     }
 
-    /// Monotonic generation bumped around multi-DB keyspace replace.
+    /// Monotonic generation bumped when multi-DB keyspace replace finishes.
     ///
-    /// Increases once when replace starts and once when it finishes (success
-    /// or panic via drop guard). Useful for tests / diagnostics; not a full
-    /// reader barrier.
+    /// Increases once per replace attempt (success or panic via drop guard).
+    /// Frozen during install (no mid-loop publish). Useful for tests /
+    /// diagnostics together with [`Self::load_in_progress`].
     pub fn load_generation(&self) -> u64 {
         self.load_generation.load(Ordering::Acquire)
     }
@@ -133,10 +157,45 @@ impl Databases {
         self.load_in_progress.load(Ordering::Acquire)
     }
 
+    /// Run `f` while holding the multi-DB keyspace epoch **read** lock.
+    ///
+    /// Blocks if a multi-DB install is mid-loop, then observes a consistent
+    /// all-old or all-new multi-DB view (no DB0-new + DB1-old tear). Use for
+    /// multi-DB export (`MultiDbSnapshot::from_databases`, SAVE internals).
+    pub fn with_stable_keyspace_view<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let _guard: RwLockReadGuard<'_, ()> = self.keyspace_epoch_lock.read();
+        f()
+    }
+
+    /// Non-blocking variant of [`Self::with_stable_keyspace_view`].
+    ///
+    /// Returns `None` if a multi-DB install currently holds the epoch write
+    /// lock. Intended for probes / tests that must not deadlock under an
+    /// `after_install_db` hook.
+    pub fn try_with_stable_keyspace_view<F, R>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce() -> R,
+    {
+        let _guard = self.keyspace_epoch_lock.try_read()?;
+        Some(f())
+    }
+
+    /// Install-time probe hook (tests). See [`Self::after_install_db`].
+    pub fn set_after_install_db_hook(
+        &self,
+        hook: Option<Arc<dyn Fn(usize) + Send + Sync>>,
+    ) {
+        *self.after_install_db.lock() = hook;
+    }
+
     /// Run `f` while [`load_in_progress`] is forced true (tests / probes).
     ///
     /// Restores the previous flag on drop (panic-safe). Does **not** bump
-    /// [`load_generation`] (unlike a real replace).
+    /// [`load_generation`] (unlike a real replace) and does **not** take the
+    /// epoch write lock.
     pub fn with_load_in_progress_flag<F, R>(&self, f: F) -> R
     where
         F: FnOnce() -> R,
@@ -168,47 +227,68 @@ impl Databases {
     /// [`with_autosweep_paused_all`]); public load wrappers do this.
     /// DB count is matched by index; extra DBs on either side are ignored.
     ///
-    /// Sets [`load_in_progress`] for the duration and bumps
-    /// [`load_generation`] at start and end.
+    /// Sets [`load_in_progress`] for the duration. Bumps [`load_generation`]
+    /// once when the call finishes (not mid-install).
     ///
     /// # Consistency under concurrent readers
     ///
-    /// This is **not** atomic across DBs from a concurrent reader's point of
-    /// view. Install is still per-DB: a client SELECT'ing across DBs can see
-    /// DB0 already replaced while DB1 still holds old data. Public load
-    /// wrappers no longer pre-flush all DBs (mid-install panic leaves remaining
-    /// DBs with **pre-load** data). Peak dual-residency during stage is
-    /// ~old multi-DB + full staged scratch (~2×). True multi-DB consistency
-    /// requires exclusive access for the duration of this call (server-wide
-    /// load barrier / epoch publish for readers remains open).
+    /// **Lock-step install (Batch DR):** after staging every source payload,
+    /// all target DBs are installed under a single `keyspace_epoch_lock`
+    /// write section. Multi-DB observers that take
+    /// [`Self::with_stable_keyspace_view`] (e.g. RDB `from_databases` / SAVE)
+    /// either finish before that section or block until **all** DBs are new —
+    /// they never sample DB0-new + DB1-old.
+    ///
+    /// Public command path still returns **`-LOADING`** while
+    /// [`load_in_progress`] is true (data plane + SYNC/PSYNC). Peak dual-
+    /// residency during stage is ~old multi-DB + full staged scratch (~2×).
+    ///
+    /// # Residuals
+    ///
+    /// - **Panic mid-install** still leaves DBs `0..=i` new and `i+1..` old
+    ///   (no rollback of already-installed DBs).
+    /// - **Raw per-DB `Arc<Cache>` access** that bypasses the epoch lock and
+    ///   the command gate can still observe a mid-loop multi-DB tear (and
+    ///   mid-`install_keyspace_payload` single-DB map tear). Privileged
+    ///   allowlisted commands (e.g. INFO key counts on the selected DB) are
+    ///   not multi-DB exporters; document if expanded.
     ///
     /// # Panic safety (partial staging)
     ///
     /// All source DBs are fully drained into staged payloads **before** any
     /// target is mutated. A panic while preparing source DBs leaves every
-    /// target intact. A panic mid-install after DB *i* is committed still
-    /// leaves DBs `0..=i` new and `i+1..` old — not fully atomic.
+    /// target intact.
     pub fn replace_keyspaces_from(&self, other: &Self) {
         self.load_in_progress.store(true, Ordering::Release);
-        self.load_generation.fetch_add(1, Ordering::AcqRel);
         struct LoadFlag<'a>(&'a Databases);
         impl Drop for LoadFlag<'_> {
             fn drop(&mut self) {
-                self.0.load_in_progress.store(false, Ordering::Release);
+                // Publish generation only at end (frozen during install).
                 self.0.load_generation.fetch_add(1, Ordering::AcqRel);
+                self.0.load_in_progress.store(false, Ordering::Release);
             }
         }
         let _flag = LoadFlag(self);
 
         let n = self.dbs.len().min(other.dbs.len());
         // Stage: drain every source first so a panic preparing later DBs does
-        // not leave earlier targets already swapped.
+        // not leave earlier targets already swapped. Staging is outside the
+        // epoch write lock so multi-DB exporters can still finish an all-old
+        // snapshot while sources are prepared.
         let mut staged = Vec::with_capacity(n);
         for i in 0..n {
             staged.push(other.dbs[i].take_keyspace_payload());
         }
-        for (i, payload) in staged.into_iter().enumerate() {
-            self.dbs[i].install_keyspace_payload(payload);
+
+        // Lock-step install: one exclusive section for every DB.
+        {
+            let _epoch: RwLockWriteGuard<'_, ()> = self.keyspace_epoch_lock.write();
+            for (i, payload) in staged.into_iter().enumerate() {
+                self.dbs[i].install_keyspace_payload(payload);
+                if let Some(ref hook) = *self.after_install_db.lock() {
+                    hook(i);
+                }
+            }
         }
     }
 

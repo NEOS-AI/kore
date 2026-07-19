@@ -13,6 +13,7 @@ patterns in the modules you touch over inventing new lock orders.
 - Atomically updated counters use `std::sync::atomic` with `Relaxed` for stats
   and `Acquire`/`Release` where publish/observe ordering matters
   (`Databases::load_in_progress`, `load_generation`).
+- Multi-DB install vs export: `Databases::keyspace_epoch_lock` (`parking_lot::RwLock`).
 
 ## Established lock orders
 
@@ -23,6 +24,7 @@ Never invert these (deadlock risk):
 | Search indices | **aliases** then **indices** (create / drop / alias_* / `get_index` / `has_any_state` / take-install) |
 | Background expire | `autosweep_cycle_lock` held for the whole expire body; `with_autosweep_paused` disables the flag then acquires the lock |
 | Multi-DB load | Pause autosweep on **all** DBs before any `replace_keyspaces_from` |
+| Multi-DB epoch | `keyspace_epoch_lock`: **write** = install loop; **read** = multi-DB export / `with_stable_keyspace_view` (never invert with per-shard map locks held across the epoch lock) |
 
 ## Keyspace replace / load commit
 
@@ -30,9 +32,19 @@ Never invert these (deadlock risk):
 - Raw `DbSnapshot::load_into` is **non-transactional** — do not call on live DBs.
 - `install_keyspace_payload`: drain target into discard locals, then **`fill_all`**
   (map must already be empty; `debug_assert` in debug builds).
-- Multi-DB replace stages **all** source payloads before any install. It is
-  **not** atomic to concurrent readers; the command path returns
-  **`-LOADING`** while `Databases::load_in_progress()` is true.
+- Multi-DB replace stages **all** source payloads first, then installs every DB
+  under one **`keyspace_epoch_lock` write** section (lock-step install).
+  - Multi-DB exporters must use **`Databases::with_stable_keyspace_view`**
+    (epoch **read**) — `MultiDbSnapshot::from_databases` does this — so they
+    never sample DB0-new + DB1-old mid-install.
+  - Command path returns **`-LOADING`** while `Databases::load_in_progress()`
+    is true (data plane + `SYNC`/`PSYNC`).
+  - `load_generation` publishes **once at end** of replace (frozen mid-install).
+- **Residuals**
+  - Panic mid-install still leaves a partial multi-DB commit (no rollback).
+  - Raw `Arc<Cache>` access that skips the epoch lock can still observe a
+    mid-loop multi-DB tear (and mid-payload single-DB map tear). Command path
+    is gated; do not walk all DBs without the epoch read lock.
 - **LOADING allowlist** (connection / discovery / repl handshake only — no
   keyspace snapshot): `AUTH`, `HELLO`, `PING`, `ECHO`, `QUIT`, `RESET`, `INFO`,
   `COMMAND`, `ROLE`, `REPLCONF`, `CLIENT`, `CONFIG`, `MODULE`.

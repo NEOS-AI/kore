@@ -12,7 +12,7 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Scratch-load AOF/RDB (preserve target on Err); load quiesce + WATCH bump (CB–CD)
 - [x] FT merge schema/alias equality on clash (CG); multi-DB LOADING gate (CK)
 - [x] Shared FT.CREATE parser; HNSW `EF_CONSTRUCTION` AOF/RDB; ACL `@search` (CA, CE)
-- [ ] True multi-DB atomic keyspace install under concurrent readers (residual; LOADING gate mitigates)
+- [x] Multi-DB lock-step keyspace install (Batch DR: epoch write + stable-view read; LOADING + SYNC deny; residuals: panic partial commit, raw Arc mid-loop)
 - [x] HNSW graph-based ANN search (Batch CQ; layer-0 edges + `ef_search`; multi-layer insert still simplified)
 - [x] HNSW remove/unlink + insert-time force-keep + update rewire (Batch CS)
 - [x] HNSW hard-delete bridge repair — closest-peer reconnect (Batch CT; 2-chain)

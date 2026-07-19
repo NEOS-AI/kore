@@ -1025,15 +1025,21 @@ impl DbSnapshot {
 // The encode() for empty uses MultiDbSnapshot::encode; non-empty encodes inline.
 
 impl MultiDbSnapshot {
+    /// Export every logical DB under the multi-DB keyspace epoch **read** lock
+    /// so a concurrent [`Databases::replace_keyspaces_from`] install cannot
+    /// produce a torn multi-DB snapshot (DB0 new + DB1 old). See
+    /// [`Databases::with_stable_keyspace_view`].
     pub fn from_databases(databases: &Databases) -> Result<Self> {
-        let mut out = Vec::new();
-        for (idx, cache) in databases.iter().enumerate() {
-            let snap = DbSnapshot::from_cache(cache)?;
-            if !snap.is_empty() {
-                out.push((idx as u32, snap));
+        databases.with_stable_keyspace_view(|| {
+            let mut out = Vec::new();
+            for (idx, cache) in databases.iter().enumerate() {
+                let snap = DbSnapshot::from_cache(cache)?;
+                if !snap.is_empty() {
+                    out.push((idx as u32, snap));
+                }
             }
-        }
-        Ok(Self { databases: out })
+            Ok(Self { databases: out })
+        })
     }
 
     pub fn from_cache(cache: &Cache) -> Result<Self> {
@@ -1259,17 +1265,17 @@ pub fn load_bytes(cache: &Cache, data: &[u8], flush: bool) -> Result<usize> {
 /// `databases` is untouched.
 ///
 /// Multi-DB install is staged (all sources drained before any target mutate)
-/// but **not** atomic to concurrent readers — see
-/// [`Databases::replace_keyspaces_from`].
+/// then installed under a single keyspace-epoch write lock — multi-DB exporters
+/// that use [`MultiDbSnapshot::from_databases`] / [`Databases::with_stable_keyspace_view`]
+/// never observe DB0-new + DB1-old. Command-path readers still see `-LOADING`.
+/// See [`Databases::replace_keyspaces_from`] for panic / raw-`Arc<Cache>` residuals.
 ///
 /// - `flush = true` (**snapshot replace**): empty scratch; on success each
 ///   target DB is swapped from scratch via [`Databases::replace_keyspaces_from`]
 ///   (full keyspace replace per DB — **no** pre-flush of all DBs). That way a
 ///   mid-install panic leaves remaining DBs with their **pre-load** data
 ///   instead of empty. Single-DB [`load_bytes`] still pre-flushes for peak
-///   memory on FULLRESYNC of one cache. Concurrent readers can still see
-///   mixed old/new DBs mid-loop (exclusive access required for a consistent
-///   multi-DB view).
+///   memory on FULLRESYNC of one cache.
 /// - `flush = false` (**merge**): scratch seeded from non-mutating multi-DB
 ///   snapshot, then merged (existing FT names kept only when schema/target
 ///   equal; clash otherwise fails — see [`DbSnapshot::load_into`]).

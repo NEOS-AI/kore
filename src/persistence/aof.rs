@@ -1261,10 +1261,11 @@ pub fn load_into_cache(cache: &Arc<Cache>, path: &Path) -> Result<usize> {
 /// **Scratch-load (transactional):** replay targets an empty multi-DB scratch
 /// collection. On `Ok`, autosweep is paused on all DBs, WATCH gens are
 /// bumped, then each DB is swapped via [`Databases::replace_keyspaces_from`]
-/// (full keyspace + FT replace per DB — **no** multi-DB pre-flush; mid-install
-/// panic leaves remaining DBs with pre-load data). Peak dual-residency during
-/// stage is ~old multi-DB + scratch. On `Err`, `databases` is left completely
-/// untouched. Requires exclusive access for the commit swap.
+/// (lock-step multi-DB install under the keyspace epoch write lock; no multi-DB
+/// pre-flush; mid-install panic leaves remaining DBs with pre-load data). Peak
+/// dual-residency during stage is ~old multi-DB + scratch. On `Err`,
+/// `databases` is left completely untouched. Multi-DB exporters take the epoch
+/// read lock; command path sees `-LOADING` during commit.
 pub fn load_into_databases(databases: &Databases, path: &Path) -> Result<usize> {
     let scratch = databases.empty_like();
     let mut current = 0usize;

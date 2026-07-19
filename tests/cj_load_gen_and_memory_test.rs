@@ -32,8 +32,8 @@ fn replace_keyspaces_bumps_load_generation() {
     dbs.replace_keyspaces_from(&scratch);
     assert!(!dbs.load_in_progress());
     let g1 = dbs.load_generation();
-    // start + end each bump once
-    assert_eq!(g1, g0 + 2, "expected start+end bumps, g0={g0} g1={g1}");
+    // Batch DR: single publish at end of replace (gen frozen during install).
+    assert_eq!(g1, g0 + 1, "expected single end bump, g0={g0} g1={g1}");
     assert_eq!(
         dbs.get(0)
             .unwrap()

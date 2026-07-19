@@ -578,7 +578,8 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P1]`** **Code review (CB post-ship):** multi-DB `replace_keyspaces_from` is not atomic across DBs
   - *Found*: commits one DB at a time; concurrent readers (FULLRESYNC) can see DB0 new + DB1 old; panic mid-loop leaves partial multi-DB commit.
   - *Mitigated (CC–CK)*: staged drain; no multi-DB pre-flush; `load_generation` / `load_in_progress`; Redis-style **`-LOADING`** for data-plane commands during replace; INFO `loading:`.
-  - *Accepted residual*: true lock-step atomic install of all DBs in one publish (no mid-loop torn maps even for privileged paths) remains a future design if needed. Documented in `docs/locking.md` + roadmap.
+  - *Done (Batch DR — Option B lock-step)*: after staging, install **all** DBs under one `keyspace_epoch_lock` write; multi-DB exporters use `with_stable_keyspace_view` (epoch read) — `MultiDbSnapshot::from_databases` wired; `load_generation` single end publish (frozen mid-install). Tests: `tests/dr_multidb_atomic_install_test.rs` (exclusion, concurrent non-torn export, raw-Arc residual, gen freeze).
+  - *Residual*: panic mid-install still partial commit; raw `Arc<Cache>` without epoch lock can still observe mid-loop tear; single-DB mid-`install_keyspace_payload` map tear for allowlisted probes. Not Arc-swap of the DB vector (Option C).
 - [x] **`[P2]`** **Code review (CP post-ship):** LOADING allowlist still runs `PSYNC`/`SYNC`/`CONFIG` during replace
   - *Found*: `loading_denied` allowed `INFO`/`ROLE`/`REPLCONF`/`PSYNC`/`SYNC`/`CLIENT`/`CONFIG`/`MODULE` (and auth/admin probes). Full sync snapshots live multi-DB maps and can observe mid-`install_keyspace_payload` torn state (strings filled, typed maps empty, counters not yet installed). Data plane is correctly gated.
   - *Done (Batch CR)*: deny `SYNC`/`PSYNC` during `load_in_progress` (`-LOADING`); keep allowlist for connection/discovery/repl handshake (`AUTH`/`HELLO`/`PING`/`ECHO`/`QUIT`/`RESET`/`INFO`/`COMMAND`/`ROLE`/`REPLCONF`/`CLIENT`/`CONFIG`/`MODULE`). `CONFIG` left allowed (ops/live params; no keyspace snapshot). Docs: `docs/locking.md` Keyspace replace. Tests: `tests/ck_loading_gate_test.rs`.
@@ -652,7 +653,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batches CZ–DQ shipped** (… **DM** `CLUSTER RESHARD`; **DN** dual-end NODE verify+retry + FINISH; **DO** partial `failed_keys` + range abort-on-partial + FINISH warning; **DP** Redis key-level `MIGRATE` via shared recreate path; **DQ** MIGRATE partial counts + typed TTL transfer — still not 2PC). **Open next:** true 2PC dual-end / epoch gossip / reshard planner; multi-DB true atomic install; string-only UI repaint residual; standing tests-for-phase P0.
+Prioritized for next letter batch(es). **Batches CZ–DR shipped** (… **DQ** MIGRATE partial counts + typed TTL; **DR** multi-DB lock-step install / epoch barrier). **Open next:** true 2PC dual-end / epoch gossip / reshard planner; multi-DB panic rollback / Arc-swap (DR residual); string-only UI repaint residual; standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -668,7 +669,7 @@ Prioritized for next letter batch(es). **Batches CZ–DQ shipped** (… **DM** `
 | P1 | RDB load `flush=true` must wipe FT schema (BY×BX clash) | done (BZ) |
 | P1 | CB: full keyspace swap under quiesce (typed maps, expires, watch) | done (CB) |
 | P1 | CB: `Cache.memory_usage` + tracker paired install (no double-account) | done (CB) |
-| P1 | CB post-ship: multi-DB replace atomic / server-wide quiesce | done mitigated (CO; residual design open) |
+| P1 | CB post-ship: multi-DB replace atomic / server-wide quiesce | done (DR lock-step epoch; panic/raw-Arc residual) |
 | P1 | CF post-ship: FT merge compare schema on name clash (not name-only skip) | done (CG) |
 | P1 | CF post-ship: FT alias merge compare targets on clash | done (CG) |
 | P1 | CB post-ship: bump `watch_gens` on keyspace replace | done (CC+CD) |
