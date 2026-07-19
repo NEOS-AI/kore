@@ -1,8 +1,8 @@
-//! CLUSTER and ASKING command handlers (Redis Cluster MVP + MEET/gossip + MIGRATEKEYS).
+//! CLUSTER and ASKING command handlers (Redis Cluster MVP + MEET/gossip + MIGRATEKEYS/RESHARD).
 
 use super::CommandHandler;
 use crate::cluster::{
-    key_hash_slot, meet_peer, migrate_slot_keys, ClusterState, SLOT_COUNT,
+    key_hash_slot, meet_peer, migrate_slot_keys, reshard_slots, ClusterState, SLOT_COUNT,
 };
 use crate::error::Result;
 use crate::protocol::RespValue;
@@ -26,7 +26,7 @@ impl CommandHandler {
     }
 
     /// CLUSTER subcommands: KEYSLOT, MYID, INFO, NODES, SLOTS, SETSLOT,
-    /// MIGRATEKEYS, MEET, MEETPEER, REPLICATE, HELP.
+    /// MIGRATEKEYS, RESHARD, MEET, MEETPEER, REPLICATE, HELP.
     pub(super) async fn handle_cluster(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.is_empty() {
             return Ok(RespValue::error(
@@ -104,6 +104,7 @@ impl CommandHandler {
                 self.handle_cluster_migratekeys(cluster, &args[1..])
                     .await
             }
+            "RESHARD" => self.handle_cluster_reshard(cluster, &args[1..]).await,
             "MEET" => self.handle_cluster_meet(cluster, &args[1..]).await,
             "MEETPEER" => self.handle_cluster_meetpeer(cluster, &args[1..]),
             "REPLICATE" => self.handle_cluster_replicate(cluster, &args[1..]),
@@ -159,6 +160,65 @@ impl CommandHandler {
                 let _ = r.skipped;
                 Ok(RespValue::Integer(r.migrated as i64))
             }
+            Err(e) => Ok(RespValue::error(e)),
+        }
+    }
+
+    /// CLUSTER RESHARD <slot> <dest-node-id>
+    /// CLUSTER RESHARD <start-slot> <end-slot> <dest-node-id>
+    ///
+    /// Source-side orchestration of the thin reshard flow for one slot or an
+    /// inclusive range. Dual-end `SETSLOT NODE` is best-effort (not atomic).
+    /// Reply: array of per-slot field arrays (slot/migrated/skipped/source_node/
+    /// dest_node/status). See `ReshardSlotResult`.
+    async fn handle_cluster_reshard(
+        &self,
+        cluster: &ClusterState,
+        args: &[RespValue],
+    ) -> Result<RespValue> {
+        let (start, end, dest_id) = match args.len() {
+            2 => {
+                let slot = match self.parse_integer(&args[0]) {
+                    Ok(s) if s >= 0 && s < SLOT_COUNT as i64 => s as u16,
+                    _ => return Ok(RespValue::error("ERR Invalid or out of range slot")),
+                };
+                let dest_id = match args[1].as_bulk_string() {
+                    Some(b) => String::from_utf8_lossy(b).into_owned(),
+                    None => return Ok(RespValue::error("ERR invalid dest node id")),
+                };
+                (slot, slot, dest_id)
+            }
+            3 => {
+                let start = match self.parse_integer(&args[0]) {
+                    Ok(s) if s >= 0 && s < SLOT_COUNT as i64 => s as u16,
+                    _ => return Ok(RespValue::error("ERR Invalid or out of range start slot")),
+                };
+                let end = match self.parse_integer(&args[1]) {
+                    Ok(s) if s >= 0 && s < SLOT_COUNT as i64 => s as u16,
+                    _ => return Ok(RespValue::error("ERR Invalid or out of range end slot")),
+                };
+                if start > end {
+                    return Ok(RespValue::error(
+                        "ERR start slot must be <= end slot",
+                    ));
+                }
+                let dest_id = match args[2].as_bulk_string() {
+                    Some(b) => String::from_utf8_lossy(b).into_owned(),
+                    None => return Ok(RespValue::error("ERR invalid dest node id")),
+                };
+                (start, end, dest_id)
+            }
+            _ => {
+                return Ok(RespValue::error(
+                    "ERR wrong number of arguments for 'cluster|reshard' command",
+                ))
+            }
+        };
+
+        match reshard_slots(&self.cache, cluster, start, end, &dest_id).await {
+            Ok(results) => Ok(RespValue::Array(
+                results.iter().map(|r| r.to_resp_array()).collect(),
+            )),
             Err(e) => Ok(RespValue::error(e)),
         }
     }
@@ -357,6 +417,9 @@ fn cluster_help() -> RespValue {
         bulk_static(b"SLOTS -- slot ranges owned by nodes"),
         bulk_static(b"SETSLOT <slot> MIGRATING|IMPORTING|STABLE|NODE [node-id]"),
         bulk_static(b"MIGRATEKEYS <slot> <ip> <port> -- move keys in slot to dest"),
+        bulk_static(
+            b"RESHARD <slot> <node-id> | <start> <end> <node-id> -- orchestrate migrate + dual-end NODE (best-effort)",
+        ),
         bulk_static(b"MEET <ip> <port> -- introduce peer into the cluster"),
         bulk_static(b"REPLICATE <node-id> -- become replica of node"),
         bulk_static(b"HELP -- print this help"),

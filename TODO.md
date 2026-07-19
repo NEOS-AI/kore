@@ -291,7 +291,8 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P1]`** Resharding / slot migration (thin MVP)
   - *Done*: `keys_in_slot` / `string_keys_in_slot`; `CLUSTER MIGRATEKEYS <slot> <ip> <port>` moves **all key types** via RESP (ASKING + type-specific recreate + DEL: SET/HSET/RPUSH/SADD/ZADD/GEOADD/XADD+groups); SETSLOT MIGRATING/IMPORTING/NODE/STABLE operator flow; MIGRATING miss → ASK; final NODE → MOVED.
   - *Done (Batch Y)*: multi-type MIGRATEKEYS (string/hash/list/set/zset/geo/stream)
-  - *Gaps*: no atomic dual-end NODE, no Redis `MIGRATE`/`CLUSTER SETSLOT` batch orchestration, no slot-stable epoch gossip of ownership.
+  - *Done (Batch DM)*: `CLUSTER RESHARD <slot> <dest-id>` / `CLUSTER RESHARD <start> <end> <dest-id>` — source-side orchestration of dest IMPORTING → source MIGRATING → MIGRATEKEYS → best-effort dual-end `SETSLOT NODE`. Reply is per-slot field arrays (`migrated` / `source_node` / `dest_node` / `status`). Hard key-move failures leave MIGRATING/IMPORTING for retry; dual-end NODE is **not atomic** (`partial_dest_node` / `partial_source_node` / `failed_*` statuses). Range aborts further slots after first `failed_*`. Prep step best-effort `SETSLOT NODE <source>` on dest before IMPORTING.
+  - *Gaps*: dual-end NODE still not atomic / no 2PC; no Redis `MIGRATE` command (key-level); no slot-stable epoch gossip of ownership; no full redis-cli-style interactive reshard planner; no multi-node quorum view of topology after reshard.
 
 ### Protocol & clients
 
@@ -635,7 +636,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batches CZ–DL shipped** (… DI noscript-only meta-refresh + numeric cell coerce; DJ shared admin_http 405/request-line; DK HNSW tighter recall + ignored larger-N median bench; DL r@10 headroom + post-churn recall + admin_http request-line async tests + 404-vs-405 docs). **Open next (after DI–DL code review):** string-only deadlock UI repaint residual (no browser harness); multi-DB true atomic install redesign; cluster automatic reshard; standing tests-for-phase P0.
+Prioritized for next letter batch(es). **Batches CZ–DM shipped** (… DL r@10 headroom + post-churn recall + admin_http request-line async tests + 404-vs-405 docs; **DM** `CLUSTER RESHARD` source-side orchestration + dual-end NODE best-effort + range + honest partial statuses). **Open next:** string-only deadlock UI repaint residual (no browser harness); multi-DB true atomic install redesign; cluster reshard residuals (atomic dual-end / epoch gossip / Redis MIGRATE); standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|

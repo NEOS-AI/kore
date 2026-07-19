@@ -6,11 +6,16 @@
 //! 3. source: CLUSTER MIGRATEKEYS <s> <dest-ip> <dest-port>
 //! 4. both:   CLUSTER SETSLOT <s> NODE <dest-id>
 //!
+//! `CLUSTER RESHARD` runs steps 1–4 on the source for one slot or an inclusive
+//! range. Dual-end NODE is **best-effort** (not atomic across nodes). Partial
+//! failures leave honest status fields so operators can finish with SETSLOT.
+//!
 //! Supports string, hash, list, set, zset, geo, and stream keys. Dest writes use
 //! ASKING so IMPORTING slots accept the transfer. Complex types are recreated
 //! with the same RESP commands as AOF rewrite (no DUMP/RESTORE).
 
 use super::crc16::{key_hash_slot, SLOT_COUNT};
+use super::state::ClusterState;
 use crate::cache::{Cache, KeyType};
 use crate::entry::LoadOptions;
 use crate::protocol::{RespParser, RespValue};
@@ -30,6 +35,43 @@ pub struct MigrateSlotResult {
     pub migrated: usize,
     /// Keys skipped (gone mid-flight, empty, or unsupported).
     pub skipped: usize,
+}
+
+/// Outcome of orchestrated reshard for one slot (`CLUSTER RESHARD`).
+///
+/// Dual-end ownership is not atomic: `source_node` / `dest_node` report each
+/// side's `SETSLOT NODE` independently. `status` summarizes recovery needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReshardSlotResult {
+    pub slot: u16,
+    pub migrated: usize,
+    pub skipped: usize,
+    /// `"ok"` or error text for local `SETSLOT NODE <dest>`.
+    pub source_node: String,
+    /// `"ok"` or error text for remote `SETSLOT NODE <dest>`.
+    pub dest_node: String,
+    /// `complete` | `partial_dest_node` | `partial_source_node` | `failed_*`
+    pub status: String,
+}
+
+impl ReshardSlotResult {
+    /// RESP2 array of flat field pairs for operator introspection.
+    pub fn to_resp_array(&self) -> RespValue {
+        RespValue::Array(vec![
+            bulk_static(b"slot"),
+            RespValue::Integer(self.slot as i64),
+            bulk_static(b"migrated"),
+            RespValue::Integer(self.migrated as i64),
+            bulk_static(b"skipped"),
+            RespValue::Integer(self.skipped as i64),
+            bulk_static(b"source_node"),
+            bulk_owned(self.source_node.clone()),
+            bulk_static(b"dest_node"),
+            bulk_owned(self.dest_node.clone()),
+            bulk_static(b"status"),
+            bulk_owned(self.status.clone()),
+        ])
+    }
 }
 
 /// Back-compat alias field name used by older call sites.
@@ -451,6 +493,232 @@ pub async fn migrate_slot_string_keys(
     migrate_slot_keys(cache, slot, dest_ip, dest_port).await
 }
 
+/// Orchestrate the documented 4-step reshard for slots `start..=end` to `dest_node_id`.
+///
+/// Runs on the **source** (this node must own each slot). For every slot:
+/// 0. Best-effort: dest `SETSLOT NODE <source-id>` so dest does not claim ownership
+/// 1. dest `SETSLOT IMPORTING <source-id>`
+/// 2. source `SETSLOT MIGRATING <dest-id>`
+/// 3. `MIGRATEKEYS` (all types)
+/// 4. source then dest `SETSLOT NODE <dest-id>` (best-effort dual-end; not atomic)
+///
+/// On key-move failure the slot is left MIGRATING/IMPORTING for operator recovery.
+/// Dual-end NODE failures are reported in `ReshardSlotResult` rather than rolled back.
+pub async fn reshard_slots(
+    cache: &Cache,
+    cluster: &ClusterState,
+    start: u16,
+    end: u16,
+    dest_node_id: &str,
+) -> Result<Vec<ReshardSlotResult>, String> {
+    if start > end || end >= SLOT_COUNT {
+        return Err(format!(
+            "ERR Invalid or out of range slot range: {}-{}",
+            start, end
+        ));
+    }
+    if dest_node_id == cluster.my_id() {
+        return Err("ERR CLUSTER RESHARD destination cannot be myself".into());
+    }
+    let dest = cluster.get_node(dest_node_id).ok_or_else(|| {
+        format!(
+            "ERR CLUSTER RESHARD I don't know about node {}",
+            dest_node_id
+        )
+    })?;
+    if dest.fail {
+        return Err(format!(
+            "ERR CLUSTER RESHARD destination node {} is marked fail",
+            dest_node_id
+        ));
+    }
+
+    let mut out = Vec::with_capacity((end - start + 1) as usize);
+    for slot in start..=end {
+        // Hard stop on slots we do not own (before mutating remote state).
+        if !cluster.owns_slot(slot) {
+            return Err(format!(
+                "ERR I'm not the owner of hash slot {} (cannot RESHARD)",
+                slot
+            ));
+        }
+        match reshard_one_slot(cache, cluster, slot, dest_node_id, &dest.ip, dest.port).await {
+            Ok(r) => {
+                let hard_fail = r.status.starts_with("failed_");
+                out.push(r);
+                // Abort remaining slots after a hard orchestration failure so
+                // operators can fix topology without cascading IMPORTING marks.
+                if hard_fail {
+                    break;
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+
+/// Single-slot convenience wrapper.
+pub async fn reshard_slot(
+    cache: &Cache,
+    cluster: &ClusterState,
+    slot: u16,
+    dest_node_id: &str,
+) -> Result<ReshardSlotResult, String> {
+    let mut v = reshard_slots(cache, cluster, slot, slot, dest_node_id).await?;
+    v.pop()
+        .ok_or_else(|| "ERR CLUSTER RESHARD internal: empty result".to_string())
+}
+
+async fn reshard_one_slot(
+    cache: &Cache,
+    cluster: &ClusterState,
+    slot: u16,
+    dest_node_id: &str,
+    dest_ip: &str,
+    dest_port: u16,
+) -> Result<ReshardSlotResult, String> {
+    let source_id = cluster.my_id();
+    let slot_s = slot.to_string();
+
+    let mut stream = match connect_dest(dest_ip, dest_port).await {
+        Ok(s) => s,
+        Err(e) => {
+            return Ok(ReshardSlotResult {
+                slot,
+                migrated: 0,
+                skipped: 0,
+                source_node: "n/a".into(),
+                dest_node: "n/a".into(),
+                status: format!("failed_connect:{}", e),
+            });
+        }
+    };
+
+    // Step 0: align dest ownership away from dest (best-effort) so clients hitting
+    // dest get MOVED to source until final NODE. Ignore errors if already aligned.
+    let _ = dest_setslot(
+        &mut stream,
+        &["CLUSTER", "SETSLOT", &slot_s, "NODE", &source_id],
+    )
+    .await;
+
+    // Step 1: dest IMPORTING <source>
+    if let Err(e) = dest_setslot(
+        &mut stream,
+        &["CLUSTER", "SETSLOT", &slot_s, "IMPORTING", &source_id],
+    )
+    .await
+    {
+        return Ok(ReshardSlotResult {
+            slot,
+            migrated: 0,
+            skipped: 0,
+            source_node: "n/a".into(),
+            dest_node: "n/a".into(),
+            status: format!("failed_importing:{}", e),
+        });
+    }
+
+    // Step 2: source MIGRATING <dest>
+    if let Err(e) = cluster.set_migrating(slot, dest_node_id) {
+        // Best-effort clear dest IMPORTING so we do not leave a dangling import.
+        let _ = dest_setslot(&mut stream, &["CLUSTER", "SETSLOT", &slot_s, "STABLE"]).await;
+        return Ok(ReshardSlotResult {
+            slot,
+            migrated: 0,
+            skipped: 0,
+            source_node: "n/a".into(),
+            dest_node: "n/a".into(),
+            status: format!("failed_migrating:{}", e),
+        });
+    }
+
+    // Drop the control connection before key migrate (migrate opens its own).
+    drop(stream);
+
+    // Step 3: move keys
+    let key_result = match migrate_slot_keys(cache, slot, dest_ip, dest_port).await {
+        Ok(r) => r,
+        Err(e) => {
+            // Leave MIGRATING / IMPORTING for operator retry (MIGRATEKEYS / SETSLOT).
+            return Ok(ReshardSlotResult {
+                slot,
+                migrated: 0,
+                skipped: 0,
+                source_node: "n/a".into(),
+                dest_node: "n/a".into(),
+                status: format!("failed_keys:{}", strip_err_prefix(&e)),
+            });
+        }
+    };
+
+    // Step 4a: source SETSLOT NODE <dest> (local, synchronous)
+    let source_node = match cluster.set_node(slot, dest_node_id) {
+        Ok(()) => "ok".to_string(),
+        Err(e) => e,
+    };
+
+    // Step 4b: dest SETSLOT NODE <dest> (remote, best-effort)
+    let dest_node = match connect_dest(dest_ip, dest_port).await {
+        Ok(mut stream) => match dest_setslot(
+            &mut stream,
+            &["CLUSTER", "SETSLOT", &slot_s, "NODE", dest_node_id],
+        )
+        .await
+        {
+            Ok(()) => "ok".to_string(),
+            Err(e) => e,
+        },
+        Err(e) => format!("connect:{}", e),
+    };
+
+    let status = match (source_node.as_str(), dest_node.as_str()) {
+        ("ok", "ok") => "complete".to_string(),
+        ("ok", _) => "partial_dest_node".to_string(),
+        (_, "ok") => "partial_source_node".to_string(),
+        _ => "partial_both_node".to_string(),
+    };
+
+    Ok(ReshardSlotResult {
+        slot,
+        migrated: key_result.migrated,
+        skipped: key_result.skipped,
+        source_node,
+        dest_node,
+        status,
+    })
+}
+
+fn strip_err_prefix(e: &str) -> &str {
+    e.strip_prefix("ERR ").unwrap_or(e)
+}
+
+async fn connect_dest(dest_ip: &str, dest_port: u16) -> Result<TcpStream, String> {
+    let addr = format!("{}:{}", dest_ip, dest_port);
+    match tokio::time::timeout(MIGRATE_IO_TIMEOUT, TcpStream::connect(&addr)).await {
+        Ok(Ok(s)) => {
+            let _ = s.set_nodelay(true);
+            Ok(s)
+        }
+        Ok(Err(e)) => Err(format!("unable to connect to {}: {}", addr, e)),
+        Err(_) => Err(format!("timed out connecting to {}", addr)),
+    }
+}
+
+async fn dest_setslot(stream: &mut TcpStream, parts: &[&str]) -> Result<(), String> {
+    let args: Vec<RespValue> = parts
+        .iter()
+        .map(|p| RespValue::BulkString(Some(Bytes::from(p.to_string()))))
+        .collect();
+    match resp_command_bytes(stream, &args, MIGRATE_IO_TIMEOUT).await {
+        Ok(RespValue::SimpleString(s)) if s.as_ref() == b"OK" => Ok(()),
+        Ok(RespValue::Error(e)) => Err(String::from_utf8_lossy(&e).into_owned()),
+        Ok(other) => Err(format!("unexpected SETSLOT reply: {:?}", other)),
+        Err(e) => Err(e),
+    }
+}
+
 fn bulk_static(s: &'static [u8]) -> RespValue {
     RespValue::BulkString(Some(Bytes::from_static(s)))
 }
@@ -495,6 +763,33 @@ async fn resp_command_bytes(
 mod tests {
     use super::*;
     use crate::entry::StoreOptions;
+
+    #[test]
+    fn reshard_result_resp_array_fields() {
+        let r = ReshardSlotResult {
+            slot: 12182,
+            migrated: 3,
+            skipped: 1,
+            source_node: "ok".into(),
+            dest_node: "connect:timeout".into(),
+            status: "partial_dest_node".into(),
+        };
+        match r.to_resp_array() {
+            RespValue::Array(a) => {
+                assert_eq!(a.len(), 12);
+                assert_eq!(a[1], RespValue::Integer(12182));
+                assert_eq!(a[3], RespValue::Integer(3));
+                assert_eq!(a[5], RespValue::Integer(1));
+                match &a[11] {
+                    RespValue::BulkString(Some(b)) => {
+                        assert_eq!(b.as_ref(), b"partial_dest_node");
+                    }
+                    other => panic!("{:?}", other),
+                }
+            }
+            other => panic!("{:?}", other),
+        }
+    }
 
     #[test]
     fn keys_in_slot_filters_by_crc16() {

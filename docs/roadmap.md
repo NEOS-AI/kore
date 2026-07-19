@@ -26,7 +26,8 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Cluster (kore cluster) — MVP: hash slots + MOVED/CROSSSLOT/ASK + CLUSTER/ASKING stubs (single-node)
 - [x] Cluster gossip / membership + thin failover (RESP MEET/PING, single-observer fail, replica claim slots)
 - [x] Cluster thin slot reshard (`CLUSTER MIGRATEKEYS` multi-type keys + SETSLOT operator flow)
-- [ ] Cluster automatic reshard / full multi-type MIGRATE orchestration
+- [x] Cluster reshard orchestration slice (Batch DM: `CLUSTER RESHARD` source-side 4-step flow + range; dual-end NODE best-effort, not atomic)
+- [ ] Cluster automatic reshard / full multi-type MIGRATE orchestration (residuals: atomic dual-end NODE / epoch ownership gossip / Redis `MIGRATE` / planner)
 - [x] 데드락 감지 고급 기능
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원
