@@ -293,19 +293,16 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch Y)*: multi-type MIGRATEKEYS (string/hash/list/set/zset/geo/stream)
   - *Done (Batch DM)*: `CLUSTER RESHARD <slot> <dest-id>` / `CLUSTER RESHARD <start> <end> <dest-id>` — source-side orchestration of dest IMPORTING → source MIGRATING → MIGRATEKEYS → best-effort dual-end `SETSLOT NODE`. Reply is per-slot field arrays (`migrated` / `source_node` / `dest_node` / `status`). Hard key-move failures leave MIGRATING/IMPORTING for retry; dual-end NODE is **not atomic** (`partial_dest_node` / `partial_source_node` / `failed_*` statuses). Range aborts further slots after first `failed_*`. Prep step best-effort `SETSLOT NODE <source>` on dest before IMPORTING.
   - *Done (Batch DN)*: dual-end `SETSLOT NODE` **verify + retry** (up to 3 attempts/side, short backoff; local `owner_of` + remote `CLUSTER SLOTS` check). Shared path `finish_slot_node` + operator `CLUSTER RESHARD FINISH <slot> <dest-id>` completes NODE only (no key re-migrate) after `partial_*_node`. Still **not** atomic / no 2PC — statuses stay honest. Tests: happy path, inject-1 retry→complete, inject-exhaust→partial_dest_node then FINISH recovery.
-  - *Gaps*: dual-end NODE still not atomic / no 2PC; no Redis `MIGRATE` command (key-level); no slot-stable epoch gossip of ownership; no full redis-cli-style interactive reshard planner; no multi-node quorum view of topology after reshard.
-  - [ ] **`[P2]`** **Code review (DM/DN post-ship):** `failed_keys` under-reports partial key moves
-    - *Found*: `migrate_slot_keys` deletes source keys as each key succeeds; on mid-slot `Err`, earlier keys already live on dest. `reshard_one_slot` maps that path to `migrated: 0` / `skipped: 0` always — operators cannot see how many keys already moved. Slot may be split across nodes under MIGRATING/IMPORTING.
-    - *Next*: plumb partial counts from migrate (or count remaining `keys_in_slot` on fail); surface in `ReshardSlotResult`; document retry = re-run MIGRATEKEYS/RESHARD for leftover keys only.
-  - [ ] **`[P3]`** **Code review (DN post-ship):** source NODE before dest NODE creates client window
-    - *Found*: `dual_end_setslot_node` sets local owner to dest first, then remote. Between success and dest NODE, clients get MOVED to dest while dest may still be IMPORTING (ASK-only) — transient unavailability under `partial_dest_node`. Retries help transient errors; permanent dest failure needs FINISH or manual SETSLOT.
-    - *Next*: document window; optional dest-first NODE order experiment; or hold source MOVED until dest verify (harder with Redis client expectations).
-  - [ ] **`[P3]`** **Code review (DM post-ship):** range RESHARD continues after `partial_*_node`
-    - *Found*: range aborts only when `status.starts_with("failed_")`. A `partial_dest_node` mid-range still proceeds to later slots — mixed complete/partial ownership without hard stop.
-    - *Next*: optional abort-on-partial flag or treat partial as hard stop for ranges; document operator expectation.
-  - [ ] **`[P3]`** **Code review (DN post-ship nit):** `RESHARD FINISH` does not check key placement
-    - *Found*: FINISH only dual-end NODE; no assert that source slot is empty / dest has keys. Safe if called only after successful key move, dangerous if used after `failed_keys` without re-migrate.
-    - *Next*: docs warn; optional soft check `keys_in_slot` on source and warn in reply.
+  - *Done (Batch DO)*: `MigrateSlotError` carries partial `migrated`/`skipped`; RESHARD `failed_keys` surfaces real counts; retry = leftover source keys only (docs + e2e). Range aborts on any non-`complete` (incl. `partial_*_node`). FINISH soft-checks `keys_in_slot` → optional `warning` field (does not hard-block). Source-before-dest NODE client window documented in rustdoc (order unchanged).
+  - *Gaps*: dual-end NODE still not atomic / no 2PC; no Redis `MIGRATE` command (key-level); no slot-stable epoch gossip of ownership; no full redis-cli-style interactive reshard planner; no multi-node quorum view of topology after reshard; source-before-dest NODE order residual (documented; dest-first experiment not done).
+  - [x] **`[P2]`** **Code review (DM/DN post-ship):** `failed_keys` under-reports partial key moves
+    - *Done (Batch DO)*: `migrate_slot_keys` → `Result<_, MigrateSlotError { partial, message }>`; `reshard_one_slot` maps partial into `ReshardSlotResult.migrated/skipped` under `failed_keys:*`. Retry re-runs MIGRATEKEYS/RESHARD for leftover keys only. Test: inject mid-slot fail after 1 success → `migrated: 1` + retry completes.
+  - [x] **`[P3]`** **Code review (DN post-ship):** source NODE before dest NODE creates client window
+    - *Done (docs, Batch DO)*: module + `dual_end_setslot_node` rustdoc describe MOVED-to-IMPORTING window under `partial_dest_node`. Code order left source-first (Redis client expectations); dest-first / 2PC still open under gaps.
+  - [x] **`[P3]`** **Code review (DM post-ship):** range RESHARD continues after `partial_*_node`
+    - *Done (Batch DO)*: abort-on-partial — range stops when `status != "complete"` (`failed_*` or `partial_*`). Test: inject dest NODE exhaust on first of two empty slots → one result, second slot still owned by source.
+  - [x] **`[P3]`** **Code review (DN post-ship nit):** `RESHARD FINISH` does not check key placement
+    - *Done (Batch DO)*: soft-check `keys_in_slot` on source; when non-empty, reply includes `warning` (ownership still applied — no hard-block). Docs: re-run MIGRATEKEYS after `failed_keys` before FINISH.
 
 ### Protocol & clients
 
@@ -649,7 +646,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batches CZ–DN shipped** (… **DM** `CLUSTER RESHARD` source-side orchestration + dual-end NODE best-effort + range + honest partial statuses; **DN** dual-end NODE verify+retry + `CLUSTER RESHARD FINISH` recovery — still not 2PC). **Open next (after DM/DN code review):** P2 `failed_keys` partial-count under-report; DN source-before-dest NODE client window; DM range continues on `partial_*`; FINISH key-placement check; true 2PC dual-end / epoch gossip / Redis MIGRATE / planner; multi-DB true atomic install; string-only UI repaint residual; standing tests-for-phase P0.
+Prioritized for next letter batch(es). **Batches CZ–DO shipped** (… **DM** `CLUSTER RESHARD` orchestration; **DN** dual-end NODE verify+retry + FINISH; **DO** partial `failed_keys` counts + range abort-on-partial + FINISH key warning + source-before-dest NODE docs — still not 2PC). **Open next:** true 2PC dual-end / epoch gossip / Redis MIGRATE / planner; multi-DB true atomic install; string-only UI repaint residual; standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -723,10 +720,10 @@ Prioritized for next letter batch(es). **Batches CZ–DN shipped** (… **DM** `
 | P3 | DF post-ship: JS poll only updates badge | done (DH; full table/stats/cycle repaint) |
 | P3 | DH post-ship: dual meta+JSON refresh when JS enabled | done (DI; meta in `<noscript>`) |
 | P3 | DH post-ship nit: coerce/escape numeric JS table cells | done (DI; `num()` / Number) |
-| P2 | DM/DN post-ship: failed_keys under-reports partial key moves | open |
-| P3 | DN post-ship: source NODE before dest creates MOVED window | open |
-| P3 | DM post-ship: range RESHARD continues after partial_*_node | open |
-| P3 | DN post-ship nit: RESHARD FINISH no key-placement check | open |
+| P2 | DM/DN post-ship: failed_keys under-reports partial key moves | done (DO) |
+| P3 | DN post-ship: source NODE before dest creates MOVED window | done docs (DO; order residual) |
+| P3 | DM post-ship: range RESHARD continues after partial_*_node | done (DO abort-on-partial) |
+| P3 | DN post-ship nit: RESHARD FINISH no key-placement check | done (DO soft warning) |
 | P3 | DH post-ship nit: repaint test is string-contains only | open (residual; no browser harness) |
 | P3 | DF post-ship: HTTP MVP gaps shared with metrics | done (DJ; shared admin_http) |
 | P3 | DK post-ship: thin r@10 headroom / cross-arch flake risk | done (DL; r@10 0.95→0.93) |

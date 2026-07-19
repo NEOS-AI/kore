@@ -161,7 +161,9 @@ impl CommandHandler {
                 let _ = r.skipped;
                 Ok(RespValue::Integer(r.migrated as i64))
             }
-            Err(e) => Ok(RespValue::error(e)),
+            // Message only: integer reply has no room for partial counts.
+            // Use CLUSTER RESHARD for honest migrated/skipped on failed_keys.
+            Err(e) => Ok(RespValue::error(e.message)),
         }
     }
 
@@ -172,9 +174,13 @@ impl CommandHandler {
     /// Source-side orchestration of the thin reshard flow for one slot or an
     /// inclusive range. Dual-end `SETSLOT NODE` is best-effort with verify+retry
     /// (still not atomic / no 2PC). `FINISH` only runs dual-end NODE (no key move)
-    /// so operators can complete `partial_*_node` without re-migrating.
+    /// so operators can complete `partial_*_node` without re-migrating; soft-warns
+    /// when the source still holds keys in the slot. Multi-slot ranges abort after
+    /// the first non-`complete` status (`failed_*` or `partial_*`). On
+    /// `failed_keys`, `migrated`/`skipped` report partial progress — retry moves
+    /// leftover source keys only.
     /// Reply: array of per-slot field arrays (slot/migrated/skipped/source_node/
-    /// dest_node/status). See `ReshardSlotResult`.
+    /// dest_node/status[/warning]). See `ReshardSlotResult`.
     async fn handle_cluster_reshard(
         &self,
         cluster: &ClusterState,
@@ -198,7 +204,7 @@ impl CommandHandler {
                         Some(b) => String::from_utf8_lossy(b).into_owned(),
                         None => return Ok(RespValue::error("ERR invalid dest node id")),
                     };
-                    return match finish_slot_node(cluster, slot, &dest_id).await {
+                    return match finish_slot_node(&self.cache, cluster, slot, &dest_id).await {
                         Ok(r) => Ok(RespValue::Array(vec![r.to_resp_array()])),
                         Err(e) => Ok(RespValue::error(e)),
                     };
@@ -448,10 +454,10 @@ fn cluster_help() -> RespValue {
         bulk_static(b"SETSLOT <slot> MIGRATING|IMPORTING|STABLE|NODE [node-id]"),
         bulk_static(b"MIGRATEKEYS <slot> <ip> <port> -- move keys in slot to dest"),
         bulk_static(
-            b"RESHARD <slot> <node-id> | <start> <end> <node-id> -- orchestrate migrate + dual-end NODE (verify+retry, not atomic)",
+            b"RESHARD <slot> <node-id> | <start> <end> <node-id> -- orchestrate migrate + dual-end NODE (verify+retry, not atomic; range aborts on non-complete)",
         ),
         bulk_static(
-            b"RESHARD FINISH <slot> <node-id> -- dual-end SETSLOT NODE only (recover partial_*_node)",
+            b"RESHARD FINISH <slot> <node-id> -- dual-end SETSLOT NODE only (recover partial_*_node; warns if source still has keys)",
         ),
         bulk_static(b"MEET <ip> <port> -- introduce peer into the cluster"),
         bulk_static(b"REPLICATE <node-id> -- become replica of node"),

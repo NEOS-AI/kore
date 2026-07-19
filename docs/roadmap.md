@@ -28,7 +28,8 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Cluster thin slot reshard (`CLUSTER MIGRATEKEYS` multi-type keys + SETSLOT operator flow)
 - [x] Cluster reshard orchestration slice (Batch DM: `CLUSTER RESHARD` source-side 4-step flow + range; dual-end NODE best-effort, not atomic)
 - [x] Cluster dual-end NODE harden (Batch DN: verify+retry after RESHARD; `CLUSTER RESHARD FINISH` NODE-only recovery; still not 2PC)
-- [ ] Cluster automatic reshard / full multi-type MIGRATE orchestration (residuals: true atomic dual-end NODE / epoch ownership gossip / Redis `MIGRATE` / planner)
+- [x] Cluster RESHARD honesty (Batch DO: partial `failed_keys` counts; range abort-on-partial; FINISH source-keys warning; source-before-dest NODE window docs)
+- [ ] Cluster automatic reshard / full multi-type MIGRATE orchestration (residuals: true atomic dual-end NODE / epoch ownership gossip / Redis `MIGRATE` / planner; dest-first NODE experiment optional)
 - [x] 데드락 감지 고급 기능
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원

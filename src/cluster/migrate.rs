@@ -12,6 +12,23 @@
 //! (Batch DN). Partial failures leave honest status fields; operators can
 //! complete with `CLUSTER RESHARD FINISH` or manual SETSLOT.
 //!
+//! **Partial key moves:** `migrate_slot_keys` deletes each source key only after
+//! dest accepts it. On mid-slot failure, earlier keys already live on dest;
+//! `MigrateSlotError::partial` (and RESHARD `migrated`/`skipped` under
+//! `failed_keys`) report how many succeeded. **Retry re-runs MIGRATEKEYS /
+//! RESHARD for leftover source keys only** — already-moved keys stay on dest.
+//!
+//! **Range abort:** multi-slot RESHARD stops after the first non-`complete`
+//! status (`failed_*` or `partial_*_node`) so operators do not cascade mixed
+//! ownership across a range.
+//!
+//! **Dual-end NODE order:** source applies `SETSLOT NODE <dest>` before dest.
+//! Between a successful source NODE and dest NODE, clients may receive MOVED
+//! to dest while dest is still IMPORTING (ASK-only) — a transient window under
+//! `partial_dest_node`. Retries cover blips; permanent dest failure needs
+//! `RESHARD FINISH` or manual SETSLOT. Dest-first ordering is intentionally
+//! not used (low-risk residual; Redis client expectations favor source MOVED).
+//!
 //! Supports string, hash, list, set, zset, geo, and stream keys. Dest writes use
 //! ASKING so IMPORTING slots accept the transfer. Complex types are recreated
 //! with the same RESP commands as AOF rewrite (no DUMP/RESTORE).
@@ -23,6 +40,7 @@ use crate::entry::LoadOptions;
 use crate::protocol::{RespParser, RespValue};
 use crate::stream_type::{StreamId, StreamStateSnapshot};
 use bytes::Bytes;
+use std::fmt;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -46,6 +64,12 @@ static DEST_NODE_INJECT_PORT: AtomicU16 = AtomicU16::new(0);
 
 /// Remaining forced failures for dest dual-end `SETSLOT NODE` (test hook).
 static DEST_NODE_INJECT_FAILS: AtomicU32 = AtomicU32::new(0);
+
+/// Serializes tests that inject mid-slot key-migrate failures.
+static MIGRATE_KEY_INJECT_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// Fail the next key attempt after this many successful migrations (`u32::MAX` = off).
+static MIGRATE_KEY_FAIL_AFTER: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// Guard holding exclusive access to dest-NODE failure injection.
 ///
@@ -100,6 +124,36 @@ fn take_dest_node_inject_fail(dest_port: u16) -> bool {
         .is_ok()
 }
 
+/// Guard for mid-slot key-migrate failure injection (Batch DO tests).
+///
+/// Drop disables the inject (`fail_after = u32::MAX`).
+pub struct MigrateKeyInjectGuard {
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl MigrateKeyInjectGuard {
+    /// After `n` successful key migrations, force the next key attempt to fail.
+    ///
+    /// `n = 1` → first key moves, second returns `MigrateSlotError` with
+    /// `partial.migrated == 1`.
+    pub fn fail_after_successes(&self, n: u32) {
+        MIGRATE_KEY_FAIL_AFTER.store(n, Ordering::SeqCst);
+    }
+}
+
+impl Drop for MigrateKeyInjectGuard {
+    fn drop(&mut self) {
+        MIGRATE_KEY_FAIL_AFTER.store(u32::MAX, Ordering::SeqCst);
+    }
+}
+
+/// Acquire exclusive access for mid-slot key-migrate failure injection tests.
+pub async fn test_acquire_migrate_key_inject() -> MigrateKeyInjectGuard {
+    MigrateKeyInjectGuard {
+        _lock: MIGRATE_KEY_INJECT_LOCK.lock().await,
+    }
+}
+
 /// Result of migrating keys for one slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrateSlotResult {
@@ -109,10 +163,40 @@ pub struct MigrateSlotResult {
     pub skipped: usize,
 }
 
+/// Mid-slot (or early) failure from [`migrate_slot_keys`], carrying partial progress.
+///
+/// Keys counted in `partial.migrated` already live on dest and were deleted from
+/// source. Retry only needs to move remaining source keys in the slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrateSlotError {
+    /// Progress before the failure (`migrated` / `skipped` so far).
+    pub partial: MigrateSlotResult,
+    /// Full error message (typically `ERR CLUSTER MIGRATEKEYS …`).
+    pub message: String,
+}
+
+impl fmt::Display for MigrateSlotError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for MigrateSlotError {}
+
+fn migrate_err(partial: MigrateSlotResult, message: impl Into<String>) -> MigrateSlotError {
+    MigrateSlotError {
+        partial,
+        message: message.into(),
+    }
+}
+
 /// Outcome of orchestrated reshard for one slot (`CLUSTER RESHARD`).
 ///
 /// Dual-end ownership is not atomic: `source_node` / `dest_node` report each
 /// side's `SETSLOT NODE` independently. `status` summarizes recovery needs.
+///
+/// On `failed_keys`, `migrated`/`skipped` reflect partial progress (keys already
+/// on dest). Retry MIGRATEKEYS/RESHARD moves only leftovers on source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReshardSlotResult {
     pub slot: u16,
@@ -124,12 +208,16 @@ pub struct ReshardSlotResult {
     pub dest_node: String,
     /// `complete` | `partial_dest_node` | `partial_source_node` | `failed_*`
     pub status: String,
+    /// Optional operator note (e.g. FINISH when source still holds keys in slot).
+    pub warning: Option<String>,
 }
 
 impl ReshardSlotResult {
     /// RESP2 array of flat field pairs for operator introspection.
+    ///
+    /// When [`Self::warning`] is set, appends `warning` / text after `status`.
     pub fn to_resp_array(&self) -> RespValue {
-        RespValue::Array(vec![
+        let mut fields = vec![
             bulk_static(b"slot"),
             RespValue::Integer(self.slot as i64),
             bulk_static(b"migrated"),
@@ -142,7 +230,12 @@ impl ReshardSlotResult {
             bulk_owned(self.dest_node.clone()),
             bulk_static(b"status"),
             bulk_owned(self.status.clone()),
-        ])
+        ];
+        if let Some(w) = &self.warning {
+            fields.push(bulk_static(b"warning"));
+            fields.push(bulk_owned(w.clone()));
+        }
+        RespValue::Array(fields)
     }
 }
 
@@ -440,22 +533,33 @@ fn accept_write_reply(reply: &RespValue, cmd: &str) -> Result<(), String> {
 /// 1. Snapshot local value (all types)
 /// 2. ASKING + recreate command(s) on dest
 /// 3. DEL on source after successful recreate
+///
+/// # Partial failure
+///
+/// On error after one or more keys succeeded, returns [`MigrateSlotError`] with
+/// `partial.migrated` / `partial.skipped` set to progress so far. Those migrated
+/// keys already live on dest and are gone from source. **Retry** this function
+/// (or RESHARD) for the same slot: only leftover source keys are moved again.
 pub async fn migrate_slot_keys(
     cache: &Cache,
     slot: u16,
     dest_ip: &str,
     dest_port: u16,
-) -> Result<MigrateSlotResult, String> {
+) -> Result<MigrateSlotResult, MigrateSlotError> {
+    let empty = MigrateSlotResult {
+        migrated: 0,
+        skipped: 0,
+    };
     if slot >= SLOT_COUNT {
-        return Err(format!("ERR Invalid or out of range slot: {}", slot));
+        return Err(migrate_err(
+            empty,
+            format!("ERR Invalid or out of range slot: {}", slot),
+        ));
     }
 
     let keys = keys_in_slot(cache, slot);
     if keys.is_empty() {
-        return Ok(MigrateSlotResult {
-            migrated: 0,
-            skipped: 0,
-        });
+        return Ok(empty);
     }
 
     let addr = format!("{}:{}", dest_ip, dest_port);
@@ -463,15 +567,21 @@ pub async fn migrate_slot_keys(
     {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
-            return Err(format!(
-                "ERR CLUSTER MIGRATEKEYS unable to connect to {}: {}",
-                addr, e
+            return Err(migrate_err(
+                empty,
+                format!(
+                    "ERR CLUSTER MIGRATEKEYS unable to connect to {}: {}",
+                    addr, e
+                ),
             ))
         }
         Err(_) => {
-            return Err(format!(
-                "ERR CLUSTER MIGRATEKEYS timed out connecting to {}",
-                addr
+            return Err(migrate_err(
+                empty,
+                format!(
+                    "ERR CLUSTER MIGRATEKEYS timed out connecting to {}",
+                    addr
+                ),
             ))
         }
     };
@@ -481,6 +591,17 @@ pub async fn migrate_slot_keys(
     let mut skipped = 0usize;
 
     for key in keys {
+        let progress = || MigrateSlotResult { migrated, skipped };
+
+        // Test inject: fail after N successful migrations (see MigrateKeyInjectGuard).
+        let fail_after = MIGRATE_KEY_FAIL_AFTER.load(Ordering::SeqCst);
+        if fail_after != u32::MAX && (migrated as u32) >= fail_after {
+            return Err(migrate_err(
+                progress(),
+                "ERR CLUSTER MIGRATEKEYS injected mid-slot failure",
+            ));
+        }
+
         let snap = match snapshot_key(cache, &key) {
             Some(s) => s,
             None => {
@@ -501,18 +622,29 @@ pub async fn migrate_slot_keys(
             {
                 Ok(RespValue::SimpleString(s)) if s.as_ref() == b"OK" => {}
                 Ok(RespValue::Error(e)) => {
-                    return Err(format!(
-                        "ERR CLUSTER MIGRATEKEYS ASKING failed: {}",
-                        String::from_utf8_lossy(&e)
+                    return Err(migrate_err(
+                        progress(),
+                        format!(
+                            "ERR CLUSTER MIGRATEKEYS ASKING failed: {}",
+                            String::from_utf8_lossy(&e)
+                        ),
                     ));
                 }
                 Ok(other) => {
-                    return Err(format!(
-                        "ERR CLUSTER MIGRATEKEYS unexpected ASKING reply: {:?}",
-                        other
+                    return Err(migrate_err(
+                        progress(),
+                        format!(
+                            "ERR CLUSTER MIGRATEKEYS unexpected ASKING reply: {:?}",
+                            other
+                        ),
                     ));
                 }
-                Err(e) => return Err(format!("ERR CLUSTER MIGRATEKEYS {}", e)),
+                Err(e) => {
+                    return Err(migrate_err(
+                        progress(),
+                        format!("ERR CLUSTER MIGRATEKEYS {}", e),
+                    ));
+                }
             }
 
             let cmd_name = parts
@@ -523,20 +655,26 @@ pub async fn migrate_slot_keys(
             match resp_command_bytes(&mut stream, parts, MIGRATE_IO_TIMEOUT).await {
                 Ok(reply) => {
                     if let Err(e) = accept_write_reply(&reply, &cmd_name) {
-                        return Err(format!(
-                            "{} (key={}, step={})",
-                            e,
-                            String::from_utf8_lossy(&key),
-                            i
+                        return Err(migrate_err(
+                            progress(),
+                            format!(
+                                "{} (key={}, step={})",
+                                e,
+                                String::from_utf8_lossy(&key),
+                                i
+                            ),
                         ));
                     }
                 }
                 Err(e) => {
-                    return Err(format!(
-                        "ERR CLUSTER MIGRATEKEYS {} I/O for key {}: {}",
-                        cmd_name,
-                        String::from_utf8_lossy(&key),
-                        e
+                    return Err(migrate_err(
+                        progress(),
+                        format!(
+                            "ERR CLUSTER MIGRATEKEYS {} I/O for key {}: {}",
+                            cmd_name,
+                            String::from_utf8_lossy(&key),
+                            e
+                        ),
                     ));
                 }
             }
@@ -544,9 +682,12 @@ pub async fn migrate_slot_keys(
 
         // Only delete after dest accepted the full key recreate sequence.
         if let Err(e) = cache.delete(&key) {
-            return Err(format!(
-                "ERR CLUSTER MIGRATEKEYS DEL failed after migrate: {}",
-                e
+            return Err(migrate_err(
+                progress(),
+                format!(
+                    "ERR CLUSTER MIGRATEKEYS DEL failed after migrate: {}",
+                    e
+                ),
             ));
         }
         migrated += 1;
@@ -561,7 +702,7 @@ pub async fn migrate_slot_string_keys(
     slot: u16,
     dest_ip: &str,
     dest_port: u16,
-) -> Result<MigrateSlotResult, String> {
+) -> Result<MigrateSlotResult, MigrateSlotError> {
     migrate_slot_keys(cache, slot, dest_ip, dest_port).await
 }
 
@@ -575,9 +716,13 @@ pub async fn migrate_slot_string_keys(
 /// 4. source then dest `SETSLOT NODE <dest-id>` (best-effort dual-end with verify+retry;
 ///    still not atomic / no 2PC)
 ///
-/// On key-move failure the slot is left MIGRATING/IMPORTING for operator recovery.
+/// On key-move failure the slot is left MIGRATING/IMPORTING for operator recovery;
+/// `migrated`/`skipped` on `failed_keys` report partial progress (retry leftover keys only).
 /// Dual-end NODE failures are reported in `ReshardSlotResult` rather than rolled back;
 /// use [`finish_slot_node`] / `CLUSTER RESHARD FINISH` to complete NODE without re-migrating.
+///
+/// **Range policy (Batch DO):** abort further slots on any non-`complete` status
+/// (`failed_*` **or** `partial_*_node`) so a mid-range partial does not cascade.
 pub async fn reshard_slots(
     cache: &Cache,
     cluster: &ClusterState,
@@ -618,11 +763,11 @@ pub async fn reshard_slots(
         }
         match reshard_one_slot(cache, cluster, slot, dest_node_id, &dest.ip, dest.port).await {
             Ok(r) => {
-                let hard_fail = r.status.starts_with("failed_");
+                // Abort remaining range slots after any non-complete outcome
+                // (failed_* orchestration errors or partial_* dual-end NODE).
+                let abort_range = reshard_range_should_abort(&r.status);
                 out.push(r);
-                // Abort remaining slots after a hard orchestration failure so
-                // operators can fix topology without cascading IMPORTING marks.
-                if hard_fail {
+                if abort_range {
                     break;
                 }
             }
@@ -630,6 +775,11 @@ pub async fn reshard_slots(
         }
     }
     Ok(out)
+}
+
+/// Multi-slot RESHARD stops after the first slot whose status is not `complete`.
+fn reshard_range_should_abort(status: &str) -> bool {
+    status != "complete"
 }
 
 /// Single-slot convenience wrapper.
@@ -665,6 +815,7 @@ async fn reshard_one_slot(
                 source_node: "n/a".into(),
                 dest_node: "n/a".into(),
                 status: format!("failed_connect:{}", e),
+                warning: None,
             });
         }
     };
@@ -691,6 +842,7 @@ async fn reshard_one_slot(
             source_node: "n/a".into(),
             dest_node: "n/a".into(),
             status: format!("failed_importing:{}", e),
+            warning: None,
         });
     }
 
@@ -705,24 +857,27 @@ async fn reshard_one_slot(
             source_node: "n/a".into(),
             dest_node: "n/a".into(),
             status: format!("failed_migrating:{}", e),
+            warning: None,
         });
     }
 
     // Drop the control connection before key migrate (migrate opens its own).
     drop(stream);
 
-    // Step 3: move keys
+    // Step 3: move keys (partial progress surfaced on failed_keys).
     let key_result = match migrate_slot_keys(cache, slot, dest_ip, dest_port).await {
         Ok(r) => r,
         Err(e) => {
             // Leave MIGRATING / IMPORTING for operator retry (MIGRATEKEYS / SETSLOT).
+            // Already-migrated keys live on dest; retry only leftover source keys.
             return Ok(ReshardSlotResult {
                 slot,
-                migrated: 0,
-                skipped: 0,
+                migrated: e.partial.migrated,
+                skipped: e.partial.skipped,
                 source_node: "n/a".into(),
                 dest_node: "n/a".into(),
-                status: format!("failed_keys:{}", strip_err_prefix(&e)),
+                status: format!("failed_keys:{}", strip_err_prefix(&e.message)),
+                warning: None,
             });
         }
     };
@@ -738,6 +893,7 @@ async fn reshard_one_slot(
         source_node,
         dest_node,
         status,
+        warning: None,
     })
 }
 
@@ -745,7 +901,13 @@ async fn reshard_one_slot(
 ///
 /// Operator recovery after `partial_*_node` from RESHARD (or manual SETSLOT half-done).
 /// Idempotent when both sides already own/claim `dest_node_id` for `slot`.
+///
+/// Does **not** move keys. Soft-checks `keys_in_slot` on the calling (source) node:
+/// if keys remain, sets [`ReshardSlotResult::warning`] but still applies NODE so
+/// operators can recover ownership when they know placement is intentional.
+/// Prefer re-running MIGRATEKEYS/RESHARD after `failed_keys` before FINISH.
 pub async fn finish_slot_node(
+    cache: &Cache,
     cluster: &ClusterState,
     slot: u16,
     dest_node_id: &str,
@@ -769,6 +931,16 @@ pub async fn finish_slot_node(
         ));
     }
 
+    let remaining = keys_in_slot(cache, slot).len();
+    let warning = if remaining > 0 {
+        Some(format!(
+            "source still holds {} key(s) in slot {}; FINISH only updates ownership — re-run MIGRATEKEYS/RESHARD for leftover keys before relying on placement",
+            remaining, slot
+        ))
+    } else {
+        None
+    };
+
     let (source_node, dest_node, status) =
         dual_end_setslot_node(cluster, slot, dest_node_id, &dest.ip, dest.port).await;
 
@@ -779,6 +951,7 @@ pub async fn finish_slot_node(
         source_node,
         dest_node,
         status,
+        warning,
     })
 }
 
@@ -795,6 +968,11 @@ fn summarize_dual_end_status(source_node: &str, dest_node: &str) -> String {
 /// Source + dest `SETSLOT NODE <dest>` with local/remote verify and short retries.
 ///
 /// Still **not** atomic across nodes (no 2PC). Returns `(source_node, dest_node, status)`.
+///
+/// **Order:** source NODE first, then dest. After source succeeds, clients may get
+/// MOVED to dest while dest is still IMPORTING (ASK-only) until dest NODE lands —
+/// the `partial_dest_node` window. Dest-first was considered; left source-first to
+/// match Redis operator expectations for MOVED after source ownership flip.
 async fn dual_end_setslot_node(
     cluster: &ClusterState,
     slot: u16,
@@ -1026,6 +1204,7 @@ mod tests {
             source_node: "ok".into(),
             dest_node: "connect:timeout".into(),
             status: "partial_dest_node".into(),
+            warning: None,
         };
         match r.to_resp_array() {
             RespValue::Array(a) => {
@@ -1042,6 +1221,44 @@ mod tests {
             }
             other => panic!("{:?}", other),
         }
+    }
+
+    #[test]
+    fn reshard_result_resp_includes_warning_when_set() {
+        let r = ReshardSlotResult {
+            slot: 1,
+            migrated: 0,
+            skipped: 0,
+            source_node: "ok".into(),
+            dest_node: "ok".into(),
+            status: "complete".into(),
+            warning: Some("source still holds 2 key(s)".into()),
+        };
+        match r.to_resp_array() {
+            RespValue::Array(a) => {
+                assert_eq!(a.len(), 14);
+                match &a[12] {
+                    RespValue::BulkString(Some(b)) => assert_eq!(b.as_ref(), b"warning"),
+                    other => panic!("{:?}", other),
+                }
+                match &a[13] {
+                    RespValue::BulkString(Some(b)) => {
+                        assert!(b.as_ref().starts_with(b"source still holds"));
+                    }
+                    other => panic!("{:?}", other),
+                }
+            }
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn reshard_range_aborts_on_partial_and_failed() {
+        assert!(!reshard_range_should_abort("complete"));
+        assert!(reshard_range_should_abort("partial_dest_node"));
+        assert!(reshard_range_should_abort("partial_source_node"));
+        assert!(reshard_range_should_abort("failed_keys:boom"));
+        assert!(reshard_range_should_abort("failed_connect:x"));
     }
 
     #[test]
