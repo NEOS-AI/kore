@@ -1,9 +1,13 @@
 use crate::cache::KeyType;
+use crate::cluster::{
+    migrate_keys_to, MigrateCommandResult, MigrateDestAuth, MigrateKeyOpts,
+};
 use crate::entry::StoreOptions;
 use crate::entry::LoadOptions;
 use crate::error::{Error, Result};
 use crate::protocol::RespValue;
 use bytes::Bytes;
+use std::time::Duration;
 use super::CommandHandler;
 
 impl CommandHandler {
@@ -1060,6 +1064,192 @@ impl CommandHandler {
                     Ok(RespValue::error(msg))
                 } else {
                     Ok(RespValue::error(format!("ERR {msg}")))
+                }
+            }
+        }
+    }
+
+    /// MIGRATE host port key destination-db timeout [COPY] [REPLACE]
+    /// [AUTH password] [AUTH2 username password] [KEYS key …]
+    ///
+    /// MVP (Batch DP): RESP recreate path (no DUMP/RESTORE). Honors timeout ms,
+    /// COPY/REPLACE/AUTH/AUTH2/KEYS/destination-db. ASKING is always issued so
+    /// cluster IMPORTING destinations accept the transfer.
+    pub(super) async fn handle_migrate(&self, args: &[RespValue]) -> Result<RespValue> {
+        // Minimum: host port key db timeout
+        if args.len() < 5 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'migrate' command",
+            ));
+        }
+
+        let host = match args[0].as_bulk_string() {
+            Some(h) => String::from_utf8_lossy(h).into_owned(),
+            None => return Ok(RespValue::error("ERR syntax error")),
+        };
+        let port = match self.parse_integer(&args[1]) {
+            Ok(n) if n > 0 && n <= u16::MAX as i64 => n as u16,
+            _ => {
+                return Ok(RespValue::error(
+                    "ERR Invalid TCP port number specified for MIGRATE",
+                ))
+            }
+        };
+        let single_key = match args[2].as_bulk_string() {
+            Some(k) => k.clone(),
+            None => return Ok(RespValue::error("ERR syntax error")),
+        };
+        let dest_db = match self.parse_integer(&args[3]) {
+            Ok(n) => n,
+            Err(_) => {
+                return Ok(RespValue::error(
+                    "ERR value is not an integer or out of range",
+                ))
+            }
+        };
+        if dest_db < 0 {
+            return Ok(RespValue::error("ERR DB index is out of range"));
+        }
+        let timeout_ms = match self.parse_integer(&args[4]) {
+            Ok(n) if n >= 0 => n as u64,
+            _ => {
+                return Ok(RespValue::error(
+                    "ERR timeout is not an integer or out of range",
+                ))
+            }
+        };
+        // Redis treats timeout 0 as a very large timeout; use a generous default.
+        let io_timeout = if timeout_ms == 0 {
+            Duration::from_secs(3600)
+        } else {
+            Duration::from_millis(timeout_ms)
+        };
+
+        let mut copy = false;
+        let mut replace = false;
+        let mut password: Option<String> = None;
+        let mut username: Option<String> = None;
+        let mut keys_from_option: Option<Vec<Bytes>> = None;
+
+        let mut i = 5;
+        while i < args.len() {
+            let opt = match args[i].as_bulk_string() {
+                Some(s) => String::from_utf8_lossy(s).to_ascii_uppercase(),
+                None => return Ok(RespValue::error("ERR syntax error")),
+            };
+            match opt.as_str() {
+                "COPY" => {
+                    copy = true;
+                    i += 1;
+                }
+                "REPLACE" => {
+                    replace = true;
+                    i += 1;
+                }
+                "AUTH" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    let p = match args[i].as_bulk_string() {
+                        Some(b) => String::from_utf8_lossy(b).into_owned(),
+                        None => return Ok(RespValue::error("ERR syntax error")),
+                    };
+                    password = Some(p);
+                    i += 1;
+                }
+                "AUTH2" => {
+                    i += 1;
+                    if i + 1 >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    let u = match args[i].as_bulk_string() {
+                        Some(b) => String::from_utf8_lossy(b).into_owned(),
+                        None => return Ok(RespValue::error("ERR syntax error")),
+                    };
+                    let p = match args[i + 1].as_bulk_string() {
+                        Some(b) => String::from_utf8_lossy(b).into_owned(),
+                        None => return Ok(RespValue::error("ERR syntax error")),
+                    };
+                    username = Some(u);
+                    password = Some(p);
+                    i += 2;
+                }
+                "KEYS" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return Ok(RespValue::error(
+                            "ERR empty key list for MIGRATE with KEYS option",
+                        ));
+                    }
+                    let mut ks = Vec::new();
+                    while i < args.len() {
+                        match args[i].as_bulk_string() {
+                            Some(b) => ks.push(b.clone()),
+                            None => return Ok(RespValue::error("ERR syntax error")),
+                        }
+                        i += 1;
+                    }
+                    keys_from_option = Some(ks);
+                }
+                _ => {
+                    return Ok(RespValue::error(format!(
+                        "ERR Unsupported MIGRATE option '{}'",
+                        opt
+                    )));
+                }
+            }
+        }
+
+        let keys: Vec<Bytes> = if let Some(ks) = keys_from_option {
+            ks
+        } else if single_key.is_empty() {
+            return Ok(RespValue::error(
+                "ERR empty key for MIGRATE (use KEYS for multi-key)",
+            ));
+        } else {
+            vec![single_key]
+        };
+
+        let opts = MigrateKeyOpts {
+            copy,
+            replace,
+            // Always ASKING: no-op on non-cluster dest; required for IMPORTING.
+            asking: true,
+            io_timeout,
+        };
+        let auth = MigrateDestAuth {
+            password,
+            username,
+            dest_db,
+        };
+
+        match migrate_keys_to(&self.cache, &host, port, &keys, &opts, &auth).await {
+            Ok((MigrateCommandResult::Ok, deleted)) => {
+                // Propagate source DELs for AOF/replicas (do not log MIGRATE itself).
+                if let Some(p) = self.persistence.as_ref() {
+                    if !p.replication.is_replica() {
+                        for k in &deleted {
+                            p.on_write_command(
+                                self.selected_db,
+                                &[Bytes::from_static(b"DEL"), k.clone()],
+                            );
+                        }
+                    }
+                }
+                for k in &deleted {
+                    self.cache.touch_watch_key(k);
+                }
+                Ok(RespValue::ok())
+            }
+            Ok((MigrateCommandResult::NoKey, _)) => {
+                Ok(RespValue::SimpleString(Bytes::from_static(b"NOKEY")))
+            }
+            Err(e) => {
+                if e.starts_with("BUSYKEY") || e.starts_with("IOERR") || e.starts_with("ERR ") {
+                    Ok(RespValue::error(e))
+                } else {
+                    Ok(RespValue::error(format!("ERR {e}")))
                 }
             }
         }

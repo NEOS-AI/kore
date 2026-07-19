@@ -1,6 +1,6 @@
-//! Thin slot migration: scan keys in a hash slot and move them over RESP.
+//! Thin slot migration + Redis key-level `MIGRATE` (shared RESP recreate path).
 //!
-//! Operator flow (Redis-like):
+//! Operator flow (Redis-like slot reshard):
 //! 1. dest:  CLUSTER SETSLOT <s> IMPORTING <source-id>
 //! 2. source: CLUSTER SETSLOT <s> MIGRATING <dest-id>
 //! 3. source: CLUSTER MIGRATEKEYS <s> <dest-ip> <dest-port>
@@ -28,6 +28,11 @@
 //! `partial_dest_node`. Retries cover blips; permanent dest failure needs
 //! `RESHARD FINISH` or manual SETSLOT. Dest-first ordering is intentionally
 //! not used (low-risk residual; Redis client expectations favor source MOVED).
+//!
+//! **Redis `MIGRATE` (Batch DP):** key-level transfer reuses
+//! [`snapshot_key`] / [`recreate_commands`] / ASKING / RESP I/O. Options:
+//! `COPY`, `REPLACE`, `AUTH`/`AUTH2`, multi-key via `KEYS`, `timeout` ms,
+//! `destination-db` (SELECT on dest). No DUMP/RESTORE wire format.
 //!
 //! Supports string, hash, list, set, zset, geo, and stream keys. Dest writes use
 //! ASKING so IMPORTING slots accept the transfer. Complex types are recreated
@@ -507,7 +512,7 @@ fn score_string(v: f64) -> String {
 }
 
 /// Expect a successful write reply (OK / integer ≥ 0 / bulk id / array).
-fn accept_write_reply(reply: &RespValue, cmd: &str) -> Result<(), String> {
+fn accept_write_reply(reply: &RespValue, cmd: &str, ctx: &str) -> Result<(), String> {
     match reply {
         RespValue::SimpleString(s) if s.as_ref() == b"OK" => Ok(()),
         RespValue::Integer(n) if *n >= 0 => Ok(()),
@@ -516,14 +521,387 @@ fn accept_write_reply(reply: &RespValue, cmd: &str) -> Result<(), String> {
         // XCLAIM returns array of claimed entries
         RespValue::Array(_) => Ok(()),
         RespValue::Error(e) => Err(format!(
-            "ERR CLUSTER MIGRATEKEYS {} failed: {}",
+            "ERR {} {} failed: {}",
+            ctx,
             cmd,
             String::from_utf8_lossy(e)
         )),
         other => Err(format!(
-            "ERR CLUSTER MIGRATEKEYS unexpected {} reply: {:?}",
-            cmd, other
+            "ERR {} unexpected {} reply: {:?}",
+            ctx, cmd, other
         )),
+    }
+}
+
+/// Options for transferring one or more keys over RESP (shared by MIGRATEKEYS + MIGRATE).
+#[derive(Debug, Clone)]
+pub struct MigrateKeyOpts {
+    /// Leave the source key in place after dest accepts the recreate.
+    pub copy: bool,
+    /// If true, `DEL` the dest key before recreate (overwrite). If false, fail with
+    /// `BUSYKEY` when the dest already has the key.
+    pub replace: bool,
+    /// Issue `ASKING` before each dest command (needed for IMPORTING slots).
+    pub asking: bool,
+    /// Connect / read / write timeout.
+    pub io_timeout: Duration,
+}
+
+impl Default for MigrateKeyOpts {
+    fn default() -> Self {
+        Self {
+            copy: false,
+            replace: true,
+            asking: true,
+            io_timeout: MIGRATE_IO_TIMEOUT,
+        }
+    }
+}
+
+/// Per-key outcome from [`migrate_one_key_on_stream`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrateOneOutcome {
+    /// Key recreated on dest; deleted on source unless `copy`.
+    Migrated,
+    /// Source key missing/empty — nothing transferred.
+    Missing,
+}
+
+/// Redis-style `MIGRATE` result (success path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrateCommandResult {
+    /// At least one key moved/copied successfully.
+    Ok,
+    /// None of the requested keys existed on the source.
+    NoKey,
+}
+
+/// Destination credentials / logical DB for Redis `MIGRATE`.
+#[derive(Debug, Clone, Default)]
+pub struct MigrateDestAuth {
+    /// `AUTH password` (no username).
+    pub password: Option<String>,
+    /// `AUTH username password` (AUTH2). Takes precedence over bare password when set.
+    pub username: Option<String>,
+    /// Destination logical database index (`SELECT` when non-zero).
+    pub dest_db: i64,
+}
+
+/// Transfer a single key over an open destination stream.
+///
+/// Steps: snapshot → (optional EXISTS/DEL) → ASKING + recreate cmds → source DEL
+/// unless `copy`. Returns [`MigrateOneOutcome::Missing`] when the key is gone or empty.
+pub async fn migrate_one_key_on_stream(
+    cache: &Cache,
+    stream: &mut TcpStream,
+    key: &Bytes,
+    opts: &MigrateKeyOpts,
+) -> Result<MigrateOneOutcome, String> {
+    let ctx = "MIGRATE";
+    let snap = match snapshot_key(cache, key) {
+        Some(s) => s,
+        None => return Ok(MigrateOneOutcome::Missing),
+    };
+    let cmds = recreate_commands(key, &snap);
+    if cmds.is_empty() {
+        return Ok(MigrateOneOutcome::Missing);
+    }
+
+    // Without REPLACE: refuse if dest already holds the key (Redis BUSYKEY).
+    if !opts.replace {
+        issue_asking(stream, opts).await?;
+        match resp_command_bytes(
+            stream,
+            &[
+                bulk_static(b"EXISTS"),
+                RespValue::BulkString(Some(key.clone())),
+            ],
+            opts.io_timeout,
+        )
+        .await
+        {
+            Ok(RespValue::Integer(n)) if n > 0 => {
+                return Err("BUSYKEY Target key name already exists.".into());
+            }
+            Ok(RespValue::Integer(_)) => {}
+            Ok(RespValue::Error(e)) => {
+                return Err(format!(
+                    "ERR {} EXISTS failed: {}",
+                    ctx,
+                    String::from_utf8_lossy(&e)
+                ));
+            }
+            Ok(other) => {
+                return Err(format!("ERR {} unexpected EXISTS reply: {:?}", ctx, other));
+            }
+            Err(e) => return Err(format!("ERR {} {}", ctx, e)),
+        }
+    } else {
+        // REPLACE: clear dest key first so complex types do not merge into leftovers.
+        issue_asking(stream, opts).await?;
+        match resp_command_bytes(
+            stream,
+            &[
+                bulk_static(b"DEL"),
+                RespValue::BulkString(Some(key.clone())),
+            ],
+            opts.io_timeout,
+        )
+        .await
+        {
+            Ok(RespValue::Integer(_)) => {}
+            Ok(RespValue::Error(e)) => {
+                return Err(format!(
+                    "ERR {} DEL (replace) failed: {}",
+                    ctx,
+                    String::from_utf8_lossy(&e)
+                ));
+            }
+            Ok(other) => {
+                return Err(format!(
+                    "ERR {} unexpected DEL (replace) reply: {:?}",
+                    ctx, other
+                ));
+            }
+            Err(e) => return Err(format!("ERR {} {}", ctx, e)),
+        }
+    }
+
+    for (i, parts) in cmds.iter().enumerate() {
+        issue_asking(stream, opts).await?;
+
+        let cmd_name = parts
+            .first()
+            .and_then(|p| p.as_bulk_string())
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_else(|| "CMD".into());
+        match resp_command_bytes(stream, parts, opts.io_timeout).await {
+            Ok(reply) => {
+                if let Err(e) = accept_write_reply(&reply, &cmd_name, ctx) {
+                    return Err(format!(
+                        "{} (key={}, step={})",
+                        e,
+                        String::from_utf8_lossy(key),
+                        i
+                    ));
+                }
+            }
+            Err(e) => {
+                return Err(format!(
+                    "ERR {} {} I/O for key {}: {}",
+                    ctx,
+                    cmd_name,
+                    String::from_utf8_lossy(key),
+                    e
+                ));
+            }
+        }
+    }
+
+    if !opts.copy {
+        cache
+            .delete(key)
+            .map_err(|e| format!("ERR {} DEL failed after migrate: {}", ctx, e))?;
+    }
+    Ok(MigrateOneOutcome::Migrated)
+}
+
+async fn issue_asking(stream: &mut TcpStream, opts: &MigrateKeyOpts) -> Result<(), String> {
+    if !opts.asking {
+        return Ok(());
+    }
+    match resp_command_bytes(stream, &[bulk_static(b"ASKING")], opts.io_timeout).await {
+        Ok(RespValue::SimpleString(s)) if s.as_ref() == b"OK" => Ok(()),
+        // Standalone / non-cluster dests reject ASKING — treat as no-op so MIGRATE
+        // still works without requiring --cluster-enabled on the destination.
+        Ok(RespValue::Error(e))
+            if String::from_utf8_lossy(&e).contains("cluster support disabled") =>
+        {
+            Ok(())
+        }
+        Ok(RespValue::Error(e)) => Err(format!(
+            "ERR MIGRATE ASKING failed: {}",
+            String::from_utf8_lossy(&e)
+        )),
+        Ok(other) => Err(format!("ERR MIGRATE unexpected ASKING reply: {:?}", other)),
+        Err(e) => Err(format!("ERR MIGRATE {}", e)),
+    }
+}
+
+/// Connect to dest, optionally AUTH + SELECT, and migrate `keys` via RESP recreate.
+///
+/// Redis-compatible success replies are expressed as [`MigrateCommandResult`].
+/// On mid-batch failure after one or more keys succeeded, returns an error string
+/// (typically `IOERR` style); already-migrated keys stay on dest (and are gone
+/// from source unless `copy`).
+///
+/// Keys that were successfully deleted from source (not `copy`) are returned in
+/// `deleted_keys` so the command handler can AOF/repl-propagate `DEL`.
+pub async fn migrate_keys_to(
+    cache: &Cache,
+    dest_ip: &str,
+    dest_port: u16,
+    keys: &[Bytes],
+    opts: &MigrateKeyOpts,
+    auth: &MigrateDestAuth,
+) -> Result<(MigrateCommandResult, Vec<Bytes>), String> {
+    if keys.is_empty() {
+        return Ok((MigrateCommandResult::NoKey, Vec::new()));
+    }
+
+    let addr = format!("{}:{}", dest_ip, dest_port);
+    let mut stream = connect_dest_with_timeout(dest_ip, dest_port, opts.io_timeout)
+        .await
+        .map_err(|e| format!("ERR MIGRATE {}", e))?;
+
+    // Probe ASKING once: disable for standalone dests (cluster support disabled).
+    let mut opts = opts.clone();
+    if opts.asking {
+        match resp_command_bytes(&mut stream, &[bulk_static(b"ASKING")], opts.io_timeout).await {
+            Ok(RespValue::SimpleString(s)) if s.as_ref() == b"OK" => {
+                // Dest accepted ASKING; keep issuing before each write (one-shot).
+            }
+            Ok(RespValue::Error(e))
+                if String::from_utf8_lossy(&e).contains("cluster support disabled") =>
+            {
+                opts.asking = false;
+            }
+            Ok(RespValue::Error(e)) => {
+                return Err(format!(
+                    "ERR MIGRATE ASKING failed: {}",
+                    String::from_utf8_lossy(&e)
+                ));
+            }
+            Ok(other) => {
+                return Err(format!("ERR MIGRATE unexpected ASKING reply: {:?}", other));
+            }
+            Err(e) => return Err(format!("ERR MIGRATE {}", e)),
+        }
+    }
+    let opts = &opts;
+
+    // AUTH / AUTH2
+    if let Some(user) = auth.username.as_ref() {
+        let pass = auth.password.as_deref().unwrap_or("");
+        match resp_command_bytes(
+            &mut stream,
+            &[
+                bulk_static(b"AUTH"),
+                bulk_owned(user.clone()),
+                bulk_owned(pass.to_string()),
+            ],
+            opts.io_timeout,
+        )
+        .await
+        {
+            Ok(RespValue::SimpleString(s)) if s.as_ref() == b"OK" => {}
+            Ok(RespValue::Error(e)) => {
+                return Err(format!(
+                    "ERR MIGRATE AUTH failed: {}",
+                    String::from_utf8_lossy(&e)
+                ));
+            }
+            Ok(other) => {
+                return Err(format!("ERR MIGRATE unexpected AUTH reply: {:?}", other));
+            }
+            Err(e) => return Err(format!("ERR MIGRATE AUTH I/O: {}", e)),
+        }
+    } else if let Some(pass) = auth.password.as_ref() {
+        match resp_command_bytes(
+            &mut stream,
+            &[bulk_static(b"AUTH"), bulk_owned(pass.clone())],
+            opts.io_timeout,
+        )
+        .await
+        {
+            Ok(RespValue::SimpleString(s)) if s.as_ref() == b"OK" => {}
+            Ok(RespValue::Error(e)) => {
+                return Err(format!(
+                    "ERR MIGRATE AUTH failed: {}",
+                    String::from_utf8_lossy(&e)
+                ));
+            }
+            Ok(other) => {
+                return Err(format!("ERR MIGRATE unexpected AUTH reply: {:?}", other));
+            }
+            Err(e) => return Err(format!("ERR MIGRATE AUTH I/O: {}", e)),
+        }
+    }
+
+    // destination-db: SELECT when non-zero (cluster dest rejects SELECT).
+    if auth.dest_db != 0 {
+        if auth.dest_db < 0 {
+            return Err("ERR DB index is out of range".into());
+        }
+        match resp_command_bytes(
+            &mut stream,
+            &[
+                bulk_static(b"SELECT"),
+                bulk_owned(auth.dest_db.to_string()),
+            ],
+            opts.io_timeout,
+        )
+        .await
+        {
+            Ok(RespValue::SimpleString(s)) if s.as_ref() == b"OK" => {}
+            Ok(RespValue::Error(e)) => {
+                return Err(format!(
+                    "ERR MIGRATE SELECT failed: {}",
+                    String::from_utf8_lossy(&e)
+                ));
+            }
+            Ok(other) => {
+                return Err(format!("ERR MIGRATE unexpected SELECT reply: {:?}", other));
+            }
+            Err(e) => return Err(format!("ERR MIGRATE SELECT I/O: {}", e)),
+        }
+    }
+
+    let mut any_migrated = false;
+    let mut deleted_keys = Vec::new();
+
+    for key in keys {
+        match migrate_one_key_on_stream(cache, &mut stream, key, opts).await {
+            Ok(MigrateOneOutcome::Migrated) => {
+                any_migrated = true;
+                if !opts.copy {
+                    deleted_keys.push(key.clone());
+                }
+            }
+            Ok(MigrateOneOutcome::Missing) => {}
+            Err(e) => {
+                // Redis uses IOERR when the link fails after partial progress.
+                if any_migrated {
+                    return Err(format!(
+                        "IOERR error or timeout transferring key to {} ({}). Partial keys may have moved.",
+                        addr, e
+                    ));
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    if any_migrated {
+        Ok((MigrateCommandResult::Ok, deleted_keys))
+    } else {
+        Ok((MigrateCommandResult::NoKey, deleted_keys))
+    }
+}
+
+async fn connect_dest_with_timeout(
+    dest_ip: &str,
+    dest_port: u16,
+    timeout: Duration,
+) -> Result<TcpStream, String> {
+    let addr = format!("{}:{}", dest_ip, dest_port);
+    match tokio::time::timeout(timeout, TcpStream::connect(&addr)).await {
+        Ok(Ok(s)) => {
+            let _ = s.set_nodelay(true);
+            Ok(s)
+        }
+        Ok(Err(e)) => Err(format!("unable to connect to {}: {}", addr, e)),
+        Err(_) => Err(format!("timed out connecting to {}", addr)),
     }
 }
 
@@ -563,29 +941,22 @@ pub async fn migrate_slot_keys(
     }
 
     let addr = format!("{}:{}", dest_ip, dest_port);
-    let mut stream = match tokio::time::timeout(MIGRATE_IO_TIMEOUT, TcpStream::connect(&addr)).await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
+    let mut stream = match connect_dest_with_timeout(dest_ip, dest_port, MIGRATE_IO_TIMEOUT).await {
+        Ok(s) => s,
+        Err(e) => {
             return Err(migrate_err(
                 empty,
-                format!(
-                    "ERR CLUSTER MIGRATEKEYS unable to connect to {}: {}",
-                    addr, e
-                ),
-            ))
-        }
-        Err(_) => {
-            return Err(migrate_err(
-                empty,
-                format!(
-                    "ERR CLUSTER MIGRATEKEYS timed out connecting to {}",
-                    addr
-                ),
+                format!("ERR CLUSTER MIGRATEKEYS {}", e),
             ))
         }
     };
-    let _ = stream.set_nodelay(true);
+
+    let opts = MigrateKeyOpts {
+        copy: false,
+        replace: true,
+        asking: true,
+        io_timeout: MIGRATE_IO_TIMEOUT,
+    };
 
     let mut migrated = 0usize;
     let mut skipped = 0usize;
@@ -602,95 +973,22 @@ pub async fn migrate_slot_keys(
             ));
         }
 
-        let snap = match snapshot_key(cache, &key) {
-            Some(s) => s,
-            None => {
-                skipped += 1;
-                continue;
-            }
-        };
-        let cmds = recreate_commands(&key, &snap);
-        if cmds.is_empty() {
-            skipped += 1;
-            continue;
-        }
-
-        // ASKING is one-shot per following command — re-issue before every write.
-        for (i, parts) in cmds.iter().enumerate() {
-            match resp_command_bytes(&mut stream, &[bulk_static(b"ASKING")], MIGRATE_IO_TIMEOUT)
-                .await
-            {
-                Ok(RespValue::SimpleString(s)) if s.as_ref() == b"OK" => {}
-                Ok(RespValue::Error(e)) => {
-                    return Err(migrate_err(
-                        progress(),
-                        format!(
-                            "ERR CLUSTER MIGRATEKEYS ASKING failed: {}",
-                            String::from_utf8_lossy(&e)
-                        ),
-                    ));
-                }
-                Ok(other) => {
-                    return Err(migrate_err(
-                        progress(),
-                        format!(
-                            "ERR CLUSTER MIGRATEKEYS unexpected ASKING reply: {:?}",
-                            other
-                        ),
-                    ));
-                }
-                Err(e) => {
-                    return Err(migrate_err(
-                        progress(),
-                        format!("ERR CLUSTER MIGRATEKEYS {}", e),
-                    ));
-                }
-            }
-
-            let cmd_name = parts
-                .first()
-                .and_then(|p| p.as_bulk_string())
-                .map(|b| String::from_utf8_lossy(b).into_owned())
-                .unwrap_or_else(|| "CMD".into());
-            match resp_command_bytes(&mut stream, parts, MIGRATE_IO_TIMEOUT).await {
-                Ok(reply) => {
-                    if let Err(e) = accept_write_reply(&reply, &cmd_name) {
-                        return Err(migrate_err(
-                            progress(),
-                            format!(
-                                "{} (key={}, step={})",
-                                e,
-                                String::from_utf8_lossy(&key),
-                                i
-                            ),
-                        ));
-                    }
-                }
-                Err(e) => {
-                    return Err(migrate_err(
-                        progress(),
-                        format!(
-                            "ERR CLUSTER MIGRATEKEYS {} I/O for key {}: {}",
-                            cmd_name,
-                            String::from_utf8_lossy(&key),
-                            e
-                        ),
-                    ));
-                }
+        match migrate_one_key_on_stream(cache, &mut stream, &key, &opts).await {
+            Ok(MigrateOneOutcome::Migrated) => migrated += 1,
+            Ok(MigrateOneOutcome::Missing) => skipped += 1,
+            Err(e) => {
+                // Rewrite generic MIGRATE prefix to CLUSTER MIGRATEKEYS for operators.
+                let msg = e.replace("ERR MIGRATE", "ERR CLUSTER MIGRATEKEYS");
+                let msg = if msg.starts_with("BUSYKEY") {
+                    format!("ERR CLUSTER MIGRATEKEYS {}", msg)
+                } else if msg.starts_with("ERR ") {
+                    msg
+                } else {
+                    format!("ERR CLUSTER MIGRATEKEYS {} (key={}, dest={})", msg, String::from_utf8_lossy(&key), addr)
+                };
+                return Err(migrate_err(progress(), msg));
             }
         }
-
-        // Only delete after dest accepted the full key recreate sequence.
-        if let Err(e) = cache.delete(&key) {
-            return Err(migrate_err(
-                progress(),
-                format!(
-                    "ERR CLUSTER MIGRATEKEYS DEL failed after migrate: {}",
-                    e
-                ),
-            ));
-        }
-        migrated += 1;
     }
 
     Ok(MigrateSlotResult { migrated, skipped })

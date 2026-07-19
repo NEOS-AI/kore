@@ -742,6 +742,7 @@ impl CommandHandler {
             "RENAMENX" => self.handle_renamenx(&args[1..]),
             "MOVE" => self.handle_move(&args[1..]),
             "COPY" => self.handle_copy(&args[1..]),
+            "MIGRATE" => self.handle_migrate(&args[1..]).await,
             "RANDOMKEY" => self.handle_randomkey(&args[1..]),
             "TOUCH" => self.handle_touch(&args[1..]),
 
@@ -984,6 +985,7 @@ impl CommandHandler {
 
         if let Ok(ref resp) = result {
             // SORT only mutates (and must be AOF/repl propagated) when STORE is used.
+            // MIGRATE propagates per-key DEL inside the handler (not the MIGRATE form).
             if cmd_upper == "SORT" {
                 if sort_has_store(&args[1..]) {
                     self.maybe_persist_write(cmd_upper, &args[1..], resp);
@@ -991,6 +993,8 @@ impl CommandHandler {
                         self.notify_watch_after_write(cmd_upper, &args[1..]);
                     }
                 }
+            } else if cmd_upper == "MIGRATE" {
+                // Watch + AOF/repl handled inside handle_migrate.
             } else {
                 self.maybe_persist_write(cmd_upper, &args[1..], resp);
                 if is_write_command(cmd_upper)
@@ -1059,9 +1063,21 @@ impl CommandHandler {
 
         // Key permission checks using COMMAND_SPECS first_key/last_key/step when available.
         // EVAL/EVALSHA: keys are dynamic (numkeys after script/sha).
+        // MIGRATE: single key or KEYS list.
         let script_keys = extract_eval_keys(cmd_upper, args);
         if let Some(keys) = script_keys {
             for key in keys {
+                if !self.acl.can_access_key(username, &key) {
+                    self.cache
+                        .acl_log
+                        .push("key", &key, username, client_id);
+                    return Some(RespValue::error(
+                        "NOPERM this user has no permissions to access one of the keys used as arguments",
+                    ));
+                }
+            }
+        } else if cmd_upper == "MIGRATE" {
+            for key in extract_migrate_keys(args) {
                 if !self.acl.can_access_key(username, &key) {
                     self.cache
                         .acl_log
@@ -1127,8 +1143,11 @@ impl CommandHandler {
         }
 
         // EVAL/EVALSHA: keys follow numkeys (args: script/sha, numkeys, key…).
+        // MIGRATE: single key at arg index 3, or KEYS list (movablekeys).
         let keys = if let Some(k) = extract_eval_key_bytes(cmd_upper, args) {
             k
+        } else if cmd_upper == "MIGRATE" {
+            extract_migrate_key_bytes(args)
         } else {
             // Commands without key specs (or first_key=0) are not redirected.
             let cmd_lower = cmd_upper.to_ascii_lowercase();
@@ -1429,6 +1448,7 @@ pub(super) fn is_write_command(cmd: &str) -> bool {
             | "RENAMENX"
             | "MOVE"
             | "COPY"
+            | "MIGRATE"
             | "TOUCH"
             | "INCR"
             | "DECR"
@@ -1635,6 +1655,58 @@ fn extract_pubsub_channels(cmd_upper: &str, args: &[RespValue]) -> Option<Vec<St
     };
     // Empty UNSUBSCRIBE (no args) unsubscribes all — no channel check needed.
     Some(channels)
+}
+
+/// MIGRATE host port key db timeout [opts…] [KEYS k…] — keys for ACL / cluster.
+fn extract_migrate_keys(args: &[RespValue]) -> Vec<String> {
+    extract_migrate_key_bytes(args)
+        .into_iter()
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .collect()
+}
+
+/// Bytes form of [`extract_migrate_keys`].
+fn extract_migrate_key_bytes(args: &[RespValue]) -> Vec<Bytes> {
+    // Look for KEYS option after the fixed 5 args (host port key db timeout).
+    let mut i = 5;
+    while i < args.len() {
+        let opt = match args[i].as_bulk_string() {
+            Some(s) => s,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        if opt.eq_ignore_ascii_case(b"KEYS") {
+            let mut keys = Vec::new();
+            for a in &args[i + 1..] {
+                if let Some(b) = a.as_bulk_string() {
+                    if !b.is_empty() {
+                        keys.push(b.clone());
+                    }
+                }
+            }
+            return keys;
+        }
+        // Skip known option arg counts.
+        if opt.eq_ignore_ascii_case(b"AUTH") {
+            i += 2;
+            continue;
+        }
+        if opt.eq_ignore_ascii_case(b"AUTH2") {
+            i += 3;
+            continue;
+        }
+        // COPY / REPLACE
+        i += 1;
+    }
+    // Single-key form: arg index 2 (0-based) is the key.
+    if let Some(b) = args.get(2).and_then(|a| a.as_bulk_string()) {
+        if !b.is_empty() {
+            return vec![b.clone()];
+        }
+    }
+    Vec::new()
 }
 
 /// Extract key argument bytes using Redis COMMAND first_key/last_key/step.

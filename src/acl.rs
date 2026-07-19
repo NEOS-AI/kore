@@ -735,7 +735,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "ft.search", "ft.info", "ft._list", "ft.tagvals",
         ],
         "write" => &[
-            "set", "del", "mset", "msetnx", "append", "setrange", "setex", "psetex", "getset", "unlink", "rename", "renamenx",
+            "set", "del", "mset", "msetnx", "append", "setrange", "setex", "psetex", "getset", "unlink", "rename", "renamenx", "migrate",
             "setnx", "getdel", "getex", "incr", "decr", "incrby", "decrby", "incrbyfloat", "expire", "pexpire", "expireat", "pexpireat", "persist", "expiretime", "pexpiretime",
             "hset", "hsetnx", "hmset", "hdel", "hgetdel", "hincrby", "hincrbyfloat", "lpush", "rpush", "lpushx", "rpushx", "lpop", "rpop", "blpop", "brpop", "lset",
             "lrem", "ltrim", "linsert", "lmove", "blmove", "rpoplpush", "brpoplpush", "lmpop", "blmpop", "sort",
@@ -766,7 +766,7 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "ssubscribe", "sunsubscribe", "spublish", // shard pub/sub (Redis 7+)
         ],
         "keyspace" => &[
-            "del", "exists", "expire", "pexpire", "expireat", "pexpireat", "persist", "expiretime", "pexpiretime", "keys", "scan", "move", "copy", "randomkey", "touch", "rename", "renamenx",
+            "del", "exists", "expire", "pexpire", "expireat", "pexpireat", "persist", "expiretime", "pexpiretime", "keys", "scan", "move", "copy", "migrate", "randomkey", "touch", "rename", "renamenx",
             "type", "unlink", "ttl", "pttl", "dbsize", "flushdb", "flushall", "swapdb", "select",
         ],
         "string" => &[

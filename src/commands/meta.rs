@@ -62,6 +62,8 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     CmdSpec { name: "renamenx", arity: 3, flags: &["write", "fast"], first_key: 1, last_key: 2, step: 1 },
     CmdSpec { name: "move", arity: 3, flags: &["write", "fast"], first_key: 1, last_key: 1, step: 1 },
     CmdSpec { name: "copy", arity: -3, flags: &["write", "denyoom"], first_key: 1, last_key: 2, step: 1 },
+    // MIGRATE host port key db timeout … — key at arg 3; KEYS form is movablekeys.
+    CmdSpec { name: "migrate", arity: -6, flags: &["write", "random", "movablekeys"], first_key: 3, last_key: 3, step: 1 },
     CmdSpec { name: "randomkey", arity: 1, flags: &["readonly", "random"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "touch", arity: -2, flags: &["write", "fast"], first_key: 1, last_key: -1, step: 1 },
     CmdSpec { name: "setnx", arity: 3, flags: &["write", "denyoom", "fast"], first_key: 1, last_key: 1, step: 1 },
@@ -1247,6 +1249,11 @@ impl CommandHandler {
             return Ok(extract_sort_keys_for_getkeys(cmd_args));
         }
 
+        // MIGRATE host port key db timeout [opts] [KEYS k…]
+        if cmd_name == "migrate" {
+            return Ok(extract_migrate_keys_for_getkeys(cmd_args));
+        }
+
         // Movablekeys / special layouts (first_key=0 in catalog).
         match cmd_name.as_str() {
             "lmpop" | "zmpop" => return Ok(extract_numkeys_keys_for_getkeys(cmd_args, 0)),
@@ -1324,7 +1331,15 @@ fn command_matches_aclcat(spec: &CmdSpec, cat: &str) -> bool {
             has("admin")
                 || matches!(
                     spec.name,
-                    "flushdb" | "flushall" | "keys" | "shutdown" | "config" | "replicaof" | "slaveof"
+                    "flushdb"
+                        | "flushall"
+                        | "keys"
+                        | "shutdown"
+                        | "config"
+                        | "replicaof"
+                        | "slaveof"
+                        | "migrate"
+                        | "restore"
                 )
         }
         "connection" => matches!(
@@ -1336,8 +1351,8 @@ fn command_matches_aclcat(spec: &CmdSpec, cat: &str) -> bool {
             spec.name,
             "del" | "unlink" | "exists" | "expire" | "pexpire" | "expireat" | "pexpireat"
                 | "ttl" | "pttl" | "persist" | "type" | "rename" | "renamenx" | "move"
-                | "copy" | "keys" | "scan" | "randomkey" | "touch" | "dump" | "restore"
-                | "object" | "memory" | "expiretime" | "pexpiretime"
+                | "copy" | "migrate" | "keys" | "scan" | "randomkey" | "touch" | "dump"
+                | "restore" | "object" | "memory" | "expiretime" | "pexpiretime"
         ),
         "string" | "hash" | "list" | "set" | "sortedset" | "sorted_set" | "stream"
         | "bitmap" | "hyperloglog" | "geo" | "server" => {
@@ -1524,6 +1539,46 @@ fn extract_keys_from_spec(
         i += step;
     }
     keys
+}
+
+/// MIGRATE args for GETKEYS: [host, port, key, db, timeout, …] or KEYS list.
+fn extract_migrate_keys_for_getkeys(cmd_args: &[RespValue]) -> Vec<Bytes> {
+    let mut i = 5;
+    while i < cmd_args.len() {
+        let opt = match cmd_args[i].as_bulk_string() {
+            Some(s) => s,
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        if opt.eq_ignore_ascii_case(b"KEYS") {
+            let mut keys = Vec::new();
+            for a in &cmd_args[i + 1..] {
+                if let Some(b) = a.as_bulk_string() {
+                    if !b.is_empty() {
+                        keys.push(b.clone());
+                    }
+                }
+            }
+            return keys;
+        }
+        if opt.eq_ignore_ascii_case(b"AUTH") {
+            i += 2;
+            continue;
+        }
+        if opt.eq_ignore_ascii_case(b"AUTH2") {
+            i += 3;
+            continue;
+        }
+        i += 1;
+    }
+    if let Some(b) = cmd_args.get(2).and_then(|a| a.as_bulk_string()) {
+        if !b.is_empty() {
+            return vec![b.clone()];
+        }
+    }
+    Vec::new()
 }
 
 /// SORT args for GETKEYS: [key, …options…, STORE dest?]
