@@ -1,4 +1,4 @@
-//! Batch DP/DQ: Redis key-level MIGRATE (RESP recreate path).
+//! Batch DP/DQ/DT: Redis key-level MIGRATE (RESP recreate; absolute expire).
 
 use bytes::Bytes;
 use kore::config::Config;
@@ -50,6 +50,11 @@ fn make_config(port: u16, cluster: bool) -> Arc<Config> {
         tls_key: String::new(),
         aclfile: String::new(),
         cluster_enabled: cluster,
+            cluster_replica_priority: 100,
+            cluster_require_full_coverage: true,
+            cluster_allow_reads_when_down: false,
+            cluster_announce_ip: String::new(),
+            cluster_announce_port: 0,
         unixsocket: String::new(),
         log_format: "text".to_string(),
     })
@@ -468,7 +473,7 @@ async fn migrate_multi_key_partial_failure_reports_counts() {
     shutdown(pair).await;
 }
 
-/// Batch DQ: string TTL transferred via SET PX.
+/// Batch DQ/DT: string TTL via absolute SET PXAT (preserves end time).
 #[tokio::test(flavor = "multi_thread")]
 async fn migrate_string_with_ttl() {
     let pair = spawn_standalone_pair(16920, 16921).await;
@@ -478,6 +483,12 @@ async fn migrate_string_with_ttl() {
     assert!(is_ok(
         &send_cmd(&mut sa, &["SET", "sttl", "v", "PX", "60000"]).await
     ));
+    let source_abs = match send_cmd(&mut sa, &["PEXPIRETIME", "sttl"]).await {
+        RespValue::Integer(n) => n,
+        other => panic!("expected PEXPIRETIME integer, got {:?}", other),
+    };
+    assert!(source_abs > 0, "source absolute expire missing");
+
     let port_b = pair.port_b.to_string();
     assert!(is_ok(
         &send_cmd(
@@ -487,6 +498,17 @@ async fn migrate_string_with_ttl() {
         .await
     ));
 
+    let dest_abs = match send_cmd(&mut sb, &["PEXPIRETIME", "sttl"]).await {
+        RespValue::Integer(n) => n,
+        other => panic!("expected integer PEXPIRETIME, got {:?}", other),
+    };
+    // Absolute end time preserved within a small clock/skew budget (not remaining-ms shrink).
+    assert!(
+        (dest_abs - source_abs).abs() <= 2_000,
+        "dest absolute expire drifted: source={} dest={}",
+        source_abs,
+        dest_abs
+    );
     let pttl = match send_cmd(&mut sb, &["PTTL", "sttl"]).await {
         RespValue::Integer(n) => n,
         other => panic!("expected integer PTTL, got {:?}", other),
@@ -501,7 +523,7 @@ async fn migrate_string_with_ttl() {
     shutdown(pair).await;
 }
 
-/// Batch DQ: hash typed TTL transferred via trailing PEXPIRE.
+/// Batch DQ/DT: hash typed TTL via trailing PEXPIREAT.
 #[tokio::test(flavor = "multi_thread")]
 async fn migrate_hash_with_ttl() {
     let pair = spawn_standalone_pair(16922, 16923).await;
@@ -516,6 +538,10 @@ async fn migrate_hash_with_ttl() {
         send_cmd(&mut sa, &["PEXPIRE", "httl", "45000"]).await,
         RespValue::Integer(1)
     );
+    let source_abs = match send_cmd(&mut sa, &["PEXPIRETIME", "httl"]).await {
+        RespValue::Integer(n) => n,
+        other => panic!("expected PEXPIRETIME integer, got {:?}", other),
+    };
 
     let port_b = pair.port_b.to_string();
     assert!(is_ok(
@@ -531,6 +557,16 @@ async fn migrate_hash_with_ttl() {
         RespValue::Integer(0)
     );
     assert_eq!(as_bulk(&send_cmd(&mut sb, &["HGET", "httl", "f"]).await), "1");
+    let dest_abs = match send_cmd(&mut sb, &["PEXPIRETIME", "httl"]).await {
+        RespValue::Integer(n) => n,
+        other => panic!("expected integer PEXPIRETIME, got {:?}", other),
+    };
+    assert!(
+        (dest_abs - source_abs).abs() <= 2_000,
+        "hash absolute expire drifted: source={} dest={}",
+        source_abs,
+        dest_abs
+    );
     let pttl = match send_cmd(&mut sb, &["PTTL", "httl"]).await {
         RespValue::Integer(n) => n,
         other => panic!("expected integer PTTL, got {:?}", other),
@@ -544,7 +580,7 @@ async fn migrate_hash_with_ttl() {
     shutdown(pair).await;
 }
 
-/// Batch DQ: list typed TTL transferred.
+/// Batch DQ/DT: list typed TTL via absolute PEXPIREAT.
 #[tokio::test(flavor = "multi_thread")]
 async fn migrate_list_with_ttl() {
     let pair = spawn_standalone_pair(16924, 16925).await;
@@ -559,6 +595,10 @@ async fn migrate_list_with_ttl() {
         send_cmd(&mut sa, &["PEXPIRE", "lttl", "40000"]).await,
         RespValue::Integer(1)
     );
+    let source_abs = match send_cmd(&mut sa, &["PEXPIRETIME", "lttl"]).await {
+        RespValue::Integer(n) => n,
+        other => panic!("expected PEXPIRETIME integer, got {:?}", other),
+    };
 
     let port_b = pair.port_b.to_string();
     assert!(is_ok(
@@ -569,6 +609,16 @@ async fn migrate_list_with_ttl() {
         .await
     ));
 
+    let dest_abs = match send_cmd(&mut sb, &["PEXPIRETIME", "lttl"]).await {
+        RespValue::Integer(n) => n,
+        other => panic!("expected integer PEXPIRETIME, got {:?}", other),
+    };
+    assert!(
+        (dest_abs - source_abs).abs() <= 2_000,
+        "list absolute expire drifted: source={} dest={}",
+        source_abs,
+        dest_abs
+    );
     let pttl = match send_cmd(&mut sb, &["PTTL", "lttl"]).await {
         RespValue::Integer(n) => n,
         other => panic!("expected integer PTTL, got {:?}", other),
@@ -577,6 +627,61 @@ async fn migrate_list_with_ttl() {
         pttl > 30_000 && pttl <= 40_000,
         "dest list PTTL out of range: {}",
         pttl
+    );
+
+    shutdown(pair).await;
+}
+
+/// Batch DT: known absolute PEXPIREAT end time survives MIGRATE (not remaining-ms).
+#[tokio::test(flavor = "multi_thread")]
+async fn migrate_preserves_absolute_pexpireat() {
+    let pair = spawn_standalone_pair(16926, 16927).await;
+    let mut sa = TcpStream::connect(("127.0.0.1", pair.port_a)).await.unwrap();
+    let mut sb = TcpStream::connect(("127.0.0.1", pair.port_b)).await.unwrap();
+
+    // Wall-clock absolute ~90s from now (stable across small delays).
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let abs = now_ms + 90_000;
+    assert!(is_ok(
+        &send_cmd(&mut sa, &["SET", "abskey", "payload"]).await
+    ));
+    assert_eq!(
+        send_cmd(
+            &mut sa,
+            &["PEXPIREAT", "abskey", &abs.to_string()]
+        )
+        .await,
+        RespValue::Integer(1)
+    );
+
+    // Brief pause simulates processing delay before MIGRATE; remaining-ms would shrink.
+    sleep(Duration::from_millis(200)).await;
+
+    let port_b = pair.port_b.to_string();
+    assert!(is_ok(
+        &send_cmd(
+            &mut sa,
+            &["MIGRATE", "127.0.0.1", &port_b, "abskey", "0", "2000"]
+        )
+        .await
+    ));
+
+    let dest_abs = match send_cmd(&mut sb, &["PEXPIRETIME", "abskey"]).await {
+        RespValue::Integer(n) => n,
+        other => panic!("expected PEXPIRETIME, got {:?}", other),
+    };
+    assert!(
+        (dest_abs - abs).abs() <= 2_000,
+        "absolute end not preserved: want≈{} got={}",
+        abs,
+        dest_abs
+    );
+    assert_eq!(
+        as_bulk(&send_cmd(&mut sb, &["GET", "abskey"]).await),
+        "payload"
     );
 
     shutdown(pair).await;

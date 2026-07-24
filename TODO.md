@@ -141,7 +141,11 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P1]`** Failover story (external Sentinel-compatible or built-in later)
   - *Hardened (Batch AC)*: full-resync holds a gate across RDB snapshot + feed register so concurrent `propagate_raw` cannot drop writes; sibling FAILOVER test waits for both `master_link_up` + `WAIT` before asserting
   - *Done (minimal + coordinated MVP-lite)*: honest promote via `REPLICAOF NO ONE` / bare `FAILOVER` on replica — new replid, offset 0, backlog clear, drop feeds, clear replica metadata, `master_replid2` in INFO; idempotent when already master.
-  - *Coordinated* `FAILOVER TO <host> <port> [TIMEOUT ms] [FORCE]` (master only, default timeout 5000ms): write pause, soft match against REPLCONF `listening-port`/`ip-address` when tracked, wait until target ack ≥ frozen `master_repl_offset` (unless **FORCE**), then TCP bare `FAILOVER`, best-effort sibling re-follow (`REPLICAOF` on feeds + client-port TCP), demote self via `set_replicaof`. Replicas honor in-stream `REPLICAOF` and reconnect on `primary_link_epoch` / primary addr change. Catch-up sources: live-link tracked ACK (`REPLCONF ACK` on feed + periodic feed GETACK probe), then client-port GETACK fallback. Replica offset uses exact wire bytes via `parse_with_consumed` and replies to master GETACK on the repl link. Catch-up timeout leaves master writable. Full Sentinel not implemented.
+  - *Coordinated* `FAILOVER TO <host> <port> [TIMEOUT ms] [FORCE]` (master only, default timeout 5000ms): write pause, soft match against REPLCONF `listening-port`/`ip-address` when tracked, wait until target ack ≥ frozen `master_repl_offset` (unless **FORCE**), then TCP bare `FAILOVER`, best-effort sibling re-follow (`REPLICAOF` on feeds + client-port TCP), demote self via `set_replicaof`. Replicas honor in-stream `REPLICAOF` and reconnect on `primary_link_epoch` / primary addr change. Catch-up sources: live-link tracked ACK (`REPLCONF ACK` on feed + periodic feed GETACK probe), then client-port GETACK fallback. Replica offset uses exact wire bytes via `parse_with_consumed` and replies to master GETACK on the repl link. Catch-up timeout leaves master writable.
+  - *Done (Batch EW, Sentinel-lite)*: `SENTINEL MONITOR|REMOVE|GET-MASTER-ADDR-BY-NAME|MASTERS|MASTER|REPLICAS|SET|FAILOVER|CKQUORUM|HELP`. Background PING + ROLE replica discover; **s_down** after `down-after-milliseconds` (default 30s); auto-failover (toggle via `SET auto-failover`) promotes first reachable replica (`FAILOVER` / `REPLICAOF NO ONE` / PING-reachable switch).
+  - *Done (Batch EX, ODOWN lite)*: `SENTINEL MYID|MEET|MEETPEER|SENTINELS|IS-MASTER-DOWN-BY-ADDR`. Peer table; vote count = self s_down + peer is-master-down replies; **o_down** when votes ≥ quorum; auto-failover gated on **o_down** (not bare s_down). CKQUORUM checks known_sentinel_count ≥ quorum. No pub/sub hello bus / leader election races.
+  - *Done (Batch EZ)*: `SENTINEL FLUSHCONFIG` → `{dir}/sentinel.conf`; load on boot (`load_or_new`); restore myid/monitors/peers/options; **autosave** on MONITOR/REMOVE/SET/MEET/switch_master.
+  - *Done (Batch FA)*: Redis-style hello CSV; `SENTINEL HELLO`; tick **PUBLISH** `__sentinel__:hello` on reachable masters; peer `SENTINEL HELLO` exchange; `apply_hello` learns peers + higher-epoch **switch-master**.
 - [x] **`[P1]`** Client durability: `WAIT` + min-replicas write gate
   - *Done*: `WAIT numreplicas timeout_ms` freezes `master_repl_offset`, probes feed GETACK, returns count of replicas with ack ≥ offset (`timeout 0` = forever). `CONFIG GET|SET min-replicas-to-write` / `min-replicas-max-lag` (aliases `min-slaves-*`); writes return `NOREPLICAS` when good replica count is below threshold. INFO exposes `min_slaves_*`.
 
@@ -287,7 +291,7 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P1]`** Hash slots / key hashing compatible with Redis Cluster clients
   - *Done (MVP)*: Redis CRC16-XMODEM + hash tags (`SLOT_COUNT=16384`); single-node `ClusterState` owns all slots; `--cluster-enabled`; `CLUSTER KEYSLOT/MYID/INFO/NODES/SLOTS/SETSLOT`; `ASKING` one-shot; gate after ACL (`CROSSSLOT` / `MOVED` / `ASK`); `SELECT` rejected in cluster mode; standalone path unchanged.
 - [x] **`[P1]`** Gossip / membership and failover
-  - *Done (thin MVP)*: `CLUSTER MEET` over client RESP (MYID + `MEETPEER` handshake); periodic PING heartbeat; **single-observer** fail (not Redis quorum) → `fail` flag in `CLUSTER NODES`; on master fail, replica (`CLUSTER REPLICATE`) runs `promote_to_master` + claims slots. Gaps: no binary cluster bus, no multi-node quorum PFAIL/FAIL, no epoch election, no replica election among peers, no automatic reconfig of other nodes' views.
+  - *Done (thin MVP + Batch DW–EC)*: `CLUSTER MEET` over client RESP; PING heartbeat; **`pfail` → quorum `fail`**; FAILREPORTS; NODES `fail?`/`fail`. On master fail: **priority → offset → id** (EB/EA/DY); **losers re-point** (DZ). Operator **`CLUSTER FAILOVER [FORCE|TAKEOVER]`** (EC). Gaps: no binary cluster bus, no full Sentinel process.
 - [x] **`[P1]`** Resharding / slot migration (thin MVP)
   - *Done*: `keys_in_slot` / `string_keys_in_slot`; `CLUSTER MIGRATEKEYS <slot> <ip> <port>` moves **all key types** via RESP (ASKING + type-specific recreate + DEL: SET/HSET/RPUSH/SADD/ZADD/GEOADD/XADD+groups); SETSLOT MIGRATING/IMPORTING/NODE/STABLE operator flow; MIGRATING miss → ASK; final NODE → MOVED.
   - *Done (Batch Y)*: multi-type MIGRATEKEYS (string/hash/list/set/zset/geo/stream)
@@ -296,16 +300,28 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch DO)*: `MigrateSlotError` carries partial `migrated`/`skipped`; RESHARD `failed_keys` surfaces real counts; retry = leftover source keys only (docs + e2e). Range aborts on any non-`complete` (incl. `partial_*_node`). FINISH soft-checks `keys_in_slot` → optional `warning` field (does not hard-block). Source-before-dest NODE client window documented in rustdoc (order unchanged).
   - *Done (Batch DP)*: Redis key-level `MIGRATE host port key dest-db timeout [COPY] [REPLACE] [AUTH password] [AUTH2 user pass] [KEYS k…]`. Shared `migrate_one_key_on_stream` / `migrate_keys_to` reuses snapshot + RESP recreate (no DUMP/RESTORE); ASKING probed (disabled on standalone dest); `COPY` / `REPLACE` / `BUSYKEY` / `NOKEY` / connect timeout; multi-key `KEYS`; dest `SELECT` for non-zero db; AOF/repl propagates source `DEL` (not the MIGRATE form). MIGRATEKEYS loop uses the same helper. Catalog + ACL `@write`/`@keyspace`/`@dangerous` + readonly replica gate. Tests: `tests/dp_migrate_test.rs` (+ existing MIGRATEKEYS suite green).
   - *Done (Batch DQ)*: multi-key mid-batch `IOERR` includes `migrated=` / `skipped=` counts (shared inject with MIGRATEKEYS); recreate path transfers remaining TTL for all types (string `SET PX`; hash/list/set/zset/geo/stream trailing `PEXPIRE` via `Cache::ttl`). Tests: partial inject e2e + string/hash/list TTL.
-  - *Gaps*: dual-end NODE still not atomic / no 2PC; no slot-stable epoch gossip of ownership; no full redis-cli-style interactive reshard planner; no multi-node quorum view of topology after reshard; source-before-dest NODE order residual (documented; dest-first experiment not done). MIGRATE: no Redis DUMP/RESTORE wire compatibility (recreate-only); ASKING probe / REPLACE pre-DEL semantics documented in module rustdoc (Batch DP).
+  - *Gaps*: dual-end NODE still not full wire-protocol 2PC (EY preflight + EP rollback); no interactive redis-cli weight UI. MIGRATE: no Redis DUMP/RESTORE wire compatibility (recreate-only); ASKING probe / REPLACE pre-DEL semantics documented in module rustdoc (Batch DP).
+  - *Done (Batch EY)*: dual-end NODE **preflight** before any SETSLOT NODE — local owns/already-dest; dest reachable + `CLUSTER MYID` matches dest-id; dest `CLUSTER SLOTS` owner is source or dest (or unbound). Failure → `failed_preflight` (no half-apply). Idempotent complete when both already own dest.
+  - *Done (Batch EP)*: when dest NODE ok but source NODE fails: EH re-asserts MIGRATING; **compensate** dest with `SETSLOT NODE <source>` + `IMPORTING` → status `rolled_back` (both sides agree source owns; retry FINISH). Rollback failure keeps `partial_source_node` + warning. Range aborts on `rolled_back`. Source NODE inject hook for tests.
+  - *Done (Batch EQ)*: Redis `cluster-require-full-coverage` (default yes) — `CLUSTER INFO cluster_state:ok|fail`; key commands get `CLUSTERDOWN The cluster is down` when any slot is unbound or fail-owned; CONFIG GET/SET + `--cluster-require-full-coverage`; ASKING+IMPORTING still allowed for reshard.
+  - *Done (Batch ER)*: connection `READONLY`/`READWRITE` wired into cluster redirect gate — replicas serve **reads** for slots owned by their master; writes still `MOVED`; without READONLY all key cmds `MOVED` (Redis-compatible).
+  - *Done (Batch ES)*: Redis `cluster-allow-reads-when-down` (default no) — when `cluster_state` is fail, **reads** of covered slots still served if enabled; **writes** remain `CLUSTERDOWN The cluster is down`. CONFIG GET/SET + `--cluster-allow-reads-when-down`.
+  - *Done (Batch ET)*: `CLUSTER SLOTS` each range is `[start, end, [master…], [replica…]…]` (replicas via `replicas_of`, non-fail); unbound ranges omitted from `slots_ranges`.
+  - *Done (Batch EU)*: Redis `cluster-announce-ip` / `cluster-announce-port` — client-facing address for myself in CLUSTER NODES/SLOTS/MEETPEER/`addr()`; bind host/port unchanged; CONFIG GET/SET + CLI; empty/0 clears.
+  - *Done (Batch EV)*: `CLUSTER SLOT-STATS SLOTSRANGE <start> <end> [ORDERBY key-count [LIMIT n] [ASC|DESC]]` — key counts for **owned** slots (one keyspace pass); `cpu-usec`/network fields 0 (shape-compatible).
+  - *Done (Batch EM/EN/EO)*: `CLUSTER SAVECONFIG` → `{dir}/nodes.conf`; load on boot (`load_or_single_node`); **autosave** after topology-mutating CLUSTER ops (SETSLOT/ADDSLOTS/MEET/FORGET/RESET/FAILOVER/RESHARD/…) and gossip failover claim. Best-effort (warn on I/O fail); not every gossip ownership merge.
+  - *Done (Batch DU)*: per-slot config epoch on `SETSLOT NODE` / reassign / failover claim; `CLUSTER OWNERS` + `CLUSTER EPOCH`; gossip/MEET pull+merge higher-epoch-wins (skip local MIGRATING/IMPORTING); third-node learns owner after NODE.
+  - *Done (Batch DV)*: dest-first dual-end NODE (source skipped if dest fails → no MOVED-to-IMPORTING window); `partial_dest_node` when source `skipped:`; stale lower-epoch gossip cannot flip post-reshard ownership.
+  - *Done (Batch DX)*: `CLUSTER RESHARD PLAN <dest> <n>` greedy donors; `AUTO` plans then executes local `reshard_slot` + remote RESP `CLUSTER RESHARD` (abort-on-partial).
   - [x] **`[P2]`** **Code review (DM/DN post-ship):** `failed_keys` under-reports partial key moves
     - *Done (Batch DO)*: `migrate_slot_keys` → `Result<_, MigrateSlotError { partial, message }>`; `reshard_one_slot` maps partial into `ReshardSlotResult.migrated/skipped` under `failed_keys:*`. Retry re-runs MIGRATEKEYS/RESHARD for leftover keys only. Test: inject mid-slot fail after 1 success → `migrated: 1` + retry completes.
   - [x] **`[P2]`** **Code review (DP post-ship):** multi-key partial failure reply is coarse `IOERR` (no counts)
     - *Done (Batch DQ)*: `migrate_keys_to` IOERR after ≥1 success reports `migrated=` / `skipped=`; leftover keys stay on source for retry. Test: inject after 1 of 3 → counts + retry completes.
   - [x] **`[P3]`** **Code review (DP post-ship):** non-string TTL not transferred on recreate
     - *Done (Batch DQ)*: `KeySnapshot` carries `pttl` for all types; string uses `SET PX`; typed keys append `PEXPIRE`. Unit + e2e (string/hash/list).
-  - [ ] **`[P3]`** **Code review (DQ post-ship nit):** migrate TTL is remaining-ms snapshot, not absolute
+  - [x] **`[P3]`** **Code review (DQ post-ship nit):** migrate TTL is remaining-ms snapshot, not absolute
     - *Found*: `Cache::ttl` → remaining ms at snapshot time; dest applies `PX`/`PEXPIRE` later so effective lifetime can shrink by RTT/processing. Absolute `PEXPIREAT` would preserve end time better under slow links.
-    - *Next*: optional switch to unix-ms absolute expire on the wire if Redis clients care; document current remaining-ms behavior.
+    - *Done (Batch DT)*: snapshot via `expire_time_unix_ms`; string `SET … PXAT`; typed trailing `PEXPIREAT`. Unit freeze-under-delay + e2e `PEXPIRETIME` (string/hash/list + known absolute).
   - [x] **`[P3]`** **Code review (DN post-ship):** source NODE before dest NODE creates client window
     - *Done (docs, Batch DO)*: module + `dual_end_setslot_node` rustdoc describe MOVED-to-IMPORTING window under `partial_dest_node`. Code order left source-first (Redis client expectations); dest-first / 2PC still open under gaps.
   - [x] **`[P3]`** **Code review (DM post-ship):** range RESHARD continues after `partial_*_node`
@@ -406,9 +422,9 @@ Also tracked in `docs/roadmap.md`.
     - *Done (Batch DI)*: wrap `<meta http-equiv="refresh" content="5">` in `<noscript>` so JSON poll is the only path when JS runs; full-page reload remains for no-JS; unit test asserts refresh sits inside noscript; docs updated.
   - [x] **`[P3]`** **Code review (DH post-ship nit):** JS numeric table cells not coerced
     - *Done (Batch DI)*: poll script `num(x)` = `Number(x)` with finite fallback `0` for `ttl_ms` / `held_for_ms` / `wait_elapsed_ms` (held/wait/orphan rows).
-  - [ ] **`[P3]`** **Code review (DH post-ship nit):** repaint test is string-contains only
+  - [x] **`[P3]`** **Code review (DH post-ship nit):** repaint test is string-contains only
     - *Found*: `html_poll_js_repaints_tables_stats_and_cycle` asserts embedded JS source and DOM ids; does not execute the poll or assert rendered row HTML after a fake JSON payload. Acceptable without a browser; residual if DOM fidelity regressions matter.
-    - *Next*: optional tiny pure-JS extract + node/quickjs test, or keep as string-contract only. (Batch DI/DL left as residual — no browser harness.)
+    - *Done (Batch DT, accept/wontfix)*: keep string-contract unit tests only — no browser/quickjs harness for localhost admin MVP.
   - [x] **`[P3]`** **Code review (DF post-ship):** HTTP MVP gaps shared with metrics server
     - *Found*: single 4KiB read (no full header parse); non-GET → 404 not 405; test binds `127.0.0.1:0` then rebinds same port (TOCTOU flake risk under load). Acceptable for localhost admin MVP. Same 4KiB pattern in `metrics::run_metrics_server`.
     - *Done (Batch DJ)*: shared `src/admin_http.rs` — request-line read until `\r\n` (8 KiB cap), method/path parse, 405+`Allow: GET` on known paths for non-GET, 404 unknown path; used by deadlock UI + metrics. Tests bind listener once (`*_on_listener` + `127.0.0.1:0`). Residual: no full header/body parse, no auth/TLS (out of scope).
@@ -588,9 +604,9 @@ Also tracked in `docs/roadmap.md`.
   - [x] **`[P2]`** **Code review (DR post-ship):** raw `Arc<Cache>` multi-DB walk still torn mid-install
     - *Found*: command path gated by LOADING; multi-DB exporters use epoch read. Residual: any internal path that holds per-DB `Arc<Cache>` and walks DBs without `with_stable_keyspace_view` can still see DB0-new + DB1-old (test `raw_per_db_access_can_see_mid_loop_tear` documents this).
     - *Done (Batch DS audit)*: AOF `rewrite_databases` now under `with_stable_keyspace_view` (was torn). RDB `from_databases` already safe. Documented: `Databases::iter` rustdoc; INFO blocked_clients / CONFIG multi-DB walks are non-keyspace (no epoch). Metrics single-cache. Residual raw mid-loop tear still true for unprivileged raw Arc walks during install (documented by existing DR test); exporters must use epoch read.
-  - [ ] **`[P3]`** **Code review (DR/DS residual):** single-DB mid-`install_keyspace_payload` tear
+  - [x] **`[P3]`** **Code review (DR/DS residual):** single-DB mid-`install_keyspace_payload` tear
     - *Found*: even under epoch write, one DB’s install is multi-map sequential (strings then typed…). Allowlisted probes on a single selected DB during LOADING can still see partial single-DB maps if they bypass LOADING (they should not). Panic mid-fill also skips multi-DB discard rollback (discard only returned after fill completes).
-    - *Next*: keep LOADING as the barrier; optional single-DB Arc-swap / all-or-nothing map install only if privileged paths grow.
+    - *Done (Batch DT, document/accept)*: keep **LOADING** as the barrier; no Arc-swap unless privileged paths grow. Documented in `docs/locking.md` (Keyspace replace residuals).
   - [x] **`[P3]`** **Code review (DR post-ship nit):** production test hook `after_install_db`
     - *Found*: `Mutex<Option<Arc<dyn Fn(usize)>>>` on `Databases` for DR tests. Harmless when None; extra field on every process.
     - *Done (Batch DS docs)*: keep on type — `tests/` integration tests cannot see lib `cfg(test)`; feature flag would force CI `--features`. Rustdoc states production always `None`.
@@ -667,7 +683,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-Prioritized for next letter batch(es). **Batches CZ–DR shipped** (… **DQ** MIGRATE partial counts + typed TTL; **DR** multi-DB lock-step install / epoch barrier). **Open next (after DQ/DR code review):** DR panic mid-install rollback; audit raw multi-DB walks; single-DB mid-payload residual; DQ absolute expire vs remaining-ms; cluster 2PC / epoch gossip / planner; string-only UI repaint residual; standing tests-for-phase P0.
+Prioritized for next letter batch(es). **Batches CZ–EZ + FA shipped** (… **EZ** sentinel.conf; **FA** hello bus lite). **Open next:** full wire 2PC / full Sentinel leader election (later); standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -750,11 +766,44 @@ Prioritized for next letter batch(es). **Batches CZ–DR shipped** (… **DQ** M
 | P3 | DP residual: non-string TTL not transferred on recreate | done (DQ) |
 | P2 | DR post-ship: panic mid-install partial multi-DB commit | done (DS; mid-fill single-DB residual) |
 | P2 | DR post-ship: raw Arc multi-DB walk still torn mid-install | done (DS AOF epoch + audit; raw residual documented) |
-| P3 | DR/DS residual: single-DB mid-payload map tear | open |
+| P3 | DR/DS residual: single-DB mid-payload map tear | done (DT document/accept; LOADING barrier) |
 | P3 | DR post-ship nit: after_install_db test hook in prod type | done (DS docs; keep for tests/) |
-| P3 | DQ post-ship nit: migrate TTL remaining-ms not absolute | open |
+| P3 | DQ post-ship nit: migrate TTL remaining-ms not absolute | done (DT PXAT/PEXPIREAT) |
 | P3 | DP residual: no DUMP/RESTORE wire compatibility | open (recreate-only; accepted) |
-| P3 | DH post-ship nit: repaint test is string-contains only | open (residual; no browser harness) |
+| P3 | DH post-ship nit: repaint test is string-contains only | done (DT accept; string-contract only) |
+| P2 | DU: slot ownership epoch + gossip after NODE | done (DU) |
+| P2 | DV: dest-first dual-end NODE + epoch fence | done (DV) |
+| P2 | DW: multi-master pfail/fail quorum + FAILREPORTS | done (DW) |
+| P2 | DX: RESHARD PLAN/AUTO greedy planner + remote execute | done (DX) |
+| P2 | DY: multi-replica election (max id) + ROLEMAP | done (DY) |
+| P2 | DZ: loser reconfig to election winner after fail | done (DZ) |
+| P2 | EA: failover election by repl offset (+ id tie-break) | done (EA) |
+| P2 | EB: replica-priority election (0=never; CLI flag) | done (EB) |
+| P2 | EC: CLUSTER FAILOVER [FORCE|TAKEOVER] manual promote | done (EC) |
+| P2 | ED: COUNTKEYSINSLOT / GETKEYSINSLOT / REPLICAS / BUMPEPOCH | done (ED) |
+| P2 | EE: ADDSLOTS / DELSLOTS / FLUSHSLOTS slot bootstrap | done (EE) |
+| P2 | EF: ADDSLOTSRANGE / DELSLOTSRANGE | done (EF) |
+| P2 | EG: CLUSTER FORGET + RESET SOFT/HARD | done (EG) |
+| P2 | EH: partial_source MIGRATING restore + COUNT-FAILURE-REPORTS | done (EH) |
+| P2 | EI: CLUSTER SHARDS (Redis-7) + LINKS empty | done (EI) |
+| P2 | EJ: post-commit dual NODE verify + MYSHARDID | done (EJ) |
+| P2 | EK: CLUSTER SET-CONFIG-EPOCH | done (EK) |
+| P2 | EL: CONFIG GET/SET cluster-replica-priority + node-timeout | done (EL) |
+| P2 | EM: CLUSTER SAVECONFIG → dir/nodes.conf | done (EM) |
+| P2 | EN: load nodes.conf on cluster boot | done (EN) |
+| P2 | EO: autosave nodes.conf on topology mutation / failover claim | done (EO) |
+| P2 | EP: dual-end NODE dest compensating rollback (`rolled_back`) | done (EP) |
+| P2 | EQ: cluster-require-full-coverage + honest cluster_state | done (EQ) |
+| P2 | ER: READONLY serves cluster replica reads of master slots | done (ER) |
+| P2 | ES: cluster-allow-reads-when-down (reads when cluster fail) | done (ES) |
+| P2 | ET: CLUSTER SLOTS includes replica endpoints | done (ET) |
+| P2 | EU: cluster-announce-ip / cluster-announce-port | done (EU) |
+| P2 | EV: CLUSTER SLOT-STATS SLOTSRANGE key-count | done (EV) |
+| P2 | EW: Sentinel-lite MONITOR/s_down/FAILOVER | done (EW) |
+| P2 | EX: multi-Sentinel MEET + ODOWN vote quorum | done (EX) |
+| P2 | EY: dual-end NODE preflight / failed_preflight | done (EY) |
+| P2 | EZ: Sentinel FLUSHCONFIG + sentinel.conf load/autosave | done (EZ) |
+| P2 | FA: Sentinel hello bus lite (HELLO + PUBLISH) | done (FA) |
 | P3 | DF post-ship: HTTP MVP gaps shared with metrics | done (DJ; shared admin_http) |
 | P3 | DK post-ship: thin r@10 headroom / cross-arch flake risk | done (DL; r@10 0.95→0.93) |
 | P3 | DK post-ship: no post-delete/update churn in recall suite | done (DL; remove+update micro) |
@@ -807,7 +856,7 @@ Highest urgency checklist (phase order preserved):
 - [x] Load from file on startup
 - [x] Async replication
 - [x] Timed SAVE policies (`--save` / CONFIG save)
-  - *Follow-ups*: Sentinel/failover
+  - *Follow-ups*: long-lived master SUBSCRIBE hello fan-in / full leader election
 
 **C**
 

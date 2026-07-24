@@ -1,6 +1,7 @@
 pub mod acl;
 pub mod cache;
 pub mod cluster;
+pub mod sentinel;
 pub mod databases;
 pub mod entry;
 pub mod hashmap;
@@ -37,12 +38,14 @@ pub mod acl_log;
 pub use acl::{AclStore, AclUser};
 pub use cache::{Cache, EvictionPolicy};
 pub use cluster::{
-    crc16, finish_slot_node, force_mark_fail, gossip_tick, key_hash_slot, keys_in_slot, meet_peer,
-    migrate_keys_to, migrate_one_key_on_stream, migrate_slot_keys, migrate_slot_string_keys,
-    reshard_slot, reshard_slots, run_cluster_gossip, string_keys_in_slot,
-    test_acquire_dest_node_inject, test_acquire_migrate_key_inject, test_inject_dest_node_failures,
-    ClusterState, DestNodeInjectGuard, MigrateCommandResult, MigrateDestAuth, MigrateKeyInjectGuard,
-    MigrateKeyOpts, MigrateOneOutcome, MigrateSlotError, MigrateSlotResult, ReshardSlotResult,
+    crc16, execute_reshard_plan, finish_slot_node, force_mark_fail, gossip_tick, key_hash_slot,
+    keys_in_slot, meet_peer, migrate_keys_to, migrate_one_key_on_stream, migrate_slot_keys,
+    migrate_slot_string_keys, plan_reshard, reshard_slot, reshard_slots, run_cluster_gossip,
+    string_keys_in_slot, test_acquire_dest_node_inject, test_acquire_migrate_key_inject,
+    test_inject_dest_node_failures, test_source_node_inject, ClusterState, DestNodeInjectGuard,
+    MigrateCommandResult, MigrateDestAuth, MigrateKeyInjectGuard, MigrateKeyOpts, MigrateOneOutcome,
+    MigrateSlotError, ManualFailoverMode, MigrateSlotResult, OwnershipApplyResult, OwnershipRange,
+    ReshardPlanEntry, ReshardSlotResult, RoleMapEntry, SourceNodeInjectGuard,
     DEFAULT_NODE_TIMEOUT_MS, SLOT_COUNT,
 };
 pub use hashmap::{
@@ -54,6 +57,10 @@ pub use config::Config;
 pub use databases::{Databases, DEFAULT_DATABASES};
 pub use error::{Error, Result};
 pub use network::Server;
+pub use sentinel::{
+    master_fields, meet_sentinel, peer_fields, run_sentinel_loop, try_failover, HelloMsg,
+    MasterInfo, PeerSentinel, ReplicaInfo, SentinelState, DEFAULT_DOWN_AFTER_MS, HELLO_CHANNEL,
+};
 pub use persistence::{
     format_save_rules, parse_save_rules, PersistenceConfig, PersistenceManager, SaveRule,
 };

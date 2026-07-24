@@ -1439,6 +1439,126 @@ impl CommandHandler {
                         p.replication.set_min_replicas_max_lag(n);
                         Ok(RespValue::ok())
                     }
+                    "cluster-replica-priority" | "cluster_replica_priority" => {
+                        // Batch EL: live failover priority (0 = never promote).
+                        let Some(c) = self.cluster.as_ref() else {
+                            return Ok(RespValue::error(
+                                "ERR CLUSTERDOWN This instance has cluster support disabled",
+                            ));
+                        };
+                        let n: u32 = match value_str.parse() {
+                            Ok(n) => n,
+                            Err(_) => {
+                                return Ok(RespValue::error(
+                                    "ERR invalid cluster-replica-priority value",
+                                ))
+                            }
+                        };
+                        c.set_local_repl_priority(n);
+                        Ok(RespValue::ok())
+                    }
+                    "cluster-node-timeout"
+                    | "cluster_node_timeout"
+                    | "cluster-node-timeout-ms"
+                    | "cluster_node_timeout_ms" => {
+                        // Batch EL: fail-detection timeout (ms); min 20.
+                        let Some(c) = self.cluster.as_ref() else {
+                            return Ok(RespValue::error(
+                                "ERR CLUSTERDOWN This instance has cluster support disabled",
+                            ));
+                        };
+                        let n: u64 = match value_str.parse() {
+                            Ok(n) if n > 0 => n,
+                            Ok(_) => {
+                                return Ok(RespValue::error(
+                                    "ERR cluster-node-timeout must be > 0",
+                                ))
+                            }
+                            Err(_) => {
+                                return Ok(RespValue::error(
+                                    "ERR invalid cluster-node-timeout value",
+                                ))
+                            }
+                        };
+                        c.set_node_timeout_ms(n);
+                        Ok(RespValue::ok())
+                    }
+                    "cluster-require-full-coverage" | "cluster_require_full_coverage" => {
+                        // Batch EQ: yes/no — refuse key commands when coverage incomplete.
+                        let Some(c) = self.cluster.as_ref() else {
+                            return Ok(RespValue::error(
+                                "ERR CLUSTERDOWN This instance has cluster support disabled",
+                            ));
+                        };
+                        let v = value_str.to_ascii_lowercase();
+                        let require = match v.as_str() {
+                            "yes" | "true" | "1" | "on" => true,
+                            "no" | "false" | "0" | "off" => false,
+                            _ => {
+                                return Ok(RespValue::error(
+                                    "ERR invalid cluster-require-full-coverage value",
+                                ))
+                            }
+                        };
+                        c.set_require_full_coverage(require);
+                        Ok(RespValue::ok())
+                    }
+                    "cluster-allow-reads-when-down" | "cluster_allow_reads_when_down" => {
+                        // Batch ES: yes/no — serve reads while cluster_state is fail.
+                        let Some(c) = self.cluster.as_ref() else {
+                            return Ok(RespValue::error(
+                                "ERR CLUSTERDOWN This instance has cluster support disabled",
+                            ));
+                        };
+                        let v = value_str.to_ascii_lowercase();
+                        let allow = match v.as_str() {
+                            "yes" | "true" | "1" | "on" => true,
+                            "no" | "false" | "0" | "off" => false,
+                            _ => {
+                                return Ok(RespValue::error(
+                                    "ERR invalid cluster-allow-reads-when-down value",
+                                ))
+                            }
+                        };
+                        c.set_allow_reads_when_down(allow);
+                        Ok(RespValue::ok())
+                    }
+                    "cluster-announce-ip" | "cluster_announce_ip" => {
+                        // Batch EU: client-facing IP (empty clears).
+                        let Some(c) = self.cluster.as_ref() else {
+                            return Ok(RespValue::error(
+                                "ERR CLUSTERDOWN This instance has cluster support disabled",
+                            ));
+                        };
+                        if value_str.is_empty() {
+                            c.set_announce_ip(None);
+                        } else {
+                            c.set_announce_ip(Some(value_str.to_string()));
+                        }
+                        Ok(RespValue::ok())
+                    }
+                    "cluster-announce-port" | "cluster_announce_port" => {
+                        // Batch EU: client-facing port (0 clears).
+                        let Some(c) = self.cluster.as_ref() else {
+                            return Ok(RespValue::error(
+                                "ERR CLUSTERDOWN This instance has cluster support disabled",
+                            ));
+                        };
+                        let n: u16 = match value_str.parse() {
+                            Ok(n) => n,
+                            Err(_) => {
+                                return Ok(RespValue::error(
+                                    "ERR invalid cluster-announce-port value",
+                                ))
+                            }
+                        };
+                        if n == 0 {
+                            c.set_announce_port(None);
+                        } else {
+                            c.set_announce_port(Some(n));
+                        }
+                        Ok(RespValue::ok())
+                    }
                     _ => Ok(RespValue::error("ERR Unsupported CONFIG parameter")),
                 }
             }

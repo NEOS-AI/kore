@@ -46,15 +46,18 @@ Never invert these (deadlock risk):
     guard reinstalls olds for `0..=i` while the epoch write is still held.
     Peak dual-residency is slightly higher during install (olds retained until
     commit). Staging-only panic still leaves all targets intact.
-- **Residuals**
+- **Residuals** (accepted Batch DT unless privileged paths grow)
   - Panic **inside** a single DB’s multi-map fill (after drain, before install
     returns) is not rolled back — that one DB can stay torn. Full Arc-swap of
-    whole DB vector (Option C) would change that.
+    whole DB vector (Option C) would change that; not planned while **LOADING**
+    remains the only public barrier to keyspace reads during install.
   - Raw `Arc<Cache>` access that skips the epoch lock can still observe a
     mid-loop multi-DB tear (and mid-payload single-DB map tear) **while install
     is running**. Command path is gated; do not walk all DBs’ keyspace without
     the epoch read lock. Non-keyspace multi-DB walks (blocked clients, CONFIG
     propagation) are fine without it.
+  - Single-DB sequential multi-map fill is **not** all-or-nothing; LOADING
+    denial of data-plane + `SYNC`/`PSYNC` is the intentional client barrier.
 - **LOADING allowlist** (connection / discovery / repl handshake only — no
   keyspace snapshot): `AUTH`, `HELLO`, `PING`, `ECHO`, `QUIT`, `RESET`, `INFO`,
   `COMMAND`, `ROLE`, `REPLCONF`, `CLIENT`, `CONFIG`, `MODULE`.

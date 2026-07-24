@@ -5,6 +5,7 @@ use crate::commands::CommandHandler;
 use crate::config::Config;
 use crate::databases::Databases;
 use crate::persistence::PersistenceManager;
+use crate::sentinel::SentinelState;
 use crate::protocol::{RespParser, RespValue};
 use crate::redlock::Redlock;
 use crate::scripting::ScriptCache;
@@ -33,6 +34,8 @@ pub struct Server {
     redlock: Option<Arc<Redlock>>,
     /// Cluster topology when `--cluster-enabled`.
     cluster: Option<Arc<ClusterState>>,
+    /// Sentinel-lite monitors (Batch EW). Always present.
+    sentinel: Arc<SentinelState>,
     /// Shared SCRIPT LOAD / EVALSHA cache for all connections.
     script_cache: Arc<ScriptCache>,
     /// When true, skip SAVE on process shutdown (SHUTDOWN NOSAVE).
@@ -92,10 +95,32 @@ impl Server {
             }
         }
         let cluster = if config.cluster_enabled {
-            Some(ClusterState::single_node(config.host.clone(), config.port))
+            // Batch EN: prefer dir/nodes.conf from CLUSTER SAVECONFIG when present.
+            let cs = ClusterState::load_or_single_node(
+                config.host.clone(),
+                config.port,
+                &config.dir,
+            );
+            cs.set_local_repl_priority(config.cluster_replica_priority);
+            // Batch EQ: cluster-require-full-coverage (default true).
+            cs.set_require_full_coverage(config.cluster_require_full_coverage);
+            // Batch ES: cluster-allow-reads-when-down (default false).
+            cs.set_allow_reads_when_down(config.cluster_allow_reads_when_down);
+            // Batch EU: client-facing announce address for NODES/SLOTS/MEET/MOVED.
+            if !config.cluster_announce_ip.is_empty() {
+                cs.set_announce_ip(Some(config.cluster_announce_ip.clone()));
+            }
+            if config.cluster_announce_port > 0 {
+                cs.set_announce_port(Some(config.cluster_announce_port));
+            }
+            // Batch EO: autosave nodes.conf after topology mutations / failover claim.
+            cs.set_nodes_conf_dir(&config.dir);
+            Some(cs)
         } else {
             None
         };
+        // Batch EZ: load dir/sentinel.conf when present.
+        let sentinel = SentinelState::load_or_new(&config.dir);
         Self {
             databases,
             config,
@@ -103,6 +128,7 @@ impl Server {
             acl,
             redlock: None,
             cluster,
+            sentinel,
             script_cache: ScriptCache::shared(),
             shutdown_nosave: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -153,6 +179,17 @@ impl Server {
     /// Cluster state held by this server, if enabled.
     pub fn cluster(&self) -> Option<&Arc<ClusterState>> {
         self.cluster.as_ref()
+    }
+
+    /// Replace Sentinel-lite state (tests).
+    pub fn with_sentinel(mut self, sentinel: Arc<SentinelState>) -> Self {
+        self.sentinel = sentinel;
+        self
+    }
+
+    /// Shared Sentinel-lite state (Batch EW).
+    pub fn sentinel(&self) -> &Arc<SentinelState> {
+        &self.sentinel
     }
 
     pub async fn run(&self) -> anyhow::Result<()> {
@@ -273,6 +310,18 @@ impl Server {
                     gossip_shutdown,
                 )
                 .await;
+            });
+        }
+
+        // Sentinel-lite health / ODOWN / auto-failover (Batch EW/EX).
+        {
+            // Advertise this process's client port for MEETPEER (Batch EX).
+            self.sentinel
+                .set_listen_addr(self.config.host.clone(), self.config.port);
+            let sentinel = Arc::clone(&self.sentinel);
+            let sentinel_shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                crate::sentinel::run_sentinel_loop(sentinel, sentinel_shutdown).await;
             });
         }
 
@@ -422,6 +471,7 @@ impl Server {
         let persistence = self.persistence.clone();
         let acl = self.acl.clone();
         let cluster = self.cluster.clone();
+        let sentinel = Arc::clone(&self.sentinel);
         let redlock = self.redlock.clone();
         let script_cache = self.script_cache.clone();
 
@@ -437,6 +487,7 @@ impl Server {
                             persistence,
                             acl,
                             cluster,
+                            sentinel,
                             redlock,
                             script_cache,
                             shutdown_tx,
@@ -454,6 +505,7 @@ impl Server {
                     persistence,
                     acl,
                     cluster,
+                    sentinel,
                     redlock,
                     script_cache,
                     shutdown_tx,
@@ -516,6 +568,7 @@ async fn handle_connection<S>(
     persistence: Option<Arc<PersistenceManager>>,
     acl: Arc<AclStore>,
     cluster: Option<Arc<ClusterState>>,
+    sentinel: Arc<SentinelState>,
     redlock: Option<Arc<Redlock>>,
     script_cache: Arc<ScriptCache>,
     shutdown_tx: Option<Arc<watch::Sender<bool>>>,
@@ -536,6 +589,7 @@ where
     let mut handler =
         CommandHandler::with_databases_and_acl(databases, config, persistence, acl)
             .with_cluster(cluster)
+            .with_sentinel(Some(sentinel))
             .with_redlock(redlock)
             .with_script_cache(script_cache);
     if let Some(tx) = shutdown_tx {
@@ -849,7 +903,12 @@ mod tests {
             tls_key: String::new(),
             aclfile: String::new(),
             cluster_enabled: false,
-                unixsocket: String::new(),
+            cluster_replica_priority: 100,
+            cluster_require_full_coverage: true,
+            cluster_allow_reads_when_down: false,
+            cluster_announce_ip: String::new(),
+            cluster_announce_port: 0,
+            unixsocket: String::new(),
             log_format: "text".to_string(),
         });
 

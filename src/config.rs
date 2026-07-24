@@ -175,6 +175,29 @@ pub struct Config {
     #[arg(long, default_value = "false")]
     pub cluster_enabled: bool,
 
+    /// Cluster replica failover priority (higher wins; 0 = never promote). Default 100.
+    #[arg(long, default_value = "100")]
+    pub cluster_replica_priority: u32,
+
+    /// When true (default), refuse key commands if any hash slot is unserved or
+    /// owned by a fail-marked master (`cluster_state:fail`). Batch EQ.
+    #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+    pub cluster_require_full_coverage: bool,
+
+    /// When true, allow **read** key commands even if `cluster_state` is fail
+    /// (Batch ES / Redis `cluster-allow-reads-when-down`). Default false.
+    #[arg(long, default_value = "false", action = clap::ArgAction::Set)]
+    pub cluster_allow_reads_when_down: bool,
+
+    /// Client-facing IP announced in CLUSTER NODES/SLOTS/MEET/MOVED (Batch EU).
+    /// Empty = use bind `host`.
+    #[arg(long, default_value = "")]
+    pub cluster_announce_ip: String,
+
+    /// Client-facing port announced in topology (0 = use bind `port`). Batch EU.
+    #[arg(long, default_value = "0")]
+    pub cluster_announce_port: u16,
+
     /// Unix domain socket path (empty = disabled). Listens in addition to TCP.
     #[arg(long, default_value = "")]
     pub unixsocket: String,
@@ -222,6 +245,11 @@ impl Default for Config {
             tls_key: String::new(),
             aclfile: String::new(),
             cluster_enabled: false,
+            cluster_replica_priority: 100,
+            cluster_require_full_coverage: true,
+            cluster_allow_reads_when_down: false,
+            cluster_announce_ip: String::new(),
+            cluster_announce_port: 0,
             unixsocket: String::new(),
         }
     }

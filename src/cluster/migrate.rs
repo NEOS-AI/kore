@@ -22,12 +22,18 @@
 //! status (`failed_*` or `partial_*_node`) so operators do not cascade mixed
 //! ownership across a range.
 //!
-//! **Dual-end NODE order:** source applies `SETSLOT NODE <dest>` before dest.
-//! Between a successful source NODE and dest NODE, clients may receive MOVED
-//! to dest while dest is still IMPORTING (ASK-only) — a transient window under
-//! `partial_dest_node`. Retries cover blips; permanent dest failure needs
-//! `RESHARD FINISH` or manual SETSLOT. Dest-first ordering is intentionally
-//! not used (low-risk residual; Redis client expectations favor source MOVED).
+//! **Dual-end NODE order (Batch DV/EH/EJ/EP):** **dest** applies `SETSLOT NODE <dest>`
+//! first, then **source**. If dest NODE fails, source is **not** flipped (no
+//! MOVED-to-IMPORTING client window). Status `partial_dest_node` means dest
+//! never took stable ownership; source still owns. If dest owns but source NODE
+//! fails: Batch **EH** re-asserts **MIGRATING**; Batch **EP** best-effort
+//! **rolls dest ownership back** to the source (`NODE <source>` + `IMPORTING`)
+//! so both sides agree again — status `rolled_back` (retry FINISH/RESHARD).
+//! If dest rollback fails, status stays `partial_source_node`. After both report
+//! ok, Batch **EJ** re-verifies local + remote ownership (post-commit check).
+//! **Batch EY:** preflight (prepare) before any NODE — dest MYID + ownership
+//! sanity; fail with `failed_preflight` without half-applying. Still not full
+//! wire-protocol 2PC. Ownership epochs (DU) fence stale gossip after NODE.
 //!
 //! **Redis `MIGRATE` (Batch DP/DQ):** key-level transfer reuses
 //! [`snapshot_key`] / [`recreate_commands`] / ASKING / RESP I/O. Options:
@@ -36,10 +42,14 @@
 //!
 //! Supports string, hash, list, set, zset, geo, and stream keys. Dest writes use
 //! ASKING so IMPORTING slots accept the transfer. Complex types are recreated
-//! with the same RESP commands as AOF rewrite (no DUMP/RESTORE). Remaining TTL
-//! is transferred for all types (string `SET PX`; typed keys trailing `PEXPIRE`).
-//! Multi-key mid-batch failure after ≥1 success returns Redis-style `IOERR`
-//! including `migrated=` / `skipped=` counts (Batch DQ).
+//! with the same RESP commands as AOF rewrite (no DUMP/RESTORE).
+//!
+//! **TTL (Batch DT):** expire is snapshotted as **absolute Unix-ms** end time
+//! (`Cache::expire_time_unix_ms`) and applied on dest via string `SET … PXAT` or
+//! trailing `PEXPIREAT`. This preserves the wall-clock end time under migrate
+//! RTT/processing delay (Batch DQ used remaining-ms `PX`/`PEXPIRE`, which could
+//! shrink lifetime). Multi-key mid-batch failure after ≥1 success returns
+//! Redis-style `IOERR` including `migrated=` / `skipped=` counts (Batch DQ).
 
 use super::crc16::{key_hash_slot, SLOT_COUNT};
 use super::state::ClusterState;
@@ -107,6 +117,32 @@ pub async fn test_acquire_dest_node_inject() -> DestNodeInjectGuard {
     DestNodeInjectGuard {
         _lock: DEST_NODE_INJECT_LOCK.lock().await,
     }
+}
+
+/// RAII clear for per-`ClusterState` source NODE injection (Batch EP).
+///
+/// Inject is stored on the cluster instance (not process-global) so parallel
+/// integration tests cannot race.
+pub struct SourceNodeInjectGuard {
+    cluster: std::sync::Arc<ClusterState>,
+}
+
+impl SourceNodeInjectGuard {
+    /// Force the next `n` local `SETSLOT NODE` attempts to fail on this cluster.
+    pub fn set_failures(&self, n: u32) {
+        self.cluster.test_inject_source_node_failures(n);
+    }
+}
+
+impl Drop for SourceNodeInjectGuard {
+    fn drop(&mut self) {
+        self.cluster.test_clear_source_node_inject();
+    }
+}
+
+/// Bind source-NODE failure injection to a specific [`ClusterState`] (Batch EP).
+pub fn test_source_node_inject(cluster: std::sync::Arc<ClusterState>) -> SourceNodeInjectGuard {
+    SourceNodeInjectGuard { cluster }
 }
 
 /// Set inject for any dest port (prefer the port-scoped guard in suites).
@@ -258,37 +294,38 @@ impl MigrateSlotResult {
 
 /// Snapshot of one key ready for RESP recreate on the destination.
 ///
-/// `pttl` is remaining TTL in milliseconds (`-1` = none), matching
-/// [`Cache::ttl`] / MOVE-COPY dump semantics. Applied on dest via `SET PX`
-/// (string) or trailing `PEXPIRE` (typed keys).
+/// `expire_unix_ms` is absolute Unix-epoch milliseconds end time (`-1` = none),
+/// from [`Cache::expire_time_unix_ms`]. Applied on dest via `SET … PXAT` (string)
+/// or trailing `PEXPIREAT` (typed keys) so migrate RTT does not shrink lifetime
+/// (Batch DT; previously remaining-ms `PX`/`PEXPIRE`).
 enum KeySnapshot {
     String {
         value: Bytes,
-        pttl: i64,
+        expire_unix_ms: i64,
     },
     Hash {
         fields: Vec<(Bytes, Bytes)>,
-        pttl: i64,
+        expire_unix_ms: i64,
     },
     List {
         items: Vec<Bytes>,
-        pttl: i64,
+        expire_unix_ms: i64,
     },
     Set {
         members: Vec<Bytes>,
-        pttl: i64,
+        expire_unix_ms: i64,
     },
     ZSet {
         members: Vec<(Bytes, f64)>,
-        pttl: i64,
+        expire_unix_ms: i64,
     },
     Geo {
         members: Vec<(Bytes, f64, f64)>,
-        pttl: i64,
+        expire_unix_ms: i64,
     },
     Stream {
         state: StreamStateSnapshot,
-        pttl: i64,
+        expire_unix_ms: i64,
     },
 }
 
@@ -320,9 +357,10 @@ pub fn string_keys_in_slot(cache: &Cache, slot: u16) -> Vec<Bytes> {
 
 /// Snapshot a single key for migration. Returns `None` if the key is gone or empty.
 fn snapshot_key(cache: &Cache, key: &Bytes) -> Option<KeySnapshot> {
-    // Unified remaining TTL (string + typed_expires); -2 = missing/expired.
-    let pttl = cache.ttl(key);
-    if pttl == -2 {
+    // Absolute Unix-ms end time (`-1` none, `-2` missing/expired). Prefer this
+    // over remaining-ms so recreate can use PXAT/PEXPIREAT (Batch DT).
+    let expire_unix_ms = cache.expire_time_unix_ms(key);
+    if expire_unix_ms == -2 {
         return None;
     }
     match cache.key_type(key) {
@@ -340,7 +378,7 @@ fn snapshot_key(cache: &Cache, key: &Bytes) -> Option<KeySnapshot> {
                 .flatten()?;
             Some(KeySnapshot::String {
                 value: entry.value.clone(),
-                pttl,
+                expire_unix_ms,
             })
         }
         KeyType::Hash => {
@@ -349,7 +387,10 @@ fn snapshot_key(cache: &Cache, key: &Bytes) -> Option<KeySnapshot> {
             if fields.is_empty() {
                 return None;
             }
-            Some(KeySnapshot::Hash { fields, pttl })
+            Some(KeySnapshot::Hash {
+                fields,
+                expire_unix_ms,
+            })
         }
         KeyType::List => {
             let l = cache.get_list(key)?;
@@ -357,7 +398,10 @@ fn snapshot_key(cache: &Cache, key: &Bytes) -> Option<KeySnapshot> {
             if items.is_empty() {
                 return None;
             }
-            Some(KeySnapshot::List { items, pttl })
+            Some(KeySnapshot::List {
+                items,
+                expire_unix_ms,
+            })
         }
         KeyType::Set => {
             let s = cache.get_set(key)?;
@@ -365,7 +409,10 @@ fn snapshot_key(cache: &Cache, key: &Bytes) -> Option<KeySnapshot> {
             if members.is_empty() {
                 return None;
             }
-            Some(KeySnapshot::Set { members, pttl })
+            Some(KeySnapshot::Set {
+                members,
+                expire_unix_ms,
+            })
         }
         KeyType::ZSet => {
             let z = cache.get_sorted_set(key)?;
@@ -373,7 +420,10 @@ fn snapshot_key(cache: &Cache, key: &Bytes) -> Option<KeySnapshot> {
             if members.is_empty() {
                 return None;
             }
-            Some(KeySnapshot::ZSet { members, pttl })
+            Some(KeySnapshot::ZSet {
+                members,
+                expire_unix_ms,
+            })
         }
         KeyType::Geo => {
             let g = cache.get_geo_set(key)?;
@@ -381,7 +431,10 @@ fn snapshot_key(cache: &Cache, key: &Bytes) -> Option<KeySnapshot> {
             if members.is_empty() {
                 return None;
             }
-            Some(KeySnapshot::Geo { members, pttl })
+            Some(KeySnapshot::Geo {
+                members,
+                expire_unix_ms,
+            })
         }
         KeyType::Stream => {
             let s = cache.get_stream(key)?;
@@ -390,41 +443,50 @@ fn snapshot_key(cache: &Cache, key: &Bytes) -> Option<KeySnapshot> {
             if state.entries.is_empty() && state.groups.is_empty() {
                 return None;
             }
-            Some(KeySnapshot::Stream { state, pttl })
+            Some(KeySnapshot::Stream {
+                state,
+                expire_unix_ms,
+            })
         }
     }
 }
 
-/// Append `PEXPIRE key pttl` when remaining TTL is positive (typed keys).
-fn push_pttl_cmd(cmds: &mut Vec<Vec<RespValue>>, key: &Bytes, pttl: i64) {
-    if pttl > 0 {
+/// Append `PEXPIREAT key <unix-ms>` when an absolute expire is set (typed keys).
+fn push_pexpireat_cmd(cmds: &mut Vec<Vec<RespValue>>, key: &Bytes, expire_unix_ms: i64) {
+    if expire_unix_ms > 0 {
         cmds.push(vec![
-            bulk_static(b"PEXPIRE"),
+            bulk_static(b"PEXPIREAT"),
             RespValue::BulkString(Some(key.clone())),
-            bulk_owned(pttl.to_string()),
+            bulk_owned(expire_unix_ms.to_string()),
         ]);
     }
 }
 
 /// Build the sequence of RESP command arrays needed to recreate `snap` at `key`.
 ///
-/// String TTL uses `SET … PX`; other types recreate value then `PEXPIRE` so
-/// expire metadata matches AOF rewrite / MOVE-COPY dump semantics.
+/// String expire uses `SET … PXAT`; other types recreate value then `PEXPIREAT`
+/// so the wall-clock end time is preserved under migrate latency (Batch DT).
 fn recreate_commands(key: &Bytes, snap: &KeySnapshot) -> Vec<Vec<RespValue>> {
     match snap {
-        KeySnapshot::String { value, pttl } => {
+        KeySnapshot::String {
+            value,
+            expire_unix_ms,
+        } => {
             let mut parts = vec![
                 bulk_static(b"SET"),
                 RespValue::BulkString(Some(key.clone())),
                 RespValue::BulkString(Some(value.clone())),
             ];
-            if *pttl > 0 {
-                parts.push(bulk_static(b"PX"));
-                parts.push(bulk_owned(pttl.to_string()));
+            if *expire_unix_ms > 0 {
+                parts.push(bulk_static(b"PXAT"));
+                parts.push(bulk_owned(expire_unix_ms.to_string()));
             }
             vec![parts]
         }
-        KeySnapshot::Hash { fields, pttl } => {
+        KeySnapshot::Hash {
+            fields,
+            expire_unix_ms,
+        } => {
             let mut parts = vec![
                 bulk_static(b"HSET"),
                 RespValue::BulkString(Some(key.clone())),
@@ -434,10 +496,13 @@ fn recreate_commands(key: &Bytes, snap: &KeySnapshot) -> Vec<Vec<RespValue>> {
                 parts.push(RespValue::BulkString(Some(v.clone())));
             }
             let mut cmds = vec![parts];
-            push_pttl_cmd(&mut cmds, key, *pttl);
+            push_pexpireat_cmd(&mut cmds, key, *expire_unix_ms);
             cmds
         }
-        KeySnapshot::List { items, pttl } => {
+        KeySnapshot::List {
+            items,
+            expire_unix_ms,
+        } => {
             let mut parts = vec![
                 bulk_static(b"RPUSH"),
                 RespValue::BulkString(Some(key.clone())),
@@ -446,10 +511,13 @@ fn recreate_commands(key: &Bytes, snap: &KeySnapshot) -> Vec<Vec<RespValue>> {
                 parts.push(RespValue::BulkString(Some(e.clone())));
             }
             let mut cmds = vec![parts];
-            push_pttl_cmd(&mut cmds, key, *pttl);
+            push_pexpireat_cmd(&mut cmds, key, *expire_unix_ms);
             cmds
         }
-        KeySnapshot::Set { members, pttl } => {
+        KeySnapshot::Set {
+            members,
+            expire_unix_ms,
+        } => {
             let mut parts = vec![
                 bulk_static(b"SADD"),
                 RespValue::BulkString(Some(key.clone())),
@@ -458,10 +526,13 @@ fn recreate_commands(key: &Bytes, snap: &KeySnapshot) -> Vec<Vec<RespValue>> {
                 parts.push(RespValue::BulkString(Some(m.clone())));
             }
             let mut cmds = vec![parts];
-            push_pttl_cmd(&mut cmds, key, *pttl);
+            push_pexpireat_cmd(&mut cmds, key, *expire_unix_ms);
             cmds
         }
-        KeySnapshot::ZSet { members, pttl } => {
+        KeySnapshot::ZSet {
+            members,
+            expire_unix_ms,
+        } => {
             let mut parts = vec![
                 bulk_static(b"ZADD"),
                 RespValue::BulkString(Some(key.clone())),
@@ -471,10 +542,13 @@ fn recreate_commands(key: &Bytes, snap: &KeySnapshot) -> Vec<Vec<RespValue>> {
                 parts.push(RespValue::BulkString(Some(m.clone())));
             }
             let mut cmds = vec![parts];
-            push_pttl_cmd(&mut cmds, key, *pttl);
+            push_pexpireat_cmd(&mut cmds, key, *expire_unix_ms);
             cmds
         }
-        KeySnapshot::Geo { members, pttl } => {
+        KeySnapshot::Geo {
+            members,
+            expire_unix_ms,
+        } => {
             let mut parts = vec![
                 bulk_static(b"GEOADD"),
                 RespValue::BulkString(Some(key.clone())),
@@ -485,12 +559,15 @@ fn recreate_commands(key: &Bytes, snap: &KeySnapshot) -> Vec<Vec<RespValue>> {
                 parts.push(RespValue::BulkString(Some(m.clone())));
             }
             let mut cmds = vec![parts];
-            push_pttl_cmd(&mut cmds, key, *pttl);
+            push_pexpireat_cmd(&mut cmds, key, *expire_unix_ms);
             cmds
         }
-        KeySnapshot::Stream { state, pttl } => {
+        KeySnapshot::Stream {
+            state,
+            expire_unix_ms,
+        } => {
             let mut cmds = stream_recreate_commands(key, state);
-            push_pttl_cmd(&mut cmds, key, *pttl);
+            push_pexpireat_cmd(&mut cmds, key, *expire_unix_ms);
             cmds
         }
     }
@@ -1154,6 +1231,7 @@ pub async fn reshard_slots(
 
 /// Multi-slot RESHARD stops after the first slot whose status is not `complete`.
 fn reshard_range_should_abort(status: &str) -> bool {
+    // Includes partial_verify (EJ), rolled_back (EP), failed_preflight (EY).
     status != "complete"
 }
 
@@ -1167,6 +1245,321 @@ pub async fn reshard_slot(
     let mut v = reshard_slots(cache, cluster, slot, slot, dest_node_id).await?;
     v.pop()
         .ok_or_else(|| "ERR CLUSTER RESHARD internal: empty result".to_string())
+}
+
+/// One planned slot move for `CLUSTER RESHARD PLAN` / `AUTO` (Batch DX).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReshardPlanEntry {
+    pub slot: u16,
+    pub source_id: String,
+    pub source_ip: String,
+    pub source_port: u16,
+}
+
+impl ReshardPlanEntry {
+    pub fn to_resp_array(&self) -> RespValue {
+        RespValue::Array(vec![
+            bulk_static(b"slot"),
+            RespValue::Integer(self.slot as i64),
+            bulk_static(b"source_id"),
+            RespValue::BulkString(Some(Bytes::from(self.source_id.clone()))),
+            bulk_static(b"source_ip"),
+            RespValue::BulkString(Some(Bytes::from(self.source_ip.clone()))),
+            bulk_static(b"source_port"),
+            RespValue::Integer(self.source_port as i64),
+        ])
+    }
+}
+
+/// Build a greedy reshard plan: take up to `num_slots` from masters that have
+/// the most slots (excluding dest and failed nodes). Stable slot order within
+/// each source. Does **not** move data.
+///
+/// Empty when dest already owns enough of the map or no donor slots exist.
+pub fn plan_reshard(
+    cluster: &ClusterState,
+    dest_node_id: &str,
+    num_slots: usize,
+) -> Result<Vec<ReshardPlanEntry>, String> {
+    if num_slots == 0 {
+        return Err("ERR CLUSTER RESHARD PLAN num-slots must be > 0".into());
+    }
+    if num_slots > SLOT_COUNT as usize {
+        return Err(format!(
+            "ERR CLUSTER RESHARD PLAN num-slots must be <= {}",
+            SLOT_COUNT
+        ));
+    }
+    let dest = cluster.get_node(dest_node_id).ok_or_else(|| {
+        format!(
+            "ERR CLUSTER RESHARD PLAN I don't know about node {}",
+            dest_node_id
+        )
+    })?;
+    if dest.fail {
+        return Err(format!(
+            "ERR CLUSTER RESHARD PLAN destination node {} is marked fail",
+            dest_node_id
+        ));
+    }
+
+    // owner_id → list of slots (ascending).
+    let mut by_owner: std::collections::HashMap<String, Vec<u16>> =
+        std::collections::HashMap::new();
+    for slot in 0..SLOT_COUNT {
+        let Some(owner_id) = cluster.owner_id_of(slot) else {
+            continue;
+        };
+        if owner_id == dest_node_id {
+            continue;
+        }
+        let Some(owner) = cluster.get_node(&owner_id) else {
+            continue;
+        };
+        if owner.fail || !owner.master {
+            continue;
+        }
+        by_owner.entry(owner_id).or_default().push(slot);
+    }
+
+    // Greedy: donors with the most slots first; tie-break by id for stability.
+    let mut donors: Vec<(String, Vec<u16>)> = by_owner.into_iter().collect();
+    donors.sort_by(|a, b| {
+        b.1.len()
+            .cmp(&a.1.len())
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut plan = Vec::with_capacity(num_slots.min(SLOT_COUNT as usize));
+    for (source_id, slots) in donors {
+        if plan.len() >= num_slots {
+            break;
+        }
+        let Some(src) = cluster.get_node(&source_id) else {
+            continue;
+        };
+        for slot in slots {
+            if plan.len() >= num_slots {
+                break;
+            }
+            plan.push(ReshardPlanEntry {
+                slot,
+                source_id: source_id.clone(),
+                source_ip: src.ip.clone(),
+                source_port: src.port,
+            });
+        }
+    }
+    Ok(plan)
+}
+
+/// Execute a reshard plan: local slots via [`reshard_slot`]; remote sources via
+/// RESP `CLUSTER RESHARD <slot> <dest>` on the source (Batch DX coordinator).
+///
+/// Aborts further entries after the first non-`complete` status (same policy as
+/// multi-slot RESHARD). Not 2PC; partial progress is honest per entry.
+pub async fn execute_reshard_plan(
+    cache: &Cache,
+    cluster: &ClusterState,
+    dest_node_id: &str,
+    plan: &[ReshardPlanEntry],
+) -> Result<Vec<ReshardSlotResult>, String> {
+    if dest_node_id == cluster.my_id() {
+        return Err("ERR CLUSTER RESHARD AUTO destination cannot be myself".into());
+    }
+    let dest = cluster.get_node(dest_node_id).ok_or_else(|| {
+        format!(
+            "ERR CLUSTER RESHARD AUTO I don't know about node {}",
+            dest_node_id
+        )
+    })?;
+    if dest.fail {
+        return Err(format!(
+            "ERR CLUSTER RESHARD AUTO destination node {} is marked fail",
+            dest_node_id
+        ));
+    }
+
+    let my_id = cluster.my_id();
+    let mut out = Vec::with_capacity(plan.len());
+    for entry in plan {
+        let result = if entry.source_id == my_id {
+            if !cluster.owns_slot(entry.slot) {
+                ReshardSlotResult {
+                    slot: entry.slot,
+                    migrated: 0,
+                    skipped: 0,
+                    source_node: "n/a".into(),
+                    dest_node: "n/a".into(),
+                    status: "failed_not_owner".into(),
+                    warning: Some(format!(
+                        "plan source is self but slot {} not owned locally",
+                        entry.slot
+                    )),
+                }
+            } else {
+                reshard_slot(cache, cluster, entry.slot, dest_node_id).await?
+            }
+        } else {
+            remote_reshard_one_slot(entry, dest_node_id).await
+        };
+        let abort = reshard_range_should_abort(&result.status);
+        out.push(result);
+        if abort {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Ask a remote source to run `CLUSTER RESHARD <slot> <dest-id>`.
+async fn remote_reshard_one_slot(
+    entry: &ReshardPlanEntry,
+    dest_node_id: &str,
+) -> ReshardSlotResult {
+    let slot_s = entry.slot.to_string();
+    let mut stream = match connect_dest(&entry.source_ip, entry.source_port).await {
+        Ok(s) => s,
+        Err(e) => {
+            return ReshardSlotResult {
+                slot: entry.slot,
+                migrated: 0,
+                skipped: 0,
+                source_node: "n/a".into(),
+                dest_node: "n/a".into(),
+                status: format!("failed_connect:{}", e),
+                warning: Some(format!(
+                    "remote source {}:{}",
+                    entry.source_ip, entry.source_port
+                )),
+            };
+        }
+    };
+
+    let args = vec![
+        RespValue::BulkString(Some(Bytes::from_static(b"CLUSTER"))),
+        RespValue::BulkString(Some(Bytes::from_static(b"RESHARD"))),
+        RespValue::BulkString(Some(Bytes::from(slot_s))),
+        RespValue::BulkString(Some(Bytes::from(dest_node_id.to_string()))),
+    ];
+    match resp_command_bytes(&mut stream, &args, MIGRATE_IO_TIMEOUT).await {
+        Ok(reply) => parse_remote_reshard_reply(entry.slot, &reply),
+        Err(e) => ReshardSlotResult {
+            slot: entry.slot,
+            migrated: 0,
+            skipped: 0,
+            source_node: "n/a".into(),
+            dest_node: "n/a".into(),
+            status: format!("failed_remote:{}", e),
+            warning: Some(format!(
+                "remote source {}:{}",
+                entry.source_ip, entry.source_port
+            )),
+        },
+    }
+}
+
+/// Parse `CLUSTER RESHARD` array reply from a remote source into one result.
+fn parse_remote_reshard_reply(slot: u16, reply: &RespValue) -> ReshardSlotResult {
+    if let RespValue::Error(e) = reply {
+        return ReshardSlotResult {
+            slot,
+            migrated: 0,
+            skipped: 0,
+            source_node: "n/a".into(),
+            dest_node: "n/a".into(),
+            status: format!("failed_remote:{}", String::from_utf8_lossy(e)),
+            warning: None,
+        };
+    }
+    let outer = match reply {
+        RespValue::Array(a) if !a.is_empty() => a,
+        _ => {
+            return ReshardSlotResult {
+                slot,
+                migrated: 0,
+                skipped: 0,
+                source_node: "n/a".into(),
+                dest_node: "n/a".into(),
+                status: "failed_remote:unexpected reply".into(),
+                warning: None,
+            };
+        }
+    };
+    // First element is the per-slot field array.
+    let fields = match &outer[0] {
+        RespValue::Array(f) => f,
+        _ => {
+            return ReshardSlotResult {
+                slot,
+                migrated: 0,
+                skipped: 0,
+                source_node: "n/a".into(),
+                dest_node: "n/a".into(),
+                status: "failed_remote:bad row".into(),
+                warning: None,
+            };
+        }
+    };
+    let mut migrated = 0usize;
+    let mut skipped = 0usize;
+    let mut source_node = String::from("n/a");
+    let mut dest_node = String::from("n/a");
+    let mut status = String::from("failed_remote:missing status");
+    let mut warning = None;
+    let mut i = 0;
+    while i + 1 < fields.len() {
+        let key = match fields[i].as_bulk_string() {
+            Some(b) => String::from_utf8_lossy(b).into_owned(),
+            None => {
+                i += 2;
+                continue;
+            }
+        };
+        match key.as_str() {
+            "migrated" => {
+                if let RespValue::Integer(n) = fields[i + 1] {
+                    migrated = n.max(0) as usize;
+                }
+            }
+            "skipped" => {
+                if let RespValue::Integer(n) = fields[i + 1] {
+                    skipped = n.max(0) as usize;
+                }
+            }
+            "source_node" => {
+                if let Some(b) = fields[i + 1].as_bulk_string() {
+                    source_node = String::from_utf8_lossy(b).into_owned();
+                }
+            }
+            "dest_node" => {
+                if let Some(b) = fields[i + 1].as_bulk_string() {
+                    dest_node = String::from_utf8_lossy(b).into_owned();
+                }
+            }
+            "status" => {
+                if let Some(b) = fields[i + 1].as_bulk_string() {
+                    status = String::from_utf8_lossy(b).into_owned();
+                }
+            }
+            "warning" => {
+                if let Some(b) = fields[i + 1].as_bulk_string() {
+                    warning = Some(String::from_utf8_lossy(b).into_owned());
+                }
+            }
+            _ => {}
+        }
+        i += 2;
+    }
+    ReshardSlotResult {
+        slot,
+        migrated,
+        skipped,
+        source_node,
+        dest_node,
+        status,
+        warning,
+    }
 }
 
 async fn reshard_one_slot(
@@ -1258,7 +1651,7 @@ async fn reshard_one_slot(
     };
 
     // Step 4: dual-end SETSLOT NODE with verify + retry (not atomic).
-    let (source_node, dest_node, status) =
+    let (source_node, dest_node, status, warning) =
         dual_end_setslot_node(cluster, slot, dest_node_id, dest_ip, dest_port).await;
 
     Ok(ReshardSlotResult {
@@ -1268,7 +1661,7 @@ async fn reshard_one_slot(
         source_node,
         dest_node,
         status,
-        warning: None,
+        warning,
     })
 }
 
@@ -1316,8 +1709,11 @@ pub async fn finish_slot_node(
         None
     };
 
-    let (source_node, dest_node, status) =
+    let (source_node, dest_node, status, node_warning) =
         dual_end_setslot_node(cluster, slot, dest_node_id, &dest.ip, dest.port).await;
+
+    // Prefer keys-remaining warning; else NODE partial warning (Batch EH).
+    let warning = warning.or(node_warning);
 
     Ok(ReshardSlotResult {
         slot,
@@ -1331,38 +1727,292 @@ pub async fn finish_slot_node(
 }
 
 /// Summarize dual-end NODE outcomes into an operator-facing status string.
+///
+/// Dest-first (Batch DV): when dest fails, source is skipped
+/// (`skipped:dest NODE incomplete`) → still reported as `partial_dest_node`
+/// so operators use the same recovery path (`RESHARD FINISH`).
 fn summarize_dual_end_status(source_node: &str, dest_node: &str) -> String {
-    match (source_node, dest_node) {
-        ("ok", "ok") => "complete".to_string(),
-        ("ok", _) => "partial_dest_node".to_string(),
-        (_, "ok") => "partial_source_node".to_string(),
-        _ => "partial_both_node".to_string(),
+    match (source_node == "ok", dest_node == "ok") {
+        (true, true) => "complete".to_string(),
+        (true, false) => "partial_dest_node".to_string(),
+        (false, true) => "partial_source_node".to_string(),
+        (false, false) => {
+            if source_node.starts_with("skipped:") {
+                "partial_dest_node".to_string()
+            } else {
+                "partial_both_node".to_string()
+            }
+        }
     }
 }
 
-/// Source + dest `SETSLOT NODE <dest>` with local/remote verify and short retries.
+/// Dest then source `SETSLOT NODE <dest>` with local/remote verify and retries.
 ///
-/// Still **not** atomic across nodes (no 2PC). Returns `(source_node, dest_node, status)`.
+/// Prepare/commit lite (Batch EY): **preflight** checks local ownership and dest
+/// identity/topology before any NODE; still not a wire-protocol 2PC.
+/// Returns `(source_node, dest_node, status, warning)`.
 ///
-/// **Order:** source NODE first, then dest. After source succeeds, clients may get
-/// MOVED to dest while dest is still IMPORTING (ASK-only) until dest NODE lands —
-/// the `partial_dest_node` window. Dest-first was considered; left source-first to
-/// match Redis operator expectations for MOVED after source ownership flip.
+/// **Order (Batch DV):** dest NODE first, then source. Source is skipped when dest
+/// does not verify as owner — avoids MOVED while dest is still IMPORTING.
+///
+/// **Batch EH:** if dest NODE ok but source NODE fails while we still own the
+/// slot, re-assert `MIGRATING → dest` so clients receive ASK (keys may already
+/// live on dest after MIGRATEKEYS).
+///
+/// **Batch EP:** after EH, best-effort **compensate** by rolling dest ownership
+/// back to the source (`SETSLOT NODE <source>` + `IMPORTING <source>`). Success →
+/// status `rolled_back` (consistent dual view; retry FINISH). Failure → keep
+/// `partial_source_node` with rollback error in the warning.
+///
+/// **Batch EJ:** when both sides report ok, re-check local owner and remote
+/// `CLUSTER SLOTS` owner; downgrade status if either side drifted.
 async fn dual_end_setslot_node(
     cluster: &ClusterState,
     slot: u16,
     dest_node_id: &str,
     dest_ip: &str,
     dest_port: u16,
-) -> (String, String, String) {
-    let source_node = apply_source_node_with_retry(cluster, slot, dest_node_id).await;
-    let dest_node =
+) -> (String, String, String, Option<String>) {
+    // Batch EY: prepare — fail closed without applying NODE on either side.
+    if let Err(e) =
+        preflight_dual_end_node(cluster, slot, dest_node_id, dest_ip, dest_port).await
+    {
+        return (
+            format!("preflight:{}", e),
+            "n/a".into(),
+            format!("failed_preflight:{}", e),
+            Some(format!(
+                "dual-end NODE preflight failed for slot {}: {} — fix topology then RESHARD FINISH",
+                slot, e
+            )),
+        );
+    }
+
+    // Idempotent complete: both sides already report dest as owner.
+    if source_owns_as(cluster, slot, dest_node_id) {
+        if let Ok(mut stream) = connect_dest(dest_ip, dest_port).await {
+            if verify_remote_slot_owner(&mut stream, slot, dest_node_id)
+                .await
+                .is_ok()
+            {
+                return ("ok".into(), "ok".into(), "complete".into(), None);
+            }
+        }
+    }
+
+    let mut dest_node =
         apply_dest_node_with_retry(slot, dest_node_id, dest_ip, dest_port).await;
-    let status = summarize_dual_end_status(&source_node, &dest_node);
-    (source_node, dest_node, status)
+    let mut source_node = if dest_node == "ok" {
+        apply_source_node_with_retry(cluster, slot, dest_node_id).await
+    } else {
+        // Do not flip source ownership if dest never took the slot stably.
+        String::from("skipped:dest NODE incomplete")
+    };
+    let mut status = summarize_dual_end_status(&source_node, &dest_node);
+    let mut warning = if dest_node == "ok" && source_node != "ok" && cluster.owns_slot(slot) {
+        match cluster.set_migrating(slot, dest_node_id) {
+            Ok(()) => Some(format!(
+                "source NODE failed after dest owned slot {}; left MIGRATING→{} for ASK",
+                slot, dest_node_id
+            )),
+            Err(e) => Some(format!(
+                "source NODE failed; could not re-assert MIGRATING: {}",
+                e
+            )),
+        }
+    } else {
+        None
+    };
+
+    // Batch EP: compensate dest when source NODE failed after dest took ownership.
+    if dest_node == "ok" && source_node != "ok" && cluster.owns_slot(slot) {
+        let source_id = cluster.my_id();
+        match rollback_dest_ownership_to_source(slot, &source_id, dest_ip, dest_port).await {
+            Ok(()) => {
+                dest_node = "rolled_back".to_string();
+                status = "rolled_back".to_string();
+                warning = Some(format!(
+                    "source NODE failed for slot {}; dest ownership rolled back to source + IMPORTING — retry CLUSTER RESHARD or FINISH",
+                    slot
+                ));
+            }
+            Err(e) => {
+                // Keep partial_source_node; surface rollback failure for ops.
+                let rb = format!(
+                    "dest rollback failed: {} — run CLUSTER RESHARD FINISH or SETSLOT NODE",
+                    e
+                );
+                warning = Some(match warning.take() {
+                    Some(w) => format!("{}; {}", w, rb),
+                    None => rb,
+                });
+            }
+        }
+    }
+
+    // Batch EJ: post-commit dual verify when both sides claimed success.
+    if status == "complete" {
+        if let Some(w) =
+            post_commit_verify_dual_end(cluster, slot, dest_node_id, dest_ip, dest_port).await
+        {
+            // Downgrade: keep sides' last apply strings but mark incomplete.
+            if !source_owns_as(cluster, slot, dest_node_id) {
+                source_node = format!("verify:{}", w);
+            }
+            dest_node = format!("verify:{}", w);
+            status = "partial_verify".to_string();
+            warning = Some(format!(
+                "post-commit ownership verify failed for slot {}: {} — run CLUSTER RESHARD FINISH or SETSLOT NODE",
+                slot, w
+            ));
+        }
+    }
+
+    (source_node, dest_node, status, warning)
+}
+
+/// Prepare phase before dual-end NODE (Batch EY).
+///
+/// Checks:
+/// 1. Local owns the slot **or** already lists `dest` as owner (idempotent FINISH)
+/// 2. Dest is reachable and `CLUSTER MYID` matches `dest_node_id`
+/// 3. Dest `CLUSTER SLOTS` owner for `slot` is either source (mid-migrate) or dest
+///    (idempotent), or the slot is missing/unbound (importing bootstrap)
+///
+/// Does **not** apply SETSLOT NODE.
+async fn preflight_dual_end_node(
+    cluster: &ClusterState,
+    slot: u16,
+    dest_node_id: &str,
+    dest_ip: &str,
+    dest_port: u16,
+) -> Result<(), String> {
+    let source_id = cluster.my_id();
+    let local_ready =
+        cluster.owns_slot(slot) || source_owns_as(cluster, slot, dest_node_id);
+    if !local_ready {
+        return Err(format!(
+            "local neither owns slot {} nor already assigned to dest",
+            slot
+        ));
+    }
+
+    let mut stream = connect_dest(dest_ip, dest_port)
+        .await
+        .map_err(|e| format!("dest {}", e))?;
+
+    let remote_id = remote_cluster_myid(&mut stream).await?;
+    if remote_id != dest_node_id {
+        return Err(format!(
+            "dest MYID is {} want {}",
+            remote_id, dest_node_id
+        ));
+    }
+
+    match remote_slot_owner_id(&mut stream, slot).await {
+        Ok(owner) if owner == dest_node_id || owner == source_id => Ok(()),
+        Ok(owner) => Err(format!(
+            "dest reports unexpected owner {} for slot {} (want source or dest)",
+            owner, slot
+        )),
+        // Unbound / missing from SLOTS: allow (dest may only have IMPORTING).
+        Err(e) if e.contains("missing") || e.contains("unbound") => Ok(()),
+        Err(e) => Err(format!("dest slots:{}", e)),
+    }
+}
+
+async fn remote_cluster_myid(stream: &mut TcpStream) -> Result<String, String> {
+    let args = vec![
+        RespValue::BulkString(Some(Bytes::from_static(b"CLUSTER"))),
+        RespValue::BulkString(Some(Bytes::from_static(b"MYID"))),
+    ];
+    match resp_command_bytes(stream, &args, MIGRATE_IO_TIMEOUT).await? {
+        RespValue::BulkString(Some(b)) => Ok(String::from_utf8_lossy(&b).into_owned()),
+        RespValue::Error(e) => Err(String::from_utf8_lossy(&e).into_owned()),
+        other => Err(format!("unexpected MYID reply: {:?}", other)),
+    }
+}
+
+/// Owner id for `slot` on remote, or Err if missing.
+async fn remote_slot_owner_id(stream: &mut TcpStream, slot: u16) -> Result<String, String> {
+    let args = vec![
+        RespValue::BulkString(Some(Bytes::from_static(b"CLUSTER"))),
+        RespValue::BulkString(Some(Bytes::from_static(b"SLOTS"))),
+    ];
+    let reply = resp_command_bytes(stream, &args, MIGRATE_IO_TIMEOUT).await?;
+    slot_owner_id_from_slots_reply(&reply, slot)
+        .ok_or_else(|| format!("slot {} missing from CLUSTER SLOTS", slot))
+}
+
+/// Best-effort reverse of dest `SETSLOT NODE <dest>` (Batch EP compensating step).
+///
+/// Restores `NODE <source>` then `IMPORTING <source>` so a later RESHARD/FINISH
+/// can complete dual-end NODE without a dual-ownership window.
+async fn rollback_dest_ownership_to_source(
+    slot: u16,
+    source_id: &str,
+    dest_ip: &str,
+    dest_port: u16,
+) -> Result<(), String> {
+    let slot_s = slot.to_string();
+    let mut last_err = String::from("dest rollback not attempted");
+    for attempt in 0..NODE_SET_ATTEMPTS {
+        match connect_dest(dest_ip, dest_port).await {
+            Ok(mut stream) => {
+                match dest_setslot(
+                    &mut stream,
+                    &["CLUSTER", "SETSLOT", &slot_s, "NODE", source_id],
+                )
+                .await
+                {
+                    Ok(()) => match verify_remote_slot_owner(&mut stream, slot, source_id).await {
+                        Ok(()) => {
+                            // Resume import state for ASKING / retry (best-effort).
+                            let _ = dest_setslot(
+                                &mut stream,
+                                &["CLUSTER", "SETSLOT", &slot_s, "IMPORTING", source_id],
+                            )
+                            .await;
+                            return Ok(());
+                        }
+                        Err(e) => last_err = format!("verify:{}", e),
+                    },
+                    Err(e) => last_err = e,
+                }
+            }
+            Err(e) => last_err = format!("connect:{}", e),
+        }
+        if attempt + 1 < NODE_SET_ATTEMPTS {
+            tokio::time::sleep(NODE_RETRY_DELAY).await;
+        }
+    }
+    Err(last_err)
+}
+
+/// Returns `Some(reason)` if post-commit ownership is inconsistent.
+async fn post_commit_verify_dual_end(
+    cluster: &ClusterState,
+    slot: u16,
+    dest_node_id: &str,
+    dest_ip: &str,
+    dest_port: u16,
+) -> Option<String> {
+    if !source_owns_as(cluster, slot, dest_node_id) {
+        return Some("local owner is not dest after dual NODE".into());
+    }
+    match connect_dest(dest_ip, dest_port).await {
+        Ok(mut stream) => match verify_remote_slot_owner(&mut stream, slot, dest_node_id).await {
+            Ok(()) => None,
+            Err(e) => Some(format!("remote {}", e)),
+        },
+        Err(e) => Some(format!("remote connect {}", e)),
+    }
 }
 
 /// Local `SETSLOT NODE` + ownership verify, with retries.
+///
+/// Source NODE inject lives on [`ClusterState::set_node`] (Batch EP) so retries
+/// and direct operator SETSLOT share the same failure path.
 async fn apply_source_node_with_retry(
     cluster: &ClusterState,
     slot: u16,
@@ -1637,6 +2287,42 @@ mod tests {
     }
 
     #[test]
+    fn plan_reshard_greedy_from_largest_donor() {
+        let a = ClusterState::single_node("127.0.0.1", 7000);
+        let b_id = "bb".repeat(20);
+        a.add_node(&b_id, "10.0.0.2", 7001);
+        // Give B a few slots so A remains largest donor.
+        a.reassign_slot_range(0, 9, &b_id).unwrap();
+        let plan = plan_reshard(&a, &b_id, 5).unwrap();
+        assert_eq!(plan.len(), 5);
+        for e in &plan {
+            assert_eq!(e.source_id, a.my_id());
+            assert!(e.slot >= 10, "should not re-plan dest-owned slots");
+        }
+        // Dest already owns 10; planning 0 slots is error.
+        assert!(plan_reshard(&a, &b_id, 0).is_err());
+    }
+
+    #[test]
+    fn plan_reshard_unknown_dest_errors() {
+        let a = ClusterState::single_node("127.0.0.1", 7000);
+        assert!(plan_reshard(&a, "no-such-node", 1).is_err());
+    }
+
+    #[test]
+    fn partial_source_reasserts_migrating() {
+        let cs = ClusterState::single_node("127.0.0.1", 7000);
+        let dest = "dd".repeat(20);
+        cs.add_node(&dest, "10.0.0.2", 7001);
+        // Simulate dest NODE ok but source NODE not applied: we still own slot.
+        assert!(cs.owns_slot(0));
+        // Directly exercise the MIGRATING restore path used after partial source NODE.
+        cs.set_migrating(0, &dest).unwrap();
+        assert!(cs.is_migrating(0));
+        assert_eq!(cs.migrating_dest(0).as_deref(), Some(dest.as_str()));
+    }
+
+    #[test]
     fn summarize_dual_end_status_matrix() {
         assert_eq!(summarize_dual_end_status("ok", "ok"), "complete");
         assert_eq!(
@@ -1651,6 +2337,32 @@ mod tests {
             summarize_dual_end_status("err", "err"),
             "partial_both_node"
         );
+        // Dest-first: source skipped when dest fails → still partial_dest_node.
+        assert_eq!(
+            summarize_dual_end_status("skipped:dest NODE incomplete", "injected dest NODE failure"),
+            "partial_dest_node"
+        );
+        // Batch EJ: post-commit verify failure aborts multi-slot ranges.
+        assert!(reshard_range_should_abort("partial_verify"));
+        // Batch EP: compensating dest rollback is not complete — abort ranges.
+        assert!(reshard_range_should_abort("rolled_back"));
+        assert!(reshard_range_should_abort("partial_source_node"));
+        // Batch EY: preflight failure aborts without applying NODE.
+        assert!(reshard_range_should_abort(
+            "failed_preflight:dest MYID is x want y"
+        ));
+    }
+
+    #[test]
+    fn preflight_local_rejects_unowned() {
+        let cs = ClusterState::single_node("127.0.0.1", 7000);
+        let other = "oo".repeat(20);
+        cs.add_node(&other, "10.0.0.2", 7001);
+        cs.reassign_slot(0, &other).unwrap();
+        // Local does not own 0 and is not dest.
+        assert!(!cs.owns_slot(0));
+        // Sync preflight piece: local_ready would fail (async preflight needs network).
+        assert!(!cs.owns_slot(0) && cs.owner_id_of(0).as_deref() != Some(cs.my_id().as_str()));
     }
 
     #[test]
@@ -1723,10 +2435,13 @@ mod tests {
         h.write()
             .hset(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
         match snapshot_key(&cache, &k).unwrap() {
-            KeySnapshot::Hash { fields, pttl } => {
+            KeySnapshot::Hash {
+                fields,
+                expire_unix_ms,
+            } => {
                 assert_eq!(fields.len(), 1);
                 assert_eq!(fields[0].0.as_ref(), b"f");
-                assert_eq!(pttl, -1);
+                assert_eq!(expire_unix_ms, -1);
             }
             _ => panic!("expected hash"),
         }
@@ -1736,41 +2451,73 @@ mod tests {
         l.write().rpush([Bytes::from_static(b"a")]);
         l.write().rpush([Bytes::from_static(b"b")]);
         match snapshot_key(&cache, &kl).unwrap() {
-            KeySnapshot::List { items, pttl } => {
+            KeySnapshot::List {
+                items,
+                expire_unix_ms,
+            } => {
                 assert_eq!(items.len(), 2);
-                assert_eq!(pttl, -1);
+                assert_eq!(expire_unix_ms, -1);
             }
             _ => panic!("expected list"),
         }
     }
 
     #[test]
-    fn snapshot_and_recreate_preserve_typed_pttl() {
+    fn snapshot_and_recreate_preserve_typed_absolute_expire() {
         let cache = Cache::new_with_sweep(4, 1024 * 1024, 1024 * 1024, false);
         let k = Bytes::from_static(b"{t}.ht");
         let h = cache.get_or_create_hash(&k).unwrap();
         h.write()
             .hset(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
         cache.expire(&k, 30_000).unwrap();
+        let expected_abs = cache.expire_time_unix_ms(&k);
+        assert!(expected_abs > 0, "expected absolute expire");
 
         let snap = snapshot_key(&cache, &k).unwrap();
         match &snap {
-            KeySnapshot::Hash { pttl, .. } => {
-                assert!(*pttl > 25_000 && *pttl <= 30_000, "pttl={}", pttl);
+            KeySnapshot::Hash { expire_unix_ms, .. } => {
+                // Snapshotted absolute should match source within 1ms clock skew.
+                assert!(
+                    (*expire_unix_ms - expected_abs).abs() <= 1,
+                    "expire_unix_ms={} expected={}",
+                    expire_unix_ms,
+                    expected_abs
+                );
             }
             _ => panic!("expected hash"),
         }
         let cmds = recreate_commands(&k, &snap);
-        assert_eq!(cmds.len(), 2, "HSET + PEXPIRE");
-        let pexpire = &cmds[1];
+        assert_eq!(cmds.len(), 2, "HSET + PEXPIREAT");
+        let pexpireat = &cmds[1];
         assert_eq!(
-            pexpire[0].as_bulk_string().map(|b| b.as_ref()),
-            Some(b"PEXPIRE".as_slice())
+            pexpireat[0].as_bulk_string().map(|b| b.as_ref()),
+            Some(b"PEXPIREAT".as_slice())
         );
+        let wire_abs: i64 = String::from_utf8_lossy(
+            pexpireat[2]
+                .as_bulk_string()
+                .expect("PEXPIREAT timestamp bulk"),
+        )
+        .parse()
+        .expect("timestamp");
+        assert_eq!(wire_abs, snap_expire(&snap));
+        assert!((snap_expire(&snap) - expected_abs).abs() <= 1);
+    }
+
+    fn snap_expire(snap: &KeySnapshot) -> i64 {
+        match snap {
+            KeySnapshot::String { expire_unix_ms, .. }
+            | KeySnapshot::Hash { expire_unix_ms, .. }
+            | KeySnapshot::List { expire_unix_ms, .. }
+            | KeySnapshot::Set { expire_unix_ms, .. }
+            | KeySnapshot::ZSet { expire_unix_ms, .. }
+            | KeySnapshot::Geo { expire_unix_ms, .. }
+            | KeySnapshot::Stream { expire_unix_ms, .. } => *expire_unix_ms,
+        }
     }
 
     #[test]
-    fn snapshot_string_pttl_uses_set_px() {
+    fn snapshot_string_uses_set_pxat() {
         let cache = Cache::new_with_sweep(4, 1024 * 1024, 1024 * 1024, false);
         let k = Bytes::from_static(b"s-ttl");
         let mut opts = StoreOptions::default();
@@ -1778,15 +2525,94 @@ mod tests {
         cache
             .store(k.clone(), Bytes::from_static(b"v"), opts)
             .unwrap();
+        let expected_abs = cache.expire_time_unix_ms(&k);
         let snap = snapshot_key(&cache, &k).unwrap();
         let cmds = recreate_commands(&k, &snap);
         assert_eq!(cmds.len(), 1);
         let parts = &cmds[0];
         assert!(
-            parts.iter().any(|p| p.as_bulk_string().map(|b| b.as_ref()) == Some(b"PX")),
-            "expected SET PX in {:?}",
+            parts
+                .iter()
+                .any(|p| p.as_bulk_string().map(|b| b.as_ref()) == Some(b"PXAT")),
+            "expected SET PXAT in {:?}",
             parts
         );
+        // PXAT argument follows the PXAT token.
+        let pxat_idx = parts
+            .iter()
+            .position(|p| p.as_bulk_string().map(|b| b.as_ref()) == Some(b"PXAT"))
+            .unwrap();
+        let wire_abs: i64 = String::from_utf8_lossy(
+            parts[pxat_idx + 1]
+                .as_bulk_string()
+                .expect("PXAT timestamp"),
+        )
+        .parse()
+        .expect("timestamp");
+        assert!(
+            (wire_abs - expected_abs).abs() <= 1,
+            "wire={} expected={}",
+            wire_abs,
+            expected_abs
+        );
+    }
+
+    /// Absolute expire on the wire is frozen at snapshot time: a delay before
+    /// recreate must not rewrite the timestamp to a later remaining-ms end.
+    #[test]
+    fn recreate_absolute_expire_stable_under_delay() {
+        let cache = Cache::new_with_sweep(4, 1024 * 1024, 1024 * 1024, false);
+        let k = Bytes::from_static(b"delay-ttl");
+        let mut opts = StoreOptions::default();
+        opts.ttl_ms = Some(60_000);
+        cache
+            .store(k.clone(), Bytes::from_static(b"v"), opts)
+            .unwrap();
+
+        let snap = snapshot_key(&cache, &k).unwrap();
+        let frozen = snap_expire(&snap);
+        assert!(frozen > 0);
+
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // Remaining-ms path would emit a smaller end after delay; absolute must not.
+        let cmds = recreate_commands(&k, &snap);
+        let parts = &cmds[0];
+        let pxat_idx = parts
+            .iter()
+            .position(|p| p.as_bulk_string().map(|b| b.as_ref()) == Some(b"PXAT"))
+            .expect("PXAT present");
+        let wire_abs: i64 = String::from_utf8_lossy(
+            parts[pxat_idx + 1]
+                .as_bulk_string()
+                .expect("PXAT timestamp"),
+        )
+        .parse()
+        .expect("timestamp");
+        assert_eq!(wire_abs, frozen, "absolute expire must be frozen at snapshot");
+
+        // Typed path: same freeze property for PEXPIREAT.
+        let hk = Bytes::from_static(b"delay-h");
+        let h = cache.get_or_create_hash(&hk).unwrap();
+        h.write()
+            .hset(Bytes::from_static(b"f"), Bytes::from_static(b"1"));
+        cache.expire(&hk, 45_000).unwrap();
+        let hsnap = snapshot_key(&cache, &hk).unwrap();
+        let hfrozen = snap_expire(&hsnap);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let hcmds = recreate_commands(&hk, &hsnap);
+        assert_eq!(
+            hcmds[1][0].as_bulk_string().map(|b| b.as_ref()),
+            Some(b"PEXPIREAT".as_slice())
+        );
+        let hwire: i64 = String::from_utf8_lossy(
+            hcmds[1][2]
+                .as_bulk_string()
+                .expect("PEXPIREAT ts"),
+        )
+        .parse()
+        .expect("timestamp");
+        assert_eq!(hwire, hfrozen);
     }
 
     #[test]

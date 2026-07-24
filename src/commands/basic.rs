@@ -117,7 +117,10 @@ impl CommandHandler {
         Ok(RespValue::BulkString(Some(Bytes::from(art))))
     }
 
-    /// READONLY — enable reading from cluster replicas on this connection.
+    /// READONLY — enable reading from cluster replicas on this connection (Batch ER).
+    ///
+    /// When this node is a cluster replica, key **reads** for slots owned by its
+    /// master are served locally instead of returning MOVED. Writes still MOVED.
     pub(super) fn handle_readonly(&mut self, args: &[RespValue]) -> Result<RespValue> {
         if !args.is_empty() {
             return Ok(RespValue::error(
@@ -128,7 +131,7 @@ impl CommandHandler {
         Ok(RespValue::ok())
     }
 
-    /// READWRITE — disable READONLY mode (default).
+    /// READWRITE — disable READONLY mode (default); replicas MOVED all key cmds.
     pub(super) fn handle_readwrite(&mut self, args: &[RespValue]) -> Result<RespValue> {
         if !args.is_empty() {
             return Ok(RespValue::error(

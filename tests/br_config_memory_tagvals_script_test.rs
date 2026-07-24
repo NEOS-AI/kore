@@ -47,6 +47,11 @@ fn test_config() -> Config {
         tls_key: String::new(),
         aclfile: String::new(),
         cluster_enabled: false,
+            cluster_replica_priority: 100,
+            cluster_require_full_coverage: true,
+            cluster_allow_reads_when_down: false,
+            cluster_announce_ip: String::new(),
+            cluster_announce_port: 0,
         unixsocket: "/tmp/kore-br.sock".to_string(),
             log_format: "text".to_string(),
     }

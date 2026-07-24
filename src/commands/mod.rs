@@ -16,6 +16,7 @@ mod transaction;
 mod meta;
 mod acl;
 mod cluster;
+mod sentinel;
 mod bitmap;
 mod hyperloglog;
 mod scripting;
@@ -23,6 +24,7 @@ mod scripting;
 use crate::acl::AclStore;
 use crate::cache::Cache;
 use crate::cluster::{key_hash_slot, ClusterState};
+use crate::sentinel::SentinelState;
 use crate::config::Config;
 use crate::databases::Databases;
 use crate::error::{Error, Result};
@@ -78,6 +80,8 @@ pub struct CommandHandler {
     replica_announce_port: Option<u16>,
     /// Cluster topology when `--cluster-enabled` (shared across connections).
     cluster: Option<Arc<ClusterState>>,
+    /// Sentinel-lite state (Batch EW) — always present on Server connections.
+    sentinel: Option<Arc<SentinelState>>,
     /// ASKING one-shot flag (allows next command against IMPORTING slots).
     asking: bool,
     /// Negotiated RESP protocol version (2 default; 3 after HELLO 3).
@@ -187,6 +191,7 @@ impl CommandHandler {
             replica_announce_ip: None,
             replica_announce_port: None,
             cluster: None,
+            sentinel: None,
             asking: false,
             protocol_version: 2,
             redlock: None,
@@ -386,6 +391,79 @@ impl CommandHandler {
                     "no".into()
                 },
             ),
+            // Live cluster params (Batch EL) — prefer ClusterState when present.
+            (
+                "cluster-replica-priority".into(),
+                self.cluster
+                    .as_ref()
+                    .map(|c| c.local_repl_priority().to_string())
+                    .unwrap_or_else(|| self.config.cluster_replica_priority.to_string()),
+            ),
+            (
+                "cluster-node-timeout".into(),
+                self.cluster
+                    .as_ref()
+                    .map(|c| c.node_timeout_ms().to_string())
+                    .unwrap_or_else(|| "15000".to_string()),
+            ),
+            (
+                "cluster-require-full-coverage".into(),
+                self.cluster
+                    .as_ref()
+                    .map(|c| {
+                        if c.require_full_coverage() {
+                            "yes".into()
+                        } else {
+                            "no".into()
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        if self.config.cluster_require_full_coverage {
+                            "yes".into()
+                        } else {
+                            "no".into()
+                        }
+                    }),
+            ),
+            (
+                "cluster-allow-reads-when-down".into(),
+                self.cluster
+                    .as_ref()
+                    .map(|c| {
+                        if c.allow_reads_when_down() {
+                            "yes".into()
+                        } else {
+                            "no".into()
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        if self.config.cluster_allow_reads_when_down {
+                            "yes".into()
+                        } else {
+                            "no".into()
+                        }
+                    }),
+            ),
+            (
+                "cluster-announce-ip".into(),
+                self.cluster
+                    .as_ref()
+                    .and_then(|c| c.announce_ip())
+                    .unwrap_or_else(|| self.config.cluster_announce_ip.clone()),
+            ),
+            (
+                "cluster-announce-port".into(),
+                self.cluster
+                    .as_ref()
+                    .and_then(|c| c.announce_port().map(|p| p.to_string()))
+                    .unwrap_or_else(|| {
+                        if self.config.cluster_announce_port > 0 {
+                            self.config.cluster_announce_port.to_string()
+                        } else {
+                            "0".into()
+                        }
+                    }),
+            ),
         ]
     }
 
@@ -418,6 +496,16 @@ fn config_param_aliases(canonical: &str) -> &'static [&'static str] {
         "min-replicas-max-lag" => &["min-slaves-max-lag"],
         "bind" => &["host"],
         "cluster-enabled" => &["cluster_enabled"],
+        "cluster-replica-priority" => &["cluster_replica_priority"],
+        "cluster-node-timeout" => &[
+            "cluster_node_timeout",
+            "cluster-node-timeout-ms",
+            "cluster_node_timeout_ms",
+        ],
+        "cluster-require-full-coverage" => &["cluster_require_full_coverage"],
+        "cluster-allow-reads-when-down" => &["cluster_allow_reads_when_down"],
+        "cluster-announce-ip" => &["cluster_announce_ip"],
+        "cluster-announce-port" => &["cluster_announce_port"],
         "appendfilename" => &["append-filename"],
         "dbfilename" => &["db-filename"],
         "unixsocket" => &["unix-socket"],
@@ -444,6 +532,12 @@ impl CommandHandler {
     /// Attach cluster state (server path when `--cluster-enabled`).
     pub fn with_cluster(mut self, cluster: Option<Arc<ClusterState>>) -> Self {
         self.cluster = cluster;
+        self
+    }
+
+    /// Wire Sentinel-lite state (Batch EW).
+    pub fn with_sentinel(mut self, sentinel: Option<Arc<SentinelState>>) -> Self {
+        self.sentinel = sentinel;
         self
     }
 
@@ -686,6 +780,7 @@ impl CommandHandler {
             "ACL" => self.handle_acl(&args[1..]),
             // Cluster
             "CLUSTER" => self.handle_cluster(&args[1..]).await,
+            "SENTINEL" => self.handle_sentinel(&args[1..]).await,
             "ASKING" => self.handle_asking(&args[1..]),
             // HELLO handled before auth gate
 
@@ -1161,7 +1256,7 @@ impl CommandHandler {
             return None;
         }
 
-        // CROSSSLOT: multi-key commands must hash to one slot.
+        // CROSSSLOT first so multi-key errors stay honest even when cluster is down.
         let mut slot: Option<u16> = None;
         for key in &keys {
             let s = key_hash_slot(key);
@@ -1177,13 +1272,36 @@ impl CommandHandler {
         }
         let slot = slot?;
 
+        let is_write = is_write_command(cmd_upper)
+            || (cmd_upper == "SORT" && sort_has_store(args));
+
+        // Batch EQ/ES: when cluster_state is fail, refuse key commands unless:
+        // - ASKING on IMPORTING (reshard), or
+        // - allow-reads-when-down and this is a read (Batch ES).
+        if !cluster.cluster_state_ok() {
+            let any_asking_import = asking && cluster.is_importing(slot);
+            let allow_read = cluster.allow_reads_when_down() && !is_write;
+            if !any_asking_import && !allow_read {
+                return Some(RespValue::error(
+                    "CLUSTERDOWN The cluster is down",
+                ));
+            }
+        }
+
         // IMPORTING + ASKING: serve one-shot even if we don't stably own the slot.
         if asking && cluster.is_importing(slot) {
             return None;
         }
 
-        // Not owned → MOVED to current owner.
+        // Not owned → MOVED to current owner (unless Batch ER READONLY replica read).
         if !cluster.owns_slot(slot) {
+            // READONLY on a cluster replica: serve reads for master's slots locally.
+            if self.cluster_readonly
+                && !is_write
+                && cluster.can_serve_readonly(slot)
+            {
+                return None;
+            }
             if let Some(t) = cluster.moved_target(slot) {
                 return Some(RespValue::error(format!(
                     "MOVED {} {}:{}",
