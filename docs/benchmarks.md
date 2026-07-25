@@ -217,23 +217,33 @@ comparison:
    - `hnsw_bridge_remove_keeps_survivors_reachable` / `hnsw_bridge_update_keeps_ends_reachable` (Batch CT)
    - `hnsw_bridge_remove_asymmetric_incoming_reconnects` / `hnsw_bridge_remove_star_multiway_reconnects` (Batch CU)
    - `hnsw_m1_hub_churn_preserves_reachability` (Batch CT smoke)
+   - `hnsw_multilayer_forced_levels_place_nodes_above_zero` / `hnsw_multilayer_seeded_inserts_use_upper_layers` / `hnsw_multilayer_remove_update_smoke` / `hnsw_multilayer_upper_layer_has_edges` (Batch FF)
 
-**Implementation note (Batch CQ + CS + CT + CU + CV + DK + DL):** `HNSWIndex::search` walks neighbor
-edges (SEARCH-LAYER) with candidate list size `ef_search` (defaults to
-`ef_construction`). Insert still assigns all nodes to **layer 0** only
-(multi-layer assignment simplified). Layer-0 prune uses `M_max ≈ 2M` and
-force-keeps a reverse edge to each **new** node at insert time (mitigates
-immediate drop under degree caps; **not** a durable global reachability
-invariant — later hub prunes can still disconnect older leaves). `remove`
-unlinks reverse edges and reconnects an **undirected** former-neighbor set
-(outgoing ∪ reverse scan) via a spanning structure — full clique when degree
-fits, else nearest-neighbor path — force-keeping those edges on both endpoints
-(Batch CU; extends CT 2-chain closest-peer). Covers asymmetric incoming-only
-links and multi-way stars under degree caps; still **not** a global
-non-partition guarantee under arbitrary later hub churn. Existing-id `add`
-rewires via remove + re-insert (inherits bridge repair). Approximate ANN; use
-FLAT for exact recall baselines. Brute-force over `vectors` remains only as a
-defensive fallback when the entry-point vector is missing.
+**Implementation note (Batch CQ + CS + CT + CU + CV + DK + DL + FF):** `HNSWIndex::search`
+greedily descends upper layers (`ef=1`) then walks layer-0 neighbor edges
+(SEARCH-LAYER) with candidate list size `ef_search` (defaults to
+`ef_construction`). **Batch FF** assigns each insert a random level with
+geometric decay (`ml = 1/ln(max(M,2))`, `level = floor(-ln(U)*ml)`, cap 16)
+and wires edges on layers `0..=level` (upper layers use `M` prune; layer 0
+uses `M_max ≈ 2M` + force-keep reverse edge to each new node at insert time —
+mitigates immediate drop under degree caps; **not** a durable global
+reachability invariant). `remove` unlinks reverse edges on **all** layers,
+reconnects an **undirected** former-neighbor set (outgoing ∪ reverse scan)
+via a spanning structure — full clique when degree fits, else nearest-neighbor
+path — force-keeping those edges on both endpoints (Batch CU; extends CT
+2-chain closest-peer), reassigns entry to a highest-layer survivor, and trims
+empty upper layers. Covers asymmetric incoming-only links and multi-way stars
+under degree caps; still **not** a global non-partition guarantee under
+arbitrary later hub churn. Existing-id `add` rewires via remove + re-insert
+(inherits bridge repair; new level is re-drawn). Approximate ANN; use FLAT for
+exact recall baselines. Brute-force over `vectors` remains only as a defensive
+fallback when the entry-point vector is missing.
+
+**Persistence honesty (Batch FF):** AOF/RDB persist vectors + HNSW params
+(`M`, `ef_construction`) only — **not** graph edges or per-node levels. On
+load the multi-layer graph is rebuilt by sequential re-`add` (levels
+re-sampled; edge structure is not bit-identical to pre-save). Do not claim
+edge-durable multi-layer HNSW round-trip.
 
 ### Indicative micro-results (Batch DK)
 

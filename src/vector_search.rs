@@ -1,6 +1,8 @@
 use bytes::Bytes;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use crate::search_index::DistanceMetric;
 
 /// Vector search result
@@ -186,8 +188,29 @@ impl PartialOrd for MaxCand {
 /// HNSW (Hierarchical Navigable Small World) index for approximate nearest neighbor search.
 ///
 /// **Batch CQ:** query search walks neighbor edges (SEARCH-LAYER) with candidate list
-/// size `ef_search`. Insert still assigns all nodes to **layer 0** only (multi-layer
-/// assignment is simplified); edges on that layer are real and used at query time.
+/// size `ef_search`.
+///
+/// **Batch FF (multi-layer insert):** each insert draws a random level with geometric
+/// decay and is wired on layers `0..=level`:
+/// - Level formula (Malkov & Yashunin / hnswlib):  
+///   `ml = 1 / ln(max(M, 2))`,  
+///   `level = floor(-ln(U) * ml)` for `U ~ Unif(0, 1)`, capped at [`HNSWIndex::MAX_LEVEL`].
+/// - Upper layers (`level+1 ..= top`): greedy SEARCH-LAYER with `ef = 1` from the
+///   entry point down to the insert level.
+/// - Layers `0..=min(top, level)`: SEARCH-LAYER with `ef_construction`, select top-`M`
+///   neighbors, bidirectional edges, prune to `max_edges(layer)` (`≈2M` on layer 0,
+///   `M` above), force-keeping reverse edges to the new node.
+/// - Entry point is updated when the new node's level exceeds the current top layer.
+/// - Query search greedily descends layers `top…1` with `ef=1`, then runs layer 0
+///   with `ef_search`.
+///
+/// Deterministic tests can force levels via [`HNSWIndex::enqueue_levels`] or seed
+/// the level RNG with [`HNSWIndex::with_level_seed`].
+///
+/// **Persistence honesty:** AOF/RDB store vectors + HNSW params (`M`, `ef_construction`)
+/// only — **not** graph edges or per-node levels. On load, the graph (including multi-layer
+/// structure) is rebuilt by re-`add` in restore order; levels are re-sampled and will not
+/// match the pre-save hierarchy. Do not claim edge-identical multi-layer graph durability.
 ///
 /// **Batch CS:** `remove` unlinks reverse edges and clears the layer entry; insert uses
 /// layer-0 `M_max ≈ 2M` and force-keeps at least one reverse edge so new nodes stay
@@ -217,25 +240,111 @@ pub struct HNSWIndex {
     ef_search: usize,
     /// Distance metric
     distance_metric: DistanceMetric,
-    /// Entry point (node ID) for search
+    /// Entry point (node ID) for search — a node present on the highest non-empty layer
     entry_point: Option<Bytes>,
+    /// Level normalization: `ml = 1 / ln(max(M, 2))` for geometric level sampling.
+    ml: f64,
+    /// FIFO of forced insert levels (tests / injectors). Empty → geometric sample.
+    level_assign_queue: VecDeque<usize>,
+    /// Optional seedable RNG for level assignment. `None` → `thread_rng`.
+    level_rng: Option<StdRng>,
 }
 
 impl HNSWIndex {
+    /// Practical cap on sampled insert level (pathological tails of the geometric draw).
+    pub const MAX_LEVEL: usize = 16;
+
     pub fn new(m: usize, ef_construction: usize, distance_metric: DistanceMetric) -> Self {
+        let m = m.max(1);
         Self {
             vectors: HashMap::new(),
             layers: vec![HNSWLayer::new()],
-            m: m.max(1),
+            m,
             ef_construction: ef_construction.max(1),
             ef_search: ef_construction.max(1),
             distance_metric,
             entry_point: None,
+            ml: Self::compute_ml(m),
+            level_assign_queue: VecDeque::new(),
+            level_rng: None,
+        }
+    }
+
+    /// Seed the level-assignment RNG for reproducible multi-layer structure in tests.
+    pub fn with_level_seed(mut self, seed: u64) -> Self {
+        self.level_rng = Some(StdRng::seed_from_u64(seed));
+        self
+    }
+
+    /// Enqueue forced insert levels (FIFO). Each `add` consumes one when present.
+    ///
+    /// Used for deterministic multi-layer unit tests so CI is not flaky on RNG tails.
+    pub fn enqueue_levels(&mut self, levels: impl IntoIterator<Item = usize>) {
+        for l in levels {
+            self.level_assign_queue.push_back(l.min(Self::MAX_LEVEL));
+        }
+    }
+
+    /// `ml = 1 / ln(max(M, 2))` — classic HNSW level multiplier (Malkov & Yashunin).
+    fn compute_ml(m: usize) -> f64 {
+        1.0 / (m.max(2) as f64).ln()
+    }
+
+    /// Assign insert level: forced queue first, else geometric decay.
+    ///
+    /// Formula: `level = floor(-ln(U) * ml)` with `U ~ Unif(0, 1)`, capped at
+    /// [`Self::MAX_LEVEL`]. Expected fraction of nodes on layer ≥ ℓ is roughly
+    /// `exp(-ℓ / ml)` ≈ `M^{-ℓ}` when `ml = 1/ln(M)`.
+    fn assign_level(&mut self) -> usize {
+        if let Some(level) = self.level_assign_queue.pop_front() {
+            return level.min(Self::MAX_LEVEL);
+        }
+        let u: f64 = match self.level_rng.as_mut() {
+            Some(rng) => loop {
+                let x: f64 = rng.gen();
+                if x > 0.0 && x < 1.0 {
+                    break x;
+                }
+            },
+            None => loop {
+                let x: f64 = rand::random();
+                if x > 0.0 && x < 1.0 {
+                    break x;
+                }
+            },
+        };
+        let level = (-u.ln() * self.ml).floor() as usize;
+        level.min(Self::MAX_LEVEL)
+    }
+
+    /// Highest layer index that still has at least one node, or 0 if only empty base.
+    fn highest_nonempty_layer(&self) -> usize {
+        for (i, layer) in self.layers.iter().enumerate().rev() {
+            if !layer.neighbors.is_empty() {
+                return i;
+            }
+        }
+        0
+    }
+
+    /// Drop trailing empty upper layers (keep at least layer 0).
+    fn trim_empty_upper_layers(&mut self) {
+        while self.layers.len() > 1 {
+            if self
+                .layers
+                .last()
+                .map(|l| l.neighbors.is_empty())
+                .unwrap_or(true)
+            {
+                self.layers.pop();
+            } else {
+                break;
+            }
         }
     }
 
     /// Max outgoing edges kept after prune. Layer 0 uses `≈ 2M` (classic HNSW
-    /// `M_max0`) so reverse links survive better under degree caps.
+    /// `M_max0`) so reverse links survive better under degree caps; upper layers use `M`.
     fn max_edges(&self, layer: usize) -> usize {
         if layer == 0 {
             self.m.saturating_mul(2).max(self.m)
@@ -244,72 +353,121 @@ impl HNSWIndex {
         }
     }
 
-    /// Add a vector to the index.
+    /// Connect `doc_id` to `neighbors` on `layer` with bidirectional edges + prune.
+    fn connect_on_layer(&mut self, doc_id: &Bytes, neighbors: &[Bytes], layer: usize) {
+        let max_m = self.max_edges(layer);
+        for neighbor in neighbors {
+            debug_assert_ne!(neighbor, doc_id, "neighbor selection must exclude self");
+            if let Some(l) = self.layers.get_mut(layer) {
+                l.add_edge(doc_id.clone(), neighbor.clone());
+                l.add_edge(neighbor.clone(), doc_id.clone());
+            }
+            // Cap degree on the existing neighbor; force-keep reverse edge to the
+            // new node so it remains reachable from entry via outgoing walks.
+            self.prune_neighbors_keeping(neighbor, layer, max_m, std::slice::from_ref(doc_id));
+        }
+        self.prune_neighbors_keeping(doc_id, layer, max_m, &[]);
+    }
+
+    /// Add a vector to the index (classic multi-layer HNSW insert — Batch FF).
     ///
-    /// Neighbors are selected via graph search **before** the vector is stored, so the
-    /// new node is never chosen as its own neighbor. Existing IDs rewire the graph
-    /// (unlink old edges, re-select neighbors for the new vector).
+    /// Neighbors are selected via graph search; the new node is never chosen as
+    /// its own neighbor (SEARCH-LAYER only follows existing edges). Existing IDs
+    /// rewire the graph (unlink old edges, re-select neighbors for the new vector
+    /// and a freshly drawn level).
     pub fn add(&mut self, doc_id: Bytes, vector: Vec<f32>) {
         // Update-in-place: full graph rewire so queries near the new location work.
         if self.vectors.contains_key(&doc_id) {
             self.remove(&doc_id);
         }
 
-        // Simplified multi-layer: all nodes live on layer 0.
-        let layer = 0;
-        while self.layers.len() <= layer {
+        let level = self.assign_level();
+        while self.layers.len() <= level {
             self.layers.push(HNSWLayer::new());
         }
 
-        // First node becomes the entry point; no edges yet.
+        // First node becomes the entry point on every layer it occupies.
         if self.entry_point.is_none() || self.vectors.is_empty() {
-            self.layers[layer].add_node(doc_id.clone());
+            for l in 0..=level {
+                self.layers[l].add_node(doc_id.clone());
+            }
             self.vectors.insert(doc_id.clone(), vector);
             self.entry_point = Some(doc_id);
             return;
         }
 
-        // Find neighbors via graph walk *before* inserting self into `vectors`.
-        let entry = self
+        let mut ep = self
             .entry_point
             .clone()
             .expect("entry_point set when index non-empty");
+        // Top layer of the *existing* graph before this insert (entry lives there).
+        let top = self.highest_nonempty_layer();
         let ef = self.ef_construction.max(self.m);
-        let candidates = self.search_layer(&vector, &entry, ef, layer);
-        let neighbors = Self::select_top_m(candidates, self.m);
 
-        // Insert vector + node (empty neighbor list — no stale revive), then edges.
-        self.vectors.insert(doc_id.clone(), vector);
-        self.layers[layer].add_node(doc_id.clone());
-
-        let max_m = self.max_edges(layer);
-        for neighbor in &neighbors {
-            debug_assert_ne!(neighbor, &doc_id, "neighbor selection must exclude self");
-            self.layers[layer].add_edge(doc_id.clone(), neighbor.clone());
-            self.layers[layer].add_edge(neighbor.clone(), doc_id.clone());
-            // Cap degree on the existing neighbor; force-keep reverse edge to the
-            // new node so it remains reachable from entry via outgoing walks.
-            self.prune_neighbors_keeping(neighbor, layer, max_m, std::slice::from_ref(&doc_id));
+        // Phase 1: greedy descent from top down to level+1 with ef=1.
+        if top > level {
+            for lc in ((level + 1)..=top).rev() {
+                let cands = self.search_layer(&vector, &ep, 1, lc);
+                if let Some((id, _)) = cands.first() {
+                    ep = id.clone();
+                }
+            }
         }
-        self.prune_neighbors_keeping(&doc_id, layer, max_m, &[]);
+
+        // Install vector + empty node shells on layers 0..=level (no stale revive).
+        self.vectors.insert(doc_id.clone(), vector);
+        for l in 0..=level {
+            self.layers[l].add_node(doc_id.clone());
+        }
+
+        // Phase 2: SEARCH-LAYER + connect on each layer the node occupies that
+        // already had graph structure (or layer 0). For layers above the previous
+        // top, the new node is alone — no neighbors to connect.
+        let connect_top = level.min(top);
+        for lc in (0..=connect_top).rev() {
+            let candidates = self.search_layer(
+                self.vectors
+                    .get(&doc_id)
+                    .expect("vector just inserted")
+                    .as_slice(),
+                &ep,
+                ef,
+                lc,
+            );
+            let neighbors = Self::select_top_m(candidates.clone(), self.m);
+            if let Some((id, _)) = candidates.first() {
+                ep = id.clone();
+            }
+            self.connect_on_layer(&doc_id, &neighbors, lc);
+        }
+
+        // Promote entry point when the new node sits above the previous top.
+        if level > top {
+            self.entry_point = Some(doc_id);
+        }
     }
 
     /// Remove a vector and fully unlink it from the HNSW graph.
     ///
-    /// Strips reverse edges, removes the node from every layer map, reconnects
+    /// Strips reverse edges, removes the node from **every** layer map, reconnects
     /// former neighbors so a bridge/cut-vertex delete does not permanently
-    /// partition the layer (Batch CT/CU/CY), and reassigns `entry_point` when
-    /// needed (prefer a remaining node that still has edges).
+    /// partition the layer (Batch CT/CU/CY), reassigns `entry_point` when needed
+    /// (prefer a remaining node on the highest non-empty layer that still has
+    /// edges), and trims trailing empty upper layers (Batch FF multi-layer).
     ///
     /// Per layer, undirected former-neighbor collection and unlink share a
     /// single reverse pass (`unlink_collecting_undirected_former`) — O(N_layer)
     /// once, not snapshot-then-unlink twice.
+    ///
+    /// Bridge repair remains a per-layer heuristic residual — not a global
+    /// non-partition guarantee under arbitrary later hub churn (same as CT–CY).
     pub fn remove(&mut self, doc_id: &Bytes) {
         if !self.vectors.contains_key(doc_id) {
             // Still scrub any orphaned layer residue (defensive).
             for layer in &mut self.layers {
                 layer.unlink_node(doc_id);
             }
+            self.trim_empty_upper_layers();
             if self.entry_point.as_ref() == Some(doc_id) {
                 self.entry_point = self.pick_entry_point();
             }
@@ -335,8 +493,28 @@ impl HNSWIndex {
             self.bridge_reconnect_neighbors(former, layer_idx);
         }
 
-        if self.entry_point.as_ref() == Some(doc_id) {
+        self.trim_empty_upper_layers();
+
+        if self.entry_point.as_ref() == Some(doc_id)
+            || self
+                .entry_point
+                .as_ref()
+                .map(|ep| !self.vectors.contains_key(ep))
+                .unwrap_or(true)
+        {
             self.entry_point = self.pick_entry_point();
+        } else if let Some(ep) = self.entry_point.as_ref() {
+            // Entry still live but may no longer sit on the highest layer after
+            // this delete emptied the top — re-pick so entry is a top-layer node.
+            let top = self.highest_nonempty_layer();
+            let on_top = self
+                .layers
+                .get(top)
+                .map(|l| l.neighbors.contains_key(ep))
+                .unwrap_or(false);
+            if !on_top {
+                self.entry_point = self.pick_entry_point();
+            }
         }
     }
 
@@ -461,31 +639,43 @@ impl HNSWIndex {
         }
     }
 
-    /// Choose a new entry point among remaining vectors; prefer one with edges.
+    /// Choose a new entry point among remaining vectors.
+    ///
+    /// Prefers a node on the **highest non-empty layer** that still has edges
+    /// (Batch FF multi-layer); falls back to any live id on that layer, then
+    /// any vector.
     fn pick_entry_point(&self) -> Option<Bytes> {
         if self.vectors.is_empty() {
             return None;
         }
-        let layer0 = self.layers.first();
-        let mut fallback: Option<Bytes> = None;
-        for id in self.vectors.keys() {
-            let has_edges = layer0
-                .map(|l| !l.get_neighbors(id).is_empty())
-                .unwrap_or(false);
-            if has_edges {
-                return Some(id.clone());
+        let top = self.highest_nonempty_layer();
+        if let Some(layer) = self.layers.get(top) {
+            let mut fallback: Option<Bytes> = None;
+            for id in layer.neighbors.keys() {
+                if !self.vectors.contains_key(id) {
+                    continue;
+                }
+                let has_edges = !layer.get_neighbors(id).is_empty();
+                if has_edges {
+                    return Some(id.clone());
+                }
+                if fallback.is_none() {
+                    fallback = Some(id.clone());
+                }
             }
-            if fallback.is_none() {
-                fallback = Some(id.clone());
+            if fallback.is_some() {
+                return fallback;
             }
         }
-        fallback
+        // Defensive: any remaining vector (layer maps out of sync).
+        self.vectors.keys().next().cloned()
     }
 
-    /// Search for k nearest neighbors by walking the HNSW graph (layer 0).
+    /// Search for k nearest neighbors via multi-layer HNSW (Batch FF).
     ///
-    /// Uses `ef_search` (at least `k`) as the dynamic candidate list size. This is
-    /// approximate: only nodes reachable via edges from the entry point are considered.
+    /// Greedy descent on layers `top…1` with `ef=1`, then SEARCH-LAYER on layer 0
+    /// with `ef_search` (at least `k`). Approximate: only nodes reachable via
+    /// edges from the refined entry are considered on layer 0.
     /// Fallback: if the entry point is missing from `vectors`, brute-force the map
     /// (should not happen after normal `add` paths).
     pub fn search(&self, query_vector: &[f32], k: usize) -> Vec<VectorSearchResult> {
@@ -496,9 +686,20 @@ impl HNSWIndex {
             return Vec::new();
         };
 
+        let mut ep = entry.clone();
+        let top = self.highest_nonempty_layer();
+        // Greedy upper-layer descent (ef=1) to refine the layer-0 entry.
+        if top >= 1 {
+            for lc in (1..=top).rev() {
+                let cands = self.search_layer(query_vector, &ep, 1, lc);
+                if let Some((id, _)) = cands.first() {
+                    ep = id.clone();
+                }
+            }
+        }
+
         let ef = self.ef_search.max(k);
-        let layer = 0;
-        let candidates = self.search_layer(query_vector, entry, ef, layer);
+        let candidates = self.search_layer(query_vector, &ep, ef, 0);
 
         candidates
             .into_iter()
@@ -511,6 +712,18 @@ impl HNSWIndex {
                 })
             })
             .collect()
+    }
+
+    /// Highest layer index where `doc_id` appears, if any (tests / diagnostics).
+    #[cfg(test)]
+    fn node_level(&self, doc_id: &Bytes) -> Option<usize> {
+        let mut max = None;
+        for (i, layer) in self.layers.iter().enumerate() {
+            if layer.neighbors.contains_key(doc_id) {
+                max = Some(i);
+            }
+        }
+        max
     }
 
     /// SEARCH-LAYER (Malkov & Yashunin): greedy expansion of neighbors with ef bound.
@@ -2191,5 +2404,197 @@ mod tests {
             "post-churn mean recall@10 {mean_r10:.3} < {MIN_RECALL_AT_10} \
              (N={N} remove={N_REMOVE} update={N_UPDATE} M={M} ef={EF})"
         );
+    }
+
+    // ── Batch FF: multi-layer insert ──────────────────────────────────────
+
+    /// Forced levels place nodes on layers > 0; entry promotes when a higher
+    /// level arrives; all nodes still present on layer 0.
+    #[test]
+    fn hnsw_multilayer_forced_levels_place_nodes_above_zero() {
+        let mut index = HNSWIndex::new(4, 32, DistanceMetric::L2);
+        // a@0, b@0, c@2 (new top), d@1
+        index.enqueue_levels([0, 0, 2, 1]);
+        index.add(Bytes::from("a"), vec![0.0, 0.0]);
+        index.add(Bytes::from("b"), vec![1.0, 0.0]);
+        index.add(Bytes::from("c"), vec![2.0, 0.0]);
+        index.add(Bytes::from("d"), vec![3.0, 0.0]);
+
+        assert_eq!(index.node_level(&Bytes::from("a")), Some(0));
+        assert_eq!(index.node_level(&Bytes::from("b")), Some(0));
+        assert_eq!(index.node_level(&Bytes::from("c")), Some(2));
+        assert_eq!(index.node_level(&Bytes::from("d")), Some(1));
+
+        // All nodes on layer 0.
+        for id in ["a", "b", "c", "d"] {
+            assert!(
+                index.layers[0].neighbors.contains_key(&Bytes::from(id)),
+                "layer 0 must contain {id}"
+            );
+        }
+        // c on layers 0,1,2; d on 0,1; not on 2.
+        assert!(index.layers[2].neighbors.contains_key(&Bytes::from("c")));
+        assert!(!index.layers[2].neighbors.contains_key(&Bytes::from("d")));
+        assert!(index.layers[1].neighbors.contains_key(&Bytes::from("d")));
+
+        // Entry should be the highest-level node (c @ 2).
+        assert_eq!(index.entry_point, Some(Bytes::from("c")));
+        assert_eq!(index.highest_nonempty_layer(), 2);
+
+        // Search still finds nearest (self at origin).
+        let hits = index.search(&[0.0f32, 0.0], 1);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, Bytes::from("a"));
+    }
+
+    /// Seeded level RNG: large N produces some nodes on layers > 0 (high probability).
+    #[test]
+    fn hnsw_multilayer_seeded_inserts_use_upper_layers() {
+        const N: usize = 200;
+        const M: usize = 8;
+        const EF: usize = 32;
+        const SEED: u64 = 0xFF_00_BA_7C;
+
+        let mut index = HNSWIndex::new(M, EF, DistanceMetric::L2).with_level_seed(SEED);
+        for i in 0..N {
+            index.add(
+                Bytes::from(format!("n{i}")),
+                vec![i as f32 * 0.01, (i % 11) as f32],
+            );
+        }
+        assert_eq!(index.len(), N);
+
+        let mut above_zero = 0usize;
+        let mut max_lvl = 0usize;
+        for i in 0..N {
+            let id = Bytes::from(format!("n{i}"));
+            let lvl = index.node_level(&id).expect("node present");
+            max_lvl = max_lvl.max(lvl);
+            if lvl > 0 {
+                above_zero += 1;
+            }
+            // Every node is on layer 0.
+            assert!(index.layers[0].neighbors.contains_key(&id));
+        }
+
+        assert!(
+            above_zero > 0,
+            "expected some nodes on layer > 0 with M={M} N={N} seed={SEED:#x} (got 0)"
+        );
+        assert!(
+            max_lvl >= 1,
+            "expected top level ≥ 1 (got {max_lvl}); multi-layer insert not active?"
+        );
+        assert_eq!(
+            index.highest_nonempty_layer(),
+            max_lvl,
+            "index top layer should match max node level"
+        );
+
+        // Entry on the top layer.
+        let entry = index.entry_point.as_ref().expect("entry");
+        assert_eq!(index.node_level(entry), Some(max_lvl));
+
+        // Search still returns k hits.
+        let results = index.search(&[1.0f32, 0.0], 5);
+        assert_eq!(results.len(), 5);
+    }
+
+    /// Remove of top-layer-only hub reassigns entry and trims empty upper layers;
+    /// update-in-place (re-add) rewires multi-layer.
+    #[test]
+    fn hnsw_multilayer_remove_update_smoke() {
+        let mut index = HNSWIndex::new(4, 32, DistanceMetric::L2);
+        // hub@3 entry; several base nodes; mid@1
+        index.enqueue_levels([3, 0, 0, 0, 1, 0]);
+        index.add(Bytes::from("hub"), vec![0.0, 0.0]);
+        index.add(Bytes::from("a"), vec![1.0, 0.0]);
+        index.add(Bytes::from("b"), vec![2.0, 0.0]);
+        index.add(Bytes::from("c"), vec![3.0, 0.0]);
+        index.add(Bytes::from("mid"), vec![1.5, 0.0]);
+        index.add(Bytes::from("d"), vec![4.0, 0.0]);
+
+        assert_eq!(index.entry_point, Some(Bytes::from("hub")));
+        assert_eq!(index.highest_nonempty_layer(), 3);
+        assert!(index.layers.len() >= 4);
+
+        // Remove the top hub — entry reassigns; upper empty layers trim.
+        index.remove(&Bytes::from("hub"));
+        assert!(!index.vectors.contains_key(&Bytes::from("hub")));
+        assert!(index.entry_point.is_some());
+        assert_ne!(index.entry_point, Some(Bytes::from("hub")));
+        // mid was the next-highest (level 1); top should be ≤ 1 after trim.
+        assert!(
+            index.highest_nonempty_layer() <= 1,
+            "top after hub remove should be ≤ 1, got {}",
+            index.highest_nonempty_layer()
+        );
+        // No residue of hub on any layer.
+        for (li, layer) in index.layers.iter().enumerate() {
+            assert!(
+                !layer.neighbors.contains_key(&Bytes::from("hub")),
+                "hub residue on layer {li}"
+            );
+            for (id, neighs) in &layer.neighbors {
+                assert!(
+                    !neighs.iter().any(|n| n == &Bytes::from("hub")),
+                    "stale hub edge from {:?} on layer {li}",
+                    id
+                );
+            }
+        }
+
+        // Survivors still searchable.
+        let hits = index.search(&[1.0f32, 0.0], 1);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, Bytes::from("a"));
+
+        // Update mid → far location; rewire must place it near far query.
+        index.enqueue_levels([1]); // re-add draws a fresh level from queue
+        index.add(Bytes::from("mid"), vec![100.0, 0.0]);
+        assert_eq!(
+            index.vectors.get(&Bytes::from("mid")),
+            Some(&vec![100.0, 0.0])
+        );
+        let far = index.search(&[100.0f32, 0.0], 1);
+        assert_eq!(far.len(), 1);
+        assert_eq!(
+            far[0].doc_id,
+            Bytes::from("mid"),
+            "updated mid should rank #1 near new location"
+        );
+    }
+
+    /// Upper-layer edges exist after multi-layer insert (not only layer-0 shells).
+    #[test]
+    fn hnsw_multilayer_upper_layer_has_edges() {
+        let mut index = HNSWIndex::new(4, 32, DistanceMetric::L2);
+        // Two nodes on layer 1 so they can link above the base.
+        index.enqueue_levels([1, 1, 0, 0, 0]);
+        for (id, v) in [
+            ("p", vec![0.0f32, 0.0]),
+            ("q", vec![1.0, 0.0]),
+            ("r", vec![2.0, 0.0]),
+            ("s", vec![3.0, 0.0]),
+            ("t", vec![4.0, 0.0]),
+        ] {
+            index.add(Bytes::from(id), v);
+        }
+        assert!(
+            index.layers.len() >= 2,
+            "expected at least layers 0 and 1"
+        );
+        let upper_edges: usize = index.layers[1]
+            .neighbors
+            .values()
+            .map(|v| v.len())
+            .sum();
+        assert!(
+            upper_edges > 0,
+            "layer 1 should have edges between multi-level nodes (got 0)"
+        );
+        // p and q both on layer 1.
+        assert!(index.layers[1].neighbors.contains_key(&Bytes::from("p")));
+        assert!(index.layers[1].neighbors.contains_key(&Bytes::from("q")));
     }
 }

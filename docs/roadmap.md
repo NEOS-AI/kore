@@ -3,7 +3,7 @@
 ## Currently working on..
 
 - [x] Support for Redis Pub-Sub
-- **Post-FE queue** (Sentinel leader election shipped): next is **Batch FF** (HNSW multi-layer insert), then **FG** unified keyspace. Details in root `TODO.md` → *Next work queue (post-FC)*.
+- **Post-FF queue** (HNSW multi-layer insert shipped): next is **Batch FG** (unified keyspace). Details in root `TODO.md` → *Next work queue (post-FE)*.
 
 ## Persistence / search letter batches (recent)
 
@@ -51,13 +51,14 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Sentinel conf persistence (Batch EZ: FLUSHCONFIG + load sentinel.conf; autosave)
 - [x] Sentinel hello bus lite (Batch FA: HELLO CSV + PUBLISH + peer exchange)
 - [x] Sentinel promote-success gate (Batch FC: FAILOVER/REPLICAOF/ROLE=master; failover_in_progress)
-- [x] HNSW graph-based ANN search (Batch CQ; layer-0 edges + `ef_search`; multi-layer insert still simplified)
+- [x] HNSW graph-based ANN search (Batch CQ; layer-0 edges + `ef_search`)
 - [x] HNSW remove/unlink + insert-time force-keep + update rewire (Batch CS)
 - [x] HNSW hard-delete bridge repair — closest-peer reconnect (Batch CT; 2-chain)
 - [x] HNSW undirected former snapshot + multi-way spanning bridge reconnect (Batch CU)
 - [x] HNSW NN-path bridge branch test + must_keep prune safety (Batch CW)
 - [x] HNSW recall@k unit gate + N=300 indicative micro (Batch CV; not large-N ANN win)
 - [x] HNSW tighter recall gate + optional larger-N median bench (Batch DK; `#[ignore]` N=5000)
+- [x] HNSW multi-layer insert (Batch FF: geometric level assignment + upper-layer SEARCH-LAYER / connect; query descent; edges/levels not AOF/RDB durable)
 
 ## Plans
 
@@ -73,8 +74,9 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Cluster automatic reshard / multi-type MIGRATE orchestration (MVP complete: PLAN/AUTO DX, epoch gossip DU, dest-first NODE DV, fail quorum DW, EY preflight, EP dest rollback, **FB RESP prepare/commit 2PC slice**)
 - [x] Sentinel promote-success gate (Batch FC: real promote required; in-process failover_in_progress)
 - [x] **FD** measured benchmarks vs Valkey (`docs/benchmarks.md`; single-host median of 3; no portable-win claims)
-- [x] Sentinel leader election depth (Batch FE: voted-leader / elect gate; residuals: hello SUBSCRIBE, CKQUORUM live)
-- [ ] **Next (see `TODO.md` Next work queue post-FC):** **FF** HNSW multi-layer · **FG** unified keyspace · later NODE 2PC slice 2
+- [x] Sentinel leader election depth (Batch FE: voted-leader / elect gate; residuals: election-timeout, hello SUBSCRIBE, CKQUORUM live)
+- [x] HNSW multi-layer insert (Batch FF)
+- [ ] **Next (see `TODO.md` Next work queue post-FE):** **FG** unified keyspace · later NODE 2PC slice 2 / Sentinel promote rank / `nodes.conf` flags
 - [x] 데드락 감지 고급 기능
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원
