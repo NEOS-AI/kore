@@ -261,8 +261,20 @@ Pass-level raw ops/s (FI):
 
 ### Residual (FI-2 / later)
 
+#### Batch FI-2 (2026-07-25) — AOF-off multi-DB SELECT ordering
+
+**Correctness fix (shipped):** FI held the AOF mutex only to update `selected_db`, then encoded + `propagate_*` outside that lock. Concurrent multi-DB writers could therefore order SELECT decision differently from backlog append (e.g. thread B’s SELECT-less cmd lands before thread A’s `SELECT n`+cmd). Peers replaying the stream could apply writes to the wrong logical DB when AOF was off.
+
+**Approach:** `ReplicationManager::propagate_write(db, args)` owns stream lazy-SELECT. Command encode stays outside the publish locks; under `fullsync_gate` + backlog the stream decides SELECT, appends SELECT+cmd as one payload (or cmd alone), and updates `selected_db`. AOF-off `on_write_command` no longer touches the AOF mutex. AOF-on still holds the AOF lock across disk append + `propagate_write` (ordered). Promote/`ReplBacklog::clear` resets stream `selected_db`.
+
+**Tests:** `tests/aof_select_concurrency_test.rs` (`aof_off_concurrent_multidb_*`, lazy serial); lib `propagate_write_concurrent_multidb_feed_replay`, `propagate_write_lazy_select_atomic`, `promote_resets_stream_selected_db`.
+
+**Perf:** Small safe wins only (skip AOF lock when AOF off; skip empty raw payload). **No redis-benchmark re-measure** this batch — single-DB hot path still serializes on the same global backlog/gate; multi-DB correctness was the goal. Residual vs Valkey pipeline SET (~2.6×) unchanged in attribution.
+
+**Still open (later):**
+
 - Optional: skip or shrink repl backlog when no replicas ever connected and operator opts in (breaks eager PSYNC until first write after replica appears — needs clear config).
-- Fuse `fullsync_gate` + backlog into one critical section; encode with small thread-local buffer reuse.
+- Fuse `fullsync_gate` + backlog into one mutex; encode with small thread-local buffer reuse.
 - Avoid dual key ownership clone (`Entry.key` + HashMap key) / thin `Entry` without duplicated key bytes.
 - Per-shard dirty counters; batch `mark_dirty` under pipeline.
 - Flamegraph / `samply` on Linux for quantitative attribution (not run this batch on macOS).

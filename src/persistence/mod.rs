@@ -483,50 +483,29 @@ impl PersistenceManager {
     /// When the selected DB changes relative to the last recorded write, a
     /// `SELECT n` command is emitted first (and also propagated to replicas).
     ///
-    /// **AOF enabled:** decide-select, AOF append(s), selected-db update, and
-    /// replication propagation run under a single critical section so concurrent
-    /// writers cannot interleave SELECT and write commands on disk.
+    /// **AOF enabled:** decide-select, AOF append(s), and AOF `selected_db`
+    /// update run under the AOF mutex. Replication uses
+    /// [`ReplicationManager::propagate_write`], which decides stream SELECT and
+    /// appends under the repl publish lock (still called while holding AOF so
+    /// disk and stream order match for concurrent writers).
     ///
-    /// **AOF disabled (common bench / standalone):** the AOF mutex is held only
-    /// long enough to decide SELECT and update `selected_db`. Command encode +
-    /// replication backlog append run **outside** that lock so concurrent writers
-    /// can encode in parallel (they still serialize on the replication backlog).
-    /// When SELECT is needed, SELECT+cmd are still one `propagate_raw` payload.
+    /// **AOF disabled (common bench / standalone):** the AOF mutex is **not**
+    /// taken. Command encode runs outside the repl lock; SELECT decision +
+    /// backlog append are atomic inside `propagate_write` so concurrent multi-DB
+    /// writers cannot interleave a SELECT-less command ahead of another thread’s
+    /// SELECT (Batch FI-2).
     ///
-    /// When SELECT is needed with AOF on, AOF still records SELECT and the write
-    /// as two separate appends (under the same `aof` lock). Replication encodes
-    /// both into one buffer and calls `propagate_raw` once so a concurrent PSYNC
-    /// cannot register a feed between SELECT and the write.
+    /// When SELECT is needed, SELECT+cmd are one contiguous `propagate` payload
+    /// so a concurrent PSYNC cannot register a feed between SELECT and the write.
+    /// AOF still records SELECT and the write as two separate appends.
     pub fn on_write_command(&self, selected_db: usize, args: &[bytes::Bytes]) {
         self.mark_dirty();
 
-        // ── Fast path: no AOF file — do not hold aof lock across encode/propagate ──
+        // ── Fast path: no AOF file — stream SELECT owned by replication ──
         if !self.config.appendonly {
-            let emit_select = {
-                let mut state = self.aof.lock();
-                let emit = match state.selected_db {
-                    Some(db) => db != selected_db,
-                    None => selected_db != 0,
-                };
-                state.selected_db = Some(selected_db);
-                emit
-            }; // aof lock released before encode + backlog
-
-            if emit_select {
-                let select_args = [
-                    bytes::Bytes::from_static(b"SELECT"),
-                    bytes::Bytes::from(selected_db.to_string()),
-                ];
-                let select_raw = aof::encode_command(&select_args);
-                let cmd_raw = aof::encode_command(args);
-                let mut combined =
-                    Vec::with_capacity(select_raw.len() + cmd_raw.len());
-                combined.extend_from_slice(&select_raw);
-                combined.extend_from_slice(&cmd_raw);
-                self.replication.propagate_raw(bytes::Bytes::from(combined));
-            } else {
-                self.replication.propagate_command(args);
-            }
+            // No aof.lock: selected_db for the repl stream is tracked inside
+            // propagate_write under the same critical section as backlog append.
+            self.replication.propagate_write(selected_db, args);
             return;
         }
 
@@ -553,24 +532,15 @@ impl PersistenceManager {
                     warn!("AOF append failed: {}", e);
                 }
             }
-            // Replication: one contiguous payload so backlog + live feeds are atomic.
-            let select_raw = aof::encode_command(&select_args);
-            let cmd_raw = aof::encode_command(args);
-            let mut combined =
-                Vec::with_capacity(select_raw.len() + cmd_raw.len());
-            combined.extend_from_slice(&select_raw);
-            combined.extend_from_slice(&cmd_raw);
-            state.selected_db = Some(selected_db);
-            self.replication.propagate_raw(bytes::Bytes::from(combined));
-        } else {
-            if let Some(ref mut writer) = state.writer {
-                if let Err(e) = writer.append_command(args) {
-                    warn!("AOF append failed: {}", e);
-                }
+        } else if let Some(ref mut writer) = state.writer {
+            if let Err(e) = writer.append_command(args) {
+                warn!("AOF append failed: {}", e);
             }
-            state.selected_db = Some(selected_db);
-            self.replication.propagate_command(args);
         }
+        state.selected_db = Some(selected_db);
+        // Replication owns stream SELECT under its own lock; holding aof here
+        // keeps AOF disk order aligned with stream order across writers.
+        self.replication.propagate_write(selected_db, args);
     }
 
     pub fn rdb_path(&self) -> PathBuf {

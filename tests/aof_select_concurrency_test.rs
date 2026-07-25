@@ -1,9 +1,12 @@
-//! AOF SELECT concurrency: concurrent writers on different DBs must not
-//! interleave SELECT and write commands incorrectly in the AOF stream.
+//! AOF / repl SELECT concurrency: concurrent writers on different DBs must not
+//! interleave SELECT and write commands incorrectly in the AOF stream or the
+//! replication backlog (AOF-off multi-DB race — Batch FI-2).
 
 use bytes::Bytes;
 use kore::databases::Databases;
+use kore::entry::{LoadOptions, StoreOptions};
 use kore::persistence::{aof, PersistenceConfig, PersistenceManager};
+use kore::protocol::{RespParser, RespValue};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -24,10 +27,14 @@ fn tmp_dir(name: &str) -> PathBuf {
 }
 
 fn make_pm(dir: &PathBuf) -> Arc<PersistenceManager> {
+    make_pm_aof(dir, true)
+}
+
+fn make_pm_aof(dir: &PathBuf, appendonly: bool) -> Arc<PersistenceManager> {
     let pconfig = PersistenceConfig {
         dir: dir.clone(),
         dbfilename: "dump.rdb".to_string(),
-        appendonly: true,
+        appendonly,
         appendfilename: "appendonly.aof".to_string(),
         save_rules: vec![],
     };
@@ -50,6 +57,58 @@ fn set_args(key: &str, val: &str) -> Vec<Bytes> {
 
 fn cmd_name(argv: &[Bytes]) -> String {
     String::from_utf8_lossy(&argv[0]).to_uppercase()
+}
+
+/// Parse a concatenated RESP command stream into argv lists.
+fn parse_resp_commands(data: &[u8]) -> Vec<Vec<Bytes>> {
+    let mut parser = RespParser::new();
+    parser.feed(data);
+    let mut cmds = Vec::new();
+    while let Some(value) = parser.parse().expect("resp parse") {
+        let args = match value {
+            RespValue::Array(arr) => arr,
+            other => panic!("expected RESP array command, got {:?}", other),
+        };
+        let mut argv = Vec::with_capacity(args.len());
+        for a in args {
+            match a {
+                RespValue::BulkString(Some(b)) => argv.push(b),
+                RespValue::SimpleString(b) => argv.push(b),
+                RespValue::Integer(i) => argv.push(Bytes::from(i.to_string())),
+                other => panic!("invalid argv element {:?}", other),
+            }
+        }
+        cmds.push(argv);
+    }
+    cmds
+}
+
+/// Replay SELECT/SET (and ignore other cmds) onto `databases`.
+fn apply_select_set_stream(databases: &Databases, cmds: &[Vec<Bytes>]) {
+    let mut logical_db = 0usize;
+    for argv in cmds {
+        match cmd_name(argv).as_str() {
+            "SELECT" => {
+                assert!(argv.len() >= 2, "SELECT needs db index");
+                logical_db = std::str::from_utf8(&argv[1])
+                    .unwrap()
+                    .parse()
+                    .expect("SELECT db index");
+            }
+            "SET" => {
+                assert!(argv.len() >= 3, "SET needs key val");
+                let cache = databases.get(logical_db).expect("db exists");
+                let _ = cache
+                    .store(
+                        argv[1].clone(),
+                        argv[2].clone(),
+                        StoreOptions::default(),
+                    )
+                    .expect("store");
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Concurrent writers on different DBs must replay every key onto its intended DB.
@@ -406,6 +465,247 @@ fn aof_select_concurrent_stress_no_cross_db_pollution() {
             }
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ── Batch FI-2: AOF-off multi-DB SELECT ordering on the repl stream ──────────
+
+/// Concurrent AOF-off multi-DB writes: drain the live repl feed and replay;
+/// every key must land on its intended DB (no SELECT/cmd interleave race).
+#[test]
+fn aof_off_concurrent_multidb_repl_feed_replay_correct() {
+    let dir = tmp_dir("aof-off-replay");
+    let mgr = make_pm_aof(&dir, false);
+
+    // Collect every live feed payload on a dedicated drain thread while writers run.
+    let mut feed = mgr.replication.register_replica();
+    let collected = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let collected_w = Arc::clone(&collected);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_w = Arc::clone(&stop);
+    let drainer = thread::spawn(move || {
+        while !stop_w.load(std::sync::atomic::Ordering::Relaxed) {
+            match feed.try_recv() {
+                Ok(msg) => collected_w.lock().unwrap().extend_from_slice(&msg),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    thread::sleep(std::time::Duration::from_micros(20));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        // Final drain
+        while let Ok(msg) = feed.try_recv() {
+            collected_w.lock().unwrap().extend_from_slice(&msg);
+        }
+    });
+
+    const N_THREADS: usize = 8;
+    const M_WRITES: usize = 80;
+
+    let mut handles = Vec::with_capacity(N_THREADS);
+    for t in 0..N_THREADS {
+        let mgr = Arc::clone(&mgr);
+        handles.push(thread::spawn(move || {
+            for i in 0..M_WRITES {
+                // Rotate DBs inside each thread to maximize SELECT churn.
+                let db = (t + i) % 4;
+                let key = format!("t{t}:k{i}");
+                let val = format!("db{db}");
+                mgr.on_write_command(db, &set_args(&key, &val));
+            }
+        }));
+    }
+    for h in handles {
+        h.join().expect("writer panicked");
+    }
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    drainer.join().expect("drainer panicked");
+
+    let stream = collected.lock().unwrap().clone();
+    assert!(
+        !stream.is_empty(),
+        "repl feed should have received write stream"
+    );
+    assert!(
+        mgr.replication.master_repl_offset() > 0,
+        "master offset must advance"
+    );
+    // Feed bytes should equal the replication offset (one feed, no drops).
+    assert_eq!(
+        stream.len() as u64,
+        mgr.replication.master_repl_offset(),
+        "drained feed must capture full stream (channel must not drop)"
+    );
+
+    let cmds = parse_resp_commands(&stream);
+    let loaded = make_databases();
+    apply_select_set_stream(&loaded, &cmds);
+
+    for t in 0..N_THREADS {
+        for i in 0..M_WRITES {
+            let db = (t + i) % 4;
+            let key = Bytes::from(format!("t{t}:k{i}"));
+            let entry = loaded
+                .get(db)
+                .unwrap()
+                .load(&key, LoadOptions::default())
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing key {key:?} on db {db} after feed replay"));
+            assert_eq!(
+                entry.value,
+                Bytes::from(format!("db{db}")),
+                "wrong value for {key:?} on db {db}"
+            );
+            for other in 0..4usize {
+                if other == db {
+                    continue;
+                }
+                assert!(
+                    loaded
+                        .get(other)
+                        .unwrap()
+                        .load(&key, LoadOptions::default())
+                        .unwrap()
+                        .is_none(),
+                    "key {key:?} for db {db} leaked onto db {other}"
+                );
+            }
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Serial AOF-off: lazy SELECT still holds (DB0 silent; switch emits SELECT).
+#[test]
+fn aof_off_repl_lazy_select_serial() {
+    let dir = tmp_dir("aof-off-lazy");
+    let mgr = make_pm_aof(&dir, false);
+    let mut feed = mgr.replication.register_replica();
+
+    mgr.on_write_command(0, &set_args("a", "1"));
+    mgr.on_write_command(0, &set_args("b", "2"));
+    let m1 = feed.try_recv().expect("SET a");
+    let m2 = feed.try_recv().expect("SET b");
+    assert!(
+        !String::from_utf8_lossy(&m1).to_uppercase().contains("SELECT"),
+        "DB0 must not emit SELECT"
+    );
+    assert!(
+        !String::from_utf8_lossy(&m2).to_uppercase().contains("SELECT"),
+        "same-DB must not emit SELECT"
+    );
+
+    mgr.on_write_command(2, &set_args("c", "3"));
+    let m3 = feed.try_recv().expect("SELECT+SET");
+    assert!(
+        feed.try_recv().is_err(),
+        "SELECT+cmd must be one atomic payload"
+    );
+    let cmds = parse_resp_commands(&m3);
+    assert_eq!(cmds.len(), 2);
+    assert_eq!(cmd_name(&cmds[0]), "SELECT");
+    assert_eq!(cmds[0][1], Bytes::from_static(b"2"));
+    assert_eq!(cmd_name(&cmds[1]), "SET");
+    assert_eq!(cmds[1][1], Bytes::from_static(b"c"));
+
+    mgr.on_write_command(0, &set_args("d", "4"));
+    let m4 = feed.try_recv().expect("SELECT 0 + SET");
+    let cmds = parse_resp_commands(&m4);
+    assert_eq!(cmd_name(&cmds[0]), "SELECT");
+    assert_eq!(cmds[0][1], Bytes::from_static(b"0"));
+    assert_eq!(cmd_name(&cmds[1]), "SET");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Stress several AOF-off concurrent batches (high SELECT churn).
+#[test]
+fn aof_off_concurrent_multidb_stress_batches() {
+    for batch in 0..3 {
+        let dir = tmp_dir(&format!("aof-off-stress-{batch}"));
+        let mgr = make_pm_aof(&dir, false);
+
+        let mut feed = mgr.replication.register_replica();
+        let collected = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let collected_w = Arc::clone(&collected);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_w = Arc::clone(&stop);
+        let drainer = thread::spawn(move || {
+            while !stop_w.load(std::sync::atomic::Ordering::Relaxed) {
+                match feed.try_recv() {
+                    Ok(msg) => collected_w.lock().unwrap().extend_from_slice(&msg),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                        thread::sleep(std::time::Duration::from_micros(20));
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                }
+            }
+            while let Ok(msg) = feed.try_recv() {
+                collected_w.lock().unwrap().extend_from_slice(&msg);
+            }
+        });
+
+        const N_THREADS: usize = 12;
+        const M_WRITES: usize = 60;
+        let mut handles = Vec::with_capacity(N_THREADS);
+        for t in 0..N_THREADS {
+            let mgr = Arc::clone(&mgr);
+            handles.push(thread::spawn(move || {
+                for i in 0..M_WRITES {
+                    let db = (t * 3 + i) % 5;
+                    let key = format!("b{batch}:t{t}:i{i}");
+                    let val = format!("db{db}");
+                    mgr.on_write_command(db, &set_args(&key, &val));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        drainer.join().unwrap();
+
+        let stream = collected.lock().unwrap().clone();
+        assert_eq!(
+            stream.len() as u64,
+            mgr.replication.master_repl_offset(),
+            "batch {batch}: feed dropped messages"
+        );
+
+        let cmds = parse_resp_commands(&stream);
+        let loaded = make_databases();
+        apply_select_set_stream(&loaded, &cmds);
+
+        for t in 0..N_THREADS {
+            for i in 0..M_WRITES {
+                let db = (t * 3 + i) % 5;
+                let key = Bytes::from(format!("b{batch}:t{t}:i{i}"));
+                let entry = loaded
+                    .get(db)
+                    .unwrap()
+                    .load(&key, LoadOptions::default())
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("batch {batch}: missing {key:?} on db {db}"));
+                assert_eq!(entry.value, Bytes::from(format!("db{db}")));
+                for other in 0..5usize {
+                    if other == db {
+                        continue;
+                    }
+                    assert!(
+                        loaded
+                            .get(other)
+                            .unwrap()
+                            .load(&key, LoadOptions::default())
+                            .unwrap()
+                            .is_none(),
+                        "batch {batch}: {key:?} leaked to db {other}"
+                    );
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

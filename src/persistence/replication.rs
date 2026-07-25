@@ -51,6 +51,10 @@ struct ReplBacklog {
     start_offset: u64,
     /// Global offset of the next byte to be written (master_repl_offset).
     end_offset: u64,
+    /// Last logical DB for which a `SELECT` was emitted on this stream
+    /// (`None` = unknown / post-clear; next non-zero DB write emits SELECT).
+    /// Updated only under the same lock as `append` via `propagate_write`.
+    selected_db: Option<usize>,
 }
 
 impl ReplBacklog {
@@ -61,6 +65,7 @@ impl ReplBacklog {
             buf: Vec::with_capacity(capacity.min(64 * 1024).max(64)),
             start_offset: 0,
             end_offset: 0,
+            selected_db: None,
         }
     }
 
@@ -125,6 +130,7 @@ impl ReplBacklog {
         self.buf.clear();
         self.start_offset = 0;
         self.end_offset = 0;
+        self.selected_db = None;
     }
 }
 
@@ -500,8 +506,68 @@ impl ReplicationManager {
         }
     }
 
-    /// Propagate a write command (as RESP array bytes) to all replicas and backlog.
+    /// Propagate a write for logical database `db` (lazy `SELECT` + command).
+    ///
+    /// Command RESP is encoded **outside** the publish locks so concurrent
+    /// writers can encode in parallel. Under `fullsync_gate` + backlog:
+    /// decide whether to emit `SELECT`, append SELECT+cmd (one payload) or
+    /// cmd alone, and update `selected_db`. That critical section is what
+    /// prevents the AOF-off multi-DB race where one writer’s SELECT-less
+    /// command could land on the stream before another writer’s SELECT.
+    pub fn propagate_write(&self, db: usize, args: &[Bytes]) {
+        let cmd_raw = aof::encode_command(args);
+        self.propagate_write_encoded(db, cmd_raw);
+    }
+
+    /// Like [`propagate_write`] but with a pre-encoded command payload.
+    pub fn propagate_write_encoded(&self, db: usize, cmd_raw: Bytes) {
+        if cmd_raw.is_empty() {
+            return;
+        }
+
+        // Hold the gate across SELECT decision, backlog append, and live
+        // fan-out so full-resync cannot register a feed between SELECT and
+        // the write (or between append and send).
+        let _gate = self.fullsync_gate.lock();
+
+        let data = {
+            let mut bl = self.backlog.lock();
+            let emit_select = match bl.selected_db {
+                Some(prev) => prev != db,
+                None => db != 0,
+            };
+            bl.selected_db = Some(db);
+
+            let payload = if emit_select {
+                let select_raw = aof::encode_command(&[
+                    Bytes::from_static(b"SELECT"),
+                    Bytes::from(db.to_string()),
+                ]);
+                let mut combined =
+                    Vec::with_capacity(select_raw.len() + cmd_raw.len());
+                combined.extend_from_slice(&select_raw);
+                combined.extend_from_slice(&cmd_raw);
+                Bytes::from(combined)
+            } else {
+                cmd_raw
+            };
+            bl.append(&payload);
+            self.master_repl_offset
+                .store(bl.end_offset(), Ordering::Relaxed);
+            payload
+        };
+
+        self.fanout_to_replicas(data);
+    }
+
+    /// Propagate raw RESP bytes to backlog + replicas **without** SELECT logic.
+    ///
+    /// Prefer [`propagate_write`] for ordinary multi-DB writes. This entry point
+    /// is for pre-ordered payloads and tests; it does not update stream DB.
     pub fn propagate_raw(&self, data: Bytes) {
+        if data.is_empty() {
+            return;
+        }
         // Share the fullsync gate so we never append/send while a full resync
         // is between RDB snapshot and feed registration.
         let _gate = self.fullsync_gate.lock();
@@ -515,6 +581,21 @@ impl ReplicationManager {
                 .store(bl.end_offset(), Ordering::Relaxed);
         }
 
+        self.fanout_to_replicas(data);
+    }
+
+    /// Propagate argv as RESP command on the current stream DB (no SELECT).
+    ///
+    /// Tests / low-level callers that do not switch DBs. Production writes
+    /// go through [`propagate_write`] via `PersistenceManager::on_write_command`.
+    pub fn propagate_command(&self, args: &[Bytes]) {
+        let raw = aof::encode_command(args);
+        self.propagate_raw(raw);
+    }
+
+    /// Fan-out a payload to live replica feeds. Caller must hold `fullsync_gate`
+    /// (or otherwise ensure register cannot interleave mid-send batch).
+    fn fanout_to_replicas(&self, data: Bytes) {
         // Fast path: no connected replicas — skip the feed list lock.
         // `connected_replicas` is updated under `replicas` lock on register/drop;
         // a stale 0 is safe (miss one send → full resync later). A stale non-zero
@@ -531,12 +612,6 @@ impl ReplicationManager {
         reps.retain(|r| r.tx.try_send(data.clone()).is_ok());
         self.connected_replicas
             .store(reps.len(), Ordering::Relaxed);
-    }
-
-    /// Propagate argv as RESP command.
-    pub fn propagate_command(&self, args: &[Bytes]) {
-        let raw = aof::encode_command(args);
-        self.propagate_raw(raw);
     }
 
     /// Legacy SYNC: full RDB bulk only (no FULLRESYNC line) + live feed.
@@ -2056,6 +2131,200 @@ mod tests {
             Bytes::from_static(b"v"),
         ]);
         assert!(repl.master_repl_offset() > 0);
+    }
+
+    /// `propagate_write` emits lazy SELECT and keeps SELECT+cmd as one payload.
+    #[test]
+    fn propagate_write_lazy_select_atomic() {
+        let repl = ReplicationManager::new();
+        let mut feed = repl.register_replica();
+
+        repl.propagate_write(
+            0,
+            &[
+                Bytes::from_static(b"SET"),
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"1"),
+            ],
+        );
+        let m0 = feed.try_recv().expect("db0 set");
+        assert!(
+            !String::from_utf8_lossy(&m0).to_uppercase().contains("SELECT"),
+            "DB0 must not SELECT"
+        );
+
+        repl.propagate_write(
+            3,
+            &[
+                Bytes::from_static(b"SET"),
+                Bytes::from_static(b"b"),
+                Bytes::from_static(b"2"),
+            ],
+        );
+        let m1 = feed.try_recv().expect("select+set");
+        assert!(feed.try_recv().is_err(), "SELECT+cmd must be one message");
+        let s = String::from_utf8_lossy(&m1).to_uppercase();
+        assert!(s.contains("SELECT") && s.contains("SET") && s.contains('3'));
+
+        // Same DB again — no SELECT.
+        repl.propagate_write(
+            3,
+            &[
+                Bytes::from_static(b"SET"),
+                Bytes::from_static(b"c"),
+                Bytes::from_static(b"3"),
+            ],
+        );
+        let m2 = feed.try_recv().expect("same-db set");
+        assert!(!String::from_utf8_lossy(&m2).to_uppercase().contains("SELECT"));
+    }
+
+    /// Concurrent multi-DB `propagate_write` must not corrupt logical DB
+    /// assignment on a live feed (FI-2 race covered at the repl layer).
+    #[test]
+    fn propagate_write_concurrent_multidb_feed_replay() {
+        use crate::entry::{LoadOptions, StoreOptions};
+        use crate::protocol::{RespParser, RespValue};
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::thread;
+
+        let repl = ReplicationManager::new();
+        let mut feed = repl.register_replica();
+        let collected = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let collected_w = Arc::clone(&collected);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_w = Arc::clone(&stop);
+        let drainer = thread::spawn(move || {
+            while !stop_w.load(AtomicOrdering::Relaxed) {
+                match feed.try_recv() {
+                    Ok(msg) => collected_w.lock().extend_from_slice(&msg),
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        thread::sleep(std::time::Duration::from_micros(20));
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+                }
+            }
+            while let Ok(msg) = feed.try_recv() {
+                collected_w.lock().extend_from_slice(&msg);
+            }
+        });
+
+        const N_THREADS: usize = 8;
+        const M_WRITES: usize = 50;
+        let mut handles = Vec::with_capacity(N_THREADS);
+        for t in 0..N_THREADS {
+            let repl = Arc::clone(&repl);
+            handles.push(thread::spawn(move || {
+                for i in 0..M_WRITES {
+                    let db = (t + i) % 4;
+                    repl.propagate_write(
+                        db,
+                        &[
+                            Bytes::from(b"SET".to_vec()),
+                            Bytes::from(format!("t{t}:k{i}")),
+                            Bytes::from(format!("db{db}")),
+                        ],
+                    );
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        stop.store(true, AtomicOrdering::Relaxed);
+        drainer.join().unwrap();
+
+        let stream = collected.lock().clone();
+        assert_eq!(stream.len() as u64, repl.master_repl_offset());
+
+        // Parse stream and apply SELECT/SET to databases.
+        let mut parser = RespParser::new();
+        parser.feed(&stream);
+        let databases = Databases::create(16, 4, 1024 * 1024, 64 * 1024 * 1024, false, 0.75);
+        let mut logical_db = 0usize;
+        while let Some(val) = parser.parse().unwrap() {
+            let RespValue::Array(arr) = val else {
+                panic!("expected array");
+            };
+            let mut argv = Vec::new();
+            for a in arr {
+                match a {
+                    RespValue::BulkString(Some(b)) => argv.push(b),
+                    RespValue::SimpleString(b) => argv.push(b),
+                    _ => panic!("bad arg"),
+                }
+            }
+            let name = String::from_utf8_lossy(&argv[0]).to_uppercase();
+            if name == "SELECT" {
+                logical_db = std::str::from_utf8(&argv[1]).unwrap().parse().unwrap();
+            } else if name == "SET" {
+                let cache = databases.get(logical_db).unwrap();
+                let _ = cache
+                    .store(argv[1].clone(), argv[2].clone(), StoreOptions::default())
+                    .unwrap();
+            }
+        }
+
+        for t in 0..N_THREADS {
+            for i in 0..M_WRITES {
+                let db = (t + i) % 4;
+                let key = Bytes::from(format!("t{t}:k{i}"));
+                let e = databases
+                    .get(db)
+                    .unwrap()
+                    .load(&key, LoadOptions::default())
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("missing {key:?} on db {db}"));
+                assert_eq!(e.value, Bytes::from(format!("db{db}")));
+                for other in 0..4usize {
+                    if other == db {
+                        continue;
+                    }
+                    assert!(databases
+                        .get(other)
+                        .unwrap()
+                        .load(&key, LoadOptions::default())
+                        .unwrap()
+                        .is_none());
+                }
+            }
+        }
+    }
+
+    /// Promote clears stream selected_db so the next non-zero DB write emits SELECT.
+    #[test]
+    fn promote_resets_stream_selected_db() {
+        let repl = ReplicationManager::new();
+        repl.propagate_write(
+            2,
+            &[
+                Bytes::from_static(b"SET"),
+                Bytes::from_static(b"x"),
+                Bytes::from_static(b"1"),
+            ],
+        );
+        assert_eq!(repl.backlog.lock().selected_db, Some(2));
+
+        // Replica → promote path clears backlog + selected_db.
+        repl.set_replicaof(Some("127.0.0.1:1".into()));
+        repl.set_replicaof(None);
+        assert_eq!(repl.master_repl_offset(), 0);
+        assert!(repl.backlog.lock().selected_db.is_none());
+
+        let mut feed = repl.register_replica();
+        repl.propagate_write(
+            2,
+            &[
+                Bytes::from_static(b"SET"),
+                Bytes::from_static(b"y"),
+                Bytes::from_static(b"2"),
+            ],
+        );
+        let msg = feed.try_recv().expect("post-promote write");
+        assert!(
+            String::from_utf8_lossy(&msg).to_uppercase().contains("SELECT"),
+            "after promote, non-zero DB must emit SELECT again"
+        );
     }
 
     #[test]

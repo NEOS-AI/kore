@@ -336,6 +336,7 @@ Also tracked in `docs/roadmap.md`.
     - *Done (Batch FC)*: `promote_replica` requires `FAILOVER` OK / `REPLICAOF NO ONE` OK / post-attempt `ROLE=master`; never PING-only. Per-master `failover_in_progress`. Tests: inject fail → no switch; inject OK + real ROLE path still switch.
   - [x] **`[P3]`** **Code review (FB post-ship nits):** prepare not re-checked at commit; dest prepare permissive; memory-only votes
     - *Done (Batch FH)*: commit re-check + prepare-epoch + TTL + boot clear. Residual: durable-on-disk prepare; bus 2PC; atomic COMMITPREPARE; dest vote breadth; operator NODE bypass (intentional).
+  - *Post-ship review (FI, 2026-07-25):* AOF-off multi-DB SELECT interleave race under concurrent writers → **fixed Batch FI-2** (`propagate_write` atomic SELECT+append).
   - [x] **`[P2]`** **Code review (EX/FA post-ship):** Sentinel failover leader election (cross-process)
     - *Done (Batch FE)*: sticky voted-leader on `IS-MASTER-DOWN-BY-ADDR`; auto path elects before `try_failover`; `voted-leader` / `voted-leader-epoch` on MASTER fields. Residual: not full Redis election-timeout state machine.
   - [x] **`[P3]`** **Code review (FE post-ship nits):** election-epoch thrash; probe self-as-leader; majority uses table size
@@ -716,18 +717,17 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
   - *Done (Batch BT)*: `bt_eval_select_persists_connection_db` — connection remains on selected DB after EVAL
 
-### Status snapshot (2026-07-25, post-FG-3 scheduled review)
+### Status snapshot (2026-07-25, post-FI-2)
 
-**Primary letter queue finished through Batch FG-3; P2 residual FH shipped.** Shipped: FB–FE (cluster/Sentinel/benches), **FF** HNSW multi-layer, **FG**–**FG-3** unified typed keyspace, **FH** NODE 2PC slice 2. Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed).
+**Primary letter queue finished through FG-3; P2 FH + FI + FI-2 shipped.** Shipped: FB–FE, **FF**, **FG**–**FG-3**, **FH** NODE 2PC slice 2, **FI** pipeline SET ~+25%, **FI-2** AOF-off multi-DB SELECT ordering. Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed).
 
-**Verification (FH):** lib cluster migrate/state unit green; `cluster_migrate_test` 41/41 serial; FH unit (epoch/TTL/boot) + e2e recheck + happy path. Only untracked `data/`.
-
-**What remains** is **optional / polish** (no open P0–P1 feature blockers from the old A–E checklist). Open review checkboxes are **P2/P3** follow-ons only.
+**What remains** is **optional / polish** (no open P0–P1 feature blockers). Next picks: **P3** **FG-4** / **FK** / **FL**.
 
 | Area | Residual | Priority | Planned batch |
 |------|----------|----------|---------------|
-| Cluster | NODE 2PC slice 2 durable-on-disk / bus / atomic COMMITPREPARE | P3 residual (FH) | later |
-| Ops | Pipelined SET gap vs Valkey; re-measure other hosts / Redis | **P2 next** | **FI** (or ad-hoc) |
+| Ops | Global **repl backlog** still serializes writers (FI residual; not solved by FI-2) | P3 | later optional |
+| Ops | AOF-off multi-DB SELECT stream race | — | **done FI-2** |
+| Cluster | NODE 2PC durable-on-disk prepare / bus / atomic COMMITPREPARE | P3 residual (FH) | later |
 | Keyspace | Strings still on `Cache::map`; dual-map TYPE probe | P3 | **FG-4** / **FJ** |
 | Keyspace | `typed_expires` side map (not slot header) | P3 | **FG-4** |
 | Keyspace | Typed RENAME remove+insert; create ensure_type→insert TOCTOU (historical) | P3 accepted | — |
@@ -739,9 +739,9 @@ Also tracked in `docs/roadmap.md`.
 
 ### Next work queue (post-FG-3)
 
-**Primary FB–FG-3 queue: done. FH (2PC slice 2) done. FI (pipeline SET) done.** Optional follow-ons below. Prefer FG-4 / FK / FL when resuming. Standing rule: land tests with each batch.
+**Primary FB–FG-3 queue: done. FH + FI + FI-2 done.** Optional follow-ons below. Prefer FG-4 / FK / FL when resuming. Standing rule: land tests with each batch.
 
-#### Completed (FB–FG-3 + FH)
+#### Completed (FB–FG-3 + FH + FI + FI-2)
 
 - [x] **`[P1]`** **Batch FB — Cluster dual-end NODE wire 2PC (slice 1)**
 - [x] **`[P1]`** **Batch FC — Sentinel promote-success gate**
@@ -755,15 +755,21 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Batch FG-3 — Remaining typed types + payload collapse** (`1db780e`)
   - list/set/zset/geo/stream in `key_values`; legacy typed maps removed; payload = `map` + `key_values` stream
   - *Post-ship review:* no dual-write leftover; typed RENAME is remove+insert (accepted); strings dual-map residual → FG-4
-- [x] **`[P2]`** **Batch FH — NODE 2PC slice 2**
+- [x] **`[P2]`** **Batch FH — NODE 2PC slice 2** (`b078988`)
   - Prepare-epoch + TTL fence; `CHECKPREPARE` + dual-end commit re-check; boot clear fail-closed
-  - Tests: stale epoch / cleared / TTL / boot; e2e recheck inject no half-apply; happy path complete
-  - Residual: durable-on-disk prepare; bus 2PC; atomic COMMITPREPARE
-- [x] **`[P2]`** **Batch FI — Pipeline SET perf investigation**
+  - Tests: stale epoch / cleared / TTL / boot; e2e recheck inject no half-apply; happy path complete (41 migrate tests)
+  - Residual: durable-on-disk prepare; bus 2PC; atomic COMMITPREPARE; dest prepare breadth; operator NODE bypass (intentional)
+- [x] **`[P2]`** **Batch FI — Pipeline SET perf investigation** (`bb97e7f`)
   - Root causes ranked in `docs/benchmarks.md` → *Pipeline SET analysis*
   - Wins: AOF-off unlock encode/propagate; direct `encode_command`; skip empty replica lock; slowlog/argv/`+OK` alloc cuts; typed-only WRONGTYPE; store value move
   - Re-measure (same host/method as FD): SET c=50 P=16 median **~621k** ops/s (FD **~498k**, **+~25%**); Valkey still ~1.59M
-  - Residual **FI-2**: global repl backlog still serializes all writers; optional backlog-off config; lock fuse; Entry dual-key clone
+  - Residual **FI-2** (correctness race fixed; backlog serialize remains):
+    - Global repl backlog still serializes all writers
+- [x] **`[P2/P3]`** **Batch FI-2 — AOF-off multi-DB SELECT ordering**
+  - Root cause: FI unlocked encode/propagate outside AOF mutex; `selected_db` update was not ordered with backlog append → concurrent multi-DB writers could land SELECT-less cmds before another thread’s SELECT
+  - Fix: `ReplicationManager::propagate_write` — stream `selected_db` + lazy SELECT + backlog append under one critical section (`fullsync_gate` + backlog); AOF-off path skips `aof` lock entirely; AOF-on still holds AOF lock across append + `propagate_write`
+  - Tests: `aof_off_concurrent_multidb_*`, `propagate_write_concurrent_multidb_feed_replay`, lazy SELECT serial, promote resets stream DB
+  - Residual: global backlog still serializes writers (no Valkey parity claim; re-measure skipped — hot path lock shape ~same for single-DB)
 
 #### Open optional queue (pick when resuming)
 
@@ -779,11 +785,11 @@ Also tracked in `docs/roadmap.md`.
   - Or document boot-flag-only requirement and close as accepted
 - [ ] **`[P3]`** **Later / backlog**
   - DUMP/RESTORE Redis wire; cluster reshard weight UI; admin_http auth/TLS
-  - HNSW durable graph; hello SUBSCRIBE fan-in; single-DB Arc-swap mid-fill
+  - HNSW durable graph; hello SUBSCRIBE fan-in; single-DB Arc-swap mid-fill; NODE durable prepare
 
 ### Code review backlog
 
-**Batches CZ–FG-3 + FH + FI shipped.** **Review 2026-07-25:** primary queue complete; FI pipeline SET ~+25% on host P=16; residual FI-2 backlog serialize. Next optional: **FG-4** / **FK** / **FL**. Open review rows: FC first-replica promote, EN/EO/EU `nodes.conf` flags (P3). Standing tests-for-phase P0.
+**Batches CZ–FG-3 + FH + FI + FI-2 shipped.** FI-2 fixed AOF-off multi-DB SELECT race; backlog serialize residual remains (P3). Next optional: **FG-4** / **FK** / **FL**. Standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -978,4 +984,4 @@ Highest urgency checklist (phase order preserved):
 - [x] Eviction policies (`maxmemory-policy`)
   - *Follow-ups*: Streams, bitmaps/HLL, RESP3 (done elsewhere); LFU decay done in Batch AB
 
-**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB–FG-3** primary queue is complete (typed keyspace unified). Resume from **Next work queue (post-FG-3)** — recommended **FH** NODE 2PC slice 2.
+**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB–FG-3** primary queue complete; **FH**/**FI** shipped. Resume from **Next work queue (post-FG-3)** — optional **FI-2** / **FG-4** / **FK** / **FL**.
