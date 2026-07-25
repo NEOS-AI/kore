@@ -1,9 +1,8 @@
-//! Redis Hash storage (Batch FG-2: physical home is [`Cache::key_values`]).
+//! Redis Hash storage (Batch FG-2/FG-3: physical home is [`Cache::key_values`]).
 //!
-//! Hashes are stored as [`KeyValue::Hash`] in the unified sharded map — not the
-//! legacy global `RwLock<HashMap>`. Command APIs (`get_or_create_hash`, …)
-//! remain type-specific for H* handlers; cross-type TYPE/DEL/EXISTS use the
-//! keyspace facade.
+//! Hashes are stored as [`KeyValue::Hash`] in the unified sharded map alongside
+//! list/set/zset/geo/stream. Command APIs remain type-specific for H* handlers;
+//! cross-type TYPE/DEL/EXISTS use the keyspace facade.
 
 use crate::error::Result;
 use crate::hash_type::{RedisHash, SharedHash};
@@ -57,16 +56,7 @@ impl Cache {
         });
         match kv {
             KeyValue::Hash(h) => Ok(h),
-            other => {
-                // FG-2: only Hash is stored in key_values. Reinsert if raced.
-                debug_assert!(
-                    false,
-                    "key_values held non-Hash during get_or_create_hash: {:?}",
-                    other.key_type()
-                );
-                self.key_values.insert(key.clone(), other);
-                Err(crate::error::Error::WrongType)
-            }
+            _ => Err(crate::error::Error::WrongType),
         }
     }
 
@@ -93,12 +83,6 @@ impl Cache {
                 true
             }
             Some(other) => {
-                // Defensive: unexpected variant must not be lost (FG-3 prep).
-                debug_assert!(
-                    false,
-                    "remove_hash saw non-Hash in key_values: {:?}",
-                    other.key_type()
-                );
                 self.key_values.insert(key.clone(), other);
                 false
             }
@@ -124,7 +108,7 @@ impl Cache {
     /// Export all hashes: (key, [(field, value), ...]).
     /// Skips keys whose typed TTL has already elapsed (no revive without TTL).
     pub fn export_hashes(&self) -> Vec<(Bytes, Vec<(Bytes, Bytes)>)> {
-        let mut out = Vec::with_capacity(self.key_values.len());
+        let mut out = Vec::new();
         self.key_values.for_each(|key, kv| {
             let KeyValue::Hash(h) = kv else {
                 return;

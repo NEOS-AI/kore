@@ -19,12 +19,7 @@ pub use bitmap::{BitOpKind, BitfieldOp, BitfieldOverflow};
 pub use keyspace::KeyValue;
 
 use crate::hashmap::{ShardedHashMap, ShardedKeyMap};
-use crate::sorted_set::SharedSortedSet;
-use crate::geospatial::GeoSet;
 use crate::list_block::ListBlockers;
-use crate::list_type::SharedList;
-use crate::set_type::SharedSet;
-use crate::stream_type::SharedStream;
 use crate::stats::Stats;
 use crate::pubsub::PubSub;
 use crate::memory::MemoryTracker;
@@ -44,41 +39,27 @@ pub use eviction::EvictionPolicy;
 
 /// The main cache structure.
 ///
-/// # Keyspace layout (Batch FG / FG-2)
+/// # Keyspace layout (Batch FG / FG-2 / FG-3)
 ///
 /// Logical Redis keyspace is **one name → one typed value**. Cross-type ops use
 /// the [`KeyValue`] facade ([`Cache::get_key_value`]).
 ///
-/// **Physical storage (FG-2):** hashes live in [`Self::key_values`] as
-/// [`KeyValue::Hash`]. Strings stay on [`Self::map`]; zset/geo remain on their
-/// sharded maps; list/set/stream remain on global `RwLock<HashMap>` maps until
-/// FG-3. See `keyspace` module docs and `docs/module_architectures.md`.
+/// **Physical storage (FG-3):** all non-string types live in [`Self::key_values`]
+/// as [`KeyValue`] variants (Hash, List, Set, ZSet, Geo, Stream). Strings stay
+/// on [`Self::map`] (merge residual → optional FG-4). See `keyspace` module
+/// docs and `docs/module_architectures.md`.
 pub struct Cache {
-    /// Sharded hashmap for string entries (`KeyValue::String`)
+    /// Sharded hashmap for string entries (`KeyValue::String` views)
     pub(super) map: ShardedHashMap,
-    /// Sharded map for sorted sets (key → SharedSortedSet)
-    pub(super) sorted_sets: ShardedKeyMap<SharedSortedSet>,
-    /// Sharded map for geospatial sets (key → SharedGeoSet)
-    pub(super) geo_sets: ShardedKeyMap<Arc<RwLock<GeoSet>>>,
-    /// Unified typed value map (FG-2: currently **only** [`KeyValue::Hash`]).
-    ///
-    /// Other types remain on legacy maps until FG-3 expands this map and
-    /// collapses `KeyspacePayload` to a single stream.
+    /// Unified typed value map: Hash / List / Set / ZSet / Geo / Stream.
     pub(super) key_values: ShardedKeyMap<KeyValue>,
-    /// Redis List keys
-    pub(super) lists: Arc<RwLock<HashMap<Bytes, SharedList>>>,
     /// Clients blocked on empty lists (BLPOP / BRPOP) for this keyspace.
     pub list_blockers: ListBlockers,
     /// Clients blocked on streams (XREAD / XREADGROUP BLOCK) for this keyspace.
     pub stream_blockers: ListBlockers,
-    /// Redis Set keys
-    pub(super) sets: Arc<RwLock<HashMap<Bytes, SharedSet>>>,
-    /// Redis Stream keys
-    pub(super) streams: Arc<RwLock<HashMap<Bytes, SharedStream>>>,
     /// Absolute Instant expiry for non-string keys (Redis expires-dict style).
     /// Strings keep TTL on `Entry`; typed keys store it here.
-    pub(super) typed_expires: RwLock<HashMap<Bytes, Instant>>,
-    /// Pub/Sub system
+    pub(super) typed_expires: RwLock<HashMap<Bytes, Instant>>,    /// Pub/Sub system
     pub pubsub: Arc<PubSub>,
     /// Search index manager
     pub(super) search_index_manager: Arc<SearchIndexManager>,
@@ -154,14 +135,9 @@ impl Cache {
 
         let cache = Arc::new(Self {
             map: ShardedHashMap::new(num_shards, cap),
-            sorted_sets: ShardedKeyMap::new(num_shards),
-            geo_sets: ShardedKeyMap::new(num_shards),
             key_values: ShardedKeyMap::new(num_shards),
-            lists: Arc::new(RwLock::new(HashMap::new())),
             list_blockers: ListBlockers::new(),
             stream_blockers: ListBlockers::new(),
-            sets: Arc::new(RwLock::new(HashMap::new())),
-            streams: Arc::new(RwLock::new(HashMap::new())),
             typed_expires: RwLock::new(HashMap::new()),
             pubsub: PubSub::new(),
             search_index_manager: Arc::new(SearchIndexManager::new()),
@@ -231,14 +207,9 @@ impl Cache {
 
         let cache = Arc::new(Self {
             map: ShardedHashMap::new(num_shards, cap),
-            sorted_sets: ShardedKeyMap::new(num_shards),
-            geo_sets: ShardedKeyMap::new(num_shards),
             key_values: ShardedKeyMap::new(num_shards),
-            lists: Arc::new(RwLock::new(HashMap::new())),
             list_blockers: ListBlockers::new(),
             stream_blockers: ListBlockers::new(),
-            sets: Arc::new(RwLock::new(HashMap::new())),
-            streams: Arc::new(RwLock::new(HashMap::new())),
             typed_expires: RwLock::new(HashMap::new()),
             pubsub: Arc::clone(&shared.pubsub),
             search_index_manager: Arc::new(SearchIndexManager::new()),
@@ -281,7 +252,6 @@ impl Cache {
             watch_gens: Mutex::new(HashMap::new()),
             loadfactor,
         });
-
         if start_sweep {
             cache.start_background_sweep();
         }

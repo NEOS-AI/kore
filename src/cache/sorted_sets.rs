@@ -1,3 +1,5 @@
+//! Redis Sorted Set storage (Batch FG-3: physical home is [`Cache::key_values`]).
+
 use crate::error::{Error, Result};
 use crate::memory::MemoryCategory;
 use crate::sorted_set::{SharedSortedSet, SortedSet};
@@ -5,6 +7,7 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
+use super::keyspace::KeyValue;
 use super::storage::KeyType;
 use super::Cache;
 
@@ -50,50 +53,69 @@ impl Cache {
     /// Returns WrongType if the key already holds a different type.
     pub fn get_or_create_sorted_set(&self, key: &Bytes) -> Result<SharedSortedSet> {
         self.ensure_type(key, KeyType::ZSet)?;
-        if let Some(existing) = self.sorted_sets.get(key) {
+        if let Some(existing) = self.sorted_set_from_key_values(key) {
             return Ok(existing);
         }
-        // Base overhead: key + empty SortedSet (allocator-aware)
         let base = crate::memory::estimate_keyed_object(
             key.len(),
             SortedSet::new().memory_size(),
         );
         self.ensure_non_string_capacity(base)?;
-        Ok(self.sorted_sets.get_or_insert_with(key.clone(), || {
+        let kv = self.key_values.get_or_insert_with(key.clone(), || {
             self.memory_tracker
                 .account(base, MemoryCategory::SortedSets);
-            Arc::new(RwLock::new(SortedSet::new()))
-        }))
+            KeyValue::ZSet(Arc::new(RwLock::new(SortedSet::new())))
+        });
+        match kv {
+            KeyValue::ZSet(z) => Ok(z),
+            _ => Err(Error::WrongType),
+        }
+    }
+
+    #[inline]
+    fn sorted_set_from_key_values(&self, key: &Bytes) -> Option<SharedSortedSet> {
+        match self.key_values.get(key) {
+            Some(KeyValue::ZSet(z)) => Some(z),
+            _ => None,
+        }
     }
 
     /// Get a sorted set if it exists
     pub fn get_sorted_set(&self, key: &Bytes) -> Option<SharedSortedSet> {
-        self.sorted_sets.get(key)
+        self.sorted_set_from_key_values(key)
     }
 
     /// Remove a sorted set and free its tracked memory
     pub fn remove_sorted_set(&self, key: &Bytes) -> bool {
-        if let Some(set) = self.sorted_sets.remove(key) {
-            let size =
-                crate::memory::estimate_keyed_object(key.len(), set.read().memory_size());
-            self.memory_tracker
-                .deallocate(size, MemoryCategory::SortedSets);
-            true
-        } else {
-            false
+        match self.key_values.remove(key) {
+            Some(KeyValue::ZSet(set)) => {
+                let size =
+                    crate::memory::estimate_keyed_object(key.len(), set.read().memory_size());
+                self.memory_tracker
+                    .deallocate(size, MemoryCategory::SortedSets);
+                true
+            }
+            Some(other) => {
+                self.key_values.insert(key.clone(), other);
+                false
+            }
+            None => false,
         }
     }
 
     /// Check if a sorted set exists
     pub fn sorted_set_exists(&self, key: &Bytes) -> bool {
-        self.sorted_sets.contains_key(key)
+        matches!(self.key_values.get(key), Some(KeyValue::ZSet(_)))
     }
 
     /// Export all sorted sets for persistence: (key, [(member, score), ...]).
     /// Skips keys whose typed TTL has already elapsed (no revive without TTL).
     pub fn export_zsets(&self) -> Vec<(Bytes, Vec<(Bytes, f64)>)> {
         let mut out = Vec::new();
-        self.sorted_sets.for_each(|key, zset| {
+        self.key_values.for_each(|key, kv| {
+            let KeyValue::ZSet(zset) = kv else {
+                return;
+            };
             if !self.typed_key_exportable(key) {
                 return;
             }

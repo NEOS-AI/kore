@@ -1,3 +1,5 @@
+//! Redis List storage (Batch FG-3: physical home is [`Cache::key_values`]).
+
 use crate::error::Result;
 use crate::list_type::{RedisList, SharedList};
 use crate::memory::MemoryCategory;
@@ -5,6 +7,7 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
+use super::keyspace::KeyValue;
 use super::storage::KeyType;
 use super::Cache;
 
@@ -21,48 +24,60 @@ impl Cache {
     }
 
     /// Get or create a list. WrongType if key holds a different type.
+    ///
+    /// Physical insert goes into [`Self::key_values`] as [`KeyValue::List`].
     pub fn get_or_create_list(&self, key: &Bytes) -> Result<SharedList> {
         self.ensure_type(key, KeyType::List)?;
-        let lists = self.lists.write();
-        if let Some(existing) = lists.get(key) {
-            return Ok(existing.clone());
+        if let Some(l) = self.list_from_key_values(key) {
+            return Ok(l);
         }
         let base = crate::memory::estimate_keyed_object(
             key.len(),
             RedisList::new().memory_size(),
         );
-        drop(lists);
         self.ensure_non_string_capacity(base)?;
-        let mut lists = self.lists.write();
-        Ok(lists
-            .entry(key.clone())
-            .or_insert_with(|| {
-                self.memory_tracker
-                    .account(base, MemoryCategory::Lists);
-                Arc::new(RwLock::new(RedisList::new()))
-            })
-            .clone())
+        let kv = self.key_values.get_or_insert_with(key.clone(), || {
+            self.memory_tracker
+                .account(base, MemoryCategory::Lists);
+            KeyValue::List(Arc::new(RwLock::new(RedisList::new())))
+        });
+        match kv {
+            KeyValue::List(l) => Ok(l),
+            _ => Err(crate::error::Error::WrongType),
+        }
+    }
+
+    #[inline]
+    fn list_from_key_values(&self, key: &Bytes) -> Option<SharedList> {
+        match self.key_values.get(key) {
+            Some(KeyValue::List(l)) => Some(l),
+            _ => None,
+        }
     }
 
     pub fn get_list(&self, key: &Bytes) -> Option<SharedList> {
-        let lists = self.lists.read();
-        lists.get(key).cloned()
+        self.list_from_key_values(key)
     }
 
     pub fn remove_list(&self, key: &Bytes) -> bool {
-        let mut lists = self.lists.write();
-        if let Some(l) = lists.remove(key) {
-            let size = crate::memory::estimate_keyed_object(key.len(), l.read().memory_size());
-            self.memory_tracker
-                .deallocate(size, MemoryCategory::Lists);
-            true
-        } else {
-            false
+        match self.key_values.remove(key) {
+            Some(KeyValue::List(l)) => {
+                let size =
+                    crate::memory::estimate_keyed_object(key.len(), l.read().memory_size());
+                self.memory_tracker
+                    .deallocate(size, MemoryCategory::Lists);
+                true
+            }
+            Some(other) => {
+                self.key_values.insert(key.clone(), other);
+                false
+            }
+            None => false,
         }
     }
 
     pub fn list_exists(&self, key: &Bytes) -> bool {
-        self.lists.read().contains_key(key)
+        matches!(self.key_values.get(key), Some(KeyValue::List(_)))
     }
 
     pub fn remove_list_if_empty(&self, key: &Bytes) {
@@ -78,15 +93,17 @@ impl Cache {
     /// Export all lists: (key, [elements left-to-right]).
     /// Skips keys whose typed TTL has already elapsed (no revive without TTL).
     pub fn export_lists(&self) -> Vec<(Bytes, Vec<Bytes>)> {
-        let lists = self.lists.read();
-        let mut out = Vec::with_capacity(lists.len());
-        for (key, l) in lists.iter() {
+        let mut out = Vec::new();
+        self.key_values.for_each(|key, kv| {
+            let KeyValue::List(l) = kv else {
+                return;
+            };
             if !self.typed_key_exportable(key) {
-                continue;
+                return;
             }
             let list = l.read();
             out.push((key.clone(), list.iter_items().collect()));
-        }
+        });
         out
     }
 }

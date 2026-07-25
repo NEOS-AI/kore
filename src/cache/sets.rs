@@ -1,3 +1,5 @@
+//! Redis Set storage (Batch FG-3: physical home is [`Cache::key_values`]).
+
 use crate::error::Result;
 use crate::set_type::{RedisSet, SharedSet};
 use crate::memory::MemoryCategory;
@@ -5,6 +7,7 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
+use super::keyspace::KeyValue;
 use super::storage::KeyType;
 use super::Cache;
 
@@ -21,48 +24,60 @@ impl Cache {
     }
 
     /// Get or create a set. WrongType if key holds a different type.
+    ///
+    /// Physical insert goes into [`Self::key_values`] as [`KeyValue::Set`].
     pub fn get_or_create_set(&self, key: &Bytes) -> Result<SharedSet> {
         self.ensure_type(key, KeyType::Set)?;
-        let sets = self.sets.write();
-        if let Some(existing) = sets.get(key) {
-            return Ok(existing.clone());
+        if let Some(s) = self.set_from_key_values(key) {
+            return Ok(s);
         }
         let base = crate::memory::estimate_keyed_object(
             key.len(),
             RedisSet::new().memory_size(),
         );
-        drop(sets);
         self.ensure_non_string_capacity(base)?;
-        let mut sets = self.sets.write();
-        Ok(sets
-            .entry(key.clone())
-            .or_insert_with(|| {
-                self.memory_tracker
-                    .account(base, MemoryCategory::Sets);
-                Arc::new(RwLock::new(RedisSet::new()))
-            })
-            .clone())
+        let kv = self.key_values.get_or_insert_with(key.clone(), || {
+            self.memory_tracker
+                .account(base, MemoryCategory::Sets);
+            KeyValue::Set(Arc::new(RwLock::new(RedisSet::new())))
+        });
+        match kv {
+            KeyValue::Set(s) => Ok(s),
+            _ => Err(crate::error::Error::WrongType),
+        }
+    }
+
+    #[inline]
+    fn set_from_key_values(&self, key: &Bytes) -> Option<SharedSet> {
+        match self.key_values.get(key) {
+            Some(KeyValue::Set(s)) => Some(s),
+            _ => None,
+        }
     }
 
     pub fn get_set(&self, key: &Bytes) -> Option<SharedSet> {
-        let sets = self.sets.read();
-        sets.get(key).cloned()
+        self.set_from_key_values(key)
     }
 
     pub fn remove_set(&self, key: &Bytes) -> bool {
-        let mut sets = self.sets.write();
-        if let Some(s) = sets.remove(key) {
-            let size = crate::memory::estimate_keyed_object(key.len(), s.read().memory_size());
-            self.memory_tracker
-                .deallocate(size, MemoryCategory::Sets);
-            true
-        } else {
-            false
+        match self.key_values.remove(key) {
+            Some(KeyValue::Set(s)) => {
+                let size =
+                    crate::memory::estimate_keyed_object(key.len(), s.read().memory_size());
+                self.memory_tracker
+                    .deallocate(size, MemoryCategory::Sets);
+                true
+            }
+            Some(other) => {
+                self.key_values.insert(key.clone(), other);
+                false
+            }
+            None => false,
         }
     }
 
     pub fn set_exists(&self, key: &Bytes) -> bool {
-        self.sets.read().contains_key(key)
+        matches!(self.key_values.get(key), Some(KeyValue::Set(_)))
     }
 
     pub fn remove_set_if_empty(&self, key: &Bytes) {
@@ -78,15 +93,17 @@ impl Cache {
     /// Export all sets: (key, [members]).
     /// Skips keys whose typed TTL has already elapsed (no revive without TTL).
     pub fn export_sets(&self) -> Vec<(Bytes, Vec<Bytes>)> {
-        let sets = self.sets.read();
-        let mut out = Vec::with_capacity(sets.len());
-        for (key, s) in sets.iter() {
+        let mut out = Vec::new();
+        self.key_values.for_each(|key, kv| {
+            let KeyValue::Set(s) = kv else {
+                return;
+            };
             if !self.typed_key_exportable(key) {
-                continue;
+                return;
             }
             let set = s.read();
             out.push((key.clone(), set.iter_members().collect()));
-        }
+        });
         out
     }
 }

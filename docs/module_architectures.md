@@ -27,28 +27,23 @@ src/cache/
 
 ## 3. Unified keyspace (Batch FG / FG-2)
 
-### Today (partial physical unify + facade)
+### Today (FG-3: typed containers unified)
 
-`Cache` holds containers per Redis type; **hashes** have migrated into the
-unified map:
+`Cache` holds:
 
 | Field | Type |
 |-------|------|
-| `map` | strings (`SharedEntry`) |
-| `key_values` | `ShardedKeyMap<KeyValue>` — **FG-2: only `KeyValue::Hash`** |
-| `sorted_sets` / `geo_sets` | sharded typed maps (legacy) |
-| `lists` / `sets` / `streams` | `RwLock<HashMap<…>>` (legacy) |
+| `map` | strings (`SharedEntry`) — residual separate map |
+| `key_values` | `ShardedKeyMap<KeyValue>` — **Hash / List / Set / ZSet / Geo / Stream** |
 | `typed_expires` | absolute `Instant` for non-string keys |
+| `list_blockers` / `stream_blockers` | blocking waiters (not key storage) |
 
 Logical invariant: **one name → at most one type** (`ensure_type` / WRONGTYPE).
 
-**FG slice A** added the view type and facade; **FG-2** put hash **physical**
-storage into `key_values` (no dual-write leftover for hashes):
-
 ```text
 enum KeyValue {
-    String(SharedEntry),  // TTL on Entry
-    Hash(SharedHash),     // physically in key_values (FG-2)
+    String(SharedEntry),  // view over Cache::map only (not stored in key_values)
+    Hash(SharedHash),     // physically in key_values
     List(SharedList),
     Set(SharedSet),
     ZSet(SharedSortedSet),
@@ -56,15 +51,15 @@ enum KeyValue {
     Stream(SharedStream),
 }
 
-Cache::get_key_value(key) -> Option<KeyValue>   // string → key_values → legacy maps
+Cache::get_key_value(key) -> Option<KeyValue>   // string map → key_values
 Cache::key_type / exists                         // via get_key_value
 Cache::delete / remove_key_value_raw             // unified remove + memory free
 ```
 
-### Target (true single map)
+### Target (true single map — optional FG-4)
 
 ```text
-ShardedKeyMap<KeyValue>   // or KeySlot { value: KeyValue, expires_at: Option<Instant> }
+ShardedKeyMap<KeyValue>   // include String; or KeySlot { value, expires_at }
 ```
 
 | Op | On unified map |
@@ -72,23 +67,21 @@ ShardedKeyMap<KeyValue>   // or KeySlot { value: KeyValue, expires_at: Option<In
 | **TYPE** | `get` → `KeyValue::key_type()` → Redis TYPE string |
 | **WRONGTYPE** | `ensure_type` vs existing variant |
 | **DEL / EXISTS** | remove / `is_some` on one map |
-| **SCAN / KEYS / DBSIZE / RANDOMKEY** | iterate one key index (type tag optional) |
+| **SCAN / KEYS / DBSIZE / RANDOMKEY** | iterate string map + `key_values` (today) |
 | **RENAME** | take value + expire meta, insert under new name |
 | **TTL / EXPIRE** | string: `Entry`; typed: side map or slot header |
-| **Memory / eviction** | per-variant size; sample from unified map |
+| **Memory / eviction** | per-variant size; typed victims sampled from `key_values` |
 
 ### Migration plan
 
-1. **FG (done, slice A):** `KeyValue` + facade; storage multi-map; tests for lookup/delete/WRONGTYPE.
-2. **FG-2 (done, hashes):** Physical hashes in `ShardedKeyMap<KeyValue>`; facade + H* + RENAME + take/install + eviction sampling; no dual-write for hashes.
-3. **FG-3:** Remaining types; collapse `KeyspacePayload` drain/fill to one value stream; eviction samples all types from one map.
-4. **FG-4 (optional):** Merge `typed_expires` into slot header.
+1. **FG (done, slice A):** `KeyValue` + facade; storage multi-map.
+2. **FG-2 (done, hashes):** Physical hashes in `ShardedKeyMap<KeyValue>`.
+3. **FG-3 (done):** list/set/zset/geo/stream into `key_values`; legacy per-type
+   maps removed; `KeyspacePayload` drains `map` + `key_values` streams; eviction
+   samples typed keys from one map. **No dual-write leftover** for migrated types.
+4. **FG-4 (optional):** Merge strings into `key_values`; fold `typed_expires`
+   into slot header; search-doc eviction remains special.
 
-**Load/install:** still multi-field payload (`hashes: HashMap` extracted from /
-re-wrapped into `KeyValue::Hash`) until FG-3 so LOADING / epoch install stays honest.
-
-### Residuals (FG-3+)
-
-- Migrate list / set / zset / geo / stream (and eventually strings) into `key_values`
-- `KeyspacePayload` single-stream serialization
-- Eviction sampling fully from one map
+**Load/install (`KeyspacePayload`):** `map: Vec<(Bytes, SharedEntry)>` +
+`key_values: Vec<(Bytes, KeyValue)>` + expires / WATCH / search / memory counters.
+Epoch install semantics (DR/DS) unchanged.

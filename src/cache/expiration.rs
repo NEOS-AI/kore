@@ -211,12 +211,8 @@ impl Cache {
 
     /// Whether a typed (non-string) key is present, without purging.
     fn typed_key_present_raw(&self, key: &Bytes) -> bool {
-        self.sorted_sets.contains_key(key)
-            || self.geo_sets.contains_key(key)
-            || self.key_values.contains_key(key) // FG-2: hashes
-            || self.lists.read().contains_key(key)
-            || self.sets.read().contains_key(key)
-            || self.streams.read().contains_key(key)
+        // FG-3: all non-string types live in key_values.
+        self.key_values.contains_key(key)
     }
 
     /// Delete any key type without touching typed_expires (caller manages expire).

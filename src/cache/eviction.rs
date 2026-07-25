@@ -1,8 +1,6 @@
 use crate::error::{Error, Result};
 use crate::memory::MemoryCategory;
 use bytes::Bytes;
-use parking_lot::RwLock;
-use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::time;
@@ -318,9 +316,10 @@ impl Cache {
             }
         }
 
-        // --- Typed keys: allkeys always; volatile only when they have a TTL ---
+        // --- Typed keys (FG-3: sample unified key_values) ---
+        // allkeys always; volatile only when they have a TTL.
         {
-            let per_type = (sample_size / 3).max(1);
+            let typed_n = sample_size.max(1);
             let push_typed = |out: &mut Vec<EvictCandidate>,
                               k: Bytes,
                               kt: KeyType,
@@ -336,54 +335,19 @@ impl Cache {
                 out.push(typed_candidate(k, kt, size, expires_at));
             };
 
-            // Sharded maps (zset / geo)
-            for (k, z) in self.sorted_sets.get_n_random(per_type) {
-                let size =
-                    crate::memory::estimate_keyed_object(k.len(), z.read().memory_size());
-                let exp = self.typed_expires_at(&k);
-                push_typed(&mut out, k, KeyType::ZSet, size, exp);
-            }
-            for (k, g) in self.geo_sets.get_n_random(per_type) {
+            for (k, kv) in self.key_values.get_n_random(typed_n) {
                 let size = crate::memory::estimate_keyed_object(
                     k.len(),
-                    g.read().memory_usage(),
+                    kv.content_memory_size(),
                 );
                 let exp = self.typed_expires_at(&k);
-                push_typed(&mut out, k, KeyType::Geo, size, exp);
+                push_typed(&mut out, k, kv.key_type(), size, exp);
             }
 
-            // FG-2: hashes in unified key_values (sharded sampling like zset/geo)
-            for (k, kv) in self.key_values.get_n_random(per_type) {
-                if let super::KeyValue::Hash(h) = kv {
-                    let size =
-                        crate::memory::estimate_keyed_object(k.len(), h.read().memory_size());
-                    let exp = self.typed_expires_at(&k);
-                    push_typed(&mut out, k, KeyType::Hash, size, exp);
-                }
-            }
-            // Global maps (list / set / stream)
-            sample_map_keys(&self.lists, per_type, |k, l| {
-                let size =
-                    crate::memory::estimate_keyed_object(k.len(), l.read().memory_size());
-                let exp = self.typed_expires_at(&k);
-                push_typed(&mut out, k, KeyType::List, size, exp);
-            });
-            sample_map_keys(&self.sets, per_type, |k, s| {
-                let size =
-                    crate::memory::estimate_keyed_object(k.len(), s.read().memory_size());
-                let exp = self.typed_expires_at(&k);
-                push_typed(&mut out, k, KeyType::Set, size, exp);
-            });
-            sample_map_keys(&self.streams, per_type, |k, s| {
-                let size =
-                    crate::memory::estimate_keyed_object(k.len(), s.read().memory_size());
-                let exp = self.typed_expires_at(&k);
-                push_typed(&mut out, k, KeyType::Stream, size, exp);
-            });
-
-            // Search index documents only under allkeys (no TTL).
+            // Search index documents only under allkeys (no TTL) — residual
+            // special case outside the keyspace maps.
             if policy.allkeys() {
-                let search_n = per_type.max(2);
+                let search_n = (sample_size / 3).max(2);
                 for (index_name, doc_id, size) in self
                     .search_index_manager
                     .sample_documents_for_eviction(search_n, exclude_search_doc)
@@ -611,34 +575,5 @@ fn typed_candidate(
         lfu_freq: 0,
         expires_at,
         search_index: None,
-    }
-}
-
-fn sample_map_keys<V, F>(map: &RwLock<HashMap<Bytes, V>>, n: usize, mut push: F)
-where
-    V: Clone,
-    F: FnMut(Bytes, V),
-{
-    use rand::Rng;
-    use std::collections::HashSet;
-
-    let guard = map.read();
-    let len = guard.len();
-    if len == 0 || n == 0 {
-        return;
-    }
-    let mut rng = rand::thread_rng();
-    let mut seen = HashSet::new();
-    let attempts = n.saturating_mul(5).max(n);
-    for _ in 0..attempts {
-        if seen.len() >= n {
-            break;
-        }
-        let idx = rng.gen_range(0..len);
-        if let Some((k, v)) = guard.iter().nth(idx) {
-            if seen.insert(k.clone()) {
-                push(k.clone(), v.clone());
-            }
-        }
     }
 }

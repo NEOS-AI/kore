@@ -1,4 +1,4 @@
-//! Stream keyspace helpers on Cache.
+//! Stream keyspace helpers on Cache (Batch FG-3: physical home is [`Cache::key_values`]).
 
 use crate::error::Result;
 use crate::memory::MemoryCategory;
@@ -7,6 +7,7 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
+use super::keyspace::KeyValue;
 use super::storage::KeyType;
 use super::Cache;
 
@@ -23,50 +24,60 @@ impl Cache {
     }
 
     /// Get or create a stream. WrongType if key holds a different type.
+    ///
+    /// Physical insert goes into [`Self::key_values`] as [`KeyValue::Stream`].
     pub fn get_or_create_stream(&self, key: &Bytes) -> Result<SharedStream> {
         self.ensure_type(key, KeyType::Stream)?;
-        {
-            let streams = self.streams.read();
-            if let Some(existing) = streams.get(key) {
-                return Ok(existing.clone());
-            }
+        if let Some(existing) = self.stream_from_key_values(key) {
+            return Ok(existing);
         }
         let base = crate::memory::estimate_keyed_object(
             key.len(),
             RedisStream::new().memory_size(),
         );
         self.ensure_non_string_capacity(base)?;
-        let mut streams = self.streams.write();
-        Ok(streams
-            .entry(key.clone())
-            .or_insert_with(|| {
-                self.memory_tracker
-                    .account(base, MemoryCategory::Streams);
-                Arc::new(RwLock::new(RedisStream::new()))
-            })
-            .clone())
+        let kv = self.key_values.get_or_insert_with(key.clone(), || {
+            self.memory_tracker
+                .account(base, MemoryCategory::Streams);
+            KeyValue::Stream(Arc::new(RwLock::new(RedisStream::new())))
+        });
+        match kv {
+            KeyValue::Stream(s) => Ok(s),
+            _ => Err(crate::error::Error::WrongType),
+        }
+    }
+
+    #[inline]
+    fn stream_from_key_values(&self, key: &Bytes) -> Option<SharedStream> {
+        match self.key_values.get(key) {
+            Some(KeyValue::Stream(s)) => Some(s),
+            _ => None,
+        }
     }
 
     pub fn get_stream(&self, key: &Bytes) -> Option<SharedStream> {
-        let streams = self.streams.read();
-        streams.get(key).cloned()
+        self.stream_from_key_values(key)
     }
 
     pub fn remove_stream(&self, key: &Bytes) -> bool {
-        let mut streams = self.streams.write();
-        if let Some(s) = streams.remove(key) {
-            let size =
-                crate::memory::estimate_keyed_object(key.len(), s.read().memory_size());
-            self.memory_tracker
-                .deallocate(size, MemoryCategory::Streams);
-            true
-        } else {
-            false
+        match self.key_values.remove(key) {
+            Some(KeyValue::Stream(s)) => {
+                let size =
+                    crate::memory::estimate_keyed_object(key.len(), s.read().memory_size());
+                self.memory_tracker
+                    .deallocate(size, MemoryCategory::Streams);
+                true
+            }
+            Some(other) => {
+                self.key_values.insert(key.clone(), other);
+                false
+            }
+            None => false,
         }
     }
 
     pub fn stream_exists(&self, key: &Bytes) -> bool {
-        self.streams.read().contains_key(key)
+        matches!(self.key_values.get(key), Some(KeyValue::Stream(_)))
     }
 
     pub fn remove_stream_if_empty(&self, key: &Bytes) {
@@ -86,15 +97,17 @@ impl Cache {
     /// Export all streams with full state (entries, last_generated_id, groups, PEL).
     /// Skips keys whose typed TTL has already elapsed (no revive without TTL).
     pub fn export_streams(&self) -> Vec<(Bytes, StreamStateSnapshot)> {
-        let streams = self.streams.read();
-        let mut out = Vec::with_capacity(streams.len());
-        for (key, s) in streams.iter() {
+        let mut out = Vec::new();
+        self.key_values.for_each(|key, kv| {
+            let KeyValue::Stream(s) = kv else {
+                return;
+            };
             if !self.typed_key_exportable(key) {
-                continue;
+                return;
             }
             let stream = s.read();
             out.push((key.clone(), stream.export_state()));
-        }
+        });
         out
     }
 

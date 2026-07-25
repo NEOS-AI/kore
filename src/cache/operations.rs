@@ -450,102 +450,26 @@ impl Cache {
                         .deallocate(delta, MemoryCategory::Cache);
                 }
             }
-            super::KeyType::Hash => {
-                // FG-2: hashes live in key_values as KeyValue::Hash
-                let h = match self.key_values.remove(src) {
-                    Some(super::KeyValue::Hash(h)) => h,
-                    Some(other) => {
-                        self.key_values.insert(src.clone(), other);
-                        return Err(Error::InvalidArgument("no such key".into()));
-                    }
-                    None => return Err(Error::InvalidArgument("no such key".into())),
-                };
-                let content = h.read().memory_size();
-                if src.len() != dst.len() {
-                    let old = crate::memory::estimate_keyed_object(src.len(), content);
-                    let new = crate::memory::estimate_keyed_object(dst.len(), content);
-                    self.memory_tracker
-                        .deallocate(old, MemoryCategory::Hashes);
-                    self.memory_tracker.account(new, MemoryCategory::Hashes);
-                }
-                self.key_values
-                    .insert(dst.clone(), super::KeyValue::Hash(h));
-            }
-            super::KeyType::List => {
-                let mut lists = self.lists.write();
-                let l = lists
+            // FG-3: all non-string types live in key_values.
+            super::KeyType::Hash
+            | super::KeyType::List
+            | super::KeyType::Set
+            | super::KeyType::ZSet
+            | super::KeyType::Geo
+            | super::KeyType::Stream => {
+                let kv = self
+                    .key_values
                     .remove(src)
                     .ok_or_else(|| Error::InvalidArgument("no such key".into()))?;
-                let content = l.read().memory_size();
-                if src.len() != dst.len() {
-                    let old = crate::memory::estimate_keyed_object(src.len(), content);
-                    let new = crate::memory::estimate_keyed_object(dst.len(), content);
-                    self.memory_tracker
-                        .deallocate(old, MemoryCategory::Lists);
-                    self.memory_tracker.account(new, MemoryCategory::Lists);
+                if kv.key_type() != src_type {
+                    // Defensive: put back if type mismatch (should not happen).
+                    self.key_values.insert(src.clone(), kv);
+                    return Err(Error::InvalidArgument("no such key".into()));
                 }
-                lists.insert(dst.clone(), l);
-            }
-            super::KeyType::Set => {
-                let mut sets = self.sets.write();
-                let s = sets
-                    .remove(src)
-                    .ok_or_else(|| Error::InvalidArgument("no such key".into()))?;
-                let content = s.read().memory_size();
-                if src.len() != dst.len() {
-                    let old = crate::memory::estimate_keyed_object(src.len(), content);
-                    let new = crate::memory::estimate_keyed_object(dst.len(), content);
-                    self.memory_tracker
-                        .deallocate(old, MemoryCategory::Sets);
-                    self.memory_tracker.account(new, MemoryCategory::Sets);
-                }
-                sets.insert(dst.clone(), s);
-            }
-            super::KeyType::ZSet => {
-                let z = self
-                    .sorted_sets
-                    .remove(src)
-                    .ok_or_else(|| Error::InvalidArgument("no such key".into()))?;
-                if src.len() != dst.len() {
-                    let content = z.read().memory_size();
-                    let old = crate::memory::estimate_keyed_object(src.len(), content);
-                    let new = crate::memory::estimate_keyed_object(dst.len(), content);
-                    self.memory_tracker
-                        .deallocate(old, MemoryCategory::SortedSets);
-                    self.memory_tracker
-                        .account(new, MemoryCategory::SortedSets);
-                }
-                self.sorted_sets.insert(dst.clone(), z);
-            }
-            super::KeyType::Geo => {
-                let g = self
-                    .geo_sets
-                    .remove(src)
-                    .ok_or_else(|| Error::InvalidArgument("no such key".into()))?;
-                if src.len() != dst.len() {
-                    let content = g.read().memory_usage();
-                    let old = crate::memory::estimate_keyed_object(src.len(), content);
-                    let new = crate::memory::estimate_keyed_object(dst.len(), content);
-                    self.memory_tracker
-                        .deallocate(old, MemoryCategory::GeoSets);
-                    self.memory_tracker.account(new, MemoryCategory::GeoSets);
-                }
-                self.geo_sets.insert(dst.clone(), g);
-            }
-            super::KeyType::Stream => {
-                let mut streams = self.streams.write();
-                let s = streams
-                    .remove(src)
-                    .ok_or_else(|| Error::InvalidArgument("no such key".into()))?;
-                let content = s.read().memory_size();
-                if src.len() != dst.len() {
-                    let old = crate::memory::estimate_keyed_object(src.len(), content);
-                    let new = crate::memory::estimate_keyed_object(dst.len(), content);
-                    self.memory_tracker
-                        .deallocate(old, MemoryCategory::Streams);
-                    self.memory_tracker.account(new, MemoryCategory::Streams);
-                }
-                streams.insert(dst.clone(), s);
+                let content = kv.content_memory_size();
+                let cat = kv.memory_category();
+                self.account_typed_key_rename(src, dst, content, cat);
+                self.key_values.insert(dst.clone(), kv);
             }
             super::KeyType::None => {
                 return Err(Error::InvalidArgument("no such key".into()));

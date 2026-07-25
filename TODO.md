@@ -75,7 +75,8 @@ Example: fix EXAT (`A` / `P0`) before RESP3 (`D` / `P1`) or HNSW benchmarks (`E`
 - [x] **`[P0]`** **Unified keyspace**: store strings, zsets, geo (and future types) under one map keyed by name
   - *Done pragmatically*: separate maps + type registry / cross-type ops
   - *Batch FG (slice A)*: `KeyValue` view enum + facade for TYPE/DEL/EXISTS/`key_type`; design + migration plan documented
-  - *Batch FG-2*: **hashes** physically stored as `KeyValue::Hash` in `Cache::key_values` (`ShardedKeyMap`); legacy global hash map removed; remaining types still multi-map until **FG-3**
+  - *Batch FG-2*: **hashes** physically stored as `KeyValue::Hash` in `Cache::key_values` (`ShardedKeyMap`); legacy global hash map removed
+  - *Batch FG-3*: **list / set / zset / geo / stream** in `key_values`; legacy per-type maps removed; `KeyspacePayload` is `map` + `key_values` streams; strings still on `Cache::map` (optional FG-4)
 - [x] **`[P0]`** **Type safety**: Redis-style type errors when a key exists with a different type
 - [x] **`[P0]`** **Cross-type ops**: `DEL`, `EXISTS`, `KEYS`/`SCAN`, `DBSIZE`, `TTL`/`EXPIRE`, `TYPE` work for all types
   - *Done*: `SCAN` implemented (cursor-based, sorted key index); `KEYS`/`DBSIZE`/`DEL`/`EXISTS`/`TYPE`/`FLUSH` cover all types
@@ -83,7 +84,7 @@ Example: fix EXAT (`A` / `P0`) before RESP3 (`D` / `P1`) or HNSW benchmarks (`E`
   - *Batch AF*: `PERSIST`, `EXPIREAT`/`PEXPIREAT`, `EXPIRETIME`/`PEXPIRETIME`; zero/past absolute expire deletes key; wired for AOF/replication/Lua/COMMAND
   - *Batch BA*: `EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT` optional `NX|XX|GT|LT`
 - [x] **`[P0]`** **Eviction / maxmemory**: account for zset, geo, search indexes, and pub/sub buffers—not only string KV
-  - *Done*: zset/geo/hash/list/set/stream/search tracked in `MemoryTracker` and count toward maxmemory; eviction still samples string KV only
+  - *Done*: zset/geo/hash/list/set/stream/search tracked in `MemoryTracker` and count toward maxmemory; FG-3 eviction samples strings + unified `key_values` (search docs still special)
 
 ### Server / ops hygiene
 
@@ -714,11 +715,11 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
   - *Done (Batch BT)*: `bt_eval_select_persists_connection_db` — connection remains on selected DB after EVAL
 
-### Status snapshot (2026-07-25, post-FG-2)
+### Status snapshot (2026-07-25, post-FG-3)
 
-**Shipped through Batch FG-2** (FB–FG facade; **FG-2** hashes → `Cache::key_values`). Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule).
+**Shipped through Batch FG-3** (FB–FG facade; FG-2 hashes; **FG-3** all typed containers → `Cache::key_values` + payload collapse). Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule).
 
-**Verification:** lib **336** pass / 1 ignored; keyspace + hash + typed_ttl + memory + multi-DB replace + persistence integration green.
+**Verification:** lib **337** pass / 1 ignored; keyspace + typed_ttl + list/set/zset/stream/geo + memory + multi-DB replace + persistence integration green.
 
 **Open / deferred residuals** (track as next queue below):
 
@@ -727,8 +728,9 @@ Also tracked in `docs/roadmap.md`.
 | Search | HNSW multi-layer insert | done (Batch FF) |
 | Search | HNSW graph edges/levels **not** AOF/RDB durable (rebuild on load; levels re-sampled) | P3 (accepted honesty; Batch FF) |
 | Search | CS rewire test flake under multi-layer RNG | **fixed** (force L0 + seed) |
-| Keyspace | `KeyValue` facade (FG) + **hashes physical** in `key_values` | **done (FG-2)** |
-| Keyspace | Remaining types → `key_values`; collapse `KeyspacePayload` | **P2 → FG-3** |
+| Keyspace | `KeyValue` facade + all **typed** physical in `key_values` | **done (FG-3)** |
+| Keyspace | Strings still on `Cache::map`; optional expire slot header | **P3 → FG-4 optional** |
+| Keyspace | Eviction search-doc sampling still special (outside keyspace maps) | P3 (accepted) |
 | Ops | Re-measure on other hosts / Redis non-Valkey; investigate pipelined SET gap | P2 (post-FD) |
 | Cluster | NODE 2PC **slice 2** (durable prepare / prepare-epoch / re-check at commit / bus) | P2 (later) |
 | Sentinel | Election **cooldown/timeout**; epoch thrash; probe self-vs-`*` | P3 (post-FE accepted lite) |
@@ -771,17 +773,22 @@ Recommended letter batches. Prefer **next open P2** before large polish. Standin
   - *Payload:* still multi-field — take extracts `HashMap<Bytes, SharedHash>`, install re-wraps as `KeyValue::Hash`
   - *Tests:* physical storage / rename / take-install units; hash suites; keyspace; typed_ttl; memory; multi-DB; persistence
   - *Residual → FG-3:* list/set/zset/geo/stream (+ strings later); collapse `KeyspacePayload`; FG-4 optional expire slot header
-- [ ] **`[P2]`** **Batch FG-3 — Remaining types into unified map** ← **do next**
-  - Migrate remaining typed containers; collapse `KeyspacePayload` drain/fill; eviction samples one map
-- [ ] **`[P3]`** **Later / optional (not blocking FG-3)**
+- [x] **`[P2]`** **Batch FG-3 — Remaining types into unified map**
+  - *Done:* list / set / zset / geo / stream physically in `key_values`; removed `lists` / `sets` / `streams` / `sorted_sets` / `geo_sets` fields
+  - *Payload:* collapsed to `map` + `key_values: Vec<(Bytes, KeyValue)>` + expires/watch/search/mem (DR/DS epoch install unchanged)
+  - *Eviction:* typed victims sampled from unified `key_values`; search docs still special
+  - *Tests:* physical storage for all typed; rename / take-install; `cargo test --lib cache::`; keyspace, typed_ttl, list/set/zset/stream/geo, memory, multi-DB, persistence
+  - *No dual-write leftover* for migrated types
+  - *Residual → FG-4 optional:* string `map` merge; `typed_expires` slot header
+- [ ] **`[P3]`** **Later / optional (not blocking)**
   - NODE 2PC slice 2 (durable prepare, prepare-epoch, commit re-check)
   - Sentinel promote rank by offset/priority; CKQUORUM live probe; election-timeout
   - `nodes.conf` live flags; DUMP/RESTORE wire; cluster reshard weight UI
-  - FG-4 optional: merge `typed_expires` into slot header
+  - FG-4 optional: merge strings into `key_values`; merge `typed_expires` into slot header
 
 ### Code review backlog
 
-**Batches CZ–FG-2 shipped.** **Review 2026-07-25:** FG-2 hash physical migrate green. **Queue:** **FG-3** remaining types + payload; P3 nits deferred. Standing tests-for-phase P0.
+**Batches CZ–FG-3 shipped.** **Review 2026-07-25:** FG-3 typed unify + payload collapse green. **Queue:** optional FG-4 / P2 NODE 2PC slice 2 / P3 nits. Standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -976,4 +983,4 @@ Highest urgency checklist (phase order preserved):
 - [x] Eviction policies (`maxmemory-policy`)
   - *Follow-ups*: Streams, bitmaps/HLL, RESP3 (done elsewhere); LFU decay done in Batch AB
 
-**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB**–**FG-2** shipped — pick from **Next work queue (post-FE)** (**FG-3** remaining types next) and keep landing tests with each batch.
+**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB–FG-3** shipped (typed keyspace unified). Next: optional **FG-4**, NODE 2PC slice 2, Sentinel P3 nits.

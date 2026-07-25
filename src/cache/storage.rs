@@ -1,14 +1,8 @@
 use crate::entry::{Entry, LoadOptions, SharedEntry, StoreOptions};
 use crate::error::{Error, Result};
-use crate::geospatial::GeoSet;
-use crate::hash_type::SharedHash;
 use crate::hashmap::EntryAction;
-use crate::list_type::SharedList;
 use crate::memory::MemoryCategory;
 use crate::search_index::SearchIndex;
-use crate::set_type::SharedSet;
-use crate::sorted_set::SharedSortedSet;
-use crate::stream_type::SharedStream;
 use bytes::Bytes;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -16,26 +10,22 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::keyspace::KeyValue;
 use super::Cache;
 
-/// Drained keyspace maps held between multi-DB stage and install.
+/// Drained keyspace held between multi-DB stage and install.
 ///
 /// Built by [`Cache::take_keyspace_payload`]; consumed by
 /// [`Cache::install_keyspace_payload`]. Not part of the public API.
 ///
-/// **FG-2:** live hashes sit in [`Cache::key_values`] as
-/// [`crate::cache::KeyValue::Hash`]; this payload still stages them as a
-/// plain `HashMap` (extract on take / re-wrap on install) so multi-DB epoch
-/// install stays multi-field until FG-3 collapses to one value stream.
+/// **FG-3:** strings remain a separate drained `map`; all non-string types are
+/// one `key_values` stream (Hash/List/Set/ZSet/Geo/Stream). Expires / WATCH /
+/// search schema / memory counters are still sibling fields (slot-header
+/// merge is optional FG-4).
 pub(crate) struct KeyspacePayload {
     map: Vec<(Bytes, SharedEntry)>,
-    zsets: Vec<(Bytes, SharedSortedSet)>,
-    geos: Vec<(Bytes, Arc<RwLock<GeoSet>>)>,
-    /// Staged hashes (from / into `key_values` as `KeyValue::Hash`).
-    hashes: HashMap<Bytes, SharedHash>,
-    lists: HashMap<Bytes, SharedList>,
-    sets: HashMap<Bytes, SharedSet>,
-    streams: HashMap<Bytes, SharedStream>,
+    /// All non-string typed keys from [`Cache::key_values`].
+    key_values: Vec<(Bytes, KeyValue)>,
     expires: HashMap<Bytes, Instant>,
     watch: HashMap<Bytes, u64>,
     indices: HashMap<String, Arc<RwLock<SearchIndex>>>,
@@ -392,15 +382,8 @@ impl Cache {
 
     /// Get database size (all key types)
     pub fn dbsize(&self) -> usize {
-        let strings = self.map.len();
-        let zsets = self.sorted_sets.len();
-        let geos = self.geo_sets.len();
-        // FG-2: hashes live in key_values
-        let hashes = self.key_values.len();
-        let lists = self.lists.read().len();
-        let sets = self.sets.read().len();
-        let streams = self.streams.read().len();
-        strings + zsets + geos + hashes + lists + sets + streams
+        // FG-3: strings + unified typed map
+        self.map.len() + self.key_values.len()
     }
 
     /// String-KV atomic counter (kept for replace/evict paths; prefer `tracked_memory`).
@@ -482,14 +465,8 @@ impl Cache {
     /// targets intact. Single-DB [`replace_keyspace_from`] uses the same path.
     pub(crate) fn take_keyspace_payload(&self) -> KeyspacePayload {
         let map = self.map.drain_all();
-        let zsets = self.sorted_sets.drain_all();
-        let geos = self.geo_sets.drain_all();
-        // FG-2: physical hashes live in key_values; payload field stays multi-map
-        // shaped (SharedHash map) until FG-3 collapses KeyspacePayload.
-        let hashes = Self::drain_hashes_from_key_values(&self.key_values);
-        let lists = std::mem::take(&mut *self.lists.write());
-        let sets = std::mem::take(&mut *self.sets.write());
-        let streams = std::mem::take(&mut *self.streams.write());
+        // FG-3: one typed stream (Hash/List/Set/ZSet/Geo/Stream).
+        let key_values = self.key_values.drain_all();
         let expires = std::mem::take(&mut *self.typed_expires.write());
         let watch = std::mem::take(&mut *self.watch_gens.lock());
         let (indices, aliases) = self.search_index_manager.take_all();
@@ -497,12 +474,7 @@ impl Cache {
         let mem = self.memory_usage.swap(0, Ordering::Relaxed);
         KeyspacePayload {
             map,
-            zsets,
-            geos,
-            hashes,
-            lists,
-            sets,
-            streams,
+            key_values,
             expires,
             watch,
             indices,
@@ -510,47 +482,6 @@ impl Cache {
             counts,
             mem,
         }
-    }
-
-    /// Drain [`Cache::key_values`] into a legacy-shaped hash map for payload staging.
-    fn drain_hashes_from_key_values(
-        key_values: &crate::hashmap::ShardedKeyMap<super::KeyValue>,
-    ) -> HashMap<Bytes, SharedHash> {
-        let drained = key_values.drain_all();
-        let mut hashes = HashMap::with_capacity(drained.len());
-        for (k, v) in drained {
-            match v {
-                super::KeyValue::Hash(h) => {
-                    hashes.insert(k, h);
-                }
-                other => {
-                    // FG-2: only Hash is stored. Do not drop unexpected data.
-                    debug_assert!(
-                        false,
-                        "key_values held non-Hash during take: {:?}",
-                        other.key_type()
-                    );
-                    key_values.insert(k, other);
-                }
-            }
-        }
-        hashes
-    }
-
-    /// Install staged hashes into [`Cache::key_values`] as [`super::KeyValue::Hash`].
-    fn install_hashes_into_key_values(
-        key_values: &crate::hashmap::ShardedKeyMap<super::KeyValue>,
-        hashes: HashMap<Bytes, SharedHash>,
-    ) {
-        debug_assert!(
-            key_values.is_empty(),
-            "install_hashes requires empty key_values (caller must drain first)"
-        );
-        let entries: Vec<_> = hashes
-            .into_iter()
-            .map(|(k, h)| (k, super::KeyValue::Hash(h)))
-            .collect();
-        key_values.fill_all(entries);
     }
 
     /// Install a staged keyspace payload into `self`, returning the prior state.
@@ -566,8 +497,9 @@ impl Cache {
     /// # Residual
     ///
     /// A panic **inside** this method (after drain, mid-fill) still leaves a
-    /// single-DB multi-map tear; discards are only returned after fill
-    /// completes. Command path relies on `-LOADING` for that window.
+    /// single-DB tear; discards are only returned after fill completes.
+    /// Command path relies on `-LOADING` for that window. Strings remain a
+    /// separate map from `key_values` (optional FG-4 merge).
     pub(crate) fn install_keyspace_payload_retaining_discard(
         &self,
         payload: KeyspacePayload,
@@ -576,12 +508,7 @@ impl Cache {
 
         // Drain target into discard, then install staged state.
         let discard_map = self.map.drain_all();
-        let discard_zsets = self.sorted_sets.drain_all();
-        let discard_geos = self.geo_sets.drain_all();
-        let discard_hashes = Self::drain_hashes_from_key_values(&self.key_values);
-        let discard_lists = std::mem::take(&mut *self.lists.write());
-        let discard_sets = std::mem::take(&mut *self.sets.write());
-        let discard_streams = std::mem::take(&mut *self.streams.write());
+        let discard_key_values = self.key_values.drain_all();
         let discard_expires = std::mem::take(&mut *self.typed_expires.write());
         let discard_watch = std::mem::take(&mut *self.watch_gens.lock());
         let (discard_indices, discard_aliases) = self.search_index_manager.take_all();
@@ -590,12 +517,7 @@ impl Cache {
 
         // Maps already drained into discard_* above — fill only (no second drain).
         self.map.fill_all(payload.map);
-        self.sorted_sets.fill_all(payload.zsets);
-        self.geo_sets.fill_all(payload.geos);
-        Self::install_hashes_into_key_values(&self.key_values, payload.hashes);
-        *self.lists.write() = payload.lists;
-        *self.sets.write() = payload.sets;
-        *self.streams.write() = payload.streams;
+        self.key_values.fill_all(payload.key_values);
         *self.typed_expires.write() = payload.expires;
         // Install scratch watch map and bump pre-swap keys under one lock so
         // `watch_generation` cannot observe a clean empty map mid-replace.
@@ -615,12 +537,7 @@ impl Cache {
 
         KeyspacePayload {
             map: discard_map,
-            zsets: discard_zsets,
-            geos: discard_geos,
-            hashes: discard_hashes,
-            lists: discard_lists,
-            sets: discard_sets,
-            streams: discard_streams,
+            key_values: discard_key_values,
             expires: discard_expires,
             watch: discard_watch,
             indices: discard_indices,
@@ -646,11 +563,10 @@ impl Cache {
     /// cannot race map/counter install. Intended only for AOF/RDB scratch-load
     /// commit after a successful decode/replay into `other`.
     ///
-    /// Swaps: string map, sorted_sets, geo_sets, hashes, lists, sets, streams,
-    /// typed_expires, watch_gens, search indices/aliases, MemoryTracker
-    /// keyspace category counts, and `memory_usage`. Memory is moved only via
-    /// tracker take/install + `memory_usage` store (never per-key `account`
-    /// after map replace).
+    /// Swaps: string map, `key_values` (all typed containers), typed_expires,
+    /// watch_gens, search indices/aliases, MemoryTracker keyspace category
+    /// counts, and `memory_usage`. Memory is moved only via tracker take/install
+    /// + `memory_usage` store (never per-key `account` after map replace).
     ///
     /// Pre-swap WATCH keys on `self` are re-tracked and bumped **atomically**
     /// with watch map install so live clients with WATCH fail EXEC (same idea
@@ -702,12 +618,7 @@ impl Cache {
     /// Clear all typed key maps / expires (not search schema).
     fn flush_keyspace(&self) {
         self.map.clear();
-        self.sorted_sets.clear();
-        self.geo_sets.clear();
         self.key_values.clear();
-        self.lists.write().clear();
-        self.sets.write().clear();
-        self.streams.write().clear();
         self.typed_expires.write().clear();
     }
 
@@ -722,7 +633,6 @@ impl Cache {
 
     /// Get all keys matching a pattern across all key-type maps.
     pub fn keys(&self, pattern: Option<&str>) -> Vec<Bytes> {
-        use crate::hashmap::pattern_match;
         use std::collections::HashSet;
 
         let mut seen: HashSet<Bytes> = HashSet::new();
@@ -740,66 +650,13 @@ impl Cache {
             }
         }
 
-        let matches = |key: &Bytes| -> bool {
-            match pattern {
-                Some(pat) => pattern_match(pat, std::str::from_utf8(key).unwrap_or("")),
-                None => true,
-            }
-        };
-
-        let push_typed = |key: Bytes, seen: &mut HashSet<Bytes>, result: &mut Vec<Bytes>| {
+        // FG-3: all typed keys in key_values
+        for key in self.key_values.keys(pattern) {
             if self.purge_typed_if_expired(&key) {
-                return;
+                continue;
             }
             if seen.insert(key.clone()) {
                 result.push(key);
-            }
-        };
-
-        for key in self.sorted_sets.keys(pattern) {
-            push_typed(key, &mut seen, &mut result);
-        }
-        for key in self.geo_sets.keys(pattern) {
-            push_typed(key, &mut seen, &mut result);
-        }
-        // FG-2: hashes in key_values
-        for key in self.key_values.keys(pattern) {
-            push_typed(key, &mut seen, &mut result);
-        }
-        {
-            let keys: Vec<Bytes> = self
-                .lists
-                .read()
-                .keys()
-                .filter(|k| matches(k))
-                .cloned()
-                .collect();
-            for key in keys {
-                push_typed(key, &mut seen, &mut result);
-            }
-        }
-        {
-            let keys: Vec<Bytes> = self
-                .sets
-                .read()
-                .keys()
-                .filter(|k| matches(k))
-                .cloned()
-                .collect();
-            for key in keys {
-                push_typed(key, &mut seen, &mut result);
-            }
-        }
-        {
-            let keys: Vec<Bytes> = self
-                .streams
-                .read()
-                .keys()
-                .filter(|k| matches(k))
-                .cloned()
-                .collect();
-            for key in keys {
-                push_typed(key, &mut seen, &mut result);
             }
         }
 

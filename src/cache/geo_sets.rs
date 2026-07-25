@@ -1,3 +1,5 @@
+//! Geospatial set storage (Batch FG-3: physical home is [`Cache::key_values`]).
+
 use crate::error::Result;
 use crate::geospatial::GeoSet;
 use crate::memory::MemoryCategory;
@@ -5,6 +7,7 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
+use super::keyspace::KeyValue;
 use super::storage::KeyType;
 use super::Cache;
 
@@ -25,14 +28,22 @@ impl Cache {
 
     /// Get a geospatial set by key
     pub fn get_geo_set(&self, key: &Bytes) -> Option<SharedGeoSet> {
-        self.geo_sets.get(key)
+        self.geo_from_key_values(key)
+    }
+
+    #[inline]
+    fn geo_from_key_values(&self, key: &Bytes) -> Option<SharedGeoSet> {
+        match self.key_values.get(key) {
+            Some(KeyValue::Geo(g)) => Some(g),
+            _ => None,
+        }
     }
 
     /// Get or create a geospatial set.
     /// Returns WrongType if the key already holds a different type.
     pub fn get_or_create_geo_set(&self, key: &Bytes) -> Result<SharedGeoSet> {
         self.ensure_type(key, KeyType::Geo)?;
-        if let Some(existing) = self.geo_sets.get(key) {
+        if let Some(existing) = self.geo_from_key_values(key) {
             return Ok(existing);
         }
         let base = crate::memory::estimate_keyed_object(
@@ -40,36 +51,52 @@ impl Cache {
             GeoSet::new().memory_usage(),
         );
         self.ensure_non_string_capacity(base)?;
-        Ok(self.geo_sets.get_or_insert_with(key.clone(), || {
+        let kv = self.key_values.get_or_insert_with(key.clone(), || {
             self.memory_tracker
                 .account(base, MemoryCategory::GeoSets);
-            Arc::new(RwLock::new(GeoSet::new()))
-        }))
+            KeyValue::Geo(Arc::new(RwLock::new(GeoSet::new())))
+        });
+        match kv {
+            KeyValue::Geo(g) => Ok(g),
+            _ => Err(crate::error::Error::WrongType),
+        }
     }
 
     /// Remove a geospatial set and free its tracked memory
     pub fn remove_geo_set(&self, key: &Bytes) -> bool {
-        if let Some(set) = self.geo_sets.remove(key) {
-            let size =
-                crate::memory::estimate_keyed_object(key.len(), set.read().memory_usage());
-            self.memory_tracker
-                .deallocate(size, MemoryCategory::GeoSets);
-            true
-        } else {
-            false
+        match self.key_values.remove(key) {
+            Some(KeyValue::Geo(set)) => {
+                let size =
+                    crate::memory::estimate_keyed_object(key.len(), set.read().memory_usage());
+                self.memory_tracker
+                    .deallocate(size, MemoryCategory::GeoSets);
+                true
+            }
+            Some(other) => {
+                self.key_values.insert(key.clone(), other);
+                false
+            }
+            None => false,
         }
     }
 
     /// Get the number of geospatial sets
     pub fn geo_set_count(&self) -> usize {
-        self.geo_sets.len()
+        let mut n = 0usize;
+        self.key_values.for_each(|_, kv| {
+            if matches!(kv, KeyValue::Geo(_)) {
+                n += 1;
+            }
+        });
+        n
     }
 
     /// Calculate total memory usage of all geospatial sets
     pub fn geo_sets_memory(&self) -> usize {
         let mut total = 0usize;
-        self.geo_sets.for_each(|key, geo_set| {
-            { let set = geo_set.read();
+        self.key_values.for_each(|key, kv| {
+            if let KeyValue::Geo(geo_set) = kv {
+                let set = geo_set.read();
                 total += crate::memory::estimate_keyed_object(key.len(), set.memory_usage());
             }
         });
@@ -78,14 +105,25 @@ impl Cache {
 
     /// Clear all geospatial sets
     pub fn clear_geo_sets(&self) {
-        self.geo_sets.clear();
+        let mut keys = Vec::new();
+        self.key_values.for_each(|k, kv| {
+            if matches!(kv, KeyValue::Geo(_)) {
+                keys.push(k.clone());
+            }
+        });
+        for k in keys {
+            let _ = self.remove_geo_set(&k);
+        }
     }
 
     /// Export all geo sets for persistence: (key, [(member, lon, lat), ...]).
     /// Skips keys whose typed TTL has already elapsed (no revive without TTL).
     pub fn export_geos(&self) -> Vec<(Bytes, Vec<(Bytes, f64, f64)>)> {
         let mut out = Vec::new();
-        self.geo_sets.for_each(|key, geoset| {
+        self.key_values.for_each(|key, kv| {
+            let KeyValue::Geo(geoset) = kv else {
+                return;
+            };
             if !self.typed_key_exportable(key) {
                 return;
             }
