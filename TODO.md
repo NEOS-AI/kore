@@ -146,7 +146,8 @@ Also tracked in `docs/roadmap.md`.
   - *Hardened (Batch AC)*: full-resync holds a gate across RDB snapshot + feed register so concurrent `propagate_raw` cannot drop writes; sibling FAILOVER test waits for both `master_link_up` + `WAIT` before asserting
   - *Done (minimal + coordinated MVP-lite)*: honest promote via `REPLICAOF NO ONE` / bare `FAILOVER` on replica — new replid, offset 0, backlog clear, drop feeds, clear replica metadata, `master_replid2` in INFO; idempotent when already master.
   - *Coordinated* `FAILOVER TO <host> <port> [TIMEOUT ms] [FORCE]` (master only, default timeout 5000ms): write pause, soft match against REPLCONF `listening-port`/`ip-address` when tracked, wait until target ack ≥ frozen `master_repl_offset` (unless **FORCE**), then TCP bare `FAILOVER`, best-effort sibling re-follow (`REPLICAOF` on feeds + client-port TCP), demote self via `set_replicaof`. Replicas honor in-stream `REPLICAOF` and reconnect on `primary_link_epoch` / primary addr change. Catch-up sources: live-link tracked ACK (`REPLCONF ACK` on feed + periodic feed GETACK probe), then client-port GETACK fallback. Replica offset uses exact wire bytes via `parse_with_consumed` and replies to master GETACK on the repl link. Catch-up timeout leaves master writable.
-  - *Done (Batch EW, Sentinel-lite)*: `SENTINEL MONITOR|REMOVE|GET-MASTER-ADDR-BY-NAME|MASTERS|MASTER|REPLICAS|SET|FAILOVER|CKQUORUM|HELP`. Background PING + ROLE replica discover; **s_down** after `down-after-milliseconds` (default 30s); auto-failover (toggle via `SET auto-failover`) promotes first reachable replica.
+  - *Done (Batch EW, Sentinel-lite)*: `SENTINEL MONITOR|REMOVE|GET-MASTER-ADDR-BY-NAME|MASTERS|MASTER|REPLICAS|SET|FAILOVER|CKQUORUM|HELP`. Background PING + ROLE replica discover; **s_down** after `down-after-milliseconds` (default 30s); auto-failover (toggle via `SET auto-failover`).
+  - *Done (Batch FK)*: promote ranking — highest priority (0 never), then highest ROLE offset, then greatest `ip:port` (mirrors cluster EA/EB); not discovery order.
   - *Done (Batch EX, ODOWN lite)*: `SENTINEL MYID|MEET|MEETPEER|SENTINELS|IS-MASTER-DOWN-BY-ADDR`. Peer table; vote count = self s_down + peer is-master-down replies; **o_down** when votes ≥ quorum; auto-failover gated on **o_down** (not bare s_down). CKQUORUM checks known_sentinel_count ≥ quorum. No full leader election races.
   - *Done (Batch EZ)*: `SENTINEL FLUSHCONFIG` → `{dir}/sentinel.conf`; load on boot (`load_or_new`); restore myid/monitors/peers/options; **autosave** on MONITOR/REMOVE/SET/MEET/switch_master.
   - *Done (Batch FA)*: Redis-style hello CSV; `SENTINEL HELLO`; tick **PUBLISH** `__sentinel__:hello` on reachable masters; peer `SENTINEL HELLO` exchange; `apply_hello` learns peers + higher-epoch **switch-master**. No long-lived master `SUBSCRIBE` fan-in (peer HELLO is primary discovery path).
@@ -342,8 +343,8 @@ Also tracked in `docs/roadmap.md`.
     - *Done (Batch FE)*: sticky voted-leader on `IS-MASTER-DOWN-BY-ADDR`; auto path elects before `try_failover`; `voted-leader` / `voted-leader-epoch` on MASTER fields. Residual: not full Redis election-timeout state machine.
   - [x] **`[P3]`** **Code review (FE post-ship nits):** election-epoch thrash; probe self-as-leader; majority uses table size
     - *Found (scheduled review after FE)*: (1) multi-sentinel o_down tick can `next_election_epoch` every second until majority; (2) probe without prior vote returns self (not `*`); (3) `leader_votes_needed` uses `known_sentinel_count` (same residual as CKQUORUM). Accept lite; optional cooldown / live voter set later.
-  - [ ] **`[P3]`** **Code review (FC post-ship nit):** Sentinel promote still first-replica-wins
-    - *Found*: `try_failover` walks `replicas` in discovery order; no offset/priority ranking (unlike cluster election EA/EB). Acceptable lite; optional later.
+  - [x] **`[P3]`** **Code review (FC post-ship nit):** Sentinel promote still first-replica-wins
+    - *Done (Batch FK)*: `rank_replicas_for_promote` — highest priority (0 never), then highest ROLE offset, then greatest `ip:port`. Tests: priority / offset / skip-0 / all-zero. Residual: live INFO `slave_priority` refresh (fields on `ReplicaInfo`; ROLE supplies offset).
   - [x] **`[P3]`** **Code review (EZ/FA post-ship):** hello-path autosave thrash (+ partial CKQUORUM)
     - *Done (Batch FE, autosave)*: `add_peer` returns changed-only and autosaves only on new/updated peer.
     - *Residual*: `CKQUORUM` / elect majority still peer-table size (not live probe).
@@ -718,30 +719,30 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
   - *Done (Batch BT)*: `bt_eval_select_persists_connection_db` — connection remains on selected DB after EVAL
 
-### Status snapshot (2026-07-25, post-FG-4 — strings unified)
+### Status snapshot (2026-07-25, post-FK — Sentinel promote ranking)
 
-**All planned P0–P2 letter work through FI-2 + optional FG-4 is finished.** Shipped: FB–FE, **FF**, **FG**–**FG-4**, **FH** NODE 2PC slice 2, **FI** pipeline SET ~+25%, **FI-2** AOF-off multi-DB SELECT ordering. Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed). Only untracked `data/` expected.
+**All planned P0–P2 letter work through FI-2 + optional FG-4 is finished; P3 FK done.** Shipped: FB–FE, **FF**, **FG**–**FG-4**, **FH**, **FI**, **FI-2**, **FK** (Sentinel promote rank). Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed). Only untracked `data/` expected.
 
-**What remains** is **optional P3 polish** only (no open P0–P2 feature blockers). **Recommended next:** **FK** (Sentinel promote rank) → **FL** (`nodes.conf` flags).
+**What remains** is **optional P3 polish** only (no open P0–P2 feature blockers). **Recommended next:** **FL** (`nodes.conf` flags).
 
 | Area | Residual | Priority | Planned batch |
 |------|----------|----------|---------------|
-| Sentinel | Promote **first-replica-wins** (open review checkbox) | **P3 next** | **FK** |
-| Cluster | `nodes.conf` omits require-full / allow-reads / announce (open review) | P3 | **FL** |
+| Sentinel | Promote ranking (priority/offset) | **done** | **FK** |
+| Cluster | `nodes.conf` omits require-full / allow-reads / announce (open review) | **P3 next** | **FL** |
 | Keyspace | `typed_expires` side map (not slot header) | P3 residual (FG-4) | later optional |
 | Ops | Global **repl backlog** still serializes writers (FI residual; FI-2 keeps CS for SELECT correctness) | P3 | later optional |
 | Ops | Dual SELECT trackers (AOF vs `ReplBacklog`); `propagate_raw` skips stream-DB | P3 accepted | — |
 | Cluster | NODE 2PC durable-on-disk prepare / bus / atomic COMMITPREPARE | P3 residual (FH) | later |
 | Keyspace | Typed RENAME remove+insert; create ensure_type→insert TOCTOU (historical) | P3 accepted | — |
-| Sentinel | election-timeout/cooldown; CKQUORUM live probe; hello SUBSCRIBE | P3 | with **FK** or later |
+| Sentinel | election-timeout/cooldown; CKQUORUM live probe; hello SUBSCRIBE; live INFO slave_priority | P3 residual (FK) | later |
 | Search | HNSW edges/levels not AOF/RDB durable; `max_m=1` spanning | P3 accepted / later | — |
 | MIGRATE / UI / load | DUMP wire; reshard weight UI; Arc-swap mid-fill | P3 accepted | — |
 
-### Next work queue (post-FG-4)
+### Next work queue (post-FG-4 / post-FK)
 
-**Primary FB–FG-4 + FH + FI + FI-2 done.** Optional P3 follow-ons below. Prefer **FK → FL**. Standing rule: land tests with each batch.
+**Primary FB–FG-4 + FH + FI + FI-2 + FK done.** Optional P3 follow-ons below. Prefer **FL** next. Standing rule: land tests with each batch.
 
-#### Completed (FB–FG-4 + FH + FI + FI-2)
+#### Completed (FB–FG-4 + FH + FI + FI-2 + FK)
 
 - [x] **`[P1]`** **Batch FB — Cluster dual-end NODE wire 2PC (slice 1)**
 - [x] **`[P1]`** **Batch FC — Sentinel promote-success gate**
@@ -779,12 +780,12 @@ Also tracked in `docs/roadmap.md`.
 
 #### Open optional queue (P3 only — pick when resuming)
 
-- [ ] **`[P3]`** **Batch FK — Sentinel promote ranking + lite SM polish** ← **recommended next**
-  - Rank replicas by priority then offset (mirror cluster EA/EB) instead of discovery order
-  - Close open review: *FC post-ship nit first-replica-wins*
-  - Optional same batch: elect cooldown; CKQUORUM/majority live probe; probe self-vs-`*` honesty
-  - Tests: multi-replica failover prefers higher priority / offset; discovery-order no longer wins alone
-- [ ] **`[P3]`** **Batch FL — `nodes.conf` live cluster flags**
+- [x] **`[P3]`** **Batch FK — Sentinel promote ranking + lite SM polish**
+  - Rank: highest priority (0 never) → highest ROLE offset → greatest `ip:port` (mirrors cluster EA/EB)
+  - Closed open review: *FC post-ship nit first-replica-wins*
+  - Tests: multi-replica prefers higher priority / offset; priority 0 skipped; all-zero fails; unit rank
+  - Residual (optional later): elect cooldown; CKQUORUM/majority live probe; probe self-vs-`*`; live INFO `slave_priority` refresh
+- [ ] **`[P3]`** **Batch FL — `nodes.conf` live cluster flags** ← **recommended next**
   - Persist/restore require-full-coverage, allow-reads-when-down, announce-ip/port, replica-priority
   - Or document boot-flag-only requirement and close as accepted
   - Close open review: *EN/EO/EU post-ship nodes.conf omits live flags*
@@ -794,10 +795,11 @@ Also tracked in `docs/roadmap.md`.
   - HNSW durable graph; hello SUBSCRIBE fan-in; single-DB Arc-swap mid-fill; NODE durable prepare
   - Global repl backlog write serialization (FI residual; no Valkey parity claim)
   - Fold `typed_expires` into per-key slot header (FG-4 residual)
+  - Sentinel elect cooldown / CKQUORUM live probe / INFO slave_priority (FK residuals)
 
 ### Code review backlog
 
-**Batches CZ–FG-4 + FH + FI + FI-2 shipped.** Next optional: **FK** (recommended) → **FL**. Standing tests-for-phase P0.
+**Batches CZ–FG-4 + FH + FI + FI-2 + FK shipped.** Next optional: **FL**. Standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -926,7 +928,7 @@ Also tracked in `docs/roadmap.md`.
 | P3 | EN/EO/EU post-ship: nodes.conf omits require-full/announce flags | **open** → planned **FL** |
 | P1 | dual-end NODE RESP 2PC prepare/commit (slice 1) | **done** (Batch FB) |
 | P3 | FB post-ship: prepare not re-checked at commit; dest prepare broad; mem-only | **done FH** epoch/TTL/recheck; durable/bus residual later |
-| P3 | FC post-ship: first-replica-wins promote order | **open** → planned **FK** (recommended next) |
+| P3 | FC post-ship: first-replica-wins promote order | **done** (Batch FK) |
 | P2 | dual-end NODE 2PC slice 2 (prepare-epoch / TTL / commit re-check) | **done** (Batch FH) |
 | P2 | FI pipeline SET perf | **done** (Batch FI; ~+25% P=16) |
 | P2/P3 | FI-2 AOF-off multi-DB SELECT ordering | **done** (Batch FI-2) |
@@ -994,4 +996,4 @@ Highest urgency checklist (phase order preserved):
 - [x] Eviction policies (`maxmemory-policy`)
   - *Follow-ups*: Streams, bitmaps/HLL, RESP3 (done elsewhere); LFU decay done in Batch AB
 
-**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB–FG-4** + **FH**/**FI**/**FI-2** complete. Resume from **Next work queue (post-FG-4)** — optional **FK** (recommended) → **FL**.
+**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB–FG-4** + **FH**/**FI**/**FI-2** + **FK** complete. Resume from **Next work queue (post-FG-4 / post-FK)** — optional **FL** next.

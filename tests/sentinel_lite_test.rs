@@ -1,13 +1,14 @@
 //! Batch EW: Sentinel-lite MONITOR / GET-MASTER-ADDR / s_down / FAILOVER.
 //! Batch FC: promote-success gate (no switch_master on PING-only).
 //! Batch FE: leader election on IS-MASTER-DOWN-BY-ADDR; only elected leader auto-failovers.
+//! Batch FK: promote ranking by priority then offset (not discovery order).
 
 use bytes::Bytes;
 use kore::config::Config;
 use kore::protocol::{RespParser, RespValue};
 use kore::{
-    test_promote_inject, test_set_promote_inject, try_elect_leader, try_failover, Cache,
-    ReplicaInfo, Server, PROMOTE_INJECT_FORCE_FAIL, PROMOTE_INJECT_FORCE_OK,
+    rank_replicas_for_promote, test_promote_inject, test_set_promote_inject, try_elect_leader,
+    try_failover, Cache, ReplicaInfo, Server, PROMOTE_INJECT_FORCE_FAIL, PROMOTE_INJECT_FORCE_OK,
 };
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -268,10 +269,7 @@ async fn sentinel_manual_failover_switches_addr() {
     // Inject replica list (ROLE would discover this).
     sentinel.note_ok(
         "mymaster",
-        Some(vec![ReplicaInfo {
-            ip: "127.0.0.1".into(),
-            port: promote_port,
-        }]),
+        Some(vec![ReplicaInfo::new("127.0.0.1", promote_port)]),
     );
 
     let mut cli = TcpStream::connect(("127.0.0.1", sentinel_port)).await.unwrap();
@@ -332,10 +330,7 @@ async fn sentinel_failover_no_switch_on_promote_fail() {
         .unwrap();
     sentinel.note_ok(
         "mymaster",
-        Some(vec![ReplicaInfo {
-            ip: "127.0.0.1".into(),
-            port: ping_ok_port,
-        }]),
+        Some(vec![ReplicaInfo::new("127.0.0.1", ping_ok_port)]),
     );
 
     let epoch_before = sentinel.master("mymaster").unwrap().failover_epoch;
@@ -422,10 +417,7 @@ async fn sentinel_failover_switches_on_inject_ok() {
         .unwrap();
     sentinel.note_ok(
         "mymaster",
-        Some(vec![ReplicaInfo {
-            ip: "127.0.0.1".into(),
-            port: target_port,
-        }]),
+        Some(vec![ReplicaInfo::new("127.0.0.1", target_port)]),
     );
 
     let _guard = test_promote_inject();
@@ -1164,10 +1156,7 @@ async fn sentinel_non_leader_does_not_elect() {
         s.maybe_sdown("mymaster");
         s.note_ok(
             "mymaster",
-            Some(vec![ReplicaInfo {
-                ip: "127.0.0.1".into(),
-                port: promote_port,
-            }]),
+            Some(vec![ReplicaInfo::new("127.0.0.1", promote_port)]),
         );
         // note_ok clears s_down — re-age.
         std::thread::sleep(std::time::Duration::from_millis(60));
@@ -1214,10 +1203,7 @@ async fn sentinel_non_leader_does_not_elect() {
         // Inject replicas by temporarily note_ok then force s_down flags back.
         s.note_ok(
             "mymaster",
-            Some(vec![ReplicaInfo {
-                ip: "127.0.0.1".into(),
-                port: promote_port,
-            }]),
+            Some(vec![ReplicaInfo::new("127.0.0.1", promote_port)]),
         );
     }
     // Force s_down/o_down after replica inject by sleeping past down-after.
@@ -1276,6 +1262,268 @@ async fn sentinel_non_leader_does_not_elect() {
     let _ = tx_t.send(true);
     hs1.abort();
     hs2.abort();
+    ht.abort();
+    sleep(Duration::from_millis(50)).await;
+}
+
+// ── Batch FK: promote ranking ────────────────────────────────────────────────
+
+/// Batch FK unit-style: pure ranking prefers priority, then offset, skips 0.
+#[test]
+fn rank_replicas_for_promote_order() {
+    let first_in_discovery = ReplicaInfo::new("127.0.0.1", 1001).with_rank(50, 9999);
+    let higher_priority = ReplicaInfo::new("127.0.0.1", 1002).with_rank(200, 1);
+    let higher_offset = ReplicaInfo::new("127.0.0.1", 1003).with_rank(50, 100);
+    let never = ReplicaInfo::new("127.0.0.1", 1004).with_rank(0, 1_000_000);
+    let ranked = rank_replicas_for_promote(&[
+        first_in_discovery,
+        higher_priority,
+        higher_offset,
+        never,
+    ]);
+    assert_eq!(ranked.len(), 3);
+    assert_eq!(ranked[0].port, 1002); // highest priority
+    assert_eq!(ranked[1].port, 1001); // same pri as 1003, higher offset
+    assert_eq!(ranked[2].port, 1003);
+}
+
+/// Batch FK: multi-replica failover prefers higher priority over discovery order.
+#[tokio::test(flavor = "multi_thread")]
+async fn sentinel_failover_prefers_higher_priority() {
+    let dead_master_port = 16950u16;
+    let low_pri_port = 16951u16; // listed first (would win under first-replica-wins)
+    let high_pri_port = 16952u16;
+    let sentinel_port = 16953u16;
+
+    let cache_lo = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_lo = Server::new(cache_lo, make_config(low_pri_port));
+    let (tx_lo, rx_lo) = watch::channel(false);
+    let h_lo = tokio::spawn(async move {
+        let _ = srv_lo.run_with_shutdown(rx_lo).await;
+    });
+    wait_listen(low_pri_port).await;
+
+    let cache_hi = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_hi = Server::new(cache_hi, make_config(high_pri_port));
+    let (tx_hi, rx_hi) = watch::channel(false);
+    let h_hi = tokio::spawn(async move {
+        let _ = srv_hi.run_with_shutdown(rx_hi).await;
+    });
+    wait_listen(high_pri_port).await;
+
+    let cache_s = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_s = Server::new(cache_s, make_config(sentinel_port));
+    let sentinel = Arc::clone(srv_s.sentinel());
+    let (tx_s, rx_s) = watch::channel(false);
+    let hs = tokio::spawn(async move {
+        let _ = srv_s.run_with_shutdown(rx_s).await;
+    });
+    wait_listen(sentinel_port).await;
+
+    sentinel
+        .monitor("mymaster", "127.0.0.1", dead_master_port, 1)
+        .unwrap();
+    // Discovery order: low priority first; high priority second.
+    sentinel.note_ok(
+        "mymaster",
+        Some(vec![
+            ReplicaInfo::new("127.0.0.1", low_pri_port).with_rank(50, 100),
+            ReplicaInfo::new("127.0.0.1", high_pri_port).with_rank(200, 1),
+        ]),
+    );
+
+    let _guard = test_promote_inject();
+    test_set_promote_inject(PROMOTE_INJECT_FORCE_OK);
+
+    assert!(try_failover(&sentinel, "mymaster").await.is_ok());
+    let m = sentinel.master("mymaster").unwrap();
+    assert_eq!(
+        m.port, high_pri_port,
+        "must promote higher priority, not first in discovery order"
+    );
+
+    let _ = tx_s.send(true);
+    let _ = tx_lo.send(true);
+    let _ = tx_hi.send(true);
+    hs.abort();
+    h_lo.abort();
+    h_hi.abort();
+    sleep(Duration::from_millis(50)).await;
+}
+
+/// Batch FK: when priority ties, prefer higher replication offset.
+#[tokio::test(flavor = "multi_thread")]
+async fn sentinel_failover_prefers_higher_offset() {
+    let dead_master_port = 16954u16;
+    let low_off_port = 16955u16; // listed first
+    let high_off_port = 16956u16;
+    let sentinel_port = 16957u16;
+
+    let cache_lo = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_lo = Server::new(cache_lo, make_config(low_off_port));
+    let (tx_lo, rx_lo) = watch::channel(false);
+    let h_lo = tokio::spawn(async move {
+        let _ = srv_lo.run_with_shutdown(rx_lo).await;
+    });
+    wait_listen(low_off_port).await;
+
+    let cache_hi = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_hi = Server::new(cache_hi, make_config(high_off_port));
+    let (tx_hi, rx_hi) = watch::channel(false);
+    let h_hi = tokio::spawn(async move {
+        let _ = srv_hi.run_with_shutdown(rx_hi).await;
+    });
+    wait_listen(high_off_port).await;
+
+    let cache_s = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_s = Server::new(cache_s, make_config(sentinel_port));
+    let sentinel = Arc::clone(srv_s.sentinel());
+    let (tx_s, rx_s) = watch::channel(false);
+    let hs = tokio::spawn(async move {
+        let _ = srv_s.run_with_shutdown(rx_s).await;
+    });
+    wait_listen(sentinel_port).await;
+
+    sentinel
+        .monitor("mymaster", "127.0.0.1", dead_master_port, 1)
+        .unwrap();
+    sentinel.note_ok(
+        "mymaster",
+        Some(vec![
+            ReplicaInfo::new("127.0.0.1", low_off_port).with_rank(100, 10),
+            ReplicaInfo::new("127.0.0.1", high_off_port).with_rank(100, 50_000),
+        ]),
+    );
+
+    let _guard = test_promote_inject();
+    test_set_promote_inject(PROMOTE_INJECT_FORCE_OK);
+
+    assert!(try_failover(&sentinel, "mymaster").await.is_ok());
+    assert_eq!(
+        sentinel.master("mymaster").unwrap().port,
+        high_off_port,
+        "must prefer higher offset when priority ties"
+    );
+
+    let _ = tx_s.send(true);
+    let _ = tx_lo.send(true);
+    let _ = tx_hi.send(true);
+    hs.abort();
+    h_lo.abort();
+    h_hi.abort();
+    sleep(Duration::from_millis(50)).await;
+}
+
+/// Batch FK: priority 0 is never selected when another eligible replica exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn sentinel_failover_skips_priority_zero() {
+    let dead_master_port = 16958u16;
+    let never_port = 16959u16; // listed first, priority 0
+    let ok_port = 16960u16;
+    let sentinel_port = 16961u16;
+
+    let cache_never = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_never = Server::new(cache_never, make_config(never_port));
+    let (tx_n, rx_n) = watch::channel(false);
+    let h_n = tokio::spawn(async move {
+        let _ = srv_never.run_with_shutdown(rx_n).await;
+    });
+    wait_listen(never_port).await;
+
+    let cache_ok = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_ok = Server::new(cache_ok, make_config(ok_port));
+    let (tx_ok, rx_ok) = watch::channel(false);
+    let h_ok = tokio::spawn(async move {
+        let _ = srv_ok.run_with_shutdown(rx_ok).await;
+    });
+    wait_listen(ok_port).await;
+
+    let cache_s = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_s = Server::new(cache_s, make_config(sentinel_port));
+    let sentinel = Arc::clone(srv_s.sentinel());
+    let (tx_s, rx_s) = watch::channel(false);
+    let hs = tokio::spawn(async move {
+        let _ = srv_s.run_with_shutdown(rx_s).await;
+    });
+    wait_listen(sentinel_port).await;
+
+    sentinel
+        .monitor("mymaster", "127.0.0.1", dead_master_port, 1)
+        .unwrap();
+    sentinel.note_ok(
+        "mymaster",
+        Some(vec![
+            ReplicaInfo::new("127.0.0.1", never_port).with_rank(0, 9_999_999),
+            ReplicaInfo::new("127.0.0.1", ok_port).with_rank(100, 1),
+        ]),
+    );
+
+    let _guard = test_promote_inject();
+    test_set_promote_inject(PROMOTE_INJECT_FORCE_OK);
+
+    assert!(try_failover(&sentinel, "mymaster").await.is_ok());
+    assert_eq!(
+        sentinel.master("mymaster").unwrap().port,
+        ok_port,
+        "priority 0 must never be promoted when an eligible replica exists"
+    );
+
+    let _ = tx_s.send(true);
+    let _ = tx_n.send(true);
+    let _ = tx_ok.send(true);
+    hs.abort();
+    h_n.abort();
+    h_ok.abort();
+    sleep(Duration::from_millis(50)).await;
+}
+
+/// Batch FK: all priority-0 replicas → no good replica (no switch_master).
+#[tokio::test(flavor = "multi_thread")]
+async fn sentinel_failover_all_priority_zero_fails() {
+    let dead_master_port = 16962u16;
+    let never_port = 16963u16;
+    let sentinel_port = 16964u16;
+
+    let cache_t = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_t = Server::new(cache_t, make_config(never_port));
+    let (tx_t, rx_t) = watch::channel(false);
+    let ht = tokio::spawn(async move {
+        let _ = srv_t.run_with_shutdown(rx_t).await;
+    });
+    wait_listen(never_port).await;
+
+    let cache_s = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_s = Server::new(cache_s, make_config(sentinel_port));
+    let sentinel = Arc::clone(srv_s.sentinel());
+    let (tx_s, rx_s) = watch::channel(false);
+    let hs = tokio::spawn(async move {
+        let _ = srv_s.run_with_shutdown(rx_s).await;
+    });
+    wait_listen(sentinel_port).await;
+
+    sentinel
+        .monitor("mymaster", "127.0.0.1", dead_master_port, 1)
+        .unwrap();
+    sentinel.note_ok(
+        "mymaster",
+        Some(vec![ReplicaInfo::new("127.0.0.1", never_port).with_rank(0, 100)]),
+    );
+
+    let err = try_failover(&sentinel, "mymaster").await.unwrap_err();
+    assert!(
+        err.to_ascii_lowercase().contains("no good replica"),
+        "expected no good replica, got {}",
+        err
+    );
+    assert_eq!(
+        sentinel.master("mymaster").unwrap().port,
+        dead_master_port,
+        "must not switch_master when only priority-0 candidates"
+    );
+
+    let _ = tx_s.send(true);
+    let _ = tx_t.send(true);
+    hs.abort();
     ht.abort();
     sleep(Duration::from_millis(50)).await;
 }

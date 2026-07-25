@@ -60,10 +60,10 @@ pub use databases::{Databases, DEFAULT_DATABASES};
 pub use error::{Error, Result};
 pub use network::Server;
 pub use sentinel::{
-    master_fields, meet_sentinel, peer_fields, run_sentinel_loop, test_promote_inject,
-    test_set_promote_inject, try_elect_leader, try_failover, HelloMsg, MasterInfo, PeerSentinel,
-    PromoteInjectGuard, ReplicaInfo, SentinelState, DEFAULT_DOWN_AFTER_MS, HELLO_CHANNEL,
-    PROMOTE_INJECT_FORCE_FAIL, PROMOTE_INJECT_FORCE_OK,
+    master_fields, meet_sentinel, peer_fields, rank_replicas_for_promote, run_sentinel_loop,
+    test_promote_inject, test_set_promote_inject, try_elect_leader, try_failover, HelloMsg,
+    MasterInfo, PeerSentinel, PromoteInjectGuard, ReplicaInfo, SentinelState,
+    DEFAULT_DOWN_AFTER_MS, HELLO_CHANNEL, PROMOTE_INJECT_FORCE_FAIL, PROMOTE_INJECT_FORCE_OK,
 };
 pub use persistence::{
     format_save_rules, parse_save_rules, PersistenceConfig, PersistenceManager, SaveRule,

@@ -1,6 +1,7 @@
 //! Redis Sentinel–compatible **lite** (Batch EW) + multi-Sentinel **ODOWN** (Batch EX)
 //! + **config persistence** (Batch EZ) + **hello bus lite** (Batch FA)
-//! + **promote-success gate** (Batch FC) + **leader election** (Batch FE).
+//! + **promote-success gate** (Batch FC) + **leader election** (Batch FE)
+//! + **promote ranking** (Batch FK).
 //!
 //! - EW: subjective-down (`s_down`), MONITOR, GET-MASTER-ADDR, FAILOVER, auto-failover
 //! - EX: peer `SENTINEL MEET`, `IS-MASTER-DOWN-BY-ADDR` votes, `o_down` when votes ≥ quorum
@@ -8,6 +9,7 @@
 //! - FA: Redis-style hello CSV; `PUBLISH __sentinel__:hello` on masters; peer `SENTINEL HELLO`
 //! - FC: `promote_replica` requires real promote (FAILOVER / REPLICAOF / ROLE=master), never PING alone
 //! - FE: voted-leader on `IS-MASTER-DOWN-BY-ADDR` (epoch/runid); only elected leader auto-failovers
+//! - FK: promote rank = highest priority (0 never), then highest ROLE offset, then greatest `ip:port`
 //!
 //! # Honesty vs full Redis Sentinel
 //!
@@ -18,7 +20,9 @@
 //! - **Hello bus:** tick `PUBLISH __sentinel__:hello` + peer `SENTINEL HELLO` exchange.
 //!   No long-lived master `SUBSCRIBE` fan-in (residual).
 //! - **CKQUORUM:** peer-table size (`1 + peers`), not live reachability probes (residual).
-//! - **Promote order:** first reachable replica wins (no offset/priority rank).
+//! - **Promote order (FK):** mirrors cluster EA/EB — highest `priority` (0 never promote), then
+//!   highest `repl_offset` (from ROLE master slave list), then lexicographically greatest `ip:port`.
+//!   Priority defaults to 100; live INFO `slave_priority` refresh is best-effort residual.
 
 use crate::protocol::{RespParser, RespValue};
 use bytes::Bytes;
@@ -84,10 +88,64 @@ pub struct HelloMsg {
     pub master_config_epoch: u64,
 }
 
-#[derive(Debug, Clone)]
+/// Known replica of a monitored master (Batch EW + FK rank fields).
+///
+/// Ranking for promote (Batch FK, mirrors cluster EA/EB):
+/// 1. highest [`Self::priority`] (**0 = never promote**)
+/// 2. then highest [`Self::repl_offset`] (ROLE master slave list)
+/// 3. then lexicographically greatest `ip:port`
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicaInfo {
     pub ip: String,
     pub port: u16,
+    /// Replication offset from ROLE master slave entry (Batch FK). Default 0.
+    pub repl_offset: u64,
+    /// Promote priority (Batch FK). Default 100; **0 = never promote**.
+    pub priority: u32,
+}
+
+impl ReplicaInfo {
+    /// Default priority 100, offset 0 (discovery placeholder / inject helper).
+    pub fn new(ip: impl Into<String>, port: u16) -> Self {
+        Self {
+            ip: ip.into(),
+            port,
+            repl_offset: 0,
+            priority: 100,
+        }
+    }
+
+    /// Set rank fields used by [`rank_replicas_for_promote`].
+    pub fn with_rank(mut self, priority: u32, repl_offset: u64) -> Self {
+        self.priority = priority;
+        self.repl_offset = repl_offset;
+        self
+    }
+
+    /// Stable address key for tie-break and logging.
+    pub fn addr_key(&self) -> String {
+        format!("{}:{}", self.ip, self.port)
+    }
+}
+
+/// Sort eligible replicas for promote attempts (Batch FK).
+///
+/// Filters out `priority == 0` (never promote). Order: highest priority, then
+/// highest offset, then lexicographically greatest `ip:port` (mirrors
+/// [`crate::cluster::ClusterState::failover_election_winner`]).
+pub fn rank_replicas_for_promote(replicas: &[ReplicaInfo]) -> Vec<ReplicaInfo> {
+    let mut eligible: Vec<ReplicaInfo> = replicas
+        .iter()
+        .filter(|r| r.priority > 0)
+        .cloned()
+        .collect();
+    eligible.sort_by(|a, b| {
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| b.repl_offset.cmp(&a.repl_offset))
+            .then_with(|| b.addr_key().cmp(&a.addr_key()))
+    });
+    eligible
 }
 
 /// Another Sentinel process known via MEET (Batch EX).
@@ -1192,13 +1250,17 @@ async fn probe_one(sentinel: &SentinelState, name: &str) {
     }
 }
 
-/// Manual or auto: promote first reachable replica.
+/// Manual or auto: promote the best-ranked reachable replica (Batch FK).
 ///
 /// Serializes per master via [`SentinelState::begin_failover`] so manual
 /// `SENTINEL FAILOVER` and the tick auto-failover path cannot overlap (Batch FC).
 ///
 /// Auto path only invokes this after [`try_elect_leader`] wins (Batch FE).
 /// Manual `SENTINEL FAILOVER` skips election (operator force).
+///
+/// **Promote order (Batch FK):** walk [`rank_replicas_for_promote`] — highest
+/// priority (0 skipped), then highest ROLE offset, then greatest `ip:port`.
+/// Continues down the ranked list when [`promote_replica`] fails.
 pub async fn try_failover(sentinel: &SentinelState, name: &str) -> Result<(), String> {
     let m = sentinel
         .master(name)
@@ -1219,15 +1281,20 @@ pub async fn try_failover(sentinel: &SentinelState, name: &str) -> Result<(), St
         return Err("ERR No good replica for failover".into());
     }
 
+    // Batch FK: rank before promote; drop priority-0 never-promote replicas.
+    let ranked = rank_replicas_for_promote(&m.replicas);
+    if ranked.is_empty() {
+        return Err("ERR No good replica for failover".into());
+    }
+
     // Per-master in-progress gate (Batch FC).
     sentinel.begin_failover(name)?;
 
     let old_ip = m.ip.clone();
     let old_port = m.port;
-    let replicas = m.replicas.clone();
     let result = async {
-        for r in &replicas {
-            let raddr = format!("{}:{}", r.ip, r.port);
+        for r in &ranked {
+            let raddr = r.addr_key();
             // Prefer bare FAILOVER (Kore replica promote); fall back to REPLICAOF NO ONE.
             // promote_replica never succeeds on PING alone (Batch FC).
             if promote_replica(&raddr).await.is_ok() {
@@ -1235,8 +1302,8 @@ pub async fn try_failover(sentinel: &SentinelState, name: &str) -> Result<(), St
                 // Best-effort re-point old master as replica of new master.
                 let _ = replicaof_to(&format!("{}:{}", old_ip, old_port), &r.ip, r.port).await;
                 info!(
-                    "sentinel: failover complete for {} -> {}:{}",
-                    name, r.ip, r.port
+                    "sentinel: failover complete for {} -> {} (priority={} offset={})",
+                    name, raddr, r.priority, r.repl_offset
                 );
                 return Ok(());
             }
@@ -1391,8 +1458,25 @@ fn parse_role_replicas(reply: &RespValue) -> Result<Vec<ReplicaInfo>, String> {
             RespValue::Integer(n) if *n > 0 && *n <= u16::MAX as i64 => *n as u16,
             _ => 0,
         };
+        // ROLE master slave entry: [ip, port, offset] (Batch FK).
+        let repl_offset = if fields.len() >= 3 {
+            match &fields[2] {
+                RespValue::BulkString(Some(b)) => {
+                    String::from_utf8_lossy(b).parse::<u64>().unwrap_or(0)
+                }
+                RespValue::Integer(n) if *n >= 0 => *n as u64,
+                _ => 0,
+            }
+        } else {
+            0
+        };
         if port > 0 {
-            out.push(ReplicaInfo { ip, port });
+            out.push(ReplicaInfo {
+                ip,
+                port,
+                repl_offset,
+                priority: 100, // default; 0 = never promote (Batch FK)
+            });
         }
     }
     Ok(out)
@@ -1690,6 +1774,32 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].ip, "10.0.0.2");
         assert_eq!(r[0].port, 6380);
+        assert_eq!(r[0].repl_offset, 50); // Batch FK: ROLE offset
+        assert_eq!(r[0].priority, 100);
+    }
+
+    /// Batch FK: rank by priority then offset then greatest ip:port; priority 0 dropped.
+    #[test]
+    fn rank_replicas_priority_offset_and_skip_zero() {
+        let a = ReplicaInfo::new("10.0.0.1", 6381).with_rank(100, 500);
+        let b = ReplicaInfo::new("10.0.0.2", 6382).with_rank(200, 10); // higher pri
+        let c = ReplicaInfo::new("10.0.0.3", 6383).with_rank(0, 9_999); // never
+        let d = ReplicaInfo::new("10.0.0.4", 6384).with_rank(100, 900); // same pri, higher off
+        let ranked = rank_replicas_for_promote(&[a.clone(), b.clone(), c.clone(), d.clone()]);
+        assert_eq!(ranked.len(), 3, "priority 0 excluded");
+        assert_eq!(ranked[0].port, 6382, "highest priority first");
+        assert_eq!(ranked[1].port, 6384, "higher offset when priority ties");
+        assert_eq!(ranked[2].port, 6381);
+        // Sole priority-0 list → empty.
+        assert!(rank_replicas_for_promote(&[c]).is_empty());
+    }
+
+    #[test]
+    fn rank_replicas_tiebreak_greatest_addr() {
+        let lo = ReplicaInfo::new("10.0.0.1", 6380).with_rank(100, 100);
+        let hi = ReplicaInfo::new("10.0.0.9", 6380).with_rank(100, 100);
+        let ranked = rank_replicas_for_promote(&[lo, hi]);
+        assert_eq!(ranked[0].ip, "10.0.0.9");
     }
 
     #[test]

@@ -471,8 +471,9 @@ fn replica_fields(m: &MasterInfo, r: &crate::sentinel::ReplicaInfo) -> RespValue
         ("master-link-status", "ok".into()),
         ("master-host", m.ip.clone()),
         ("master-port", m.port.to_string()),
-        ("slave-priority", "100".into()),
-        ("slave-repl-offset", "0".into()),
+        // Batch FK: surface rank fields used by promote ranking.
+        ("slave-priority", r.priority.to_string()),
+        ("slave-repl-offset", r.repl_offset.to_string()),
     ];
     let mut out = Vec::new();
     for (k, v) in pairs {
