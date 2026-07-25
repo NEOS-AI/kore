@@ -31,9 +31,11 @@
 //! **NODE compensate (Batch EP):** dest ownership rollback on partial source NODE
 //! (`rolled_back` status + IMPORTING restore).
 //! **Epoch control (Batch EK):** CLUSTER SET-CONFIG-EPOCH.
-//! **Live config (Batch EL/EQ/ES/EU):** CONFIG cluster-replica-priority /
+//! **Live config (Batch EL/EQ/ES/EU/FL):** CONFIG cluster-replica-priority /
 //! cluster-node-timeout / cluster-require-full-coverage /
 //! cluster-allow-reads-when-down / cluster-announce-ip|port; honest `cluster_state`.
+//! Live flags (except node-timeout) persist in `nodes.conf` header and restore
+//! on boot; CONFIG SET autosaves when dir is set (Batch FL).
 //! **Replica reads (Batch ER):** connection `READONLY` allows serving reads for
 //! slots owned by this node's master (writes still MOVED).
 //! **CLUSTER SLOTS (Batch ET):** each range lists master then known replicas.
@@ -45,9 +47,11 @@
 //! re-check before NODE; dest-first NODE; EP rollback on source commit fail;
 //! status `failed_prepare` / `failed_prepare:recheck:…` without half-apply.
 //! Prepares memory-only (boot clear / fail-closed; not in `nodes.conf`).
-//! **Persistence (Batch EM/EN/EO):** CLUSTER SAVECONFIG → dir/nodes.conf; load on
+//! **Persistence (Batch EM/EN/EO/FL):** CLUSTER SAVECONFIG → dir/nodes.conf; load on
 //! boot via [`ClusterState::load_or_single_node`]; best-effort autosave after
-//! topology-mutating CLUSTER ops and failover claim.
+//! topology-mutating CLUSTER ops, failover claim, and live-flag CONFIG SET.
+//! Header `# key value` comments carry require-full / allow-reads / announce /
+//! replica-priority (legacy files without keys keep defaults).
 //!
 //! Slot migration (thin MVP): `CLUSTER MIGRATEKEYS` moves all key types over RESP.
 //! Orchestration: `CLUSTER RESHARD` runs the documented SETSLOT + MIGRATEKEYS flow

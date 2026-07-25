@@ -153,8 +153,9 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch FA)*: Redis-style hello CSV; `SENTINEL HELLO`; tick **PUBLISH** `__sentinel__:hello` on reachable masters; peer `SENTINEL HELLO` exchange; `apply_hello` learns peers + higher-epoch **switch-master**. No long-lived master `SUBSCRIBE` fan-in (peer HELLO is primary discovery path).
   - *Done (Batch FC)*: `promote_replica` success gate — requires `FAILOVER` OK, `REPLICAOF NO ONE` OK, or post-attempt `ROLE=master`; **never** `switch_master` on PING alone. Per-master `failover_in_progress` serializes manual FAILOVER vs tick. Promote inject hooks for tests.
   - *Done (Batch FE)*: voted-leader on `IS-MASTER-DOWN-BY-ADDR` (sticky first-seen per epoch; higher epoch re-votes); auto-failover only after `try_elect_leader` (≥ `max(quorum, floor(N/2)+1)`); ODOWN probes use runid `*`; `add_peer` autosave only on real change. Manual `SENTINEL FAILOVER` still force-bypasses election.
-  - *Residual (EN–FE post-ship + scheduled review)* — see Phase D cluster + backlog table:
-    - **P3** promote walks replicas in discovery order (**first success wins**; no offset/priority).
+  - *Residual (post-FK/FL)* — see Phase D cluster + backlog table / Later:
+    - **done** promote ranking (Batch FK: priority → offset → `ip:port`).
+    - **done** `nodes.conf` live flags (Batch FL).
     - **P3** `CKQUORUM` / `leader_votes_needed` use peer-table size, not live reachability (dead peers inflate majority).
     - **P3** no long-lived master `__sentinel__:hello` SUBSCRIBE fan-in (tick PUBLISH + peer HELLO only).
     - **P3** election lite: no Redis election-timeout / cooldown — while `o_down`, tick may open a **new campaign epoch every 1s** until elected (higher-epoch re-vote can thrash under multi-sentinel).
@@ -348,9 +349,8 @@ Also tracked in `docs/roadmap.md`.
   - [x] **`[P3]`** **Code review (EZ/FA post-ship):** hello-path autosave thrash (+ partial CKQUORUM)
     - *Done (Batch FE, autosave)*: `add_peer` returns changed-only and autosaves only on new/updated peer.
     - *Residual*: `CKQUORUM` / elect majority still peer-table size (not live probe).
-  - [ ] **`[P3]`** **Code review (EN/EO/EU post-ship):** `nodes.conf` omits live cluster flags
-    - *Found*: SAVECONFIG / load restore id/peers/slots/epoch only. `cluster-require-full-coverage`, `cluster-allow-reads-when-down`, `cluster-announce-ip/port`, replica-priority are CLI/CONFIG only — reboot loses announce overrides unless re-applied. Gossip OWNERS merge does not autosave (already documented EO).
-    - *Next*: optional extended conf lines, or document boot-flag requirement; optional autosave throttle after ownership merge.
+  - [x] **`[P3]`** **Code review (EN/EO/EU post-ship):** `nodes.conf` omits live cluster flags
+    - *Done (Batch FL)*: header `# key value` comments persist require-full-coverage / allow-reads-when-down / announce-ip|port / replica-priority; load restores; CONFIG SET autosaves when dir set. Legacy files without keys keep defaults. Boot CLI overrides only non-default flags (plain restart keeps saved).
   - [x] **`[P2]`** **Code review (DM/DN post-ship):** `failed_keys` under-reports partial key moves
     - *Done (Batch DO)*: `migrate_slot_keys` → `Result<_, MigrateSlotError { partial, message }>`; `reshard_one_slot` maps partial into `ReshardSlotResult.migrated/skipped` under `failed_keys:*`. Retry re-runs MIGRATEKEYS/RESHARD for leftover keys only. Test: inject mid-slot fail after 1 success → `migrated: 1` + retry completes.
   - [x] **`[P2]`** **Code review (DP post-ship):** multi-key partial failure reply is coarse `IOERR` (no counts)
@@ -719,28 +719,30 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
   - *Done (Batch BT)*: `bt_eval_select_persists_connection_db` — connection remains on selected DB after EVAL
 
-### Status snapshot (2026-07-25, post-FK — Sentinel promote ranking)
+### Status snapshot (2026-07-25, post-FL)
 
-**All planned P0–P2 letter work through FI-2 + optional FG-4 is finished; P3 FK done.** Shipped: FB–FE, **FF**, **FG**–**FG-4**, **FH**, **FI**, **FI-2**, **FK** (Sentinel promote rank). Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed). Only untracked `data/` expected.
+**All planned P0–P2 letter work through FI-2 + optional FG-4 + FK + FL finished.** Shipped: FB–FE, **FF**, **FG**–**FG-4**, **FH**, **FI**, **FI-2**, **FK**, **FL** (`nodes.conf` live flags). Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed). Only untracked `data/` expected.
 
-**What remains** is **optional P3 polish** only (no open P0–P2 feature blockers). **Recommended next:** **FL** (`nodes.conf` flags).
+**What remains** is **Later / backlog residuals only** (no open optional letter batch). Optional letter queue is empty after FL.
 
 | Area | Residual | Priority | Planned batch |
 |------|----------|----------|---------------|
-| Sentinel | Promote ranking (priority/offset) | **done** | **FK** |
-| Cluster | `nodes.conf` omits require-full / allow-reads / announce (open review) | **P3 next** | **FL** |
-| Keyspace | `typed_expires` side map (not slot header) | P3 residual (FG-4) | later optional |
-| Ops | Global **repl backlog** still serializes writers (FI residual; FI-2 keeps CS for SELECT correctness) | P3 | later optional |
-| Ops | Dual SELECT trackers (AOF vs `ReplBacklog`); `propagate_raw` skips stream-DB | P3 accepted | — |
+| Cluster | `nodes.conf` live flags (require-full / allow-reads / announce / priority) | **done** | **FL** |
+| Keyspace | `typed_expires` side map (not slot header); search-doc eviction special | P3 residual (FG-4) | later optional |
+| Sentinel | Promote ranking (priority/offset; 0 never) | **done** | **FK** |
+| Sentinel | live INFO `slave_priority` refresh (ROLE always defaults priority **100**) | P3 residual (FK) | later |
+| Sentinel | election-timeout/cooldown; CKQUORUM live probe; hello SUBSCRIBE | P3 residual | later |
+| Ops | Global **repl backlog** still serializes writers | P3 | later optional |
+| Ops | Dual SELECT trackers; `propagate_raw` skips stream-DB | P3 accepted | — |
 | Cluster | NODE 2PC durable-on-disk prepare / bus / atomic COMMITPREPARE | P3 residual (FH) | later |
-| Keyspace | Typed RENAME remove+insert; create ensure_type→insert TOCTOU (historical) | P3 accepted | — |
-| Sentinel | election-timeout/cooldown; CKQUORUM live probe; hello SUBSCRIBE; live INFO slave_priority | P3 residual (FK) | later |
+| Keyspace | RENAME remove+insert; create ensure_type→insert TOCTOU (historical) | P3 accepted | — |
 | Search | HNSW edges/levels not AOF/RDB durable; `max_m=1` spanning | P3 accepted / later | — |
 | MIGRATE / UI / load | DUMP wire; reshard weight UI; Arc-swap mid-fill | P3 accepted | — |
+| Tests | Sentinel suite hard-coded ports (flake risk under parallel bind) | P3 | later |
 
-### Next work queue (post-FG-4 / post-FK)
+### Next work queue (post-FL)
 
-**Primary FB–FG-4 + FH + FI + FI-2 + FK done.** Optional P3 follow-ons below. Prefer **FL** next. Standing rule: land tests with each batch.
+**Primary FB–FG-4 + FH + FI + FI-2 + FK + FL done.** Optional letter queue empty — only Later/backlog below. Standing rule: land tests with each batch.
 
 #### Completed (FB–FG-4 + FH + FI + FI-2 + FK)
 
@@ -756,12 +758,12 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Batch FG-3 — Remaining typed types + payload collapse** (`1db780e`)
   - list/set/zset/geo/stream in `key_values`; legacy typed maps removed; payload = `map` + `key_values` stream
   - *Post-ship review:* no dual-write leftover; typed RENAME is remove+insert (accepted); strings dual-map residual → FG-4
-- [x] **`[P3]`** **Batch FG-4 / FJ — Strings into unified map**
-  - `KeyValue::String` physically in `Cache::key_values`; `Cache::map` removed; `mutate_string` RMW + CAS on `ShardedKeyMap`
+- [x] **`[P3]`** **Batch FG-4 / FJ — Strings into unified map** (`6f40cbb`)
+  - `KeyValue::String` physically in `Cache::key_values`; dual `Cache::map` removed; `mutate_string` RMW under shard lock + CAS
   - `KeyspacePayload` collapsed to single `key_values` stream (+ expires/WATCH/search/memory)
   - Eviction / active expire / SCAN / KEYS / DBSIZE / RENAME sample or walk one map
-  - Residual: `typed_expires` side map (not slot header); search-doc eviction special; legacy `ShardedHashMap` kept for unit API
-  - Tests: keyspace unit (strings live in map + payload roundtrip); string_ops / keyspace / typed_ttl / eviction / phase_a / persistence multi-DB green
+  - *Post-ship review:* true single-map keyspace for all Redis types; residual `typed_expires` side map + search-doc eviction special
+  - Tests: keyspace / string_ops / typed_ttl / phase_a / eviction / persistence green
 - [x] **`[P2]`** **Batch FH — NODE 2PC slice 2** (`b078988`)
   - Prepare-epoch + TTL fence; `CHECKPREPARE` + dual-end commit re-check; boot clear fail-closed
   - Tests: stale epoch / cleared / TTL / boot; e2e recheck inject no half-apply; happy path complete (41 migrate tests)
@@ -780,16 +782,18 @@ Also tracked in `docs/roadmap.md`.
 
 #### Open optional queue (P3 only — pick when resuming)
 
-- [x] **`[P3]`** **Batch FK — Sentinel promote ranking + lite SM polish**
+- [x] **`[P3]`** **Batch FK — Sentinel promote ranking + lite SM polish** (`78730ca`)
   - Rank: highest priority (0 never) → highest ROLE offset → greatest `ip:port` (mirrors cluster EA/EB)
   - Closed open review: *FC post-ship nit first-replica-wins*
-  - Tests: multi-replica prefers higher priority / offset; priority 0 skipped; all-zero fails; unit rank
+  - ROLE parse stores offset; priority defaults **100** (no INFO `slave_priority` wire yet)
+  - Tests: sentinel_lite **16/16** (rank unit + multi-replica prefers priority/offset; priority 0 skipped)
   - Residual (optional later): elect cooldown; CKQUORUM/majority live probe; probe self-vs-`*`; live INFO `slave_priority` refresh
-- [ ] **`[P3]`** **Batch FL — `nodes.conf` live cluster flags** ← **recommended next**
-  - Persist/restore require-full-coverage, allow-reads-when-down, announce-ip/port, replica-priority
-  - Or document boot-flag-only requirement and close as accepted
-  - Close open review: *EN/EO/EU post-ship nodes.conf omits live flags*
-  - Tests: SAVECONFIG → reboot restores flags; CONFIG SET then autosave round-trip
+- [x] **`[P3]`** **Batch FL — `nodes.conf` live cluster flags**
+  - Header comments: `# require-full-coverage` / `# allow-reads-when-down` / `# announce-ip` / `# announce-port` / `# replica-priority`
+  - SAVECONFIG + topology autosave write flags; load_or_single_node / from_nodes_conf restore; missing keys → defaults
+  - CONFIG SET of live flags best-effort autosaves when `dir` set; boot CLI overrides only **non-default** values (plain restart keeps saved)
+  - Closed open review: *EN/EO/EU post-ship nodes.conf omits live flags*
+  - Tests: unit live-flags round-trip + legacy defaults; e2e CONFIG SET autosave + reload; cluster_migrate green
 - [ ] **`[P3]`** **Later / backlog**
   - DUMP/RESTORE Redis wire; cluster reshard weight UI; admin_http auth/TLS
   - HNSW durable graph; hello SUBSCRIBE fan-in; single-DB Arc-swap mid-fill; NODE durable prepare
@@ -799,7 +803,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-**Batches CZ–FG-4 + FH + FI + FI-2 + FK shipped.** Next optional: **FL**. Standing tests-for-phase P0.
+**Batches CZ–FG-4 + FH + FI + FI-2 + FK + FL shipped.** Optional letter queue empty (Later/backlog only). Standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -925,7 +929,7 @@ Also tracked in `docs/roadmap.md`.
 | P2 | EX/FA post-ship: failover leader election (cross-process); in-process gate done FC | **done** (Batch FE) |
 | P3 | FE post-ship: election epoch thrash / probe self / majority table-size | **accepted lite** (later optional) |
 | P3 | EZ/FA post-ship: hello add_peer autosave thrash; CKQUORUM live count | **partial** (FE autosave; CKQUORUM residual) |
-| P3 | EN/EO/EU post-ship: nodes.conf omits require-full/announce flags | **open** → planned **FL** |
+| P3 | EN/EO/EU post-ship: nodes.conf omits require-full/announce flags | **done** (Batch FL) |
 | P1 | dual-end NODE RESP 2PC prepare/commit (slice 1) | **done** (Batch FB) |
 | P3 | FB post-ship: prepare not re-checked at commit; dest prepare broad; mem-only | **done FH** epoch/TTL/recheck; durable/bus residual later |
 | P3 | FC post-ship: first-replica-wins promote order | **done** (Batch FK) |

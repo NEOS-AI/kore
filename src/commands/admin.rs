@@ -1455,6 +1455,7 @@ impl CommandHandler {
                             }
                         };
                         c.set_local_repl_priority(n);
+                        self.try_autosave_nodes_conf(c); // Batch FL
                         Ok(RespValue::ok())
                     }
                     "cluster-node-timeout"
@@ -1481,6 +1482,7 @@ impl CommandHandler {
                             }
                         };
                         c.set_node_timeout_ms(n);
+                        // Timeout is process-local (not in nodes.conf header); no autosave.
                         Ok(RespValue::ok())
                     }
                     "cluster-require-full-coverage" | "cluster_require_full_coverage" => {
@@ -1501,6 +1503,7 @@ impl CommandHandler {
                             }
                         };
                         c.set_require_full_coverage(require);
+                        self.try_autosave_nodes_conf(c); // Batch FL
                         Ok(RespValue::ok())
                     }
                     "cluster-allow-reads-when-down" | "cluster_allow_reads_when_down" => {
@@ -1521,6 +1524,7 @@ impl CommandHandler {
                             }
                         };
                         c.set_allow_reads_when_down(allow);
+                        self.try_autosave_nodes_conf(c); // Batch FL
                         Ok(RespValue::ok())
                     }
                     "cluster-announce-ip" | "cluster_announce_ip" => {
@@ -1535,6 +1539,7 @@ impl CommandHandler {
                         } else {
                             c.set_announce_ip(Some(value_str.to_string()));
                         }
+                        self.try_autosave_nodes_conf(c); // Batch FL
                         Ok(RespValue::ok())
                     }
                     "cluster-announce-port" | "cluster_announce_port" => {
@@ -1557,6 +1562,7 @@ impl CommandHandler {
                         } else {
                             c.set_announce_port(Some(n));
                         }
+                        self.try_autosave_nodes_conf(c); // Batch FL
                         Ok(RespValue::ok())
                     }
                     _ => Ok(RespValue::error("ERR Unsupported CONFIG parameter")),

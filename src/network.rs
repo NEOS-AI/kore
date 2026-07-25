@@ -95,18 +95,27 @@ impl Server {
             }
         }
         let cluster = if config.cluster_enabled {
-            // Batch EN: prefer dir/nodes.conf from CLUSTER SAVECONFIG when present.
+            // Batch EN/FL: prefer dir/nodes.conf (topology + live flags) when present.
             let cs = ClusterState::load_or_single_node(
                 config.host.clone(),
                 config.port,
                 &config.dir,
             );
-            cs.set_local_repl_priority(config.cluster_replica_priority);
-            // Batch EQ: cluster-require-full-coverage (default true).
-            cs.set_require_full_coverage(config.cluster_require_full_coverage);
-            // Batch ES: cluster-allow-reads-when-down (default false).
-            cs.set_allow_reads_when_down(config.cluster_allow_reads_when_down);
-            // Batch EU: client-facing announce address for NODES/SLOTS/MEET/MOVED.
+            // Batch FL: CLI/boot flags override only when non-default so a plain
+            // restart keeps SAVECONFIG / CONFIG SET values from nodes.conf.
+            // Explicit non-default CLI still wins (ops pin).
+            if config.cluster_replica_priority != 100 {
+                cs.set_local_repl_priority(config.cluster_replica_priority);
+            }
+            if !config.cluster_require_full_coverage {
+                // Default is true; only apply explicit "no"/false.
+                cs.set_require_full_coverage(false);
+            }
+            if config.cluster_allow_reads_when_down {
+                // Default is false; only apply explicit true.
+                cs.set_allow_reads_when_down(true);
+            }
+            // Batch EU: client-facing announce (empty/0 = leave loaded/default).
             if !config.cluster_announce_ip.is_empty() {
                 cs.set_announce_ip(Some(config.cluster_announce_ip.clone()));
             }

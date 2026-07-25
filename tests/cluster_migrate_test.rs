@@ -3128,6 +3128,106 @@ async fn cluster_saveconfig_load_on_boot_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Batch FL: CONFIG SET live flags autosave; load restores require/allow/announce/priority.
+#[tokio::test(flavor = "multi_thread")]
+async fn cluster_config_set_live_flags_autosave_and_reload() {
+    let port = 16793u16;
+    let dir = std::env::temp_dir().join(format!(
+        "kore-liveflags-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+
+    let cs = ClusterState::single_node("127.0.0.1", port);
+    let my_id = cs.my_id();
+    let cache = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let mut cfg = (*make_config(port, true)).clone();
+    cfg.dir = dir.to_string_lossy().to_string();
+    let srv = Server::new(cache, Arc::new(cfg)).with_cluster(Some(Arc::clone(&cs)));
+    let (tx, rx) = watch::channel(false);
+    let h = tokio::spawn(async move {
+        let _ = srv.run_with_shutdown(rx).await;
+    });
+    wait_listen(port).await;
+
+    let mut cli = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    assert!(is_ok(
+        &send_cmd(
+            &mut cli,
+            &["CONFIG", "SET", "cluster-require-full-coverage", "no"]
+        )
+        .await
+    ));
+    assert!(is_ok(
+        &send_cmd(
+            &mut cli,
+            &["CONFIG", "SET", "cluster-allow-reads-when-down", "yes"]
+        )
+        .await
+    ));
+    assert!(is_ok(
+        &send_cmd(
+            &mut cli,
+            &["CONFIG", "SET", "cluster-announce-ip", "10.1.2.3"]
+        )
+        .await
+    ));
+    assert!(is_ok(
+        &send_cmd(
+            &mut cli,
+            &["CONFIG", "SET", "cluster-announce-port", "18000"]
+        )
+        .await
+    ));
+    assert!(is_ok(
+        &send_cmd(
+            &mut cli,
+            &["CONFIG", "SET", "cluster-replica-priority", "33"]
+        )
+        .await
+    ));
+
+    // Live state updated.
+    assert!(!cs.require_full_coverage());
+    assert!(cs.allow_reads_when_down());
+    assert_eq!(cs.announce_ip().as_deref(), Some("10.1.2.3"));
+    assert_eq!(cs.announce_port(), Some(18000));
+    assert_eq!(cs.local_repl_priority(), 33);
+
+    let path = dir.join("nodes.conf");
+    let body = std::fs::read_to_string(&path).expect("nodes.conf autosaved after CONFIG SET");
+    assert!(
+        body.contains("# require-full-coverage no"),
+        "body: {}",
+        body
+    );
+    assert!(
+        body.contains("# allow-reads-when-down yes"),
+        "body: {}",
+        body
+    );
+    assert!(body.contains("# announce-ip 10.1.2.3"), "body: {}", body);
+    assert!(body.contains("# announce-port 18000"), "body: {}", body);
+    assert!(body.contains("# replica-priority 33"), "body: {}", body);
+
+    let _ = tx.send(true);
+    h.abort();
+    sleep(Duration::from_millis(50)).await;
+
+    let loaded = ClusterState::load_or_single_node("127.0.0.1", port, dir.to_str().unwrap());
+    assert_eq!(loaded.my_id(), my_id);
+    assert!(!loaded.require_full_coverage());
+    assert!(loaded.allow_reads_when_down());
+    assert_eq!(loaded.announce_ip().as_deref(), Some("10.1.2.3"));
+    assert_eq!(loaded.announce_port(), Some(18000));
+    assert_eq!(loaded.local_repl_priority(), 33);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Batch EY/FB: dual-end NODE prepare fails when dest MYID does not match dest-id.
 #[tokio::test(flavor = "multi_thread")]
 async fn reshard_finish_preflight_rejects_wrong_dest_id() {

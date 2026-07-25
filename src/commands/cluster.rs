@@ -1189,12 +1189,13 @@ impl CommandHandler {
         }
     }
 
-    /// Best-effort write of `nodes.conf` after topology-mutating CLUSTER ops (Batch EO).
+    /// Best-effort write of `nodes.conf` after topology-mutating CLUSTER ops (Batch EO)
+    /// and live-flag CONFIG SET (Batch FL).
     ///
     /// Uses `config.dir` (same as explicit SAVECONFIG). Also keeps
     /// [`ClusterState::set_nodes_conf_dir`] in sync so gossip failover claims
     /// can autosave. Failures are logged only — client replies stay OK.
-    fn try_autosave_nodes_conf(&self, cluster: &ClusterState) {
+    pub(super) fn try_autosave_nodes_conf(&self, cluster: &ClusterState) {
         cluster.set_nodes_conf_dir(&self.config.dir);
         match cluster.save_nodes_conf_to(&self.config.dir) {
             Ok(path) => {
@@ -1301,7 +1302,7 @@ fn cluster_help() -> RespValue {
             b"RESET [SOFT|HARD] -- clear cluster config (HARD also FLUSHALL-style key wipe)",
         ),
         bulk_static(
-            b"SAVECONFIG -- write cluster nodes.conf under dir (also autosaved on topology changes; loaded on next boot if present)",
+            b"SAVECONFIG -- write cluster nodes.conf under dir (topology + live flags; also autosaved on topology / CONFIG flag changes; loaded on next boot if present)",
         ),
         bulk_static(
             b"OWNERS -- compressed slot ownership ranges with config epochs (gossip merge)",

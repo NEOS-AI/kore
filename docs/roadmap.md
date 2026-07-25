@@ -3,7 +3,7 @@
 ## Currently working on..
 
 - [x] Support for Redis Pub-Sub
-- **Primary through FG-4 + FH + FI + FI-2 + FK done.** Optional next (P3): **FL** `nodes.conf` flags. See root `TODO.md` → *Next work queue (post-FG-4 / post-FK)*.
+- **Primary through FG-4 + FH + FI + FI-2 + FK + FL done** (single `key_values` map; Sentinel promote rank; `nodes.conf` live flags). Optional letter queue empty — Later/backlog only. See root `TODO.md` → *Next work queue (post-FL)*.
 
 ## Persistence / search letter batches (recent)
 
@@ -37,6 +37,7 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] CLUSTER SAVECONFIG (Batch EM: write nodes.conf)
 - [x] nodes.conf load-on-boot (Batch EN: restore id/peers/slots/epoch; fallback single-node)
 - [x] nodes.conf autosave (Batch EO: topology-mutating CLUSTER ops + failover claim)
+- [x] nodes.conf live flags (Batch FL: require-full / allow-reads / announce-ip|port / replica-priority header; CONFIG SET autosave)
 - [x] Dual-end NODE dest rollback (Batch EP: source NODE fail → `rolled_back` + IMPORTING)
 - [x] cluster-require-full-coverage (Batch EQ: cluster_state fail + CLUSTERDOWN gate; CONFIG/CLI)
 - [x] Cluster READONLY replica reads (Batch ER: serve master slots; writes still MOVED)
@@ -88,7 +89,8 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] **FI-2** AOF-off multi-DB SELECT ordering (`propagate_write`; backlog serialize residual remains)
 - [x] **P2 follow-ons complete** (FH 2PC slice 2 · FI pipeline SET · FI-2 AOF-off SELECT)
 - [x] **FK** Sentinel promote ranking (priority then ROLE offset then greatest `ip:port`; 0 never; closed first-replica-wins)
-- [ ] **Next (see `TODO.md` post-FK):** optional **FL** `nodes.conf` flags
+- [x] **FL** `nodes.conf` live cluster flags (require-full / allow-reads / announce / replica-priority; CONFIG SET autosave; legacy defaults)
+- [ ] **Next (see `TODO.md` post-FL):** Later/backlog only (no open optional letter batch)
 - [x] 데드락 감지 고급 기능
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원
