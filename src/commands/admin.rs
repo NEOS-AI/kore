@@ -1439,6 +1439,22 @@ impl CommandHandler {
                         p.replication.set_min_replicas_max_lag(n);
                         Ok(RespValue::ok())
                     }
+                    "replica-priority" | "slave-priority" | "replica_priority" | "slave_priority" => {
+                        // Batch FM: Sentinel promote priority in INFO `slave_priority` (0 = never).
+                        let Some(p) = self.persistence.as_ref() else {
+                            return Ok(RespValue::error("ERR persistence not configured"));
+                        };
+                        let n: u32 = match value_str.parse() {
+                            Ok(n) => n,
+                            Err(_) => {
+                                return Ok(RespValue::error(
+                                    "ERR invalid replica-priority value",
+                                ))
+                            }
+                        };
+                        p.replication.set_slave_priority(n);
+                        Ok(RespValue::ok())
+                    }
                     "cluster-replica-priority" | "cluster_replica_priority" => {
                         // Batch EL: live failover priority (0 = never promote).
                         let Some(c) = self.cluster.as_ref() else {

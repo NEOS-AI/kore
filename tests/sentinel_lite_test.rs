@@ -2,14 +2,18 @@
 //! Batch FC: promote-success gate (no switch_master on PING-only).
 //! Batch FE: leader election on IS-MASTER-DOWN-BY-ADDR; only elected leader auto-failovers.
 //! Batch FK: promote ranking by priority then offset (not discovery order).
+//! Batch FM: live INFO slave_priority refresh + auto failover cooldown.
 
 use bytes::Bytes;
 use kore::config::Config;
+use kore::persistence::{PersistenceConfig, PersistenceManager, SaveRule};
 use kore::protocol::{RespParser, RespValue};
 use kore::{
-    rank_replicas_for_promote, test_promote_inject, test_set_promote_inject, try_elect_leader,
-    try_failover, Cache, ReplicaInfo, Server, PROMOTE_INJECT_FORCE_FAIL, PROMOTE_INJECT_FORCE_OK,
+    parse_info_slave_priority, rank_replicas_for_promote, test_promote_inject,
+    test_set_failover_cooldown_ms, test_set_promote_inject, try_elect_leader, try_failover, Cache,
+    ReplicaInfo, Server, PROMOTE_INJECT_FORCE_FAIL, PROMOTE_INJECT_FORCE_OK,
 };
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -28,6 +32,11 @@ fn make_config(port: u16) -> Arc<Config> {
             .as_nanos()
     ));
     let _ = std::fs::create_dir_all(&dir);
+    make_config_with_dir(port, dir.to_string_lossy().as_ref())
+}
+
+fn make_config_with_dir(port: u16, dir: &str) -> Arc<Config> {
+    let _ = std::fs::create_dir_all(dir);
     Arc::new(Config {
         host: "127.0.0.1".to_string(),
         port,
@@ -48,7 +57,7 @@ fn make_config(port: u16) -> Arc<Config> {
         enable_fair_queue: false,
         fair_queue_max_size: 1024,
         fair_queue_cleanup_ms: 500,
-        dir: dir.to_string_lossy().to_string(),
+        dir: dir.to_string(),
         dbfilename: "dump.rdb".to_string(),
         appendonly: false,
         appendfilename: "appendonly.aof".to_string(),
@@ -75,6 +84,30 @@ fn make_config(port: u16) -> Arc<Config> {
         unixsocket: String::new(),
         log_format: "text".to_string(),
     })
+}
+
+/// Persistence-backed server so INFO reports `slave_priority` (Batch FM).
+fn make_persisted_server(port: u16) -> (Server, Arc<Config>) {
+    let dir = std::env::temp_dir().join(format!(
+        "kore-sent-pers-{}-{}",
+        port,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let pconfig = PersistenceConfig {
+        dir: PathBuf::from(&dir),
+        dbfilename: "dump.rdb".to_string(),
+        appendonly: false,
+        appendfilename: "appendonly.aof".to_string(),
+        save_rules: vec![SaveRule::new(900, 1)],
+    };
+    let mgr = PersistenceManager::new(pconfig).unwrap();
+    let cfg = make_config_with_dir(port, dir.to_string_lossy().as_ref());
+    let cache = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    (Server::with_persistence(cache, Arc::clone(&cfg), mgr), cfg)
 }
 
 async fn wait_listen(port: u16) {
@@ -1521,6 +1554,252 @@ async fn sentinel_failover_all_priority_zero_fails() {
         "must not switch_master when only priority-0 candidates"
     );
 
+    let _ = tx_s.send(true);
+    let _ = tx_t.send(true);
+    hs.abort();
+    ht.abort();
+    sleep(Duration::from_millis(50)).await;
+}
+
+// ── Batch FM: INFO slave_priority refresh + failover cooldown ────────────────
+
+#[test]
+fn parse_info_slave_priority_unit() {
+    assert_eq!(parse_info_slave_priority("role:master\r\n"), None);
+    assert_eq!(
+        parse_info_slave_priority("slave_priority:50\r\nrole:slave\r\n"),
+        Some(50)
+    );
+    assert_eq!(parse_info_slave_priority("slave_priority:0\r\n"), Some(0));
+}
+
+/// Batch FM: live INFO `slave_priority` (150) beats discovery-order peer at default 100.
+#[tokio::test(flavor = "multi_thread")]
+async fn sentinel_info_priority_refresh_prefers_higher() {
+    let dead_master_port = 16970u16;
+    let discovery_first_port = 16971u16; // default priority 100, listed first
+    let info_high_port = 16972u16; // CONFIG priority 150
+    let sentinel_port = 16973u16;
+
+    let (srv_lo, _) = make_persisted_server(discovery_first_port);
+    let (tx_lo, rx_lo) = watch::channel(false);
+    let h_lo = tokio::spawn(async move {
+        let _ = srv_lo.run_with_shutdown(rx_lo).await;
+    });
+    wait_listen(discovery_first_port).await;
+
+    let (srv_hi, _) = make_persisted_server(info_high_port);
+    let (tx_hi, rx_hi) = watch::channel(false);
+    let h_hi = tokio::spawn(async move {
+        let _ = srv_hi.run_with_shutdown(rx_hi).await;
+    });
+    wait_listen(info_high_port).await;
+
+    // Set live INFO slave_priority on the second replica.
+    let mut cli_hi = TcpStream::connect(("127.0.0.1", info_high_port))
+        .await
+        .unwrap();
+    assert!(is_ok(
+        &send_cmd(
+            &mut cli_hi,
+            &["CONFIG", "SET", "replica-priority", "150"]
+        )
+        .await
+    ));
+    // Confirm INFO surface.
+    let info = send_cmd(&mut cli_hi, &["INFO", "replication"]).await;
+    let info_s = as_bulk(&info);
+    assert!(
+        info_s.contains("slave_priority:150"),
+        "expected INFO slave_priority:150, got {}",
+        info_s
+    );
+
+    let cache_s = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_s = Server::new(cache_s, make_config(sentinel_port));
+    let sentinel = Arc::clone(srv_s.sentinel());
+    let (tx_s, rx_s) = watch::channel(false);
+    let hs = tokio::spawn(async move {
+        let _ = srv_s.run_with_shutdown(rx_s).await;
+    });
+    wait_listen(sentinel_port).await;
+
+    sentinel
+        .monitor("mymaster", "127.0.0.1", dead_master_port, 1)
+        .unwrap();
+    // Discovery order: default-100 first; ROLE-style inject without rank fields.
+    // try_failover will INFO-refresh and promote the higher priority.
+    sentinel.note_ok(
+        "mymaster",
+        Some(vec![
+            ReplicaInfo::new("127.0.0.1", discovery_first_port),
+            ReplicaInfo::new("127.0.0.1", info_high_port),
+        ]),
+    );
+
+    let _guard = test_promote_inject();
+    test_set_promote_inject(PROMOTE_INJECT_FORCE_OK);
+
+    assert!(try_failover(&sentinel, "mymaster").await.is_ok());
+    assert_eq!(
+        sentinel.master("mymaster").unwrap().port,
+        info_high_port,
+        "INFO slave_priority 150 must beat discovery-order peer at default 100"
+    );
+
+    let _ = tx_s.send(true);
+    let _ = tx_lo.send(true);
+    let _ = tx_hi.send(true);
+    hs.abort();
+    h_lo.abort();
+    h_hi.abort();
+    sleep(Duration::from_millis(50)).await;
+}
+
+/// Batch FM: INFO priority 0 is never promoted when an eligible peer exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn sentinel_info_priority_zero_skipped() {
+    let dead_master_port = 16974u16;
+    let never_port = 16975u16;
+    let ok_port = 16976u16;
+    let sentinel_port = 16977u16;
+
+    let (srv_n, _) = make_persisted_server(never_port);
+    let (tx_n, rx_n) = watch::channel(false);
+    let h_n = tokio::spawn(async move {
+        let _ = srv_n.run_with_shutdown(rx_n).await;
+    });
+    wait_listen(never_port).await;
+
+    let (srv_ok, _) = make_persisted_server(ok_port);
+    let (tx_ok, rx_ok) = watch::channel(false);
+    let h_ok = tokio::spawn(async move {
+        let _ = srv_ok.run_with_shutdown(rx_ok).await;
+    });
+    wait_listen(ok_port).await;
+
+    let mut cli_n = TcpStream::connect(("127.0.0.1", never_port))
+        .await
+        .unwrap();
+    assert!(is_ok(
+        &send_cmd(&mut cli_n, &["CONFIG", "SET", "slave-priority", "0"]).await
+    ));
+
+    let cache_s = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_s = Server::new(cache_s, make_config(sentinel_port));
+    let sentinel = Arc::clone(srv_s.sentinel());
+    let (tx_s, rx_s) = watch::channel(false);
+    let hs = tokio::spawn(async move {
+        let _ = srv_s.run_with_shutdown(rx_s).await;
+    });
+    wait_listen(sentinel_port).await;
+
+    sentinel
+        .monitor("mymaster", "127.0.0.1", dead_master_port, 1)
+        .unwrap();
+    // Discovery lists never-promote first.
+    sentinel.note_ok(
+        "mymaster",
+        Some(vec![
+            ReplicaInfo::new("127.0.0.1", never_port),
+            ReplicaInfo::new("127.0.0.1", ok_port),
+        ]),
+    );
+
+    let _guard = test_promote_inject();
+    test_set_promote_inject(PROMOTE_INJECT_FORCE_OK);
+
+    assert!(try_failover(&sentinel, "mymaster").await.is_ok());
+    assert_eq!(
+        sentinel.master("mymaster").unwrap().port,
+        ok_port,
+        "INFO priority 0 must be skipped"
+    );
+
+    let _ = tx_s.send(true);
+    let _ = tx_n.send(true);
+    let _ = tx_ok.send(true);
+    hs.abort();
+    h_n.abort();
+    h_ok.abort();
+    sleep(Duration::from_millis(50)).await;
+}
+
+/// Batch FM: after try_failover, auto cooldown is armed; eventually clears.
+/// Manual path is not blocked by cooldown (operator force).
+#[tokio::test(flavor = "multi_thread")]
+async fn sentinel_failover_cooldown_after_attempt() {
+    let dead_master_port = 16978u16;
+    let target_port = 16979u16;
+    let sentinel_port = 16980u16;
+
+    let cache_t = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_t = Server::new(cache_t, make_config(target_port));
+    let (tx_t, rx_t) = watch::channel(false);
+    let ht = tokio::spawn(async move {
+        let _ = srv_t.run_with_shutdown(rx_t).await;
+    });
+    wait_listen(target_port).await;
+
+    let cache_s = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_s = Server::new(cache_s, make_config(sentinel_port));
+    let sentinel = Arc::clone(srv_s.sentinel());
+    let (tx_s, rx_s) = watch::channel(false);
+    let hs = tokio::spawn(async move {
+        let _ = srv_s.run_with_shutdown(rx_s).await;
+    });
+    wait_listen(sentinel_port).await;
+
+    sentinel
+        .monitor("mymaster", "127.0.0.1", dead_master_port, 1)
+        .unwrap();
+    sentinel.note_ok(
+        "mymaster",
+        Some(vec![ReplicaInfo::new("127.0.0.1", target_port)]),
+    );
+
+    // Short cooldown for the test; restore default on exit.
+    test_set_failover_cooldown_ms(400);
+    let _guard = test_promote_inject();
+    test_set_promote_inject(PROMOTE_INJECT_FORCE_FAIL);
+
+    // Failed attempt still arms cooldown (auto path would suppress thrash).
+    let err = try_failover(&sentinel, "mymaster").await.unwrap_err();
+    assert!(
+        err.to_ascii_lowercase().contains("failed")
+            || err.to_ascii_lowercase().contains("promote"),
+        "expected promote failure, got {}",
+        err
+    );
+    assert!(
+        sentinel.in_failover_cooldown("mymaster"),
+        "auto cooldown must arm after failed try_failover"
+    );
+    // Master address unchanged (FC gate).
+    assert_eq!(
+        sentinel.master("mymaster").unwrap().port,
+        dead_master_port
+    );
+
+    // Manual force still allowed during cooldown (switch via inject OK).
+    test_set_promote_inject(PROMOTE_INJECT_FORCE_OK);
+    // note_ok again with replica after failed attempt (list still present).
+    assert!(
+        try_failover(&sentinel, "mymaster").await.is_ok(),
+        "manual/direct try_failover must bypass auto cooldown"
+    );
+    assert_eq!(sentinel.master("mymaster").unwrap().port, target_port);
+    // Cooldown re-armed after the successful attempt.
+    assert!(sentinel.in_failover_cooldown("mymaster"));
+
+    // Eventually allows auto retry.
+    sleep(Duration::from_millis(450)).await;
+    assert!(
+        !sentinel.in_failover_cooldown("mymaster"),
+        "cooldown must expire"
+    );
+
+    test_set_failover_cooldown_ms(0);
     let _ = tx_s.send(true);
     let _ = tx_t.send(true);
     hs.abort();

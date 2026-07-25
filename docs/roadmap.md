@@ -3,7 +3,7 @@
 ## Currently working on..
 
 - [x] Support for Redis Pub-Sub
-- **Primary through FG-4 + FH + FI + FI-2 + FK + FL done** (single `key_values` map; Sentinel promote rank; `nodes.conf` live flags). Optional letter queue empty — Later/backlog only. See root `TODO.md` → *Next work queue (post-FL)*.
+- **Committed through FM.** Sentinel INFO `slave_priority` refresh + auto-failover 15s cooldown shipped. Optional FN/FO/FP next. See root `TODO.md` → *Next work queue (post-FM)*.
 
 ## Persistence / search letter batches (recent)
 
@@ -90,7 +90,8 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] **P2 follow-ons complete** (FH 2PC slice 2 · FI pipeline SET · FI-2 AOF-off SELECT)
 - [x] **FK** Sentinel promote ranking (priority then ROLE offset then greatest `ip:port`; 0 never; closed first-replica-wins)
 - [x] **FL** `nodes.conf` live cluster flags (require-full / allow-reads / announce / replica-priority; CONFIG SET autosave; legacy defaults)
-- [ ] **Next (see `TODO.md` post-FL):** Later/backlog only (no open optional letter batch)
+- [x] **FM** Sentinel residual polish (live INFO `slave_priority` refresh; auto-failover 15s cooldown; manual FAILOVER force-bypasses)
+- [ ] **Next (see `TODO.md` post-FM):** optional **FN** CKQUORUM live · **FO** durable prepare · **FP** expire slot
 - [x] 데드락 감지 고급 기능
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원
@@ -109,6 +110,7 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Sentinel FLUSHCONFIG / load-on-boot (Batch EZ)
 - [x] Sentinel hello bus lite (Batch FA: peer HELLO + PUBLISH on master)
 - [x] Sentinel cross-process leader election lite (Batch FE; residuals: election-timeout SM, hello SUBSCRIBE)
+- [x] Sentinel promote ranking (Batch FK) + INFO `slave_priority` + failover cooldown (Batch FM)
 - [x] Blocking `XREAD` / `XREADGROUP` (`BLOCK`)
 - [x] Multi-DB replication parity (SYNC/PSYNC all DBs + SELECT apply)
 - [x] AOF SELECT concurrency fix + atomic SELECT+cmd replication

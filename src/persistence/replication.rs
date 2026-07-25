@@ -16,7 +16,7 @@ use crate::persistence::{aof, rdb};
 use crate::protocol::{RespParser, RespValue};
 use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -192,6 +192,9 @@ pub struct ReplicationManager {
     /// `propagate_raw` so a write cannot land in the gap between snapshot and
     /// register (would be missing from both RDB and the new live feed).
     fullsync_gate: Mutex<()>,
+    /// Sentinel / promote priority (Batch FM). Default 100; **0 = never promote**.
+    /// Reported in INFO as `slave_priority` (Redis alias for replica-priority).
+    slave_priority: AtomicU32,
 }
 
 impl ReplicationManager {
@@ -217,6 +220,7 @@ impl ReplicationManager {
             min_replicas_max_lag_secs: AtomicUsize::new(10),
             primary_link_epoch: AtomicU64::new(0),
             fullsync_gate: Mutex::new(()),
+            slave_priority: AtomicU32::new(100),
         })
     }
 
@@ -269,6 +273,16 @@ impl ReplicationManager {
 
     pub fn set_min_replicas_max_lag(&self, secs: usize) {
         self.min_replicas_max_lag_secs.store(secs, Ordering::Relaxed);
+    }
+
+    /// Sentinel promote priority (Batch FM). Default 100; **0 = never promote**.
+    pub fn slave_priority(&self) -> u32 {
+        self.slave_priority.load(Ordering::Relaxed)
+    }
+
+    /// Set `slave_priority` / `replica-priority` (Batch FM).
+    pub fn set_slave_priority(&self, priority: u32) {
+        self.slave_priority.store(priority, Ordering::Relaxed);
     }
 
     /// Number of connected replicas whose last ACK is within `min-replicas-max-lag`.
@@ -1329,13 +1343,15 @@ impl ReplicationManager {
                  master_link_status:{}\r\n\
                  master_replid:{}\r\n\
                  slave_repl_offset:{}\r\n\
-                 master_repl_offset:{}\r\n",
+                 master_repl_offset:{}\r\n\
+                 slave_priority:{}\r\n",
                 host,
                 port,
                 link,
                 self.cached_master_replid(),
                 self.replica_offset(),
                 self.master_repl_offset(),
+                self.slave_priority(),
             )
         } else {
             let bl = self.backlog.lock();
@@ -1348,13 +1364,15 @@ impl ReplicationManager {
                  master_repl_offset:{}\r\n\
                  min_slaves_good:{}\r\n\
                  min_slaves_to_write:{}\r\n\
-                 min_slaves_max_lag:{}\r\n",
+                 min_slaves_max_lag:{}\r\n\
+                 slave_priority:{}\r\n",
                 self.connected_replicas(),
                 self.replid(),
                 self.master_repl_offset(),
                 self.good_replica_count(),
                 self.min_replicas_to_write(),
                 self.min_replicas_max_lag(),
+                self.slave_priority(),
             );
             if !replid2.is_empty() {
                 s.push_str(&format!(
@@ -1400,6 +1418,7 @@ impl Default for ReplicationManager {
             min_replicas_max_lag_secs: AtomicUsize::new(10),
             primary_link_epoch: AtomicU64::new(0),
             fullsync_gate: Mutex::new(()),
+            slave_priority: AtomicU32::new(100),
         }
     }
 }
@@ -3335,6 +3354,11 @@ mod tests {
         assert!(info.contains("min_slaves_to_write:2"), "{}", info);
         assert!(info.contains("min_slaves_max_lag:5"), "{}", info);
         assert!(info.contains("min_slaves_good:"), "{}", info);
+        // Batch FM: default slave_priority on master INFO.
+        assert!(info.contains("slave_priority:100"), "{}", info);
+        repl.set_slave_priority(50);
+        let info2 = repl.info_replication();
+        assert!(info2.contains("slave_priority:50"), "{}", info2);
     }
 
     #[test]

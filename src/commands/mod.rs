@@ -366,6 +366,14 @@ impl CommandHandler {
                 "min-replicas-max-lag".into(),
                 min_lag.to_string(),
             ),
+            // Batch FM: Sentinel promote priority (INFO slave_priority).
+            (
+                "replica-priority".into(),
+                self.persistence
+                    .as_ref()
+                    .map(|p| p.replication.slave_priority().to_string())
+                    .unwrap_or_else(|| "100".to_string()),
+            ),
             // Ops / networking / persistence paths (CONFIG GET read-only snapshot)
             ("port".into(), self.config.port.to_string()),
             ("bind".into(), self.config.host.clone()),
@@ -494,6 +502,7 @@ fn config_param_aliases(canonical: &str) -> &'static [&'static str] {
         "acllog-max-len" => &["acllog_max_len", "acl-log-max-len"],
         "min-replicas-to-write" => &["min-slaves-to-write"],
         "min-replicas-max-lag" => &["min-slaves-max-lag"],
+        "replica-priority" => &["slave-priority", "replica_priority", "slave_priority"],
         "bind" => &["host"],
         "cluster-enabled" => &["cluster_enabled"],
         "cluster-replica-priority" => &["cluster_replica_priority"],

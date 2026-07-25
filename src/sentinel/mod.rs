@@ -1,7 +1,7 @@
 //! Redis Sentinel–compatible **lite** (Batch EW) + multi-Sentinel **ODOWN** (Batch EX)
 //! + **config persistence** (Batch EZ) + **hello bus lite** (Batch FA)
 //! + **promote-success gate** (Batch FC) + **leader election** (Batch FE)
-//! + **promote ranking** (Batch FK).
+//! + **promote ranking** (Batch FK) + **INFO priority + failover cooldown** (Batch FM).
 //!
 //! - EW: subjective-down (`s_down`), MONITOR, GET-MASTER-ADDR, FAILOVER, auto-failover
 //! - EX: peer `SENTINEL MEET`, `IS-MASTER-DOWN-BY-ADDR` votes, `o_down` when votes ≥ quorum
@@ -10,6 +10,7 @@
 //! - FC: `promote_replica` requires real promote (FAILOVER / REPLICAOF / ROLE=master), never PING alone
 //! - FE: voted-leader on `IS-MASTER-DOWN-BY-ADDR` (epoch/runid); only elected leader auto-failovers
 //! - FK: promote rank = highest priority (0 never), then highest ROLE offset, then greatest `ip:port`
+//! - FM: live `INFO replication` `slave_priority` refresh; auto-failover cooldown after `try_failover`
 //!
 //! # Honesty vs full Redis Sentinel
 //!
@@ -20,9 +21,14 @@
 //! - **Hello bus:** tick `PUBLISH __sentinel__:hello` + peer `SENTINEL HELLO` exchange.
 //!   No long-lived master `SUBSCRIBE` fan-in (residual).
 //! - **CKQUORUM:** peer-table size (`1 + peers`), not live reachability probes (residual).
-//! - **Promote order (FK):** mirrors cluster EA/EB — highest `priority` (0 never promote), then
+//! - **Promote order (FK/FM):** mirrors cluster EA/EB — highest `priority` (0 never promote), then
 //!   highest `repl_offset` (from ROLE master slave list), then lexicographically greatest `ip:port`.
-//!   Priority defaults to 100; live INFO `slave_priority` refresh is best-effort residual.
+//!   ROLE discovery defaults priority to 100; probe / `try_failover` refresh each replica via
+//!   `INFO replication` `slave_priority` (Batch FM). Note: Redis Sentinel prefers **lower**
+//!   priority numbers; Kore mirrors cluster (**higher** wins) for EA/EB consistency.
+//! - **Failover cooldown (FM):** after a completed or failed `try_failover`, auto path suppresses
+//!   re-entry for [`FAILOVER_COOLDOWN`] (15s, Redis failover-timeout ballpark lite). Manual
+//!   `SENTINEL FAILOVER` always forces (bypasses cooldown).
 
 use crate::protocol::{RespParser, RespValue};
 use bytes::Bytes;
@@ -67,6 +73,12 @@ pub fn test_promote_inject() -> PromoteInjectGuard {
 /// Default subjective-down timeout (Redis-like 30s).
 pub const DEFAULT_DOWN_AFTER_MS: u64 = 30_000;
 
+/// Auto-failover re-entry cooldown after `try_failover` completes or fails (Batch FM).
+///
+/// Redis `failover-timeout` defaults to 180s; lite uses **15s** so ops recover without
+/// thrashing every tick. Manual `SENTINEL FAILOVER` bypasses this gate.
+pub const FAILOVER_COOLDOWN: Duration = Duration::from_secs(15);
+
 /// Redis Sentinel hello pub/sub channel (Batch FA).
 pub const HELLO_CHANNEL: &str = "__sentinel__:hello";
 
@@ -74,6 +86,24 @@ pub const HELLO_CHANNEL: &str = "__sentinel__:hello";
 const SENTINEL_TICK: Duration = Duration::from_secs(1);
 
 const IO_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// Test override for [`FAILOVER_COOLDOWN`] duration (ms). `0` = use default 15s.
+static FAILOVER_COOLDOWN_MS_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+
+/// Set failover cooldown override for tests (`0` restores [`FAILOVER_COOLDOWN`]).
+pub fn test_set_failover_cooldown_ms(ms: u64) {
+    FAILOVER_COOLDOWN_MS_OVERRIDE.store(ms, Ordering::SeqCst);
+}
+
+/// Effective auto-failover cooldown (Batch FM).
+pub fn failover_cooldown_duration() -> Duration {
+    let ov = FAILOVER_COOLDOWN_MS_OVERRIDE.load(Ordering::SeqCst);
+    if ov == 0 {
+        FAILOVER_COOLDOWN
+    } else {
+        Duration::from_millis(ov)
+    }
+}
 
 /// Parsed Redis-style hello payload (Batch FA).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +212,8 @@ pub struct MasterInfo {
     pub leader_runid: String,
     /// Epoch of [`Self::leader_runid`] (Batch FE). Sticky until a higher epoch arrives.
     pub leader_epoch: u64,
+    /// When the last `try_failover` finished (success or fail). Batch FM cooldown clock.
+    pub last_failover_attempt: Option<Instant>,
 }
 
 impl MasterInfo {
@@ -332,6 +364,7 @@ impl SentinelState {
                 failover_in_progress: false,
                 leader_runid: String::new(),
                 leader_epoch: 0,
+                last_failover_attempt: None,
             },
         );
         drop(g);
@@ -665,6 +698,40 @@ impl SentinelState {
         }
     }
 
+    /// Record that `try_failover` just finished (success or fail). Starts auto cooldown (Batch FM).
+    pub fn note_failover_attempt(&self, name: &str) {
+        if let Some(m) = self.masters.write().get_mut(name) {
+            m.last_failover_attempt = Some(Instant::now());
+        }
+    }
+
+    /// True while auto-failover should wait after a recent `try_failover` (Batch FM).
+    ///
+    /// Manual `SENTINEL FAILOVER` does **not** consult this (operator force).
+    pub fn in_failover_cooldown(&self, name: &str) -> bool {
+        let Some(m) = self.master(name) else {
+            return false;
+        };
+        let Some(t) = m.last_failover_attempt else {
+            return false;
+        };
+        t.elapsed() < failover_cooldown_duration()
+    }
+
+    /// Clear cooldown (tests / operator recovery). Batch FM.
+    pub fn clear_failover_cooldown(&self, name: &str) {
+        if let Some(m) = self.masters.write().get_mut(name) {
+            m.last_failover_attempt = None;
+        }
+    }
+
+    /// Replace known replica list without touching s_down / last_ok (Batch FM priority refresh).
+    pub fn set_replicas(&self, name: &str, replicas: Vec<ReplicaInfo>) {
+        if let Some(m) = self.masters.write().get_mut(name) {
+            m.replicas = replicas;
+        }
+    }
+
     pub fn names(&self) -> Vec<String> {
         self.masters.read().keys().cloned().collect()
     }
@@ -949,7 +1016,12 @@ async fn tick_all(sentinel: &SentinelState) {
         let _ = sentinel.apply_down_votes(&name, peer_votes);
         if let Some(m) = sentinel.master(&name) {
             // Auto-failover on o_down only; only elected leader promotes (Batch FE).
-            if m.o_down && m.auto_failover && !m.failover_in_progress {
+            // Batch FM: suppress re-entry during post-try_failover cooldown (manual FAILOVER bypasses).
+            if m.o_down
+                && m.auto_failover
+                && !m.failover_in_progress
+                && !sentinel.in_failover_cooldown(&name)
+            {
                 if try_elect_leader(sentinel, &name).await {
                     let _ = try_failover(sentinel, &name).await;
                 }
@@ -1241,7 +1313,9 @@ async fn probe_one(sentinel: &SentinelState, name: &str) {
     let addr = format!("{}:{}", m.ip, m.port);
     match connect_and_ping(&addr).await {
         Ok(()) => {
-            let replicas = fetch_replicas_role(&addr).await.unwrap_or_default();
+            let mut replicas = fetch_replicas_role(&addr).await.unwrap_or_default();
+            // Batch FM: enrich ROLE list with live INFO slave_priority per replica.
+            enrich_replica_priorities(&mut replicas).await;
             sentinel.note_ok(name, Some(replicas));
         }
         Err(e) => {
@@ -1250,17 +1324,24 @@ async fn probe_one(sentinel: &SentinelState, name: &str) {
     }
 }
 
-/// Manual or auto: promote the best-ranked reachable replica (Batch FK).
+/// Manual or auto: promote the best-ranked reachable replica (Batch FK + FM).
 ///
 /// Serializes per master via [`SentinelState::begin_failover`] so manual
 /// `SENTINEL FAILOVER` and the tick auto-failover path cannot overlap (Batch FC).
 ///
-/// Auto path only invokes this after [`try_elect_leader`] wins (Batch FE).
-/// Manual `SENTINEL FAILOVER` skips election (operator force).
+/// Auto path only invokes this after [`try_elect_leader`] wins (Batch FE) and
+/// outside [`SentinelState::in_failover_cooldown`] (Batch FM). Manual
+/// `SENTINEL FAILOVER` skips election **and** cooldown (operator force).
 ///
 /// **Promote order (Batch FK):** walk [`rank_replicas_for_promote`] — highest
 /// priority (0 skipped), then highest ROLE offset, then greatest `ip:port`.
 /// Continues down the ranked list when [`promote_replica`] fails.
+///
+/// **Priority source (Batch FM):** before ranking, re-query each known replica's
+/// `INFO replication` for `slave_priority` (ROLE still supplies offset; default 100).
+///
+/// Always records [`SentinelState::note_failover_attempt`] on exit so auto path
+/// respects [`FAILOVER_COOLDOWN`].
 pub async fn try_failover(sentinel: &SentinelState, name: &str) -> Result<(), String> {
     let m = sentinel
         .master(name)
@@ -1268,8 +1349,10 @@ pub async fn try_failover(sentinel: &SentinelState, name: &str) -> Result<(), St
     if m.replicas.is_empty() {
         // Best-effort refresh ROLE once more if master still up (unlikely in s_down).
         let addr = format!("{}:{}", m.ip, m.port);
-        if let Ok(reps) = fetch_replicas_role(&addr).await {
+        if let Ok(mut reps) = fetch_replicas_role(&addr).await {
             if !reps.is_empty() {
+                enrich_replica_priorities(&mut reps).await;
+                // Master still answered ROLE — mark ok + store replicas.
                 sentinel.note_ok(name, Some(reps));
             }
         }
@@ -1281,14 +1364,23 @@ pub async fn try_failover(sentinel: &SentinelState, name: &str) -> Result<(), St
         return Err("ERR No good replica for failover".into());
     }
 
+    // Batch FM: refresh live INFO priorities before ranking (master may be s_down).
+    let mut replicas = m.replicas.clone();
+    enrich_replica_priorities(&mut replicas).await;
+    sentinel.set_replicas(name, replicas.clone());
+
     // Batch FK: rank before promote; drop priority-0 never-promote replicas.
-    let ranked = rank_replicas_for_promote(&m.replicas);
+    let ranked = rank_replicas_for_promote(&replicas);
     if ranked.is_empty() {
+        // Still start cooldown so auto path does not thrash "no good replica".
+        sentinel.note_failover_attempt(name);
         return Err("ERR No good replica for failover".into());
     }
 
     // Per-master in-progress gate (Batch FC).
-    sentinel.begin_failover(name)?;
+    if let Err(e) = sentinel.begin_failover(name) {
+        return Err(e);
+    }
 
     let old_ip = m.ip.clone();
     let old_port = m.port;
@@ -1313,6 +1405,8 @@ pub async fn try_failover(sentinel: &SentinelState, name: &str) -> Result<(), St
     .await;
 
     sentinel.end_failover(name);
+    // Batch FM: always arm cooldown after a completed or failed attempt.
+    sentinel.note_failover_attempt(name);
     result
 }
 
@@ -1417,6 +1511,67 @@ async fn fetch_replicas_role(addr: &str) -> Result<Vec<ReplicaInfo>, String> {
     let mut stream = connect(addr).await?;
     let reply = resp_command(&mut stream, &["ROLE"], IO_TIMEOUT).await?;
     parse_role_replicas(&reply)
+}
+
+/// Parse `slave_priority` / `replica_priority` from INFO text (Batch FM).
+///
+/// Returns `None` when the field is absent so callers can keep ROLE / injected
+/// priority (no-persistence Kore INFO omits the key). Unparsable values → 100.
+pub fn parse_info_slave_priority(info: &str) -> Option<u32> {
+    for line in info.lines() {
+        let line = line.trim();
+        // Accept both Redis names; INFO uses snake_case keys.
+        if let Some(rest) = line.strip_prefix("slave_priority:") {
+            return Some(rest.trim().parse().unwrap_or(100));
+        }
+        if let Some(rest) = line.strip_prefix("replica_priority:") {
+            return Some(rest.trim().parse().unwrap_or(100));
+        }
+    }
+    None
+}
+
+/// Best-effort `INFO replication` → `slave_priority` for one replica address.
+///
+/// `None` when connect/INFO fails **or** the field is missing from the body.
+async fn fetch_slave_priority(addr: &str) -> Option<u32> {
+    let mut stream = connect(addr).await.ok()?;
+    let reply = resp_command(&mut stream, &["INFO", "replication"], IO_TIMEOUT)
+        .await
+        .ok()?;
+    let text = match reply {
+        RespValue::BulkString(Some(b)) => String::from_utf8_lossy(&b).into_owned(),
+        RespValue::SimpleString(b) => String::from_utf8_lossy(&b).into_owned(),
+        _ => return None,
+    };
+    parse_info_slave_priority(&text)
+}
+
+/// Query each replica's INFO for live `slave_priority` (Batch FM).
+///
+/// On fetch failure or missing field keeps the existing priority (ROLE default
+/// 100, inject via `with_rank`, or a prior successful INFO refresh).
+async fn enrich_replica_priorities(replicas: &mut [ReplicaInfo]) {
+    for r in replicas.iter_mut() {
+        let addr = r.addr_key();
+        match fetch_slave_priority(&addr).await {
+            Some(p) => {
+                if r.priority != p {
+                    debug!(
+                        "sentinel: replica {} slave_priority {} -> {}",
+                        addr, r.priority, p
+                    );
+                }
+                r.priority = p;
+            }
+            None => {
+                debug!(
+                    "sentinel: INFO slave_priority for {} unavailable; keeping {}",
+                    addr, r.priority
+                );
+            }
+        }
+    }
 }
 
 fn parse_role_replicas(reply: &RespValue) -> Result<Vec<ReplicaInfo>, String> {
@@ -1800,6 +1955,49 @@ mod tests {
         let hi = ReplicaInfo::new("10.0.0.9", 6380).with_rank(100, 100);
         let ranked = rank_replicas_for_promote(&[lo, hi]);
         assert_eq!(ranked[0].ip, "10.0.0.9");
+    }
+
+    /// Batch FM: INFO slave_priority parse (missing → None; present → value).
+    #[test]
+    fn parse_info_slave_priority_fields() {
+        assert_eq!(parse_info_slave_priority("role:slave\r\n"), None);
+        assert_eq!(
+            parse_info_slave_priority("role:slave\r\nslave_priority:50\r\n"),
+            Some(50)
+        );
+        assert_eq!(
+            parse_info_slave_priority("slave_priority:0\r\nrole:slave\r\n"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_info_slave_priority("replica_priority:150\r\n"),
+            Some(150)
+        );
+        assert_eq!(
+            parse_info_slave_priority("slave_priority:notanumber\r\n"),
+            Some(100)
+        );
+    }
+
+    /// Batch FM: auto cooldown after note_failover_attempt; clear restores.
+    #[test]
+    fn failover_cooldown_gates_auto_reentry() {
+        let s = SentinelState::new();
+        s.monitor("m", "10.0.0.1", 6379, 1).unwrap();
+        assert!(!s.in_failover_cooldown("m"));
+        // Short override so unit test is fast.
+        test_set_failover_cooldown_ms(200);
+        s.note_failover_attempt("m");
+        assert!(s.in_failover_cooldown("m"));
+        s.clear_failover_cooldown("m");
+        assert!(!s.in_failover_cooldown("m"));
+        // Expired cooldown.
+        s.note_failover_attempt("m");
+        assert!(s.in_failover_cooldown("m"));
+        std::thread::sleep(Duration::from_millis(220));
+        assert!(!s.in_failover_cooldown("m"));
+        test_set_failover_cooldown_ms(0); // restore default
+        assert_eq!(failover_cooldown_duration(), FAILOVER_COOLDOWN);
     }
 
     #[test]
