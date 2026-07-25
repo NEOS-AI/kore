@@ -3,7 +3,7 @@
 ## Currently working on..
 
 - [x] Support for Redis Pub-Sub
-- **Post-FC queue** (through Sentinel promote-success gate FC): next is **Batch FD** (benchmarks vs Redis/Valkey). Details in root `TODO.md` → *Next work queue (post-FB)*.
+- **Post-FD queue** (FD measured Kore vs Valkey benches shipped): next is **Batch FE** (Sentinel leader election depth). Details in root `TODO.md` → *Next work queue (post-FC)*.
 
 ## Persistence / search letter batches (recent)
 
@@ -50,6 +50,7 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Dual-end NODE wire 2PC slice 1 (Batch FB: SETSLOT PREPARE/ABORTPREPARE + dest-first commit; failed_prepare)
 - [x] Sentinel conf persistence (Batch EZ: FLUSHCONFIG + load sentinel.conf; autosave)
 - [x] Sentinel hello bus lite (Batch FA: HELLO CSV + PUBLISH + peer exchange)
+- [x] Sentinel promote-success gate (Batch FC: FAILOVER/REPLICAOF/ROLE=master; failover_in_progress)
 - [x] HNSW graph-based ANN search (Batch CQ; layer-0 edges + `ef_search`; multi-layer insert still simplified)
 - [x] HNSW remove/unlink + insert-time force-keep + update rewire (Batch CS)
 - [x] HNSW hard-delete bridge repair — closest-peer reconnect (Batch CT; 2-chain)
@@ -70,7 +71,9 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] MIGRATE honesty (Batch DQ: multi-key IOERR `migrated=`/`skipped=`; typed TTL via SET PX / trailing PEXPIRE)
 - [x] MIGRATE absolute expire (Batch DT: snapshot unix-ms end; string `SET PXAT` / typed `PEXPIREAT`; remaining-ms shrink closed)
 - [x] Cluster automatic reshard / multi-type MIGRATE orchestration (MVP complete: PLAN/AUTO DX, epoch gossip DU, dest-first NODE DV, fail quorum DW, EY preflight, EP dest rollback, **FB RESP prepare/commit 2PC slice**)
-- [ ] **Next (see `TODO.md` Next work queue):** **FC** Sentinel promote-success gate · **FD** measured benchmarks · **FE** Sentinel leader election · **FF** HNSW multi-layer · **FG** unified keyspace
+- [x] Sentinel promote-success gate (Batch FC: real promote required; in-process failover_in_progress)
+- [x] **FD** measured benchmarks vs Valkey (`docs/benchmarks.md`; single-host median of 3; no portable-win claims)
+- [ ] **Next (see `TODO.md` Next work queue post-FC):** **FE** Sentinel leader election · **FF** HNSW multi-layer · **FG** unified keyspace · later NODE 2PC slice 2
 - [x] 데드락 감지 고급 기능
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원
@@ -88,7 +91,7 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Sentinel multi-instance ODOWN lite (Batch EX: MEET peers + vote quorum)
 - [x] Sentinel FLUSHCONFIG / load-on-boot (Batch EZ)
 - [x] Sentinel hello bus lite (Batch FA: peer HELLO + PUBLISH on master)
-- [ ] Sentinel promote-success + leader election residuals (EN–FA post-ship; see `TODO.md` FB/FE)
+- [ ] Sentinel cross-process leader election residual (see `TODO.md` Batch FE)
 - [x] Blocking `XREAD` / `XREADGROUP` (`BLOCK`)
 - [x] Multi-DB replication parity (SYNC/PSYNC all DBs + SELECT apply)
 - [x] AOF SELECT concurrency fix + atomic SELECT+cmd replication

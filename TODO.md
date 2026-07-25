@@ -149,6 +149,7 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch FC)*: `promote_replica` success gate — requires `FAILOVER` OK, `REPLICAOF NO ONE` OK, or post-attempt `ROLE=master`; **never** `switch_master` on PING alone. Per-master `failover_in_progress` serializes manual FAILOVER vs tick. Promote inject hooks for tests.
   - *Residual (EN–FA / FC post-ship)* — see Phase D cluster + backlog table:
     - **P2** no failover **leader election** / voted-leader — every o_down Sentinel with auto-failover may still race across processes (in-process gate only).
+    - **P3** promote walks replicas in discovery order (**first success wins**; no offset/priority).
     - **P3** `CKQUORUM` uses peer-table size, not live reachability.
     - **P3** `apply_hello` → `add_peer` **autosaves every hello** (disk thrash under multi-master × multi-peer ticks).
 - [x] **`[P1]`** Client durability: `WAIT` + min-replicas write gate
@@ -308,6 +309,11 @@ Also tracked in `docs/roadmap.md`.
   - *Gaps*: no interactive redis-cli weight UI. MIGRATE: no Redis DUMP/RESTORE wire compatibility (recreate-only); ASKING probe / REPLACE pre-DEL semantics documented in module rustdoc (Batch DP). Dual-end NODE has RESP prepare/commit (Batch FB); not Redis binary cluster-bus 2PC.
   - *Done (Batch EY)*: dual-end NODE **preflight** before any SETSLOT NODE — local owns/already-dest; dest reachable + `CLUSTER MYID` matches dest-id; dest `CLUSTER SLOTS` owner is source or dest (or unbound). Failure → `failed_preflight` (no half-apply). Idempotent complete when both already own dest.
   - *Done (Batch FB)*: dual-end NODE **wire 2PC slice 1** — `SETSLOT PREPARE`/`ABORTPREPARE` votes on source+dest (extends EY); commit only after both prepares (dest-first NODE, DV); EP rollback on source commit fail; status `failed_prepare` without half-apply; range aborts on prepare fail. Tests: happy path, dest prepare inject, source commit→rolled_back + FINISH, range abort. Residual (slice 2): durable prepare fence across crash, prepare-epoch fencing, bus-level 2PC if/when bus exists.
+  - *Residual (FB post-ship code review 2026-07-25 later pass)*:
+    - **P3** commit path does **not** re-assert `prepared_node` immediately before NODE (concurrent `ABORTPREPARE` / operator clear can race between prepare and commit).
+    - **P3** dest-side `set_prepare_node(myself)` accepts unbound **or any known-peer owner** (broad vote; intentional for mid-reshard but weak fencing).
+    - **P3** `prepare_node` is memory-only (not in `nodes.conf`); crash mid-prepare loses votes (slice 2).
+    - **P3** operator `SETSLOT NODE` still bypasses prepare (FINISH/recovery intentional; dual-end path enforces prepare).
   - *Done (Batch EP)*: when dest NODE ok but source NODE fails: EH re-asserts MIGRATING; **compensate** dest with `SETSLOT NODE <source>` + `IMPORTING` → status `rolled_back` (both sides agree source owns; retry FINISH). Rollback failure keeps `partial_source_node` + warning. Range aborts on `rolled_back`. Source NODE inject hook for tests.
   - *Done (Batch EQ)*: Redis `cluster-require-full-coverage` (default yes) — `CLUSTER INFO cluster_state:ok|fail`; key commands get `CLUSTERDOWN The cluster is down` when any slot is unbound or fail-owned; CONFIG GET/SET + `--cluster-require-full-coverage`; ASKING+IMPORTING still allowed for reshard.
   - *Done (Batch ER)*: connection `READONLY`/`READWRITE` wired into cluster redirect gate — replicas serve **reads** for slots owned by their master; writes still `MOVED`; without READONLY all key cmds `MOVED` (Redis-compatible).
@@ -321,9 +327,14 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch DX)*: `CLUSTER RESHARD PLAN <dest> <n>` greedy donors; `AUTO` plans then executes local `reshard_slot` + remote RESP `CLUSTER RESHARD` (abort-on-partial).
   - [x] **`[P1]`** **Code review (EW post-ship):** `promote_replica` succeeds on PING alone
     - *Done (Batch FC)*: `promote_replica` requires `FAILOVER` OK / `REPLICAOF NO ONE` OK / post-attempt `ROLE=master`; never PING-only. Per-master `failover_in_progress`. Tests: inject fail → no switch; inject OK + real ROLE path still switch.
+  - [x] **`[P3]`** **Code review (FB post-ship nits):** prepare not re-checked at commit; dest prepare permissive; memory-only votes
+    - *Found (scheduled review after FB/FC)*: see Batch FB residual bullets above. Accept for slice 1; fold re-check + prepare-epoch into **slice 2** / later if dual-end races matter under concurrent operators.
+    - *Accepted (slice 1)*: dual-end path enforces prepare; operator NODE bypass for recovery; prepare not durable.
   - [ ] **`[P2]`** **Code review (EX/FA post-ship):** Sentinel failover leader election (cross-process)
     - *Found*: no voted-leader on `IS-MASTER-DOWN-BY-ADDR`; every o_down Sentinel with `auto-failover` may race `try_failover` **across processes**. (In-process manual-vs-tick gate done FC.)
     - *Next*: Redis-style leader vote by epoch/runid; surface `voted-leader` in peer fields.
+  - [ ] **`[P3]`** **Code review (FC post-ship nit):** Sentinel promote still first-replica-wins
+    - *Found*: `try_failover` walks `replicas` in discovery order; no offset/priority ranking (unlike cluster election EA/EB). Acceptable lite; improve under FE if multi-replica quality matters.
   - [ ] **`[P3]`** **Code review (EZ/FA post-ship):** hello-path autosave thrash + CKQUORUM reachability
     - *Found*: `apply_hello` → `add_peer` → `autosave_conf` on every peer HELLO (1s tick × masters × peers). `CKQUORUM` uses `1 + peers.len()` (not live probe).
     - *Next*: autosave only when peer table or master addr actually changes; optional peer ping for CKQUORUM.
@@ -684,7 +695,7 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P1]`** **CI**: build, unit tests, integration tests, optional redis-cli compatibility smoke
   - *Done*: `.github/workflows/ci.yml` — build + `cargo test --all-targets -- --test-threads=1`
 - [x] **`[P1]`** **Benchmarks**: expand `docs/benchmarks.md` with methodology and numbers vs Redis/Valkey (`redis-benchmark`, same hardware)
-  - *Done*: methodology runbook; result tables TBD until measured
+  - *Done*: methodology runbook; **Batch FD** filled single-host median tables vs Valkey 9.0.0 (Redis non-Valkey not measured — 6379 busy)
 - [x] **`[P1]`** **Fuzz** RESP parser and command argument parsing
   - *Done*: in-tree smoke fuzz unit tests (random + structured); `fuzz/` crate with `resp_parse` + `command_dispatch` targets (`cargo +nightly fuzz run …` when cargo-fuzz installed).
 - [x] **`[P1]`** **Concurrency / loom or stress** jobs for shard RMW paths
@@ -698,18 +709,21 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
   - *Done (Batch BT)*: `bt_eval_select_persists_connection_db` — connection remains on selected DB after EVAL
 
-### Status snapshot (2026-07-25)
+### Status snapshot (2026-07-25, post-FD)
 
-**Shipped through Batch FC** (cluster HA EN–EV, Sentinel EW–EZ/FA/FC, dual-end NODE RESP 2PC slice FB). Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule).
+**Shipped through Batch FD** (cluster HA EN–EV; NODE RESP 2PC **FB**; Sentinel EW–EZ/FA + promote gate **FC**; measured benches **FD**). Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule).
+
+**Verification (FB/FC review):** `cluster_migrate_test` 39/39 · `cluster_gossip_test` 8/8 · `sentinel_lite_test` 8/8 · lib unit 321 pass / 1 ignored HNSW large-N. FD: warm-up + 3-pass median vs Valkey 9.0.0 on M3 Pro (see `docs/benchmarks.md`).
 
 **Open / deferred residuals** (track as next queue below):
 
 | Area | Residual | Priority |
 |------|----------|----------|
-| Cluster | NODE 2PC **slice 2** (durable prepare across crash / prepare-epoch / bus 2PC) | P2 |
-| Ops | Measured **benchmark tables** vs Redis/Valkey (`docs/benchmarks.md` methodology only) | P1 (Batch FD) |
-| Sentinel | Full **leader election** + long-lived hello SUBSCRIBE (in-process failover gate done FC) | P2 (Batch FE) |
+| Ops | Re-measure on other hosts / Redis non-Valkey; investigate pipelined SET gap | P2 (post-FD) |
+| Cluster | NODE 2PC **slice 2** (durable prepare / prepare-epoch / re-check at commit / bus) | P2 |
+| Sentinel | Cross-process **leader election** + long-lived hello SUBSCRIBE | P2 (Batch FE) |
 | Sentinel | Hello `add_peer` **autosave thrash**; CKQUORUM peer-table not live | P3 (Batch FE) |
+| Sentinel | Promote still **first-replica-wins** (no offset/priority rank) | P3 (FE optional) |
 | Cluster | `nodes.conf` omits require-full / allow-reads / announce flags | P3 |
 | Cluster | Interactive redis-cli weight UI for reshard | P3 |
 | MIGRATE | Redis **DUMP/RESTORE wire** compatibility (Kore recreate-only / KDF1 today) | P3 (accepted) |
@@ -719,25 +733,23 @@ Also tracked in `docs/roadmap.md`.
 | Deadlock UI | Browser/DOM harness for poll repaint (string-contract tests accepted) | P3 |
 | Load | Single-DB mid-fill Arc-swap all-or-nothing (LOADING barrier accepted) | P3 |
 
-### Next work queue (post-FB)
+### Next work queue (post-FC)
 
-Recommended letter batches. Prefer **P1** correctness before large differentiator polish. Standing rule: land tests with each batch.
+Recommended letter batches. Prefer **P1** before large differentiator polish. Standing rule: land tests with each batch.
 
 - [x] **`[P1]`** **Batch FB — Cluster dual-end NODE wire 2PC (slice 1)**
-  - Prepare / vote / commit (or explicit abort) across source+dest for `SETSLOT NODE`
-  - Honest statuses if prepare fails mid-flight; range RESHARD uses prepare gate
-  - Integration tests: inject dest prepare fail, source commit fail, happy path + FINISH recovery
+  - Prepare / vote / commit across source+dest; `failed_prepare` fail-closed; range abort
 - [x] **`[P1]`** **Batch FC — Sentinel promote-success gate**
-  - `promote_replica`: require `FAILOVER` or `REPLICAOF NO ONE` **OK**, or post-promote `ROLE` = master; drop silent PING-only success
-  - Per-master `failover_in_progress` so manual FAILOVER and tick do not overlap (in-process)
-  - Tests: inject promote-cmd fail + PING ok → no `switch_master`; happy promote still switches
-- [ ] **`[P1]`** **Batch FD — Benchmarks: measured numbers vs Redis/Valkey**
-  - Run `redis-benchmark` (or equivalent) on same host for SET/GET/INCR/LPUSH/…; fill `docs/benchmarks.md` result tables
-  - Document Kore flags, thread count, persistence off/on; no portable-win claims without host re-measure
+  - Real promote required; in-process `failover_in_progress`; inject tests
+- [x] **`[P1]`** **Batch FD — Benchmarks: measured numbers vs Redis/Valkey**
+  - *Done (2026-07-25)*: `cargo build --release`; Kore `:6380 --save ""` (AOF off); Valkey 9.0.0 `:6378 --save "" --appendonly no` (6379 occupied by unrelated instance — Redis non-Valkey not measured)
+  - Warm-up discarded + **3** passes median; filled `docs/benchmarks.md` environment / throughput / p50 tables (SET/GET P=1 & P=16, INCR, d=256)
+  - Host: Apple M3 Pro / macOS arm64; Kore 0.6.0 git `1745294`; **no portable-win claims** — pipeline SET is the main Kore gap vs Valkey on this host
 - [ ] **`[P2]`** **Batch FE — Sentinel leader election depth**
   - Voted-leader on `IS-MASTER-DOWN-BY-ADDR` (epoch/runid); serialize multi-Sentinel auto-failover
   - Long-lived `__sentinel__:hello` SUBSCRIBE fan-in if not already covered by FA tick PUBLISH
   - Hello autosave only on peer/master change; CKQUORUM optional live probe
+  - Optional: rank promote candidates by replica offset/priority (FC residual)
 - [ ] **`[P2]`** **Batch FF — HNSW multi-layer insert**
   - Level assignment + upper-layer SEARCH-LAYER / insert (move past all-layer-0 simplification)
   - Recall@k gate still green; update `docs/benchmarks.md` honesty notes
@@ -745,12 +757,12 @@ Recommended letter batches. Prefer **P1** correctness before large differentiato
   - Typed value enum (or equivalent) under one name map; preserve type errors + cross-type DEL/SCAN/TTL
   - Migration plan for memory accounting / eviction sampling
 - [ ] **`[P3]`** **Later / optional**
-  - Redis DUMP/RESTORE wire codec (interop beyond recreate); `nodes.conf` live flags (require-full/announce)
-  - NODE 2PC slice 2 (durable prepare / bus); cluster reshard weight UI; admin_http auth/TLS
+  - NODE 2PC slice 2 (durable prepare, prepare-epoch, commit re-check); DUMP/RESTORE; `nodes.conf` live flags
+  - Cluster reshard weight UI; admin_http auth/TLS
 
 ### Code review backlog
 
-**Batches CZ–FC shipped** (FC = Sentinel promote-success gate). **Queue:** **FD** benches → **FE** Sentinel election → **FF** HNSW multi-layer → **FG** unified keyspace; standing tests-for-phase P0.
+**Batches CZ–FD shipped.** **Review 2026-07-25 (later):** FB/FC green (migrate 39, gossip 8, sentinel 8, lib 321); FD measured tables in `docs/benchmarks.md`. **Queue:** **FE** Sentinel election → **FF** HNSW multi-layer → **FG** unified keyspace; standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -876,7 +888,9 @@ Recommended letter batches. Prefer **P1** correctness before large differentiato
 | P3 | EZ/FA post-ship: hello add_peer autosave thrash; CKQUORUM live count | **open** (Batch FE) |
 | P3 | EN/EO/EU post-ship: nodes.conf omits require-full/announce flags | **open** (later / doc) |
 | P1 | dual-end NODE RESP 2PC prepare/commit (slice 1) | **done** (Batch FB) |
-| P2 | dual-end NODE 2PC slice 2 (durable prepare / bus) | **open** (later) |
+| P3 | FB post-ship: prepare not re-checked at commit; dest prepare broad; mem-only | **accepted** (slice 1; slice 2 later) |
+| P3 | FC post-ship: first-replica-wins promote order | **open** (FE optional) |
+| P2 | dual-end NODE 2PC slice 2 (durable prepare / prepare-epoch / bus) | **open** (later) |
 | P3 | DP residual: no DUMP/RESTORE wire compatibility | open (recreate-only; accepted) |
 | P3 | DF post-ship: HTTP MVP gaps shared with metrics | done (DJ; shared admin_http) |
 | P3 | DK post-ship: thin r@10 headroom / cross-arch flake risk | done (DL; r@10 0.95→0.93) |
@@ -941,4 +955,4 @@ Highest urgency checklist (phase order preserved):
 - [x] Eviction policies (`maxmemory-policy`)
   - *Follow-ups*: Streams, bitmaps/HLL, RESP3 (done elsewhere); LFU decay done in Batch AB
 
-**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; pick from **Next work queue (post-FA)** above (**FB** promote-success → **FC** 2PC → …) and keep landing tests with each batch.
+**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB**/**FC**/**FD** shipped — pick from **Next work queue (post-FC)** (**FE** Sentinel election → …) and keep landing tests with each batch.

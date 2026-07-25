@@ -16,15 +16,17 @@ This document is a **reproducible runbook**, not a marketing claim. Fill result 
 
 ```bash
 cargo build --release
-# Disable RDB auto-save and AOF for pure memory comparison
+# Disable RDB auto-save for pure memory comparison.
+# AOF is off by default (do not pass --appendonly).
 ./target/release/kore \
   --host 127.0.0.1 \
   --port 6380 \
-  --save "" \
-  --appendonly false
+  --save ""
 ```
 
-If your binary does not accept empty `--save`, use whatever disables timed SAVE rules (or delete save rules via `CONFIG SET save ""` after start). Prefer **port 6380** so a local Redis on 6379 can run in parallel for A/B runs.
+- `--save ""` disables timed RDB auto-save (`parse_save_rules` empty list).
+- `--appendonly` is a clap **flag** (presence enables AOF). Omit it for persistence-off runs; do not pass `--appendonly false`.
+- Prefer **port 6380** so a local Redis/Valkey on 6379 can run in parallel for A/B runs. If 6379 is occupied by an unrelated instance, start the comparison peer on another port (e.g. 6378) and record that port in the result table.
 
 ### Redis / Valkey (apples-to-apples)
 
@@ -97,31 +99,83 @@ Suggested variants (report separately):
 
 ## Result tables
 
-Fill after measurement. Until then, leave cells as `TBD`.
+**Batch FD (2026-07-25):** filled from a single-host run. Numbers are **indicative for this host only** — not a portable win claim. Re-measure before citing elsewhere.
 
 ### Environment
 
 | Field | Value |
 |-------|--------|
-| Date | TBD |
-| Host / CPU | TBD |
-| OS | TBD |
-| Kore | 0.6.0 (release) |
-| Redis | TBD |
-| Valkey | TBD |
+| Date | 2026-07-25 |
+| Host / CPU | Apple M3 Pro (11 logical CPUs), 18 GB RAM |
+| OS | macOS 26.3.1 (Darwin 25.3.0 arm64) |
+| Kore | **0.6.0** release; git `1745294`; `cargo build --release`; default `--threads 0` (= ncpu); `--host 127.0.0.1 --port 6380 --save ""` (AOF off); `--dir /tmp/kore-bench-fd` |
+| Redis | **Not measured this run** — port 6379 already held by an unrelated long-running Valkey (RDB save enabled); did not stop user daemons |
+| Valkey | **9.0.0** (`redis-server` / `valkey-server` Homebrew build `28c4ffd24ca1d1ff`); `127.0.0.1:6378 --save "" --appendonly no --dir /tmp/redis-bench-fd` |
+| Client | `valkey-benchmark` 9.0.0 (`redis-benchmark` symlink); loopback only |
+| Power | default turbo / power management (not pinned) |
+| Method | warm-up suite discarded; **3** measured passes; table = **median** ops/s (and median p50) |
+
+### Flags used (identical client flags on both servers)
+
+```text
+# baseline
+redis-benchmark -h 127.0.0.1 -p PORT -t set,get -n 100000 -q -c 50 -P 1
+# pipelined
+redis-benchmark -h 127.0.0.1 -p PORT -t set,get -n 100000 -q -c 50 -P 16
+# INCR
+redis-benchmark -h 127.0.0.1 -p PORT -t incr -n 100000 -q -c 50
+# larger values
+redis-benchmark -h 127.0.0.1 -p PORT -t set,get -n 100000 -q -c 50 -d 256
+```
+
+Quiet mode (`-q`) reports **p50 only** (no p99 in this client build).
 
 ### Throughput (ops/s, median of 3)
 
-| Workload | Kore | Redis | Valkey | Notes |
-|----------|------|-------|--------|-------|
-| SET/GET c=50 P=1 | TBD | TBD | TBD | |
-| SET/GET c=50 P=16 | TBD | TBD | TBD | |
-| INCR c=50 | TBD | TBD | TBD | |
-| SET/GET c=50 P=1 d=256 | TBD | TBD | TBD | |
+SET and GET reported separately (redis-benchmark does not emit a combined figure).
 
-### Latency (optional)
+| Workload | Kore | Redis | Valkey 9.0.0 (:6378) | Notes |
+|----------|------|-------|----------------------|-------|
+| SET c=50 P=1 | **185,874** | — | **203,252** | baseline; value size default (3 bytes) |
+| GET c=50 P=1 | **186,916** | — | **196,464** | |
+| SET c=50 P=16 | **497,512** | — | **1,515,152** | pipeline; Kore SET pipeline lag vs GET |
+| GET c=50 P=16 | **1,818,182** | — | **1,886,793** | |
+| INCR c=50 | **186,916** | — | **190,114** | |
+| SET c=50 P=1 d=256 | **177,620** | — | **200,401** | larger payload |
+| GET c=50 P=1 d=256 | **190,114** | — | **205,339** | |
 
-If `redis-benchmark` reports p50/p99, record them in a second table with the same workload labels.
+Pass-level raw ops/s (for audit):
+
+| Workload | Kore passes | Valkey passes |
+|----------|-------------|---------------|
+| SET P=1 | 185874 / 187266 / 181488 | 203252 / 209644 / 186567 |
+| GET P=1 | 186916 / 186916 / 189394 | 196464 / 210084 / 187617 |
+| SET P=16 | 429185 / 546448 / 497512 | 1515152 / 1587302 / 1515152 |
+| GET P=16 | 1818182 / 1428571 / 1818182 | 1886793 / 1960784 / 1818182 |
+| INCR | 186916 / 153610 / 187266 | 190114 / 210084 / 187617 |
+| SET d=256 | 177620 / 158730 / 184162 | 196464 / 202429 / 200401 |
+| GET d=256 | 190114 / 190840 / 185529 | 205339 / 199203 / 205761 |
+
+### Latency p50 (msec, median of 3)
+
+| Workload | Kore p50 | Valkey p50 | Notes |
+|----------|----------|------------|-------|
+| SET c=50 P=1 | 0.143 | 0.127 | |
+| GET c=50 P=1 | 0.143 | 0.127 | |
+| SET c=50 P=16 | 1.567 | 0.447 | pipeline batch latency (higher is expected) |
+| GET c=50 P=16 | 0.311 | 0.343 | |
+| INCR c=50 | 0.143 | 0.127 | |
+| SET c=50 P=1 d=256 | 0.151 | 0.127 | |
+| GET c=50 P=1 d=256 | 0.143 | 0.127 | |
+
+p99: **not reported** by this `redis-benchmark -q` build.
+
+### Interpretation (host-local only)
+
+- On this M3 Pro / loopback run, Kore is **within ~5–15%** of Valkey 9 on non-pipelined SET/GET/INCR and on GET with pipeline.
+- **Pipelined SET** is the clear gap (Kore ~0.5M ops/s vs Valkey ~1.5M) — likely write-path / command-dispatch cost under batching; not investigated in Batch FD.
+- **No portable performance claim.** Different CPUs, OS, thread counts, or Valkey/Redis builds will move absolute ops/s and ratios. Re-run this section before any external comparison.
+- Redis (non-Valkey) left unmeasured because 6379 was busy; Valkey is the Redis-protocol peer used here.
 
 ## Vector search (HNSW vs FLAT) — methodology
 
