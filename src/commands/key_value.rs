@@ -83,16 +83,19 @@ impl CommandHandler {
             i += 1;
         }
 
-        match self.cache.store(key, value, opts.clone()) {
+        // Capture flags before move into store (StoreOptions is small; avoid clone).
+        let want_get = opts.get;
+        let want_nx = opts.nx;
+        match self.cache.store(key, value, opts) {
             Ok(old_value) => {
-                if opts.get {
+                if want_get {
                     // GET option: return old value
                     if let Some(entry) = old_value {
                         Ok(RespValue::BulkString(Some(entry.value.clone())))
                     } else {
                         Ok(RespValue::null())
                     }
-                } else if opts.nx {
+                } else if want_nx {
                     // NX option: return null if key existed (failed), OK if set successfully
                     if old_value.is_some() {
                         Ok(RespValue::null())

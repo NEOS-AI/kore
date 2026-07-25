@@ -101,8 +101,18 @@ impl Cache {
     }
 
     /// Ensure `key` is absent or a string (for SET/GET-family commands).
+    ///
+    /// Hot-path optimized (Batch FI): only probes the typed `key_values` map.
+    /// String keys live in `map` and never conflict with SET; a full
+    /// `get_key_value` would Arc-clone the existing string entry on every SET.
     pub fn ensure_string_or_absent(&self, key: &Bytes) -> Result<()> {
-        self.ensure_type(key, KeyType::String)
+        if self.purge_typed_if_expired(key) {
+            return Ok(());
+        }
+        if self.key_values.contains_key(key) {
+            return Err(Error::WrongType);
+        }
+        Ok(())
     }
 
     /// Update both memory_usage and memory_tracker after a successful map mutation.
@@ -150,13 +160,17 @@ impl Cache {
             return Ok(());
         }
 
+        let max_memory = self.max_memory.load(Ordering::Relaxed);
+        // 0 = unlimited (Redis-compatible CONFIG SET maxmemory 0) — skip total scan.
+        if max_memory == 0 {
+            return Ok(());
+        }
+
         let tracker_ok = self
             .memory_tracker
             .can_allocate(needed, MemoryCategory::Cache);
-        let max_memory = self.max_memory.load(Ordering::Relaxed);
-        // 0 = unlimited (Redis-compatible CONFIG SET maxmemory 0)
         let total = self.memory_tracker.total_memory();
-        let usage_ok = max_memory == 0 || total.saturating_add(needed) <= max_memory;
+        let usage_ok = total.saturating_add(needed) <= max_memory;
 
         if tracker_ok && usage_ok {
             return Ok(());
@@ -202,9 +216,15 @@ impl Cache {
             std::mem::size_of::<Entry>(),
         );
 
-        // Rough pre-check: account for memory that would be freed on replace
-        let existing_size = self.map.get(&key).map(|e| e.size()).unwrap_or(0);
-        let net_memory_change = entry_size.saturating_sub(existing_size);
+        // Rough pre-check: account for memory that would be freed on replace.
+        // When maxmemory is unlimited, skip the extra shard read (Batch FI).
+        let max_memory = self.max_memory.load(Ordering::Relaxed);
+        let net_memory_change = if max_memory == 0 {
+            entry_size
+        } else {
+            let existing_size = self.map.get(&key).map(|e| e.size()).unwrap_or(0);
+            entry_size.saturating_sub(existing_size)
+        };
         self.ensure_capacity(net_memory_change)?;
 
         // Resolve absolute expiration outside the lock (keepttl handled under lock)
@@ -216,6 +236,9 @@ impl Cache {
         let flags = opts.flags;
         let cas_expected = opts.cas;
 
+        // Build entry shell outside the shard lock when we do not need keepttl
+        // (expires resolved above). CAS/NX/XX still decide under the lock.
+        // Moving `value` in avoids a second clone under the write lock (Batch FI).
         let outcome = self.map.mutate(&key, |current, next_cas| {
             // NX: only set if not exists (treat expired as absent)
             if nx {
@@ -257,7 +280,8 @@ impl Cache {
 
             let old_size = current.map(|e| e.size()).unwrap_or(0);
 
-            let mut entry = Entry::new(key.clone(), value.clone());
+            // key still cloned for Entry + map slot; value is moved (single owner).
+            let mut entry = Entry::new(key.clone(), value);
 
             if let Some(exp) = expires_at {
                 entry.expires_at = Some(exp);

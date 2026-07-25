@@ -32,6 +32,12 @@ pub enum RespValue {
 impl RespValue {
     /// Serialize RESP value to bytes
     pub fn serialize(&self) -> Bytes {
+        // Hot path: SET / many writes return +OK\r\n (Batch FI).
+        if let RespValue::SimpleString(s) = self {
+            if s.as_ref() == b"OK" {
+                return Bytes::from_static(b"+OK\r\n");
+            }
+        }
         let mut buf = BytesMut::new();
         self.write_to(&mut buf);
         buf.freeze()

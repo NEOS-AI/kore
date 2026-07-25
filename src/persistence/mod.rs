@@ -483,17 +483,54 @@ impl PersistenceManager {
     /// When the selected DB changes relative to the last recorded write, a
     /// `SELECT n` command is emitted first (and also propagated to replicas).
     ///
-    /// Decide-select, AOF append(s), selected-db update, and replication
-    /// propagation run under a single critical section so concurrent writers
-    /// cannot interleave SELECT and write commands.
+    /// **AOF enabled:** decide-select, AOF append(s), selected-db update, and
+    /// replication propagation run under a single critical section so concurrent
+    /// writers cannot interleave SELECT and write commands on disk.
     ///
-    /// When SELECT is needed, AOF still records SELECT and the write as two
-    /// separate appends (under the same `aof` lock). Replication encodes both
-    /// into one buffer and calls `propagate_raw` once so a concurrent PSYNC
+    /// **AOF disabled (common bench / standalone):** the AOF mutex is held only
+    /// long enough to decide SELECT and update `selected_db`. Command encode +
+    /// replication backlog append run **outside** that lock so concurrent writers
+    /// can encode in parallel (they still serialize on the replication backlog).
+    /// When SELECT is needed, SELECT+cmd are still one `propagate_raw` payload.
+    ///
+    /// When SELECT is needed with AOF on, AOF still records SELECT and the write
+    /// as two separate appends (under the same `aof` lock). Replication encodes
+    /// both into one buffer and calls `propagate_raw` once so a concurrent PSYNC
     /// cannot register a feed between SELECT and the write.
     pub fn on_write_command(&self, selected_db: usize, args: &[bytes::Bytes]) {
         self.mark_dirty();
 
+        // ── Fast path: no AOF file — do not hold aof lock across encode/propagate ──
+        if !self.config.appendonly {
+            let emit_select = {
+                let mut state = self.aof.lock();
+                let emit = match state.selected_db {
+                    Some(db) => db != selected_db,
+                    None => selected_db != 0,
+                };
+                state.selected_db = Some(selected_db);
+                emit
+            }; // aof lock released before encode + backlog
+
+            if emit_select {
+                let select_args = [
+                    bytes::Bytes::from_static(b"SELECT"),
+                    bytes::Bytes::from(selected_db.to_string()),
+                ];
+                let select_raw = aof::encode_command(&select_args);
+                let cmd_raw = aof::encode_command(args);
+                let mut combined =
+                    Vec::with_capacity(select_raw.len() + cmd_raw.len());
+                combined.extend_from_slice(&select_raw);
+                combined.extend_from_slice(&cmd_raw);
+                self.replication.propagate_raw(bytes::Bytes::from(combined));
+            } else {
+                self.replication.propagate_command(args);
+            }
+            return;
+        }
+
+        // ── AOF path: hold lock across SELECT + command appends for disk order ──
         let mut state = self.aof.lock();
 
         let emit_select = match state.selected_db {

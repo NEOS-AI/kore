@@ -158,7 +158,7 @@ impl Clone for Entry {
 pub type SharedEntry = Arc<Entry>;
 
 /// Options for storing an entry
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone, Copy, Debug)]
 pub struct StoreOptions {
     /// Only set if key does not exist (NX)
     pub nx: bool,

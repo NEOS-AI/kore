@@ -3,7 +3,7 @@
 ## Currently working on..
 
 - [x] Support for Redis Pub-Sub
-- **Primary queue complete through FG-3.** Next recommended: **Batch FH** (NODE 2PC slice 2). Optional: FI pipeline SET, FG-4 strings, FK Sentinel promote rank, FL `nodes.conf` flags. See root `TODO.md` → *Next work queue (post-FG-3)*.
+- **Primary queue complete through FG-3; FH + FI done.** Optional next: FG-4 strings, FK Sentinel promote rank, FL `nodes.conf` flags, FI-2 residual (repl backlog). See root `TODO.md` → *Next work queue (post-FG-3)*.
 
 ## Persistence / search letter batches (recent)
 
@@ -49,6 +49,7 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Dual-end NODE preflight (Batch EY: prepare MYID+owner check; failed_preflight)
 - [x] Dual-end NODE wire 2PC slice 1 (Batch FB: SETSLOT PREPARE/ABORTPREPARE + dest-first commit; failed_prepare)
 - [x] Dual-end NODE wire 2PC slice 2 (Batch FH: prepare-epoch + TTL + CHECKPREPARE commit re-check; boot clear; failed_prepare:recheck)
+- [x] Pipeline SET perf investigation (Batch FI: AOF-off unlock + encode/argv/`+OK` cuts; ~+25% SET P=16 on M3 Pro; residual FI-2 repl backlog)
 - [x] Sentinel conf persistence (Batch EZ: FLUSHCONFIG + load sentinel.conf; autosave)
 - [x] Sentinel hello bus lite (Batch FA: HELLO CSV + PUBLISH + peer exchange)
 - [x] Sentinel promote-success gate (Batch FC: FAILOVER/REPLICAOF/ROLE=master; failover_in_progress)

@@ -602,8 +602,9 @@ impl CommandHandler {
             if p.replication.is_replica() {
                 return;
             }
+            // Avoid `cmd.to_string()` heap alloc on every write (Batch FI).
             let mut argv = Vec::with_capacity(args.len() + 1);
-            argv.push(Bytes::from(cmd.to_string()));
+            argv.push(Bytes::copy_from_slice(cmd.as_bytes()));
             for a in args {
                 if let Some(b) = a.as_bulk_string() {
                     argv.push(b.clone());
@@ -1102,16 +1103,20 @@ impl CommandHandler {
         }
 
         // Slow log (skip SLOWLOG itself and transaction control).
+        // Build argv only when the command exceeds the threshold (Batch FI).
         if !matches!(
             cmd_upper,
             "SLOWLOG" | "EXEC" | "MULTI" | "DISCARD" | "WATCH" | "UNWATCH"
         ) {
             let duration_us = handle_start.elapsed().as_micros() as i64;
-            let argv: Vec<Bytes> = args
-                .iter()
-                .filter_map(|a| a.as_bulk_string().cloned())
-                .collect();
-            self.cache.slowlog.maybe_push(duration_us, argv);
+            let threshold = self.cache.slowlog.slower_than_us();
+            if threshold >= 0 && duration_us >= threshold {
+                let argv: Vec<Bytes> = args
+                    .iter()
+                    .filter_map(|a| a.as_bulk_string().cloned())
+                    .collect();
+                self.cache.slowlog.maybe_push(duration_us, argv);
+            }
         }
 
         result

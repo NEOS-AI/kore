@@ -177,6 +177,96 @@ p99: **not reported** by this `redis-benchmark -q` build.
 - **No portable performance claim.** Different CPUs, OS, thread counts, or Valkey/Redis builds will move absolute ops/s and ratios. Re-run this section before any external comparison.
 - Redis (non-Valkey) left unmeasured because 6379 was busy; Valkey is the Redis-protocol peer used here.
 
+---
+
+## Pipeline SET analysis (Batch FI, 2026-07-25)
+
+Qualitative code analysis of the pipelined SET path (network → RESP → `CommandHandler` → `Cache::store` → AOF/repl hooks), plus low-risk hot-path wins. Re-measured with the same FD methodology on the same host.
+
+### Root causes (ranked)
+
+| Rank | Cause | Evidence / notes |
+|------|--------|------------------|
+| **1** | **Global write serialization on every SET** | Even with `--save ""` and AOF off, `maybe_persist_write` → `PersistenceManager::on_write_command` always: marks dirty, took the **AOF mutex for the whole encode + propagate**, then `ReplicationManager::propagate_raw` takes **fullsync_gate + backlog** (and previously **replicas** even when empty). Multi-threaded workers (c=50) contend on these locks; Valkey is single-threaded and avoids that tax. Explains SET≪GET under pipeline while non-pipeline stays close. |
+| **2** | **Per-write encode / argv allocs** | `maybe_persist_write` built argv with `Bytes::from(cmd.to_string())`; `encode_command` built a full `Vec<RespValue>` cloning each arg, then `serialize()`. Done under or adjacent to global locks → amplifies (1). |
+| **3** | **Extra work on SET vs GET** | SET: `ensure_string_or_absent` via `get_key_value` (string-map Arc clone on hit) + `store` pre-`map.get` for capacity + shard **write** lock + `Entry::new` + memory account + dirty/repl. GET: shard **read** lock, optional LRU touch, no persist path. |
+| **4** | **Slowlog argv clone every command** | `handle` always cloned full argv before `slowlog.maybe_push` even when under the 10ms threshold (GET and SET). |
+| **5** | **Reply serialize for `+OK`** | `RespValue::serialize` heap-allocated `BytesMut` for the ubiquitous SimpleString `OK`. |
+
+Network pipeline coalescing (`pipeline_buf` + write-task batching) is already in good shape and is **not** the primary SET gap (GET P=16 is already near Valkey).
+
+### Changes shipped (Batch FI)
+
+1. **AOF-off fast path** in `on_write_command`: hold AOF mutex only to decide SELECT / update `selected_db`; encode + `propagate_*` run **outside** that lock (AOF-on path unchanged for disk ordering).
+2. **`encode_command`**: direct RESP write (no intermediate `RespValue` tree / per-arg `Bytes` clones); stack decimal digits.
+3. **`propagate_raw`**: skip replicas list lock when `connected_replicas == 0`.
+4. **`maybe_persist_write`**: `Bytes::copy_from_slice(cmd)` instead of `cmd.to_string()`.
+5. **Slowlog**: clone argv only when duration ≥ threshold.
+6. **`ensure_string_or_absent`**: probe typed `key_values` only (no string-map Arc clone).
+7. **`store`**: move value into entry (one less clone); skip pre-get / capacity work when `maxmemory == 0` (unlimited).
+8. **`RespValue::serialize`**: static `+OK\r\n` for SimpleString `OK`.
+9. **`StoreOptions: Copy`**; drop redundant `opts.clone()` in `handle_set`.
+
+### Re-measure (same host / methodology as FD)
+
+| Field | Value |
+|-------|--------|
+| Date | 2026-07-25 |
+| Host | Apple M3 Pro (11 logical), 18 GB; macOS 26.3.1 |
+| Kore | **0.6.0** release post-FI; `--host 127.0.0.1 --port 6380 --save "" --dir /tmp/kore-bench-fi` |
+| Valkey | **9.0.0** `127.0.0.1:6378 --save "" --appendonly no --dir /tmp/redis-bench-fi` |
+| Method | warm-up discarded; **3** passes; **median** ops/s |
+
+#### Throughput (ops/s, median of 3) — FI vs FD
+
+| Workload | Kore FD | Kore FI | Δ vs FD | Valkey FI | Notes |
+|----------|---------|---------|---------|-----------|-------|
+| SET c=50 P=1 | 185,874 | **202,020** | +9% | 212,314 | |
+| GET c=50 P=1 | 186,916 | **189,036** | ~flat | 212,314 | |
+| SET c=50 P=16 | 497,512 | **621,118** | **+25%** | 1,587,302 | main target |
+| GET c=50 P=16 | 1,818,182 | **1,851,852** | ~flat | 1,960,784 | |
+| INCR c=50 | 186,916 | **193,424** | +3% | 212,314 | |
+| SET c=50 P=1 d=256 | 177,620 | **191,939** | +8% | 208,768 | |
+| GET c=50 P=1 d=256 | 190,114 | **193,798** | ~flat | 210,970 | |
+
+Pass-level raw ops/s (FI):
+
+| Workload | Kore passes | Valkey passes |
+|----------|-------------|---------------|
+| SET P=1 | 191205 / 206612 / 202020 | 212314 / 214133 / 210084 |
+| GET P=1 | 189036 / 207469 / 188679 | 212314 / 212314 / 211417 |
+| SET P=16 | 649351 / 621118 / 621118 | 1587302 / 1587302 / 1612903 |
+| GET P=16 | 1851852 / 1851852 / 1250000 | 2000000 / 1960784 / 1960784 |
+| INCR | 193424 / 205761 / 166113 | 212766 / 212314 / 212314 |
+| SET d=256 | 197239 / 139470 / 191939 | 209205 / 208333 / 208768 |
+| GET d=256 | 212314 / 162338 / 193798 | 210970 / 211417 / 208333 |
+
+#### Latency p50 (msec, median of 3) — FI
+
+| Workload | Kore p50 | Valkey p50 |
+|----------|----------|------------|
+| SET c=50 P=1 | 0.127 | 0.127 |
+| GET c=50 P=1 | 0.127 | 0.127 |
+| SET c=50 P=16 | 1.231 | 0.439 |
+| GET c=50 P=16 | 0.303 | 0.343 |
+| INCR c=50 | 0.135 | 0.127 |
+| SET c=50 P=1 d=256 | 0.143 | 0.127 |
+| GET c=50 P=1 d=256 | 0.143 | 0.127 |
+
+### Interpretation (FI)
+
+- **Real win on pipelined SET** (~0.50M → ~0.62M ops/s, **~+25%** on this host) without changing protocol semantics.
+- **Residual gap** vs Valkey pipelined SET remains large (~0.62M vs ~1.59M, ~2.6×). Dominant leftover cost is still **global replication-backlog serialization** (every write encodes RESP + appends 1 MiB circular backlog under mutexes) plus multi-threaded lock contention vs Valkey’s single-threaded event loop.
+- Non-pipelined and GET pipeline remain roughly in the FD band (within noise / slightly better).
+
+### Residual (FI-2 / later)
+
+- Optional: skip or shrink repl backlog when no replicas ever connected and operator opts in (breaks eager PSYNC until first write after replica appears — needs clear config).
+- Fuse `fullsync_gate` + backlog into one critical section; encode with small thread-local buffer reuse.
+- Avoid dual key ownership clone (`Entry.key` + HashMap key) / thin `Entry` without duplicated key bytes.
+- Per-shard dirty counters; batch `mark_dirty` under pipeline.
+- Flamegraph / `samply` on Linux for quantitative attribution (not run this batch on macOS).
+
 ## Vector search (HNSW vs FLAT) — methodology
 
 Generic `redis-benchmark` does not cover RediSearch vectors. For Kore-internal

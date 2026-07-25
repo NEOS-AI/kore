@@ -21,12 +21,50 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Serialize a command (argv) as a RESP array.
+///
+/// Writes bulk strings directly (no intermediate `RespValue` tree / `Bytes`
+/// clones of each arg). Hot path for AOF append and replication propagation.
 pub fn encode_command(args: &[Bytes]) -> Bytes {
-    let arr: Vec<RespValue> = args
-        .iter()
-        .map(|a| RespValue::BulkString(Some(a.clone())))
-        .collect();
-    RespValue::Array(arr).serialize()
+    use bytes::{BufMut, BytesMut};
+
+    // *N\r\n + per-arg $len\r\n<data>\r\n — digit budget is generous (20).
+    let mut cap: usize = 1 + 20 + 2;
+    for a in args {
+        cap = cap
+            .saturating_add(1 + 20 + 2)
+            .saturating_add(a.len())
+            .saturating_add(2);
+    }
+    let mut buf = BytesMut::with_capacity(cap);
+    buf.put_u8(b'*');
+    put_usize(&mut buf, args.len());
+    buf.put_slice(b"\r\n");
+    for a in args {
+        buf.put_u8(b'$');
+        put_usize(&mut buf, a.len());
+        buf.put_slice(b"\r\n");
+        buf.extend_from_slice(a);
+        buf.put_slice(b"\r\n");
+    }
+    buf.freeze()
+}
+
+/// Write a decimal usize without heap allocation (hot encode path).
+#[inline]
+fn put_usize(buf: &mut bytes::BytesMut, mut n: usize) {
+    use bytes::BufMut;
+    if n == 0 {
+        buf.put_u8(b'0');
+        return;
+    }
+    let mut tmp = [0u8; 20];
+    let mut i = 20;
+    while n > 0 {
+        i -= 1;
+        tmp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    buf.extend_from_slice(&tmp[i..]);
 }
 
 /// Open or create an AOF file for append.

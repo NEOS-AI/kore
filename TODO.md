@@ -739,7 +739,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Next work queue (post-FG-3)
 
-**Primary FB–FG-3 queue: done. FH (2PC slice 2) done.** Optional follow-ons below. Prefer **P2 FI** before large keyspace churn. Standing rule: land tests with each batch.
+**Primary FB–FG-3 queue: done. FH (2PC slice 2) done. FI (pipeline SET) done.** Optional follow-ons below. Prefer FG-4 / FK / FL when resuming. Standing rule: land tests with each batch.
 
 #### Completed (FB–FG-3 + FH)
 
@@ -759,12 +759,14 @@ Also tracked in `docs/roadmap.md`.
   - Prepare-epoch + TTL fence; `CHECKPREPARE` + dual-end commit re-check; boot clear fail-closed
   - Tests: stale epoch / cleared / TTL / boot; e2e recheck inject no half-apply; happy path complete
   - Residual: durable-on-disk prepare; bus 2PC; atomic COMMITPREPARE
+- [x] **`[P2]`** **Batch FI — Pipeline SET perf investigation**
+  - Root causes ranked in `docs/benchmarks.md` → *Pipeline SET analysis*
+  - Wins: AOF-off unlock encode/propagate; direct `encode_command`; skip empty replica lock; slowlog/argv/`+OK` alloc cuts; typed-only WRONGTYPE; store value move
+  - Re-measure (same host/method as FD): SET c=50 P=16 median **~621k** ops/s (FD **~498k**, **+~25%**); Valkey still ~1.59M
+  - Residual **FI-2**: global repl backlog still serializes all writers; optional backlog-off config; lock fuse; Entry dual-key clone
 
 #### Open optional queue (pick when resuming)
 
-- [ ] **`[P2]`** **Batch FI — Pipeline SET perf investigation** ← **recommended next**
-  - Profile Kore pipelined SET vs Valkey (FD gap); document findings in `docs/benchmarks.md`
-  - Optional micro-optimizations only if root cause is clear (no drive-by rewrites)
 - [ ] **`[P3]`** **Batch FG-4 / FJ — Strings into unified map (optional)**
   - Merge `Cache::map` string entries into `KeyValue::String` in `key_values` (or keep dual-map + document forever)
   - Optional: fold `typed_expires` into per-key slot header; keep LOADING/epoch install correct
@@ -781,7 +783,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-**Batches CZ–FG-3 + FH shipped.** **Review 2026-07-25:** primary queue complete; FH 2PC slice 2 landed. Next recommended **FI** (pipeline SET). Open review rows: FC first-replica promote, EN/EO/EU `nodes.conf` flags (P3). Standing tests-for-phase P0.
+**Batches CZ–FG-3 + FH + FI shipped.** **Review 2026-07-25:** primary queue complete; FI pipeline SET ~+25% on host P=16; residual FI-2 backlog serialize. Next optional: **FG-4** / **FK** / **FL**. Open review rows: FC first-replica promote, EN/EO/EU `nodes.conf` flags (P3). Standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|

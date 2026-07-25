@@ -515,8 +515,17 @@ impl ReplicationManager {
                 .store(bl.end_offset(), Ordering::Relaxed);
         }
 
+        // Fast path: no connected replicas — skip the feed list lock.
+        // `connected_replicas` is updated under `replicas` lock on register/drop;
+        // a stale 0 is safe (miss one send → full resync later). A stale non-zero
+        // just takes the lock and finds the list empty/non-empty correctly.
+        if self.connected_replicas.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+
         let mut reps = self.replicas.lock();
         if reps.is_empty() {
+            self.connected_replicas.store(0, Ordering::Relaxed);
             return;
         }
         reps.retain(|r| r.tx.try_send(data.clone()).is_ok());
