@@ -73,7 +73,8 @@ Example: fix EXAT (`A` / `P0`) before RESP3 (`D` / `P1`) or HNSW benchmarks (`E`
 ### Keyspace model
 
 - [x] **`[P0]`** **Unified keyspace**: store strings, zsets, geo (and future types) under one map keyed by name
-  - *Done pragmatically*: separate maps + type registry / cross-type ops (not a single typed enum map yet)
+  - *Done pragmatically*: separate maps + type registry / cross-type ops
+  - *Batch FG (slice A)*: `KeyValue` view enum + facade for TYPE/DEL/EXISTS/`key_type`; design + migration plan documented; physical single map deferred to **FG-2**
 - [x] **`[P0]`** **Type safety**: Redis-style type errors when a key exists with a different type
 - [x] **`[P0]`** **Cross-type ops**: `DEL`, `EXISTS`, `KEYS`/`SCAN`, `DBSIZE`, `TTL`/`EXPIRE`, `TYPE` work for all types
   - *Done*: `SCAN` implemented (cursor-based, sorted key index); `KEYS`/`DBSIZE`/`DEL`/`EXISTS`/`TYPE`/`FLUSH` cover all types
@@ -712,11 +713,11 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
   - *Done (Batch BT)*: `bt_eval_select_persists_connection_db` — connection remains on selected DB after EVAL
 
-### Status snapshot (2026-07-25, post-FF)
+### Status snapshot (2026-07-25, post-FG)
 
-**Shipped through Batch FF** (NODE 2PC **FB**; promote gate **FC**; benches **FD**; Sentinel leader election **FE**; HNSW multi-layer insert **FF**). **Not finished:** open queue **FG** + deferred **P3** nits. Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule).
+**Shipped through Batch FG** (NODE 2PC **FB**; promote gate **FC**; benches **FD**; Sentinel leader election **FE**; HNSW multi-layer insert **FF**; unified keyspace facade **FG**). **Not finished:** **FG-2** physical single-map migrate + deferred **P3** nits. Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule).
 
-**Verification (FF):** `cargo test --lib vector_search` **25 passed / 1 ignored**; hnsw filter **22 passed / 1 ignored**; `ce_acl_search_hnsw_test` **4/4**; `search_test` **9/9**; `search_resp_test` **8/8**. main **ahead of origin** (FB–FF); only untracked `data/`.
+**Verification (FG):** `cargo test --lib cache::keyspace` **5/5**; `keyspace_test` + related suites. main **ahead of origin** (FB–FG); only untracked `data/`.
 
 **Open / deferred residuals** (track as next queue below):
 
@@ -724,7 +725,8 @@ Also tracked in `docs/roadmap.md`.
 |------|----------|----------|
 | Search | HNSW multi-layer insert | done (Batch FF) |
 | Search | HNSW graph edges/levels **not** AOF/RDB durable (rebuild on load; levels re-sampled) | P3 (accepted honesty; Batch FF) |
-| Keyspace | True **single typed enum map** (pragmatic multi-map + registry today) | **P2 → Batch FG** |
+| Keyspace | `KeyValue` + TYPE/DEL/EXISTS facade (multi-map underneath) | done (Batch FG slice A) |
+| Keyspace | Physical **single typed enum map** (migrate one type, then rest; payload collapse) | **P2 → FG-2** |
 | Ops | Re-measure on other hosts / Redis non-Valkey; investigate pipelined SET gap | P2 (post-FD) |
 | Cluster | NODE 2PC **slice 2** (durable prepare / prepare-epoch / re-check at commit / bus) | P2 (later) |
 | Sentinel | Election **cooldown/timeout**; epoch thrash; probe self-vs-`*` | P3 (post-FE accepted lite) |
@@ -757,10 +759,14 @@ Recommended letter batches. Prefer **next open P2** before large polish. Standin
   - *Done*: geometric level assignment (`ml = 1/ln(max(M,2))`, `level = floor(-ln(U)*ml)`, cap 16); upper-layer greedy SEARCH-LAYER (`ef=1`) + per-layer connect with `ef_construction` / prune / entry promote; query multi-layer descent; remove unlinks all layers + trim empty tops + re-pick top-layer entry; `enqueue_levels` / `with_level_seed` for deterministic tests
   - *Recall@k*: existing CV/DK/DL gates still green under multi-layer insert
   - *Residual*: graph edges/levels **not** persisted in AOF/RDB (vectors + `M`/`ef_construction` only; rebuild re-samples levels); multi-layer `max_m=1` spanning force-keep still P3
-- [ ] **`[P2]`** **Batch FG — Unified keyspace map (design + incremental)** ← **do next**
-  - Typed value enum (or equivalent) under one name map; preserve type errors + cross-type DEL/SCAN/TTL
-  - Migration plan for memory accounting / eviction sampling; land behind incremental PR if large
-- [ ] **`[P3]`** **Later / optional (not blocking FG)**
+- [x] **`[P2]`** **Batch FG — Unified keyspace map (design + incremental)**
+  - *Done (slice A):* `KeyValue` enum + `Cache::get_key_value` / `remove_key_value_raw`; `key_type` / `exists` / `delete` / expire-delete routed through facade; design in `src/cache/keyspace.rs` rustdoc + `docs/module_architectures.md` §3 + `docs/locking.md`
+  - Storage remains multi-map (safe incremental); load/install payload multi-field unchanged
+  - *Tests:* `cache::keyspace` unit (5); existing `tests/keyspace_test.rs` cross-type suite
+  - *Residual → FG-2:* migrate one typed container into a single `KeyValue` map (prefer hashes/sets); then FG-3 remaining types + `KeyspacePayload` collapse; FG-4 optional expire slot header
+- [ ] **`[P2]`** **Batch FG-2 — Physical single-map migrate (one type first)** ← **do next**
+  - Move hashes or sets into unified storage behind facade; dual-read if needed; tests green
+- [ ] **`[P3]`** **Later / optional (not blocking FG-2)**
   - NODE 2PC slice 2 (durable prepare, prepare-epoch, commit re-check)
   - Sentinel promote rank by offset/priority (FC first-replica-wins nit); CKQUORUM live probe
   - `nodes.conf` live flags (require-full / allow-reads / announce)
@@ -768,7 +774,7 @@ Recommended letter batches. Prefer **next open P2** before large polish. Standin
 
 ### Code review backlog
 
-**Batches CZ–FF shipped.** **Review 2026-07-25:** FF multi-layer HNSW insert green. **Queue:** **FG** unified keyspace; P3 nits deferred. Standing tests-for-phase P0.
+**Batches CZ–FG shipped.** **Review 2026-07-25:** FG keyspace facade green. **Queue:** **FG-2** physical map migrate; P3 nits deferred. Standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -963,4 +969,4 @@ Highest urgency checklist (phase order preserved):
 - [x] Eviction policies (`maxmemory-policy`)
   - *Follow-ups*: Streams, bitmaps/HLL, RESP3 (done elsewhere); LFU decay done in Batch AB
 
-**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB**–**FF** shipped — pick from **Next work queue (post-FE)** (**FG** unified keyspace next) and keep landing tests with each batch.
+**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB**–**FG** shipped — pick from **Next work queue (post-FE)** (**FG-2** physical keyspace map next) and keep landing tests with each batch.

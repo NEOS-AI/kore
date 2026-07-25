@@ -13,8 +13,10 @@ mod search;
 mod bitmap;
 mod hyperloglog;
 mod key_xfer;
+mod keyspace;
 
 pub use bitmap::{BitOpKind, BitfieldOp, BitfieldOverflow};
+pub use keyspace::KeyValue;
 
 use crate::hashmap::{ShardedHashMap, ShardedKeyMap};
 use crate::sorted_set::SharedSortedSet;
@@ -41,9 +43,17 @@ pub use storage::KeyType;
 pub(crate) use storage::KeyspacePayload;
 pub use eviction::EvictionPolicy;
 
-/// The main cache structure
+/// The main cache structure.
+///
+/// # Keyspace layout (Batch FG)
+///
+/// Logical Redis keyspace is **one name → one typed value**. Today that is
+/// implemented as a **multi-map** (fields below) with a facade
+/// ([`KeyValue`], [`Cache::get_key_value`]) so TYPE / DEL / EXISTS share one
+/// lookup path. See `keyspace` module docs and `docs/module_architectures.md`
+/// for the migration plan toward a single `KeyValue` map (FG-2+).
 pub struct Cache {
-    /// Sharded hashmap for storing entries
+    /// Sharded hashmap for string entries (`KeyValue::String`)
     pub(super) map: ShardedHashMap,
     /// Sharded map for sorted sets (key → SharedSortedSet)
     pub(super) sorted_sets: ShardedKeyMap<SharedSortedSet>,

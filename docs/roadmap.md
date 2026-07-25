@@ -3,7 +3,7 @@
 ## Currently working on..
 
 - [x] Support for Redis Pub-Sub
-- **Post-FF queue** (HNSW multi-layer insert shipped): next is **Batch FG** (unified keyspace). Details in root `TODO.md` → *Next work queue (post-FE)*.
+- **Post-FG queue** (unified keyspace facade shipped): next is **Batch FG-2** (physical single-map migrate, one type first). Details in root `TODO.md` → *Next work queue (post-FE)*.
 
 ## Persistence / search letter batches (recent)
 
@@ -76,7 +76,8 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] **FD** measured benchmarks vs Valkey (`docs/benchmarks.md`; single-host median of 3; no portable-win claims)
 - [x] Sentinel leader election depth (Batch FE: voted-leader / elect gate; residuals: election-timeout, hello SUBSCRIBE, CKQUORUM live)
 - [x] HNSW multi-layer insert (Batch FF)
-- [ ] **Next (see `TODO.md` Next work queue post-FE):** **FG** unified keyspace · later NODE 2PC slice 2 / Sentinel promote rank / `nodes.conf` flags
+- [x] Unified keyspace design + `KeyValue` facade (Batch FG slice A; multi-map storage)
+- [ ] **Next (see `TODO.md` Next work queue post-FE):** **FG-2** physical single-map migrate · later NODE 2PC slice 2 / Sentinel promote rank / `nodes.conf` flags
 - [x] 데드락 감지 고급 기능
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원

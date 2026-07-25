@@ -1,5 +1,4 @@
 use crate::error::Result;
-use crate::memory::MemoryCategory;
 use bytes::Bytes;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -222,26 +221,7 @@ impl Cache {
 
     /// Delete any key type without touching typed_expires (caller manages expire).
     fn delete_without_clearing_expire(&self, key: &Bytes) -> Result<bool> {
-        let deleted = if let Some(entry) = self.map.remove(key) {
-            let size = entry.size();
-            self.memory_usage.fetch_sub(size, Ordering::Relaxed);
-            self.memory_tracker.deallocate(size, MemoryCategory::Cache);
-            true
-        } else if self.remove_sorted_set(key) {
-            true
-        } else if self.remove_geo_set(key) {
-            true
-        } else if self.remove_hash(key) {
-            true
-        } else if self.remove_list(key) {
-            true
-        } else if self.remove_set(key) {
-            true
-        } else if self.remove_stream(key) {
-            true
-        } else {
-            false
-        };
+        let deleted = self.remove_key_value_raw(key);
         if deleted {
             self.auto_remove_from_indices(key);
             self.touch_watch_key(key);

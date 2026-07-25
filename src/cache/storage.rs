@@ -87,35 +87,12 @@ enum StoreOutcome {
 
 impl Cache {
     /// Determine the type of value stored at `key`.
+    ///
+    /// Routed through [`Cache::get_key_value`] (unified keyspace facade).
     pub fn key_type(&self, key: &Bytes) -> KeyType {
-        if let Some(entry) = self.map.get(key) {
-            if !entry.is_expired() {
-                return KeyType::String;
-            }
-        }
-        // Lazy expire for typed keys with TTL.
-        if self.purge_typed_if_expired(key) {
-            return KeyType::None;
-        }
-        if self.sorted_sets.contains_key(key) {
-            return KeyType::ZSet;
-        }
-        if self.geo_sets.contains_key(key) {
-            return KeyType::Geo;
-        }
-        if self.hashes.read().contains_key(key) {
-            return KeyType::Hash;
-        }
-        if self.lists.read().contains_key(key) {
-            return KeyType::List;
-        }
-        if self.sets.read().contains_key(key) {
-            return KeyType::Set;
-        }
-        if self.streams.read().contains_key(key) {
-            return KeyType::Stream;
-        }
-        KeyType::None
+        self.get_key_value(key)
+            .map(|v| v.key_type())
+            .unwrap_or(KeyType::None)
     }
 
     /// Ensure `key` is either absent or already of `expected` type.
@@ -371,30 +348,14 @@ impl Cache {
         }
     }
 
-    /// Delete a key (string, sorted set, geo, hash, list, or set)
+    /// Delete a key of any type (unified keyspace facade).
+    ///
+    /// Removes the value via [`Cache::remove_key_value_raw`], clears typed
+    /// expire metadata, and drops search-index documents for the name.
     pub fn delete(&self, key: &Bytes) -> Result<bool> {
         self.stats.incr(&self.stats.cmd_del);
 
-        let deleted = if let Some(entry) = self.map.remove(key) {
-            let size = entry.size();
-            self.memory_usage.fetch_sub(size, Ordering::Relaxed);
-            self.memory_tracker.deallocate(size, MemoryCategory::Cache);
-            true
-        } else if self.remove_sorted_set(key) {
-            true
-        } else if self.remove_geo_set(key) {
-            true
-        } else if self.remove_hash(key) {
-            true
-        } else if self.remove_list(key) {
-            true
-        } else if self.remove_set(key) {
-            true
-        } else if self.remove_stream(key) {
-            true
-        } else {
-            false
-        };
+        let deleted = self.remove_key_value_raw(key);
 
         // Always drop typed expire metadata (no-op if absent).
         self.clear_typed_expire(key);
@@ -418,9 +379,9 @@ impl Cache {
         Ok(count)
     }
 
-    /// Check if key exists (any type)
+    /// Check if key exists (any type). Uses the unified keyspace facade.
     pub fn exists(&self, key: &Bytes) -> bool {
-        self.key_type(key) != KeyType::None
+        self.get_key_value(key).is_some()
     }
 
     /// Get database size (all key types)
