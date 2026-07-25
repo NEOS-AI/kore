@@ -3,7 +3,7 @@
 ## Currently working on..
 
 - [x] Support for Redis Pub-Sub
-- **Post-FG-3:** all non-string types physical in `Cache::key_values`; strings still on `map` (optional FG-4). Details in root `TODO.md`.
+- **Primary queue complete through FG-3.** Next recommended: **Batch FH** (NODE 2PC slice 2). Optional: FI pipeline SET, FG-4 strings, FK Sentinel promote rank, FL `nodes.conf` flags. See root `TODO.md` → *Next work queue (post-FG-3)*.
 
 ## Persistence / search letter batches (recent)
 
@@ -48,6 +48,7 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Sentinel ODOWN quorum (Batch EX: MEET + IS-MASTER-DOWN-BY-ADDR votes; failover on o_down)
 - [x] Dual-end NODE preflight (Batch EY: prepare MYID+owner check; failed_preflight)
 - [x] Dual-end NODE wire 2PC slice 1 (Batch FB: SETSLOT PREPARE/ABORTPREPARE + dest-first commit; failed_prepare)
+- [x] Dual-end NODE wire 2PC slice 2 (Batch FH: prepare-epoch + TTL + CHECKPREPARE commit re-check; boot clear; failed_prepare:recheck)
 - [x] Sentinel conf persistence (Batch EZ: FLUSHCONFIG + load sentinel.conf; autosave)
 - [x] Sentinel hello bus lite (Batch FA: HELLO CSV + PUBLISH + peer exchange)
 - [x] Sentinel promote-success gate (Batch FC: FAILOVER/REPLICAOF/ROLE=master; failover_in_progress)
@@ -71,7 +72,7 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Redis key-level `MIGRATE` (Batch DP: COPY/REPLACE/AUTH/KEYS/timeout; shared recreate path with MIGRATEKEYS; no DUMP/RESTORE)
 - [x] MIGRATE honesty (Batch DQ: multi-key IOERR `migrated=`/`skipped=`; typed TTL via SET PX / trailing PEXPIRE)
 - [x] MIGRATE absolute expire (Batch DT: snapshot unix-ms end; string `SET PXAT` / typed `PEXPIREAT`; remaining-ms shrink closed)
-- [x] Cluster automatic reshard / multi-type MIGRATE orchestration (MVP complete: PLAN/AUTO DX, epoch gossip DU, dest-first NODE DV, fail quorum DW, EY preflight, EP dest rollback, **FB RESP prepare/commit 2PC slice**)
+- [x] Cluster automatic reshard / multi-type MIGRATE orchestration (MVP complete: PLAN/AUTO DX, epoch gossip DU, dest-first NODE DV, fail quorum DW, EY preflight, EP dest rollback, **FB/FH RESP prepare/commit 2PC**)
 - [x] Sentinel promote-success gate (Batch FC: real promote required; in-process failover_in_progress)
 - [x] **FD** measured benchmarks vs Valkey (`docs/benchmarks.md`; single-host median of 3; no portable-win claims)
 - [x] Sentinel leader election depth (Batch FE: voted-leader / elect gate; residuals: election-timeout, hello SUBSCRIBE, CKQUORUM live)
@@ -79,7 +80,9 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Unified keyspace design + `KeyValue` facade (Batch FG slice A; multi-map storage)
 - [x] **FG-2** physical hashes in `ShardedKeyMap<KeyValue>` (`Cache::key_values`)
 - [x] **FG-3** remaining typed containers (list/set/zset/geo/stream) + `KeyspacePayload` collapse; eviction samples typed from one map
-- [ ] **Next (see `TODO.md`):** optional **FG-4** (strings / expire slot) · NODE 2PC slice 2 · Sentinel nits
+- [x] **Primary FB–FG-3 queue complete** (typed keyspace unified; strings still on `map`)
+- [x] **FH** NODE 2PC slice 2 (prepare-epoch + TTL + commit re-check + boot clear)
+- [ ] **Next (see `TODO.md` post-FG-3):** **FI** pipeline SET · optional **FG-4**/FJ strings · **FK** Sentinel promote rank · **FL** `nodes.conf` flags
 - [x] 데드락 감지 고급 기능
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원

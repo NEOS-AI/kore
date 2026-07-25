@@ -313,12 +313,14 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch DQ)*: multi-key mid-batch `IOERR` includes `migrated=` / `skipped=` counts (shared inject with MIGRATEKEYS); recreate path transfers remaining TTL for all types (string `SET PX`; hash/list/set/zset/geo/stream trailing `PEXPIRE` via `Cache::ttl`). Tests: partial inject e2e + string/hash/list TTL.
   - *Gaps*: no interactive redis-cli weight UI. MIGRATE: no Redis DUMP/RESTORE wire compatibility (recreate-only); ASKING probe / REPLACE pre-DEL semantics documented in module rustdoc (Batch DP). Dual-end NODE has RESP prepare/commit (Batch FB); not Redis binary cluster-bus 2PC.
   - *Done (Batch EY)*: dual-end NODE **preflight** before any SETSLOT NODE — local owns/already-dest; dest reachable + `CLUSTER MYID` matches dest-id; dest `CLUSTER SLOTS` owner is source or dest (or unbound). Failure → `failed_preflight` (no half-apply). Idempotent complete when both already own dest.
-  - *Done (Batch FB)*: dual-end NODE **wire 2PC slice 1** — `SETSLOT PREPARE`/`ABORTPREPARE` votes on source+dest (extends EY); commit only after both prepares (dest-first NODE, DV); EP rollback on source commit fail; status `failed_prepare` without half-apply; range aborts on prepare fail. Tests: happy path, dest prepare inject, source commit→rolled_back + FINISH, range abort. Residual (slice 2): durable prepare fence across crash, prepare-epoch fencing, bus-level 2PC if/when bus exists.
-  - *Residual (FB post-ship code review 2026-07-25 later pass)*:
-    - **P3** commit path does **not** re-assert `prepared_node` immediately before NODE (concurrent `ABORTPREPARE` / operator clear can race between prepare and commit).
+  - *Done (Batch FB)*: dual-end NODE **wire 2PC slice 1** — `SETSLOT PREPARE`/`ABORTPREPARE` votes on source+dest (extends EY); commit only after both prepares (dest-first NODE, DV); EP rollback on source commit fail; status `failed_prepare` without half-apply; range aborts on prepare fail. Tests: happy path, dest prepare inject, source commit→rolled_back + FINISH, range abort.
+  - *Done (Batch FH)*: dual-end NODE **wire 2PC slice 2** — prepare votes stamp **slot config epoch** + wall-clock **TTL** (`PREPARE_VOTE_TTL`); `SETSLOT CHECKPREPARE` + local `check_prepare_valid` before dest NODE; source re-checks again immediately before its NODE; stale epoch / cleared / expired prepare → `failed_prepare:recheck:…` without half-apply; boot/`from_nodes_conf` empty prepare map (fail-closed soft restart). Tests: unit epoch/TTL/clear/boot; e2e recheck inject + happy path; FB suite green.
+  - *Residual (FH / FB)*:
+    - **P3** prepare still **not durable on disk** (`nodes.conf` omits votes) — intentional slice-2 choice (TTL + boot clear + epoch fence). Full durable prepare residual if crash-window votes must survive hard restart without re-PREPARE.
+    - **P3** no Redis **binary cluster bus** 2PC (RESP-only prepare/commit).
     - **P3** dest-side `set_prepare_node(myself)` accepts unbound **or any known-peer owner** (broad vote; intentional for mid-reshard but weak fencing).
-    - **P3** `prepare_node` is memory-only (not in `nodes.conf`); crash mid-prepare loses votes (slice 2).
-    - **P3** operator `SETSLOT NODE` still bypasses prepare (FINISH/recovery intentional; dual-end path enforces prepare).
+    - **P3** operator `SETSLOT NODE` still bypasses prepare (FINISH/recovery intentional; dual-end path enforces prepare + re-check).
+    - **P3** CHECKPREPARE→NODE race on dest remains (no single atomic COMMITPREPARE opcode).
   - *Done (Batch EP)*: when dest NODE ok but source NODE fails: EH re-asserts MIGRATING; **compensate** dest with `SETSLOT NODE <source>` + `IMPORTING` → status `rolled_back` (both sides agree source owns; retry FINISH). Rollback failure keeps `partial_source_node` + warning. Range aborts on `rolled_back`. Source NODE inject hook for tests.
   - *Done (Batch EQ)*: Redis `cluster-require-full-coverage` (default yes) — `CLUSTER INFO cluster_state:ok|fail`; key commands get `CLUSTERDOWN The cluster is down` when any slot is unbound or fail-owned; CONFIG GET/SET + `--cluster-require-full-coverage`; ASKING+IMPORTING still allowed for reshard.
   - *Done (Batch ER)*: connection `READONLY`/`READWRITE` wired into cluster redirect gate — replicas serve **reads** for slots owned by their master; writes still `MOVED`; without READONLY all key cmds `MOVED` (Redis-compatible).
@@ -333,8 +335,7 @@ Also tracked in `docs/roadmap.md`.
   - [x] **`[P1]`** **Code review (EW post-ship):** `promote_replica` succeeds on PING alone
     - *Done (Batch FC)*: `promote_replica` requires `FAILOVER` OK / `REPLICAOF NO ONE` OK / post-attempt `ROLE=master`; never PING-only. Per-master `failover_in_progress`. Tests: inject fail → no switch; inject OK + real ROLE path still switch.
   - [x] **`[P3]`** **Code review (FB post-ship nits):** prepare not re-checked at commit; dest prepare permissive; memory-only votes
-    - *Found (scheduled review after FB/FC)*: see Batch FB residual bullets above. Accept for slice 1; fold re-check + prepare-epoch into **slice 2** / later if dual-end races matter under concurrent operators.
-    - *Accepted (slice 1)*: dual-end path enforces prepare; operator NODE bypass for recovery; prepare not durable.
+    - *Done (Batch FH)*: commit re-check + prepare-epoch + TTL + boot clear. Residual: durable-on-disk prepare; bus 2PC; atomic COMMITPREPARE; dest vote breadth; operator NODE bypass (intentional).
   - [x] **`[P2]`** **Code review (EX/FA post-ship):** Sentinel failover leader election (cross-process)
     - *Done (Batch FE)*: sticky voted-leader on `IS-MASTER-DOWN-BY-ADDR`; auto path elects before `try_failover`; `voted-leader` / `voted-leader-epoch` on MASTER fields. Residual: not full Redis election-timeout state machine.
   - [x] **`[P3]`** **Code review (FE post-ship nits):** election-epoch thrash; probe self-as-leader; majority uses table size
@@ -715,80 +716,72 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
   - *Done (Batch BT)*: `bt_eval_select_persists_connection_db` — connection remains on selected DB after EVAL
 
-### Status snapshot (2026-07-25, post-FG-3)
+### Status snapshot (2026-07-25, post-FG-3 scheduled review)
 
-**Shipped through Batch FG-3** (FB–FG facade; FG-2 hashes; **FG-3** all typed containers → `Cache::key_values` + payload collapse). Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule).
+**Primary letter queue finished through Batch FG-3; P2 residual FH shipped.** Shipped: FB–FE (cluster/Sentinel/benches), **FF** HNSW multi-layer, **FG**–**FG-3** unified typed keyspace, **FH** NODE 2PC slice 2. Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed).
 
-**Verification:** lib **337** pass / 1 ignored; keyspace + typed_ttl + list/set/zset/stream/geo + memory + multi-DB replace + persistence integration green.
+**Verification (FH):** lib cluster migrate/state unit green; `cluster_migrate_test` 41/41 serial; FH unit (epoch/TTL/boot) + e2e recheck + happy path. Only untracked `data/`.
 
-**Open / deferred residuals** (track as next queue below):
+**What remains** is **optional / polish** (no open P0–P1 feature blockers from the old A–E checklist). Open review checkboxes are **P2/P3** follow-ons only.
 
-| Area | Residual | Priority |
-|------|----------|----------|
-| Search | HNSW multi-layer insert | done (Batch FF) |
-| Search | HNSW graph edges/levels **not** AOF/RDB durable (rebuild on load; levels re-sampled) | P3 (accepted honesty; Batch FF) |
-| Search | CS rewire test flake under multi-layer RNG | **fixed** (force L0 + seed) |
-| Keyspace | `KeyValue` facade + all **typed** physical in `key_values` | **done (FG-3)** |
-| Keyspace | Strings still on `Cache::map`; optional expire slot header | **P3 → FG-4 optional** |
-| Keyspace | Eviction search-doc sampling still special (outside keyspace maps) | P3 (accepted) |
-| Ops | Re-measure on other hosts / Redis non-Valkey; investigate pipelined SET gap | P2 (post-FD) |
-| Cluster | NODE 2PC **slice 2** (durable prepare / prepare-epoch / re-check at commit / bus) | P2 (later) |
-| Sentinel | Election **cooldown/timeout**; epoch thrash; probe self-vs-`*` | P3 (post-FE accepted lite) |
-| Sentinel | Long-lived hello SUBSCRIBE fan-in | P3 (post-FE residual) |
-| Sentinel | CKQUORUM / elect majority peer-table not live probe | P3 (post-FE residual) |
-| Sentinel | Promote still **first-replica-wins** (no offset/priority rank) | P3 (open review) |
-| Cluster | `nodes.conf` omits require-full / allow-reads / announce flags | P3 (open review) |
-| Cluster | Interactive redis-cli weight UI for reshard | P3 |
-| MIGRATE | Redis **DUMP/RESTORE wire** compatibility (Kore recreate-only / KDF1 today) | P3 (accepted) |
-| Search | Multi-layer `max_m=1` spanning force-keep edge cases | P3 |
-| Deadlock UI | Browser/DOM harness for poll repaint (string-contract tests accepted) | P3 |
-| Load | Single-DB mid-fill Arc-swap all-or-nothing (LOADING barrier accepted) | P3 |
+| Area | Residual | Priority | Planned batch |
+|------|----------|----------|---------------|
+| Cluster | NODE 2PC slice 2 durable-on-disk / bus / atomic COMMITPREPARE | P3 residual (FH) | later |
+| Ops | Pipelined SET gap vs Valkey; re-measure other hosts / Redis | **P2 next** | **FI** (or ad-hoc) |
+| Keyspace | Strings still on `Cache::map`; dual-map TYPE probe | P3 | **FG-4** / **FJ** |
+| Keyspace | `typed_expires` side map (not slot header) | P3 | **FG-4** |
+| Keyspace | Typed RENAME remove+insert; create ensure_type→insert TOCTOU (historical) | P3 accepted | — |
+| Sentinel | Promote **first-replica-wins** (open review) | P3 | **FK** |
+| Cluster | `nodes.conf` omits require-full / allow-reads / announce (open review) | P3 | **FL** |
+| Sentinel | election-timeout/cooldown; CKQUORUM live probe; hello SUBSCRIBE | P3 | with **FK** or later |
+| Search | HNSW edges/levels not AOF/RDB durable; `max_m=1` spanning | P3 accepted / later | — |
+| MIGRATE / UI / load | DUMP wire; reshard weight UI; Arc-swap mid-fill | P3 accepted | — |
 
-### Next work queue (post-FE)
+### Next work queue (post-FG-3)
 
-Recommended letter batches. Prefer **next open P2** before large polish. Standing rule: land tests with each batch.
+**Primary FB–FG-3 queue: done. FH (2PC slice 2) done.** Optional follow-ons below. Prefer **P2 FI** before large keyspace churn. Standing rule: land tests with each batch.
+
+#### Completed (FB–FG-3 + FH)
 
 - [x] **`[P1]`** **Batch FB — Cluster dual-end NODE wire 2PC (slice 1)**
-  - Prepare / vote / commit across source+dest; `failed_prepare` fail-closed; range abort
 - [x] **`[P1]`** **Batch FC — Sentinel promote-success gate**
-  - Real promote required; in-process `failover_in_progress`; inject tests
-- [x] **`[P1]`** **Batch FD — Benchmarks: measured numbers vs Redis/Valkey**
-  - *Done (2026-07-25)*: `cargo build --release`; Kore `:6380 --save ""` (AOF off); Valkey 9.0.0 `:6378 --save "" --appendonly no` (6379 occupied by unrelated instance — Redis non-Valkey not measured)
-  - Warm-up discarded + **3** passes median; filled `docs/benchmarks.md` environment / throughput / p50 tables (SET/GET P=1 & P=16, INCR, d=256)
-  - Host: Apple M3 Pro / macOS arm64; Kore 0.6.0 git `1745294`; **no portable-win claims** — pipeline SET is the main Kore gap vs Valkey on this host
+- [x] **`[P1]`** **Batch FD — Benchmarks: measured numbers vs Valkey**
+  - Host M3 Pro; pipeline SET is main Kore gap; no portable-win claims
 - [x] **`[P2]`** **Batch FE — Sentinel leader election depth**
-  - *Done*: voted-leader on `IS-MASTER-DOWN-BY-ADDR`; multi-Sentinel auto-failover elect gate; `add_peer` autosave-on-change
-  - *Residual (accepted lite)*: election-timeout/cooldown (epoch thrash under o_down ticks); CKQUORUM/majority live probe; hello SUBSCRIBE; first-replica promote rank; probe self-vs-`*`
 - [x] **`[P2]`** **Batch FF — HNSW multi-layer insert**
-  - *Done*: geometric level assignment (`ml = 1/ln(max(M,2))`, `level = floor(-ln(U)*ml)`, cap 16); upper-layer greedy SEARCH-LAYER (`ef=1`) + per-layer connect with `ef_construction` / prune / entry promote; query multi-layer descent; remove unlinks all layers + trim empty tops + re-pick top-layer entry; `enqueue_levels` / `with_level_seed` for deterministic tests
-  - *Recall@k*: existing CV/DK/DL gates still green under multi-layer insert
-  - *Residual*: graph edges/levels **not** persisted in AOF/RDB (vectors + `M`/`ef_construction` only; rebuild re-samples levels); multi-layer `max_m=1` spanning force-keep still P3
-  - *Post-ship fix (review):* `hnsw_update_rewires_graph` flaked under multi-layer `thread_rng` (~35%); force all inserts to **layer 0** + seed so CS rewire assertion is deterministic (working tree)
-- [x] **`[P2]`** **Batch FG — Unified keyspace map (design + incremental)**
-  - *Done (slice A):* `KeyValue` enum + facade; multi-map storage
-  - *Tests:* `cache::keyspace` unit; `tests/keyspace_test.rs`
+  - Geometric levels + upper-layer connect/search; residual: edges not durable in AOF/RDB
+- [x] **`[P2]`** **Batch FG — Unified keyspace design + facade**
 - [x] **`[P2]`** **Batch FG-2 — Physical hashes in `key_values`**
-  - *Choice:* **hashes** — single global map (not already sharded), no list/stream blockers, heavy H* surface; sets deferred to FG-3
-  - *Done:* `Cache::key_values: ShardedKeyMap<KeyValue>` holds only `KeyValue::Hash`; removed legacy `hashes` field; H* / RENAME / DEL / TYPE / EXISTS / KEYS / SCAN / DBSIZE / export / take·install / eviction / typed expire via unified path; **no dual-write leftover**
-  - *Payload:* still multi-field — take extracts `HashMap<Bytes, SharedHash>`, install re-wraps as `KeyValue::Hash`
-  - *Tests:* physical storage / rename / take-install units; hash suites; keyspace; typed_ttl; memory; multi-DB; persistence
-  - *Residual → FG-3:* list/set/zset/geo/stream (+ strings later); collapse `KeyspacePayload`; FG-4 optional expire slot header
-- [x] **`[P2]`** **Batch FG-3 — Remaining types into unified map**
-  - *Done:* list / set / zset / geo / stream physically in `key_values`; removed `lists` / `sets` / `streams` / `sorted_sets` / `geo_sets` fields
-  - *Payload:* collapsed to `map` + `key_values: Vec<(Bytes, KeyValue)>` + expires/watch/search/mem (DR/DS epoch install unchanged)
-  - *Eviction:* typed victims sampled from unified `key_values`; search docs still special
-  - *Tests:* physical storage for all typed; rename / take-install; `cargo test --lib cache::`; keyspace, typed_ttl, list/set/zset/stream/geo, memory, multi-DB, persistence
-  - *No dual-write leftover* for migrated types
-  - *Residual → FG-4 optional:* string `map` merge; `typed_expires` slot header
-- [ ] **`[P3]`** **Later / optional (not blocking)**
-  - NODE 2PC slice 2 (durable prepare, prepare-epoch, commit re-check)
-  - Sentinel promote rank by offset/priority; CKQUORUM live probe; election-timeout
-  - `nodes.conf` live flags; DUMP/RESTORE wire; cluster reshard weight UI
-  - FG-4 optional: merge strings into `key_values`; merge `typed_expires` into slot header
+- [x] **`[P2]`** **Batch FG-3 — Remaining typed types + payload collapse** (`1db780e`)
+  - list/set/zset/geo/stream in `key_values`; legacy typed maps removed; payload = `map` + `key_values` stream
+  - *Post-ship review:* no dual-write leftover; typed RENAME is remove+insert (accepted); strings dual-map residual → FG-4
+- [x] **`[P2]`** **Batch FH — NODE 2PC slice 2**
+  - Prepare-epoch + TTL fence; `CHECKPREPARE` + dual-end commit re-check; boot clear fail-closed
+  - Tests: stale epoch / cleared / TTL / boot; e2e recheck inject no half-apply; happy path complete
+  - Residual: durable-on-disk prepare; bus 2PC; atomic COMMITPREPARE
+
+#### Open optional queue (pick when resuming)
+
+- [ ] **`[P2]`** **Batch FI — Pipeline SET perf investigation** ← **recommended next**
+  - Profile Kore pipelined SET vs Valkey (FD gap); document findings in `docs/benchmarks.md`
+  - Optional micro-optimizations only if root cause is clear (no drive-by rewrites)
+- [ ] **`[P3]`** **Batch FG-4 / FJ — Strings into unified map (optional)**
+  - Merge `Cache::map` string entries into `KeyValue::String` in `key_values` (or keep dual-map + document forever)
+  - Optional: fold `typed_expires` into per-key slot header; keep LOADING/epoch install correct
+  - Tests: SET/GET/expire/evict/RDB/AOF/multi-DB parity with FG-3
+- [ ] **`[P3]`** **Batch FK — Sentinel promote ranking + lite SM polish**
+  - Rank replicas by priority then offset (mirror cluster EA/EB) instead of discovery order
+  - Optional: elect cooldown; CKQUORUM/majority live probe; probe self-vs-`*` honesty
+- [ ] **`[P3]`** **Batch FL — `nodes.conf` live cluster flags**
+  - Persist/restore require-full-coverage, allow-reads-when-down, announce-ip/port, replica-priority
+  - Or document boot-flag-only requirement and close as accepted
+- [ ] **`[P3]`** **Later / backlog**
+  - DUMP/RESTORE Redis wire; cluster reshard weight UI; admin_http auth/TLS
+  - HNSW durable graph; hello SUBSCRIBE fan-in; single-DB Arc-swap mid-fill
 
 ### Code review backlog
 
-**Batches CZ–FG-3 shipped.** **Review 2026-07-25:** FG-3 typed unify + payload collapse green. **Queue:** optional FG-4 / P2 NODE 2PC slice 2 / P3 nits. Standing tests-for-phase P0.
+**Batches CZ–FG-3 + FH shipped.** **Review 2026-07-25:** primary queue complete; FH 2PC slice 2 landed. Next recommended **FI** (pipeline SET). Open review rows: FC first-replica promote, EN/EO/EU `nodes.conf` flags (P3). Standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -914,11 +907,11 @@ Recommended letter batches. Prefer **next open P2** before large polish. Standin
 | P2 | EX/FA post-ship: failover leader election (cross-process); in-process gate done FC | **done** (Batch FE) |
 | P3 | FE post-ship: election epoch thrash / probe self / majority table-size | **accepted lite** (later optional) |
 | P3 | EZ/FA post-ship: hello add_peer autosave thrash; CKQUORUM live count | **partial** (FE autosave; CKQUORUM residual) |
-| P3 | EN/EO/EU post-ship: nodes.conf omits require-full/announce flags | **open** (later / doc) |
+| P3 | EN/EO/EU post-ship: nodes.conf omits require-full/announce flags | **open** → planned **FL** |
 | P1 | dual-end NODE RESP 2PC prepare/commit (slice 1) | **done** (Batch FB) |
-| P3 | FB post-ship: prepare not re-checked at commit; dest prepare broad; mem-only | **accepted** (slice 1; slice 2 later) |
-| P3 | FC post-ship: first-replica-wins promote order | **open** (later optional) |
-| P2 | dual-end NODE 2PC slice 2 (durable prepare / prepare-epoch / bus) | **open** (later) |
+| P3 | FB post-ship: prepare not re-checked at commit; dest prepare broad; mem-only | **accepted** slice 1 → **FH** slice 2 |
+| P3 | FC post-ship: first-replica-wins promote order | **open** → planned **FK** |
+| P2 | dual-end NODE 2PC slice 2 (durable prepare / prepare-epoch / bus) | **open** → planned **FH** |
 | P3 | DP residual: no DUMP/RESTORE wire compatibility | open (recreate-only; accepted) |
 | P3 | DF post-ship: HTTP MVP gaps shared with metrics | done (DJ; shared admin_http) |
 | P3 | DK post-ship: thin r@10 headroom / cross-arch flake risk | done (DL; r@10 0.95→0.93) |
@@ -962,7 +955,7 @@ Highest urgency checklist (phase order preserved):
   - *Done (Batch AE)*: typed-key TTL (`EXPIRE`/`PEXPIRE`/`TTL`/`PTTL`) via side `typed_expires` map; lazy + active expire; volatile policies sample typed keys with TTL; RDB v4 + AOF rewrite `PEXPIREAT`
   - *Done (Batch AF)*: full expire command family (`PERSIST`, `EXPIREAT`/`PEXPIREAT`, `EXPIRETIME`/`PEXPIRETIME`)
   - *Done (Batch AG)*: `MOVE` / `COPY` / `RANDOMKEY` / `TOUCH`
-  - *Follow-ups*: true single-map keyspace
+  - *Follow-ups*: true single-map keyspace — **typed done FG-3**; strings optional FG-4
 - [x] Phase A concurrency / memory / EXAT / network tests (incl. AUTH)
 
 **B**
@@ -983,4 +976,4 @@ Highest urgency checklist (phase order preserved):
 - [x] Eviction policies (`maxmemory-policy`)
   - *Follow-ups*: Streams, bitmaps/HLL, RESP3 (done elsewhere); LFU decay done in Batch AB
 
-**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB–FG-3** shipped (typed keyspace unified). Next: optional **FG-4**, NODE 2PC slice 2, Sentinel P3 nits.
+**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB–FG-3** primary queue is complete (typed keyspace unified). Resume from **Next work queue (post-FG-3)** — recommended **FH** NODE 2PC slice 2.

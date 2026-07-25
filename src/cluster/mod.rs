@@ -40,9 +40,11 @@
 //! **SLOT-STATS (Batch EV):** `CLUSTER SLOT-STATS SLOTSRANGE` local key counts.
 //! **NODE preflight (Batch EY):** dual-end NODE prepare (MYID + owner check)
 //! before commit; `failed_preflight` without half-apply.
-//! **NODE 2PC slice (Batch FB):** `SETSLOT PREPARE` / `ABORTPREPARE` votes on
-//! source+dest before commit; dest-first NODE; EP rollback on source commit
-//! fail; status `failed_prepare` without half-apply.
+//! **NODE 2PC slice (Batch FB/FH):** `SETSLOT PREPARE` / `ABORTPREPARE` /
+//! `CHECKPREPARE` votes on source+dest; prepare-epoch + TTL fence; commit
+//! re-check before NODE; dest-first NODE; EP rollback on source commit fail;
+//! status `failed_prepare` / `failed_prepare:recheck:…` without half-apply.
+//! Prepares memory-only (boot clear / fail-closed; not in `nodes.conf`).
 //! **Persistence (Batch EM/EN/EO):** CLUSTER SAVECONFIG → dir/nodes.conf; load on
 //! boot via [`ClusterState::load_or_single_node`]; best-effort autosave after
 //! topology-mutating CLUSTER ops and failover claim.
@@ -68,13 +70,14 @@ pub use migrate::{
     execute_reshard_plan, finish_slot_node, keys_in_slot, migrate_keys_to,
     migrate_one_key_on_stream, migrate_slot_keys, migrate_slot_string_keys, plan_reshard,
     reshard_slot, reshard_slots, string_keys_in_slot, test_acquire_dest_node_inject,
-    test_acquire_dest_prepare_inject, test_acquire_migrate_key_inject,
+    test_acquire_dest_prepare_inject, test_acquire_migrate_key_inject, test_commit_recheck_inject,
     test_inject_dest_node_failures, test_source_node_inject, test_source_prepare_inject,
-    DestNodeInjectGuard, DestPrepareInjectGuard, MigrateCommandResult, MigrateDestAuth,
-    MigrateKeyInjectGuard, MigrateKeyOpts, MigrateOneOutcome, MigrateSlotError, MigrateSlotResult,
-    ReshardPlanEntry, ReshardSlotResult, SourceNodeInjectGuard, SourcePrepareInjectGuard,
+    CommitRecheckInjectGuard, DestNodeInjectGuard, DestPrepareInjectGuard, MigrateCommandResult,
+    MigrateDestAuth, MigrateKeyInjectGuard, MigrateKeyOpts, MigrateOneOutcome, MigrateSlotError,
+    MigrateSlotResult, ReshardPlanEntry, ReshardSlotResult, SourceNodeInjectGuard,
+    SourcePrepareInjectGuard,
 };
 pub use state::{
     ClusterNode, ClusterState, ManualFailoverMode, OwnershipApplyResult, OwnershipRange,
-    RedirectTarget, RoleMapEntry, DEFAULT_NODE_TIMEOUT_MS,
+    RedirectTarget, RoleMapEntry, DEFAULT_NODE_TIMEOUT_MS, PREPARE_VOTE_TTL,
 };

@@ -5,7 +5,8 @@ use kore::entry::StoreOptions;
 use kore::protocol::{RespParser, RespValue};
 use kore::{
     key_hash_slot, keys_in_slot, test_acquire_dest_node_inject, test_acquire_dest_prepare_inject,
-    test_acquire_migrate_key_inject, test_source_node_inject, Cache, ClusterState, Server,
+    test_acquire_migrate_key_inject, test_commit_recheck_inject, test_source_node_inject, Cache,
+    ClusterState, Server,
 };
 use kore::config::Config;
 use std::sync::Arc;
@@ -3475,6 +3476,188 @@ async fn reshard_range_aborts_after_prepare_fail() {
     assert!(cs_a.owns_slot(start), "prepare fail must not apply NODE");
     assert!(!cs_b.owns_slot(start));
     assert!(cs_a.owns_slot(end), "later range slots must stay on source");
+
+    let _ = shut_a_tx.send(true);
+    let _ = shut_b_tx.send(true);
+    let _ = ha.await;
+    let _ = hb.await;
+}
+
+/// Batch FH: commit re-check fails when prepare is cleared mid-flight — no half-apply.
+#[tokio::test(flavor = "multi_thread")]
+async fn reshard_commit_recheck_cleared_prepare_no_half_apply() {
+    let port_a = 16850u16;
+    let port_b = 16851u16;
+
+    let cs_a = ClusterState::single_node("127.0.0.1", port_a);
+    let cs_b = ClusterState::single_node("127.0.0.1", port_b);
+    let cache_a = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let cache_b = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+
+    let srv_a =
+        Server::new(cache_a, make_config(port_a, true)).with_cluster(Some(Arc::clone(&cs_a)));
+    let srv_b =
+        Server::new(cache_b, make_config(port_b, true)).with_cluster(Some(Arc::clone(&cs_b)));
+
+    let (shut_a_tx, shut_a_rx) = watch::channel(false);
+    let (shut_b_tx, shut_b_rx) = watch::channel(false);
+    let ha = tokio::spawn(async move {
+        let _ = srv_a.run_with_shutdown(shut_a_rx).await;
+    });
+    let hb = tokio::spawn(async move {
+        let _ = srv_b.run_with_shutdown(shut_b_rx).await;
+    });
+    wait_listen(port_a).await;
+    wait_listen(port_b).await;
+
+    let mut sa = TcpStream::connect(("127.0.0.1", port_a)).await.unwrap();
+    let mut sb = TcpStream::connect(("127.0.0.1", port_b)).await.unwrap();
+
+    assert!(is_ok(
+        &send_cmd(&mut sa, &["CLUSTER", "MEET", "127.0.0.1", &port_b.to_string()]).await
+    ));
+    assert!(is_ok(
+        &send_cmd(&mut sb, &["CLUSTER", "MEET", "127.0.0.1", &port_a.to_string()]).await
+    ));
+
+    let id_b = cs_a
+        .peer_snapshots()
+        .into_iter()
+        .find(|n| n.port == port_b)
+        .map(|n| n.id)
+        .expect("peer B");
+
+    let key = "{fhrecheck}.k";
+    let slot = key_hash_slot(key.as_bytes());
+    assert!(is_ok(
+        &send_cmd(&mut sa, &["SET", key, "recheck-val"]).await
+    ));
+
+    {
+        let inj = test_commit_recheck_inject(Arc::clone(&cs_a));
+        // Clear source prepare at commit re-check (after both prepares succeed).
+        inj.set_clear_count(1);
+        let resp = send_cmd(
+            &mut sa,
+            &["CLUSTER", "RESHARD", &slot.to_string(), &id_b],
+        )
+        .await;
+        let (got_slot, migrated, source_node, dest_node, status) = parse_reshard_slot(&resp);
+        assert_eq!(got_slot, slot);
+        assert_eq!(migrated, 1, "keys may still move before NODE commit");
+        assert!(
+            status.starts_with("failed_prepare:recheck") || status.starts_with("failed_prepare"),
+            "expected failed_prepare recheck, got {} source={} dest={}",
+            status,
+            source_node,
+            dest_node
+        );
+        assert!(
+            source_node.starts_with("recheck:") || source_node.starts_with("prepare:"),
+            "expected recheck/prepare prefix, got {}",
+            source_node
+        );
+        assert!(
+            cs_a.owns_slot(slot),
+            "source must keep ownership after commit re-check fail"
+        );
+        assert!(
+            !cs_b.owns_slot(slot),
+            "dest must not own after commit re-check fail"
+        );
+        assert!(!cs_a.is_prepared(slot));
+        drop(inj);
+    }
+
+    // Retry FINISH after inject cleared should complete.
+    let finish = send_cmd(
+        &mut sa,
+        &["CLUSTER", "RESHARD", "FINISH", &slot.to_string(), &id_b],
+    )
+    .await;
+    let (got_slot, _migrated, source_node, dest_node, status) = parse_reshard_slot(&finish);
+    assert_eq!(got_slot, slot);
+    assert_eq!(source_node, "ok");
+    assert_eq!(dest_node, "ok");
+    assert_eq!(status, "complete");
+    assert!(cs_b.owns_slot(slot));
+    assert!(!cs_a.owns_slot(slot));
+
+    let _ = shut_a_tx.send(true);
+    let _ = shut_b_tx.send(true);
+    let _ = ha.await;
+    let _ = hb.await;
+}
+
+/// Batch FH: happy path still complete under prepare-epoch + commit re-check.
+#[tokio::test(flavor = "multi_thread")]
+async fn reshard_fh_happy_path_complete() {
+    let port_a = 16852u16;
+    let port_b = 16853u16;
+
+    let cs_a = ClusterState::single_node("127.0.0.1", port_a);
+    let cs_b = ClusterState::single_node("127.0.0.1", port_b);
+    let cache_a = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let cache_b = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+
+    let srv_a =
+        Server::new(cache_a, make_config(port_a, true)).with_cluster(Some(Arc::clone(&cs_a)));
+    let srv_b =
+        Server::new(cache_b, make_config(port_b, true)).with_cluster(Some(Arc::clone(&cs_b)));
+
+    let (shut_a_tx, shut_a_rx) = watch::channel(false);
+    let (shut_b_tx, shut_b_rx) = watch::channel(false);
+    let ha = tokio::spawn(async move {
+        let _ = srv_a.run_with_shutdown(shut_a_rx).await;
+    });
+    let hb = tokio::spawn(async move {
+        let _ = srv_b.run_with_shutdown(shut_b_rx).await;
+    });
+    wait_listen(port_a).await;
+    wait_listen(port_b).await;
+
+    let mut sa = TcpStream::connect(("127.0.0.1", port_a)).await.unwrap();
+    let mut sb = TcpStream::connect(("127.0.0.1", port_b)).await.unwrap();
+
+    assert!(is_ok(
+        &send_cmd(&mut sa, &["CLUSTER", "MEET", "127.0.0.1", &port_b.to_string()]).await
+    ));
+    assert!(is_ok(
+        &send_cmd(&mut sb, &["CLUSTER", "MEET", "127.0.0.1", &port_a.to_string()]).await
+    ));
+
+    let id_b = cs_a
+        .peer_snapshots()
+        .into_iter()
+        .find(|n| n.port == port_b)
+        .map(|n| n.id)
+        .expect("peer B");
+
+    let key = "{fhhappy}.k";
+    let slot = key_hash_slot(key.as_bytes());
+    assert!(is_ok(
+        &send_cmd(&mut sa, &["SET", key, "fh-happy"]).await
+    ));
+
+    let resp = send_cmd(
+        &mut sa,
+        &["CLUSTER", "RESHARD", &slot.to_string(), &id_b],
+    )
+    .await;
+    let (got_slot, migrated, source_node, dest_node, status) = parse_reshard_slot(&resp);
+    assert_eq!(got_slot, slot);
+    assert_eq!(migrated, 1);
+    assert_eq!(source_node, "ok");
+    assert_eq!(dest_node, "ok");
+    assert_eq!(status, "complete");
+    assert!(cs_b.owns_slot(slot));
+    assert!(!cs_a.owns_slot(slot));
+    assert!(!cs_a.is_prepared(slot));
+    assert!(!cs_b.is_prepared(slot));
+    assert_eq!(
+        as_bulk(&send_cmd(&mut sb, &["GET", key]).await),
+        "fh-happy"
+    );
 
     let _ = shut_a_tx.send(true);
     let _ = shut_b_tx.send(true);

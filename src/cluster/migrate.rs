@@ -8,7 +8,7 @@
 //!
 //! `CLUSTER RESHARD` runs steps 1–4 on the source for one slot or an inclusive
 //! range. Dual-end NODE uses a **RESP prepare/vote then commit** path (Batch FB
-//! 2PC slice 1) — not Redis binary cluster-bus 2PC. After each side's NODE,
+//! + FH 2PC slices) — not Redis binary cluster-bus 2PC. After each side's NODE,
 //! ownership is re-checked and failed NODE is retried a few times (Batch DN).
 //! Partial failures leave honest status fields; operators can complete with
 //! `CLUSTER RESHARD FINISH` or manual SETSLOT.
@@ -23,16 +23,21 @@
 //! status (`failed_*`, `failed_prepare`, or `partial_*_node`) so operators do
 //! not cascade mixed ownership across a range.
 //!
-//! **Dual-end NODE 2PC (Batch FB + DV/EH/EJ/EP/EY):**
+//! **Dual-end NODE 2PC (Batch FB/FH + DV/EH/EJ/EP/EY):**
 //! 1. **Prepare/vote** on source + dest (`SETSLOT PREPARE <dest>`): MYID,
-//!    ownership / MIGRATING / IMPORTING sanity. Fail → `failed_prepare` with
-//!    **no** NODE on either side (ABORTPREPARE clears votes).
-//! 2. **Commit** only after both prepares: **dest** `SETSLOT NODE <dest>` first,
-//!    then **source** (Batch DV — no MOVED-to-IMPORTING if dest fails).
-//! 3. If dest owns but source NODE fails: EH re-asserts MIGRATING; EP rolls
+//!    ownership / MIGRATING / IMPORTING sanity; votes stamp slot config epoch
+//!    + TTL (FH). Fail → `failed_prepare` with **no** NODE (ABORTPREPARE).
+//! 2. **Commit re-check (FH):** both sides re-validate prepare (epoch/TTL/
+//!    topology / MYID) via local + `SETSLOT CHECKPREPARE` before any NODE.
+//!    Fail → `failed_prepare:recheck:…` without half-apply.
+//! 3. **Commit** only after re-check: **dest** `SETSLOT NODE <dest>` first,
+//!    then **source** (Batch DV — no MOVED-to-IMPORTING if dest fails). Source
+//!    re-checks prepare again immediately before its NODE.
+//! 4. If dest owns but source NODE fails: EH re-asserts MIGRATING; EP rolls
 //!    dest back to source (`NODE <source>` + `IMPORTING`) → `rolled_back`.
-//! 4. Both ok → EJ post-commit dual verify (`partial_verify` on drift).
-//! Ownership epochs (DU) fence stale gossip after NODE.
+//! 5. Both ok → EJ post-commit dual verify (`partial_verify` on drift).
+//! Ownership epochs (DU) fence stale gossip after NODE. Prepares are memory-only
+//! (empty on boot / soft restart — fail-closed; not in `nodes.conf`).
 //!
 //! **Redis `MIGRATE` (Batch DP/DQ):** key-level transfer reuses
 //! [`snapshot_key`] / [`recreate_commands`] / ASKING / RESP I/O. Options:
@@ -203,6 +208,31 @@ pub fn test_source_prepare_inject(
     cluster: std::sync::Arc<ClusterState>,
 ) -> SourcePrepareInjectGuard {
     SourcePrepareInjectGuard { cluster }
+}
+
+/// RAII clear for per-`ClusterState` commit re-check clear injection (Batch FH).
+pub struct CommitRecheckInjectGuard {
+    cluster: std::sync::Arc<ClusterState>,
+}
+
+impl CommitRecheckInjectGuard {
+    /// Force the next `n` local commit re-checks to clear prepare first.
+    pub fn set_clear_count(&self, n: u32) {
+        self.cluster.test_inject_commit_recheck_clear(n);
+    }
+}
+
+impl Drop for CommitRecheckInjectGuard {
+    fn drop(&mut self) {
+        self.cluster.test_clear_commit_recheck_inject();
+    }
+}
+
+/// Bind commit-recheck clear injection to a specific [`ClusterState`] (Batch FH).
+pub fn test_commit_recheck_inject(
+    cluster: std::sync::Arc<ClusterState>,
+) -> CommitRecheckInjectGuard {
+    CommitRecheckInjectGuard { cluster }
 }
 
 /// Set inject for any dest port (prefer the port-scoped guard in suites).
@@ -1824,13 +1854,17 @@ fn summarize_dual_end_status(source_node: &str, dest_node: &str) -> String {
     }
 }
 
-/// Dest then source `SETSLOT NODE <dest>` with prepare/vote then commit (Batch FB).
+/// Dest then source `SETSLOT NODE <dest>` with prepare/vote then commit (Batch FB/FH).
 ///
 /// Returns `(source_node, dest_node, status, warning)`.
 ///
-/// **Prepare (Batch FB/EY):** source + dest vote via `SETSLOT PREPARE <dest>`
-/// (local + remote RESP). Fail closed → `failed_prepare` without NODE; both
-/// sides ABORTPREPARE.
+/// **Prepare (Batch FB/EY/FH):** source + dest vote via `SETSLOT PREPARE <dest>`
+/// (local + remote RESP); votes carry slot-epoch + TTL. Fail closed →
+/// `failed_prepare` without NODE; both sides ABORTPREPARE.
+///
+/// **Commit re-check (Batch FH):** source `check_prepare_valid` + dest
+/// `SETSLOT CHECKPREPARE` before any NODE; source re-checks again immediately
+/// before its NODE. Fail → `failed_prepare:recheck:…` without half-apply.
 ///
 /// **Commit order (Batch DV):** dest NODE first, then source. Source is skipped
 /// when dest does not verify as owner — avoids MOVED while dest is still
@@ -1883,11 +1917,32 @@ async fn dual_end_setslot_node(
         );
     }
 
+    // Phase 1b: commit re-check — both sides still prepared (Batch FH).
+    if let Err(e) =
+        recheck_prepare_before_commit(cluster, slot, dest_node_id, dest_ip, dest_port).await
+    {
+        let _ = cluster.abort_prepare_node(slot);
+        let _ = abort_dest_prepare(slot, dest_ip, dest_port).await;
+        return (
+            format!("recheck:{}", e),
+            "n/a".into(),
+            format!("failed_prepare:recheck:{}", e),
+            Some(format!(
+                "dual-end NODE commit re-check failed for slot {}: {} — fix topology then RESHARD FINISH",
+                slot, e
+            )),
+        );
+    }
+
     // Phase 2: commit — dest NODE first, then source (Batch DV).
     let mut dest_node =
         apply_dest_node_with_retry(slot, dest_node_id, dest_ip, dest_port).await;
     let mut source_node = if dest_node == "ok" {
-        apply_source_node_with_retry(cluster, slot, dest_node_id).await
+        // Source re-check immediately before NODE (epoch / abort race, Batch FH).
+        match cluster.check_prepare_valid(slot, dest_node_id) {
+            Ok(()) => apply_source_node_with_retry(cluster, slot, dest_node_id).await,
+            Err(e) => format!("recheck:{}", e),
+        }
     } else {
         // Do not flip source ownership if dest never took the slot stably.
         String::from("skipped:dest NODE incomplete")
@@ -1963,9 +2018,10 @@ async fn dual_end_setslot_node(
     (source_node, dest_node, status, warning)
 }
 
-/// Prepare/vote phase for dual-end NODE (Batch FB; extends EY preflight).
+/// Prepare/vote phase for dual-end NODE (Batch FB/FH; extends EY preflight).
 ///
-/// 1. Source `SETSLOT PREPARE <dest>` (local vote — owns/already-dest + MIGRATING)
+/// 1. Source `SETSLOT PREPARE <dest>` (local vote — owns/already-dest + MIGRATING;
+///    stamps slot epoch + wall time)
 /// 2. Dest reachable + `CLUSTER MYID` matches `dest_node_id`
 /// 3. Dest `CLUSTER SLOTS` owner is source or dest (or unbound/missing)
 /// 4. Dest `SETSLOT PREPARE <dest>` (remote vote)
@@ -1993,6 +2049,49 @@ async fn prepare_dual_end_node(
         return Err(e.clone());
     }
     Ok(())
+}
+
+/// Commit-phase re-check of prepare votes on source + dest (Batch FH).
+///
+/// Ensures epoch fence / TTL / topology still hold and dest MYID still matches
+/// before either side applies NODE. Fail closed — caller aborts prepares.
+async fn recheck_prepare_before_commit(
+    cluster: &ClusterState,
+    slot: u16,
+    dest_node_id: &str,
+    dest_ip: &str,
+    dest_port: u16,
+) -> Result<(), String> {
+    // Source local re-check first (may consume commit-recheck inject).
+    if let Err(e) = cluster.check_prepare_valid(slot, dest_node_id) {
+        return Err(format!("source {}", e));
+    }
+
+    let mut stream = connect_dest(dest_ip, dest_port)
+        .await
+        .map_err(|e| format!("dest {}", e))?;
+
+    let remote_id = remote_cluster_myid(&mut stream).await?;
+    if remote_id != dest_node_id {
+        return Err(format!(
+            "dest MYID is {} want {} (commit re-check)",
+            remote_id, dest_node_id
+        ));
+    }
+
+    let slot_s = slot.to_string();
+    dest_setslot(
+        &mut stream,
+        &[
+            "CLUSTER",
+            "SETSLOT",
+            &slot_s,
+            "CHECKPREPARE",
+            dest_node_id,
+        ],
+    )
+    .await
+    .map_err(|e| format!("dest {}", strip_err_prefix(&e)))
 }
 
 /// Dest half of prepare: MYID + owner sanity + SETSLOT PREPARE (Batch FB/EY).
@@ -2497,8 +2596,10 @@ mod tests {
         cs.set_prepare_node(0, &dest).unwrap();
         assert!(cs.is_prepared(0));
         assert_eq!(cs.prepared_node(0).as_deref(), Some(dest.as_str()));
+        assert!(cs.check_prepare_valid(0, &dest).is_ok());
         cs.abort_prepare_node(0).unwrap();
         assert!(!cs.is_prepared(0));
+        assert!(cs.check_prepare_valid(0, &dest).is_err());
     }
 
     #[test]
@@ -2510,6 +2611,99 @@ mod tests {
         cs.add_node(&dest, "10.0.0.3", 7002);
         cs.reassign_slot(0, &other).unwrap();
         assert!(cs.set_prepare_node(0, &dest).is_err());
+    }
+
+    /// Batch FH: epoch fence rejects commit re-check after slot epoch moves.
+    #[test]
+    fn prepare_stale_epoch_fails_commit_recheck() {
+        let cs = ClusterState::single_node("127.0.0.1", 7000);
+        let dest = "dd".repeat(20);
+        cs.add_node(&dest, "10.0.0.2", 7001);
+        cs.set_migrating(0, &dest).unwrap();
+        cs.set_prepare_node(0, &dest).unwrap();
+        let stamped = cs.prepared_slot_epoch(0).expect("stamped epoch");
+        assert_eq!(stamped, cs.slot_epoch(0));
+        assert!(cs.check_prepare_valid(0, &dest).is_ok());
+
+        // Ownership/epoch moves under the vote (without NODE clearing prepare).
+        cs.test_bump_slot_epoch_keep_prepare(0);
+        assert!(cs.is_prepared(0), "vote still in memory until re-check");
+        let err = cs.check_prepare_valid(0, &dest).unwrap_err();
+        assert!(
+            err.contains("epoch stale") || err.contains("stale"),
+            "expected epoch stale error, got {}",
+            err
+        );
+        // No half-apply: we still own the slot.
+        assert!(cs.owns_slot(0));
+        assert_ne!(cs.owner_id_of(0).as_deref(), Some(dest.as_str()));
+    }
+
+    /// Batch FH: cleared prepare fails commit re-check (no NODE).
+    #[test]
+    fn prepare_cleared_fails_commit_recheck() {
+        let cs = ClusterState::single_node("127.0.0.1", 7000);
+        let dest = "dd".repeat(20);
+        cs.add_node(&dest, "10.0.0.2", 7001);
+        cs.set_migrating(0, &dest).unwrap();
+        cs.set_prepare_node(0, &dest).unwrap();
+        cs.abort_prepare_node(0).unwrap();
+        let err = cs.check_prepare_valid(0, &dest).unwrap_err();
+        assert!(
+            err.contains("no prepare") || err.contains("cleared"),
+            "expected cleared prepare error, got {}",
+            err
+        );
+        assert!(cs.owns_slot(0));
+    }
+
+    /// Batch FH: boot / soft-reset clears prepares (fail-closed; not durable).
+    #[test]
+    fn prepare_boot_clear_fail_closed() {
+        let cs = ClusterState::single_node("127.0.0.1", 7000);
+        let dest = "dd".repeat(20);
+        cs.add_node(&dest, "10.0.0.2", 7001);
+        cs.set_migrating(0, &dest).unwrap();
+        cs.set_prepare_node(0, &dest).unwrap();
+        assert!(cs.is_prepared(0));
+        cs.clear_all_prepares();
+        assert!(!cs.is_prepared(0));
+        assert!(cs.check_prepare_valid(0, &dest).is_err());
+        // nodes.conf load path starts with empty prepare map (documented FH).
+        let conf = format!(
+            "# Kore cluster nodes.conf\n# epoch {}\n{}",
+            cs.current_epoch(),
+            cs.format_nodes()
+        );
+        let loaded =
+            ClusterState::from_nodes_conf("127.0.0.1", 7000, &conf).expect("load conf");
+        assert!(!loaded.is_prepared(0));
+    }
+
+    /// Batch FH: TTL-expired prepare fails re-check and is purged.
+    #[test]
+    fn prepare_ttl_expired_fails_recheck() {
+        let cs = ClusterState::single_node("127.0.0.1", 7000);
+        let dest = "dd".repeat(20);
+        cs.add_node(&dest, "10.0.0.2", 7001);
+        cs.set_migrating(0, &dest).unwrap();
+        cs.set_prepare_node(0, &dest).unwrap();
+        cs.test_expire_prepare(0);
+        let err = cs.check_prepare_valid(0, &dest).unwrap_err();
+        assert!(
+            err.contains("expired") || err.contains("no prepare"),
+            "expected expired prepare, got {}",
+            err
+        );
+        assert!(!cs.is_prepared(0));
+    }
+
+    /// Batch FH: range abort covers recheck failure statuses.
+    #[test]
+    fn reshard_range_aborts_on_failed_prepare_recheck() {
+        assert!(reshard_range_should_abort(
+            "failed_prepare:recheck:source no prepare vote for slot 0"
+        ));
     }
 
     #[test]
