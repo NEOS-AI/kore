@@ -4,7 +4,11 @@
 //! `SETSLOT NODE` / reassign bumps `current_epoch` and stamps the slot.
 //! Peers exchange compressed ownership ranges via `CLUSTER OWNERS` on gossip;
 //! higher per-slot epoch wins. Slots in local MIGRATING/IMPORTING are not
-//! overwritten by peer gossip (transition safety). Not Redis binary bus / 2PC.
+//! overwritten by peer gossip (transition safety).
+//!
+//! **NODE prepare (Batch FB):** `SETSLOT PREPARE` records a per-slot vote that
+//! this node is ready to commit `NODE` to a target id. Dual-end reshard runs
+//! prepare on source+dest before either side applies NODE (RESP 2PC slice).
 //!
 //! **nodes.conf (Batch EM/EN/EO):** explicit `CLUSTER SAVECONFIG` and best-effort
 //! autosave after topology-mutating ops / failover claim when a dir is configured.
@@ -122,6 +126,8 @@ pub struct ClusterState {
     /// Test-only: remaining forced failures for local `SETSLOT NODE` (Batch EP).
     /// Per-instance so parallel integration tests do not race.
     source_node_fail_inject: AtomicU32,
+    /// Test-only: remaining forced failures for local `SETSLOT PREPARE` (Batch FB).
+    prepare_fail_inject: AtomicU32,
     /// When true (default), cluster is `fail` unless every slot has a non-fail
     /// owner (Batch EQ / Redis `cluster-require-full-coverage`).
     require_full_coverage: AtomicBool,
@@ -146,6 +152,8 @@ struct Inner {
     migrating: HashMap<u16, String>,
     /// slot → source node id (we are importing this slot)
     importing: HashMap<u16, String>,
+    /// slot → prepared NODE target id (Batch FB dual-end prepare vote)
+    prepare_node: HashMap<u16, String>,
     /// known nodes by id
     nodes: HashMap<String, ClusterNode>,
     current_epoch: u64,
@@ -317,6 +325,7 @@ impl ClusterState {
                 slot_config_epoch,
                 migrating: HashMap::new(),
                 importing: HashMap::new(),
+                prepare_node: HashMap::new(),
                 nodes,
                 current_epoch: 1,
                 node_timeout_ms: DEFAULT_NODE_TIMEOUT_MS,
@@ -327,6 +336,7 @@ impl ClusterState {
             }),
             nodes_conf_dir: RwLock::new(None),
             source_node_fail_inject: AtomicU32::new(0),
+            prepare_fail_inject: AtomicU32::new(0),
             require_full_coverage: AtomicBool::new(true),
             allow_reads_when_down: AtomicBool::new(false),
             announce_ip: RwLock::new(None),
@@ -586,9 +596,10 @@ impl ClusterState {
         for set in g.fail_reports.values_mut() {
             set.remove(node_id);
         }
-        // Drop migrating/importing edges that named this peer.
+        // Drop migrating/importing/prepare edges that named this peer.
         g.migrating.retain(|_, dest| dest != node_id);
         g.importing.retain(|_, src| src != node_id);
+        g.prepare_node.retain(|_, target| target != node_id);
         Ok(())
     }
 
@@ -607,6 +618,7 @@ impl ClusterState {
         }
         g.migrating.clear();
         g.importing.clear();
+        g.prepare_node.clear();
         g.fail_reports.clear();
         g.last_pong.clear();
         // Keep only myself; force master.
@@ -716,6 +728,7 @@ impl ClusterState {
             g.slot_config_epoch[slot as usize] = epoch;
             g.migrating.remove(&slot);
             g.importing.remove(&slot);
+            g.prepare_node.remove(&slot);
         }
         Ok(())
     }
@@ -749,6 +762,7 @@ impl ClusterState {
             g.slot_config_epoch[slot as usize] = epoch;
             g.migrating.remove(&slot);
             g.importing.remove(&slot);
+            g.prepare_node.remove(&slot);
         }
         Ok(())
     }
@@ -820,6 +834,7 @@ impl ClusterState {
         if !any {
             g.migrating.clear();
             g.importing.clear();
+            g.prepare_node.clear();
             return;
         }
         g.current_epoch = g.current_epoch.saturating_add(1);
@@ -832,6 +847,7 @@ impl ClusterState {
         }
         g.migrating.clear();
         g.importing.clear();
+        g.prepare_node.clear();
     }
 
     pub fn migrating_dest(&self, slot: u16) -> Option<String> {
@@ -1524,6 +1540,7 @@ impl ClusterState {
         }
         g.migrating.clear();
         g.importing.clear();
+        g.prepare_node.clear();
         if let Some(me) = g.nodes.get_mut(&my_id) {
             me.master = false;
             me.master_id = Some(master_id.to_string());
@@ -1568,6 +1585,7 @@ impl ClusterState {
         }
         g.migrating.clear();
         g.importing.clear();
+        g.prepare_node.clear();
         if let Some(me) = g.nodes.get_mut(&my_id) {
             me.master = true;
             me.master_id = None;
@@ -1593,6 +1611,7 @@ impl ClusterState {
         g.slot_config_epoch[slot as usize] = g.current_epoch;
         g.migrating.remove(&slot);
         g.importing.remove(&slot);
+        g.prepare_node.remove(&slot);
         Ok(())
     }
 
@@ -1647,7 +1666,104 @@ impl ClusterState {
         let mut g = self.inner.write();
         g.migrating.remove(&slot);
         g.importing.remove(&slot);
+        g.prepare_node.remove(&slot);
         Ok(())
+    }
+
+    /// CLUSTER SETSLOT <slot> PREPARE <node-id> (Batch FB prepare/vote).
+    ///
+    /// Records that this node votes it can commit `SETSLOT NODE <node-id>` for
+    /// `slot`. Does **not** change ownership.
+    ///
+    /// - When `node_id` is **myself** (dest vote): accept if we already own the
+    ///   slot, have IMPORTING set, the current owner is a known peer (or empty
+    ///   unbound), matching EY dest topology sanity.
+    /// - When `node_id` is a **peer** (source vote): accept if we own the slot or
+    ///   already list `node_id` as owner; if MIGRATING is set it must match.
+    pub fn set_prepare_node(&self, slot: u16, node_id: &str) -> Result<(), String> {
+        if slot >= SLOT_COUNT {
+            return Err("Slot out of range".into());
+        }
+        if self.take_prepare_inject_fail() {
+            return Err("injected PREPARE failure".into());
+        }
+        let mut g = self.inner.write();
+        let my_id = g.my_id.clone();
+        let myself = node_id == my_id.as_str();
+        if !myself && !g.nodes.contains_key(node_id) {
+            return Err(format!("I don't know about node {}", node_id));
+        }
+        // Ensure myself is always present (constructor inserts it).
+        if myself && !g.nodes.contains_key(node_id) {
+            return Err(format!("I don't know about node {}", node_id));
+        }
+
+        let owner = g
+            .slot_owner
+            .get(slot as usize)
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        let owns = owner == my_id.as_str();
+        let already_target = !owner.is_empty() && owner == node_id;
+
+        if myself {
+            // Dest-side vote: ready to take stable ownership.
+            if owns || already_target {
+                g.prepare_node.insert(slot, node_id.to_string());
+                return Ok(());
+            }
+            if g.importing.contains_key(&slot) {
+                g.prepare_node.insert(slot, node_id.to_string());
+                return Ok(());
+            }
+            // Unbound or owned by a known peer (typical mid-reshard source).
+            if owner.is_empty() || g.nodes.contains_key(owner) {
+                g.prepare_node.insert(slot, node_id.to_string());
+                return Ok(());
+            }
+            return Err(format!(
+                "not ready to prepare NODE as dest for slot {} (unexpected owner {})",
+                slot, owner
+            ));
+        }
+
+        // Source-side vote: ready to hand ownership to dest.
+        if !owns && !already_target {
+            return Err(format!(
+                "local neither owns slot {} nor already assigned to dest",
+                slot
+            ));
+        }
+        if let Some(m) = g.migrating.get(&slot) {
+            if m != node_id {
+                return Err(format!(
+                    "MIGRATING dest is {} want {} for slot {}",
+                    m, node_id, slot
+                ));
+            }
+        }
+        g.prepare_node.insert(slot, node_id.to_string());
+        Ok(())
+    }
+
+    /// CLUSTER SETSLOT <slot> ABORTPREPARE — clear prepare vote without NODE.
+    pub fn abort_prepare_node(&self, slot: u16) -> Result<(), String> {
+        if slot >= SLOT_COUNT {
+            return Err("Slot out of range".into());
+        }
+        let mut g = self.inner.write();
+        g.prepare_node.remove(&slot);
+        Ok(())
+    }
+
+    /// Prepared NODE target for `slot`, if any (Batch FB).
+    pub fn prepared_node(&self, slot: u16) -> Option<String> {
+        self.inner.read().prepare_node.get(&slot).cloned()
+    }
+
+    /// Whether a prepare vote is recorded for `slot`.
+    pub fn is_prepared(&self, slot: u16) -> bool {
+        self.inner.read().prepare_node.contains_key(&slot)
     }
 
     /// CLUSTER SETSLOT <slot> NODE <node-id>
@@ -1675,6 +1791,28 @@ impl ClusterState {
 
     fn take_source_node_inject_fail(&self) -> bool {
         self.source_node_fail_inject
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                if n > 0 {
+                    Some(n - 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+    }
+
+    /// Force the next `n` local `SETSLOT PREPARE` attempts to fail (Batch FB tests).
+    pub fn test_inject_prepare_failures(&self, n: u32) {
+        self.prepare_fail_inject.store(n, Ordering::SeqCst);
+    }
+
+    /// Clear PREPARE failure injection (Batch FB tests).
+    pub fn test_clear_prepare_inject(&self) {
+        self.prepare_fail_inject.store(0, Ordering::SeqCst);
+    }
+
+    fn take_prepare_inject_fail(&self) -> bool {
+        self.prepare_fail_inject
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 if n > 0 {
                     Some(n - 1)

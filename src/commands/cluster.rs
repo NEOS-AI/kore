@@ -532,13 +532,14 @@ impl CommandHandler {
     /// CLUSTER RESHARD AUTO <dest-node-id> <num-slots>   (Batch DX)
     ///
     /// Source-side orchestration of the thin reshard flow for one slot or an
-    /// inclusive range. Dual-end `SETSLOT NODE` is best-effort with verify+retry
-    /// (still not atomic / no 2PC). `FINISH` only runs dual-end NODE (no key move)
-    /// so operators can complete `partial_*_node` without re-migrating; soft-warns
-    /// when the source still holds keys in the slot. Multi-slot ranges abort after
-    /// the first non-`complete` status (`failed_*` or `partial_*`). On
-    /// `failed_keys`, `migrated`/`skipped` report partial progress — retry moves
-    /// leftover source keys only.
+    /// inclusive range. Dual-end `SETSLOT NODE` uses prepare/vote then commit
+    /// (Batch FB 2PC slice) with verify+retry. `FINISH` only runs dual-end NODE
+    /// (no key move) so operators can complete `partial_*_node` without
+    /// re-migrating; soft-warns when the source still holds keys in the slot.
+    /// Multi-slot ranges abort after the first non-`complete` status
+    /// (`failed_*`, `failed_prepare`, or `partial_*`). On `failed_keys`,
+    /// `migrated`/`skipped` report partial progress — retry moves leftover
+    /// source keys only.
     ///
     /// **PLAN** returns a greedy donor plan (no data move). **AUTO** plans then
     /// executes (local + remote source RESP). Reply: array of per-slot field
@@ -1138,6 +1139,33 @@ impl CommandHandler {
                     Err(e) => Ok(RespValue::error(format!("ERR {}", e))),
                 }
             }
+            // Batch FB: prepare/vote for dual-end NODE 2PC (no ownership change).
+            "PREPARE" => {
+                if args.len() != 3 {
+                    return Ok(RespValue::error(
+                        "ERR syntax error, expected CLUSTER SETSLOT <slot> PREPARE <node-id>",
+                    ));
+                }
+                let node_id = match args[2].as_bulk_string() {
+                    Some(b) => String::from_utf8_lossy(b).into_owned(),
+                    None => return Ok(RespValue::error("ERR syntax error")),
+                };
+                match cluster.set_prepare_node(slot, &node_id) {
+                    Ok(()) => Ok(RespValue::ok()),
+                    Err(e) => Ok(RespValue::error(format!("ERR {}", e))),
+                }
+            }
+            "ABORTPREPARE" => {
+                if args.len() != 2 {
+                    return Ok(RespValue::error(
+                        "ERR syntax error, expected CLUSTER SETSLOT <slot> ABORTPREPARE",
+                    ));
+                }
+                match cluster.abort_prepare_node(slot) {
+                    Ok(()) => Ok(RespValue::ok()),
+                    Err(e) => Ok(RespValue::error(format!("ERR {}", e))),
+                }
+            }
             _ => Ok(RespValue::error(format!(
                 "ERR unknown subcommand '{}'. Try CLUSTER HELP.",
                 sub
@@ -1214,7 +1242,7 @@ fn cluster_help() -> RespValue {
             b"SHARDS -- Redis-7 style shards (slots + master/replica nodes; RESP2 field arrays)",
         ),
         bulk_static(b"LINKS -- cluster bus links (always empty; no binary bus)"),
-        bulk_static(b"SETSLOT <slot> MIGRATING|IMPORTING|STABLE|NODE [node-id]"),
+        bulk_static(b"SETSLOT <slot> MIGRATING|IMPORTING|STABLE|NODE|PREPARE|ABORTPREPARE [node-id]"),
         bulk_static(b"MIGRATEKEYS <slot> <ip> <port> -- move keys in slot to dest"),
         bulk_static(
             b"RESHARD <slot> <node-id> | <start> <end> <node-id> -- orchestrate migrate + dual-end NODE (verify+retry, not atomic; range aborts on non-complete)",

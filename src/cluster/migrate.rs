@@ -7,10 +7,11 @@
 //! 4. both:   CLUSTER SETSLOT <s> NODE <dest-id>
 //!
 //! `CLUSTER RESHARD` runs steps 1–4 on the source for one slot or an inclusive
-//! range. Dual-end NODE is **best-effort** (not atomic / no 2PC). After each
-//! side's NODE, ownership is re-checked and failed NODE is retried a few times
-//! (Batch DN). Partial failures leave honest status fields; operators can
-//! complete with `CLUSTER RESHARD FINISH` or manual SETSLOT.
+//! range. Dual-end NODE uses a **RESP prepare/vote then commit** path (Batch FB
+//! 2PC slice 1) — not Redis binary cluster-bus 2PC. After each side's NODE,
+//! ownership is re-checked and failed NODE is retried a few times (Batch DN).
+//! Partial failures leave honest status fields; operators can complete with
+//! `CLUSTER RESHARD FINISH` or manual SETSLOT.
 //!
 //! **Partial key moves:** `migrate_slot_keys` deletes each source key only after
 //! dest accepts it. On mid-slot failure, earlier keys already live on dest;
@@ -19,21 +20,19 @@
 //! RESHARD for leftover source keys only** — already-moved keys stay on dest.
 //!
 //! **Range abort:** multi-slot RESHARD stops after the first non-`complete`
-//! status (`failed_*` or `partial_*_node`) so operators do not cascade mixed
-//! ownership across a range.
+//! status (`failed_*`, `failed_prepare`, or `partial_*_node`) so operators do
+//! not cascade mixed ownership across a range.
 //!
-//! **Dual-end NODE order (Batch DV/EH/EJ/EP):** **dest** applies `SETSLOT NODE <dest>`
-//! first, then **source**. If dest NODE fails, source is **not** flipped (no
-//! MOVED-to-IMPORTING client window). Status `partial_dest_node` means dest
-//! never took stable ownership; source still owns. If dest owns but source NODE
-//! fails: Batch **EH** re-asserts **MIGRATING**; Batch **EP** best-effort
-//! **rolls dest ownership back** to the source (`NODE <source>` + `IMPORTING`)
-//! so both sides agree again — status `rolled_back` (retry FINISH/RESHARD).
-//! If dest rollback fails, status stays `partial_source_node`. After both report
-//! ok, Batch **EJ** re-verifies local + remote ownership (post-commit check).
-//! **Batch EY:** preflight (prepare) before any NODE — dest MYID + ownership
-//! sanity; fail with `failed_preflight` without half-applying. Still not full
-//! wire-protocol 2PC. Ownership epochs (DU) fence stale gossip after NODE.
+//! **Dual-end NODE 2PC (Batch FB + DV/EH/EJ/EP/EY):**
+//! 1. **Prepare/vote** on source + dest (`SETSLOT PREPARE <dest>`): MYID,
+//!    ownership / MIGRATING / IMPORTING sanity. Fail → `failed_prepare` with
+//!    **no** NODE on either side (ABORTPREPARE clears votes).
+//! 2. **Commit** only after both prepares: **dest** `SETSLOT NODE <dest>` first,
+//!    then **source** (Batch DV — no MOVED-to-IMPORTING if dest fails).
+//! 3. If dest owns but source NODE fails: EH re-asserts MIGRATING; EP rolls
+//!    dest back to source (`NODE <source>` + `IMPORTING`) → `rolled_back`.
+//! 4. Both ok → EJ post-commit dual verify (`partial_verify` on drift).
+//! Ownership epochs (DU) fence stale gossip after NODE.
 //!
 //! **Redis `MIGRATE` (Batch DP/DQ):** key-level transfer reuses
 //! [`snapshot_key`] / [`recreate_commands`] / ASKING / RESP I/O. Options:
@@ -82,6 +81,15 @@ static DEST_NODE_INJECT_PORT: AtomicU16 = AtomicU16::new(0);
 
 /// Remaining forced failures for dest dual-end `SETSLOT NODE` (test hook).
 static DEST_NODE_INJECT_FAILS: AtomicU32 = AtomicU32::new(0);
+
+/// Serializes tests that inject dest PREPARE failures (Batch FB).
+static DEST_PREPARE_INJECT_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// Only dual-end PREPARE toward this dest port is affected (0 = disabled).
+static DEST_PREPARE_INJECT_PORT: AtomicU16 = AtomicU16::new(0);
+
+/// Remaining forced failures for dest dual-end PREPARE (test hook).
+static DEST_PREPARE_INJECT_FAILS: AtomicU32 = AtomicU32::new(0);
 
 /// Serializes tests that inject mid-slot key-migrate failures.
 static MIGRATE_KEY_INJECT_LOCK: Mutex<()> = Mutex::const_new(());
@@ -145,6 +153,58 @@ pub fn test_source_node_inject(cluster: std::sync::Arc<ClusterState>) -> SourceN
     SourceNodeInjectGuard { cluster }
 }
 
+/// Guard holding exclusive access to dest-PREPARE failure injection (Batch FB).
+pub struct DestPrepareInjectGuard {
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl DestPrepareInjectGuard {
+    /// Force the next `n` dest PREPARE attempts toward `dest_port` to fail.
+    pub fn set_failures_for_port(&self, dest_port: u16, n: u32) {
+        DEST_PREPARE_INJECT_PORT.store(dest_port, Ordering::SeqCst);
+        DEST_PREPARE_INJECT_FAILS.store(n, Ordering::SeqCst);
+    }
+}
+
+impl Drop for DestPrepareInjectGuard {
+    fn drop(&mut self) {
+        DEST_PREPARE_INJECT_PORT.store(0, Ordering::SeqCst);
+        DEST_PREPARE_INJECT_FAILS.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Acquire exclusive access for dest-PREPARE failure injection tests (Batch FB).
+pub async fn test_acquire_dest_prepare_inject() -> DestPrepareInjectGuard {
+    DestPrepareInjectGuard {
+        _lock: DEST_PREPARE_INJECT_LOCK.lock().await,
+    }
+}
+
+/// RAII clear for per-`ClusterState` source PREPARE injection (Batch FB).
+pub struct SourcePrepareInjectGuard {
+    cluster: std::sync::Arc<ClusterState>,
+}
+
+impl SourcePrepareInjectGuard {
+    /// Force the next `n` local `SETSLOT PREPARE` attempts to fail.
+    pub fn set_failures(&self, n: u32) {
+        self.cluster.test_inject_prepare_failures(n);
+    }
+}
+
+impl Drop for SourcePrepareInjectGuard {
+    fn drop(&mut self) {
+        self.cluster.test_clear_prepare_inject();
+    }
+}
+
+/// Bind source-PREPARE failure injection to a specific [`ClusterState`] (Batch FB).
+pub fn test_source_prepare_inject(
+    cluster: std::sync::Arc<ClusterState>,
+) -> SourcePrepareInjectGuard {
+    SourcePrepareInjectGuard { cluster }
+}
+
 /// Set inject for any dest port (prefer the port-scoped guard in suites).
 pub fn test_inject_dest_node_failures(n: u32) {
     DEST_NODE_INJECT_PORT.store(u16::MAX, Ordering::SeqCst);
@@ -158,6 +218,23 @@ fn take_dest_node_inject_fail(dest_port: u16) -> bool {
         return false;
     }
     DEST_NODE_INJECT_FAILS
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            if n > 0 {
+                Some(n - 1)
+            } else {
+                None
+            }
+        })
+        .is_ok()
+}
+
+/// Consume one injected dest PREPARE failure if `dest_port` matches (Batch FB).
+fn take_dest_prepare_inject_fail(dest_port: u16) -> bool {
+    let inject_port = DEST_PREPARE_INJECT_PORT.load(Ordering::SeqCst);
+    if inject_port == 0 || (inject_port != u16::MAX && inject_port != dest_port) {
+        return false;
+    }
+    DEST_PREPARE_INJECT_FAILS
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
             if n > 0 {
                 Some(n - 1)
@@ -1165,16 +1242,17 @@ pub async fn migrate_slot_string_keys(
 /// 1. dest `SETSLOT IMPORTING <source-id>`
 /// 2. source `SETSLOT MIGRATING <dest-id>`
 /// 3. `MIGRATEKEYS` (all types)
-/// 4. source then dest `SETSLOT NODE <dest-id>` (best-effort dual-end with verify+retry;
-///    still not atomic / no 2PC)
+/// 4. dual-end NODE with **prepare/vote then commit** (Batch FB 2PC slice) +
+///    verify+retry (DN); dest-first commit (DV); EP rollback on source commit fail
 ///
 /// On key-move failure the slot is left MIGRATING/IMPORTING for operator recovery;
 /// `migrated`/`skipped` on `failed_keys` report partial progress (retry leftover keys only).
 /// Dual-end NODE failures are reported in `ReshardSlotResult` rather than rolled back;
 /// use [`finish_slot_node`] / `CLUSTER RESHARD FINISH` to complete NODE without re-migrating.
 ///
-/// **Range policy (Batch DO):** abort further slots on any non-`complete` status
-/// (`failed_*` **or** `partial_*_node`) so a mid-range partial does not cascade.
+/// **Range policy (Batch DO/FB):** abort further slots on any non-`complete` status
+/// (`failed_*`, `failed_prepare`, or `partial_*_node`) so a mid-range prepare or
+/// commit failure does not cascade mixed ownership.
 pub async fn reshard_slots(
     cache: &Cache,
     cluster: &ClusterState,
@@ -1231,7 +1309,7 @@ pub async fn reshard_slots(
 
 /// Multi-slot RESHARD stops after the first slot whose status is not `complete`.
 fn reshard_range_should_abort(status: &str) -> bool {
-    // Includes partial_verify (EJ), rolled_back (EP), failed_preflight (EY).
+    // Includes partial_verify (EJ), rolled_back (EP), failed_prepare (FB/EY).
     status != "complete"
 }
 
@@ -1650,7 +1728,7 @@ async fn reshard_one_slot(
         }
     };
 
-    // Step 4: dual-end SETSLOT NODE with verify + retry (not atomic).
+    // Step 4: dual-end SETSLOT NODE — prepare/vote then commit (Batch FB).
     let (source_node, dest_node, status, warning) =
         dual_end_setslot_node(cluster, slot, dest_node_id, dest_ip, dest_port).await;
 
@@ -1746,14 +1824,17 @@ fn summarize_dual_end_status(source_node: &str, dest_node: &str) -> String {
     }
 }
 
-/// Dest then source `SETSLOT NODE <dest>` with local/remote verify and retries.
+/// Dest then source `SETSLOT NODE <dest>` with prepare/vote then commit (Batch FB).
 ///
-/// Prepare/commit lite (Batch EY): **preflight** checks local ownership and dest
-/// identity/topology before any NODE; still not a wire-protocol 2PC.
 /// Returns `(source_node, dest_node, status, warning)`.
 ///
-/// **Order (Batch DV):** dest NODE first, then source. Source is skipped when dest
-/// does not verify as owner — avoids MOVED while dest is still IMPORTING.
+/// **Prepare (Batch FB/EY):** source + dest vote via `SETSLOT PREPARE <dest>`
+/// (local + remote RESP). Fail closed → `failed_prepare` without NODE; both
+/// sides ABORTPREPARE.
+///
+/// **Commit order (Batch DV):** dest NODE first, then source. Source is skipped
+/// when dest does not verify as owner — avoids MOVED while dest is still
+/// IMPORTING.
 ///
 /// **Batch EH:** if dest NODE ok but source NODE fails while we still own the
 /// slot, re-assert `MIGRATING → dest` so clients receive ASK (keys may already
@@ -1773,33 +1854,36 @@ async fn dual_end_setslot_node(
     dest_ip: &str,
     dest_port: u16,
 ) -> (String, String, String, Option<String>) {
-    // Batch EY: prepare — fail closed without applying NODE on either side.
-    if let Err(e) =
-        preflight_dual_end_node(cluster, slot, dest_node_id, dest_ip, dest_port).await
-    {
-        return (
-            format!("preflight:{}", e),
-            "n/a".into(),
-            format!("failed_preflight:{}", e),
-            Some(format!(
-                "dual-end NODE preflight failed for slot {}: {} — fix topology then RESHARD FINISH",
-                slot, e
-            )),
-        );
-    }
-
-    // Idempotent complete: both sides already report dest as owner.
+    // Idempotent complete: both sides already report dest as owner (skip 2PC).
     if source_owns_as(cluster, slot, dest_node_id) {
         if let Ok(mut stream) = connect_dest(dest_ip, dest_port).await {
             if verify_remote_slot_owner(&mut stream, slot, dest_node_id)
                 .await
                 .is_ok()
             {
+                // Clear any stale prepare votes from a prior partial attempt.
+                let _ = cluster.abort_prepare_node(slot);
                 return ("ok".into(), "ok".into(), "complete".into(), None);
             }
         }
     }
 
+    // Phase 1: prepare / vote on both ends (no NODE yet).
+    if let Err(e) =
+        prepare_dual_end_node(cluster, slot, dest_node_id, dest_ip, dest_port).await
+    {
+        return (
+            format!("prepare:{}", e),
+            "n/a".into(),
+            format!("failed_prepare:{}", e),
+            Some(format!(
+                "dual-end NODE prepare failed for slot {}: {} — fix topology then RESHARD FINISH",
+                slot, e
+            )),
+        );
+    }
+
+    // Phase 2: commit — dest NODE first, then source (Batch DV).
     let mut dest_node =
         apply_dest_node_with_retry(slot, dest_node_id, dest_ip, dest_port).await;
     let mut source_node = if dest_node == "ok" {
@@ -1850,6 +1934,14 @@ async fn dual_end_setslot_node(
         }
     }
 
+    // After commit path: clear local prepare (NODE already cleared it on success;
+    // abort leftover vote after partial/rollback so state does not stick).
+    let _ = cluster.abort_prepare_node(slot);
+    // Best-effort clear dest prepare if commit did not land as complete.
+    if status != "complete" {
+        let _ = abort_dest_prepare(slot, dest_ip, dest_port).await;
+    }
+
     // Batch EJ: post-commit dual verify when both sides claimed success.
     if status == "complete" {
         if let Some(w) =
@@ -1871,16 +1963,16 @@ async fn dual_end_setslot_node(
     (source_node, dest_node, status, warning)
 }
 
-/// Prepare phase before dual-end NODE (Batch EY).
+/// Prepare/vote phase for dual-end NODE (Batch FB; extends EY preflight).
 ///
-/// Checks:
-/// 1. Local owns the slot **or** already lists `dest` as owner (idempotent FINISH)
-/// 2. Dest is reachable and `CLUSTER MYID` matches `dest_node_id`
-/// 3. Dest `CLUSTER SLOTS` owner for `slot` is either source (mid-migrate) or dest
-///    (idempotent), or the slot is missing/unbound (importing bootstrap)
+/// 1. Source `SETSLOT PREPARE <dest>` (local vote — owns/already-dest + MIGRATING)
+/// 2. Dest reachable + `CLUSTER MYID` matches `dest_node_id`
+/// 3. Dest `CLUSTER SLOTS` owner is source or dest (or unbound/missing)
+/// 4. Dest `SETSLOT PREPARE <dest>` (remote vote)
 ///
+/// On any failure: abort local prepare + best-effort dest ABORTPREPARE.
 /// Does **not** apply SETSLOT NODE.
-async fn preflight_dual_end_node(
+async fn prepare_dual_end_node(
     cluster: &ClusterState,
     slot: u16,
     dest_node_id: &str,
@@ -1888,13 +1980,31 @@ async fn preflight_dual_end_node(
     dest_port: u16,
 ) -> Result<(), String> {
     let source_id = cluster.my_id();
-    let local_ready =
-        cluster.owns_slot(slot) || source_owns_as(cluster, slot, dest_node_id);
-    if !local_ready {
-        return Err(format!(
-            "local neither owns slot {} nor already assigned to dest",
-            slot
-        ));
+
+    // Source vote first (fail closed before touching dest prepare state).
+    if let Err(e) = cluster.set_prepare_node(slot, dest_node_id) {
+        return Err(format!("source {}", e));
+    }
+
+    let result = prepare_dest_vote(slot, dest_node_id, &source_id, dest_ip, dest_port).await;
+    if let Err(ref e) = result {
+        let _ = cluster.abort_prepare_node(slot);
+        let _ = abort_dest_prepare(slot, dest_ip, dest_port).await;
+        return Err(e.clone());
+    }
+    Ok(())
+}
+
+/// Dest half of prepare: MYID + owner sanity + SETSLOT PREPARE (Batch FB/EY).
+async fn prepare_dest_vote(
+    slot: u16,
+    dest_node_id: &str,
+    source_id: &str,
+    dest_ip: &str,
+    dest_port: u16,
+) -> Result<(), String> {
+    if take_dest_prepare_inject_fail(dest_port) {
+        return Err("injected dest PREPARE failure".into());
     }
 
     let mut stream = connect_dest(dest_ip, dest_port)
@@ -1910,15 +2020,37 @@ async fn preflight_dual_end_node(
     }
 
     match remote_slot_owner_id(&mut stream, slot).await {
-        Ok(owner) if owner == dest_node_id || owner == source_id => Ok(()),
-        Ok(owner) => Err(format!(
-            "dest reports unexpected owner {} for slot {} (want source or dest)",
-            owner, slot
-        )),
+        Ok(owner) if owner == dest_node_id || owner == source_id => {}
+        Ok(owner) => {
+            return Err(format!(
+                "dest reports unexpected owner {} for slot {} (want source or dest)",
+                owner, slot
+            ));
+        }
         // Unbound / missing from SLOTS: allow (dest may only have IMPORTING).
-        Err(e) if e.contains("missing") || e.contains("unbound") => Ok(()),
-        Err(e) => Err(format!("dest slots:{}", e)),
+        Err(e) if e.contains("missing") || e.contains("unbound") => {}
+        Err(e) => return Err(format!("dest slots:{}", e)),
     }
+
+    let slot_s = slot.to_string();
+    dest_setslot(
+        &mut stream,
+        &["CLUSTER", "SETSLOT", &slot_s, "PREPARE", dest_node_id],
+    )
+    .await
+    .map_err(|e| format!("dest prepare:{}", strip_err_prefix(&e)))
+}
+
+/// Best-effort dest ABORTPREPARE (clear prepare vote without NODE).
+async fn abort_dest_prepare(slot: u16, dest_ip: &str, dest_port: u16) -> Result<(), String> {
+    let slot_s = slot.to_string();
+    let mut stream = connect_dest(dest_ip, dest_port).await?;
+    dest_setslot(
+        &mut stream,
+        &["CLUSTER", "SETSLOT", &slot_s, "ABORTPREPARE"],
+    )
+    .await
+    .map_err(|e| strip_err_prefix(&e).to_string())
 }
 
 async fn remote_cluster_myid(stream: &mut TcpStream) -> Result<String, String> {
@@ -2347,10 +2479,37 @@ mod tests {
         // Batch EP: compensating dest rollback is not complete — abort ranges.
         assert!(reshard_range_should_abort("rolled_back"));
         assert!(reshard_range_should_abort("partial_source_node"));
-        // Batch EY: preflight failure aborts without applying NODE.
+        // Batch FB/EY: prepare failure aborts without applying NODE.
+        assert!(reshard_range_should_abort(
+            "failed_prepare:dest MYID is x want y"
+        ));
         assert!(reshard_range_should_abort(
             "failed_preflight:dest MYID is x want y"
         ));
+    }
+
+    #[test]
+    fn prepare_source_vote_records_and_abort_clears() {
+        let cs = ClusterState::single_node("127.0.0.1", 7000);
+        let dest = "dd".repeat(20);
+        cs.add_node(&dest, "10.0.0.2", 7001);
+        cs.set_migrating(0, &dest).unwrap();
+        cs.set_prepare_node(0, &dest).unwrap();
+        assert!(cs.is_prepared(0));
+        assert_eq!(cs.prepared_node(0).as_deref(), Some(dest.as_str()));
+        cs.abort_prepare_node(0).unwrap();
+        assert!(!cs.is_prepared(0));
+    }
+
+    #[test]
+    fn prepare_source_rejects_unowned() {
+        let cs = ClusterState::single_node("127.0.0.1", 7000);
+        let other = "oo".repeat(20);
+        let dest = "dd".repeat(20);
+        cs.add_node(&other, "10.0.0.2", 7001);
+        cs.add_node(&dest, "10.0.0.3", 7002);
+        cs.reassign_slot(0, &other).unwrap();
+        assert!(cs.set_prepare_node(0, &dest).is_err());
     }
 
     #[test]

@@ -40,6 +40,9 @@
 //! **SLOT-STATS (Batch EV):** `CLUSTER SLOT-STATS SLOTSRANGE` local key counts.
 //! **NODE preflight (Batch EY):** dual-end NODE prepare (MYID + owner check)
 //! before commit; `failed_preflight` without half-apply.
+//! **NODE 2PC slice (Batch FB):** `SETSLOT PREPARE` / `ABORTPREPARE` votes on
+//! source+dest before commit; dest-first NODE; EP rollback on source commit
+//! fail; status `failed_prepare` without half-apply.
 //! **Persistence (Batch EM/EN/EO):** CLUSTER SAVECONFIG → dir/nodes.conf; load on
 //! boot via [`ClusterState::load_or_single_node`]; best-effort autosave after
 //! topology-mutating CLUSTER ops and failover claim.
@@ -65,10 +68,11 @@ pub use migrate::{
     execute_reshard_plan, finish_slot_node, keys_in_slot, migrate_keys_to,
     migrate_one_key_on_stream, migrate_slot_keys, migrate_slot_string_keys, plan_reshard,
     reshard_slot, reshard_slots, string_keys_in_slot, test_acquire_dest_node_inject,
-    test_acquire_migrate_key_inject, test_inject_dest_node_failures, test_source_node_inject,
-    DestNodeInjectGuard, MigrateCommandResult, MigrateDestAuth, MigrateKeyInjectGuard,
-    MigrateKeyOpts, MigrateOneOutcome, MigrateSlotError, MigrateSlotResult, ReshardPlanEntry,
-    ReshardSlotResult, SourceNodeInjectGuard,
+    test_acquire_dest_prepare_inject, test_acquire_migrate_key_inject,
+    test_inject_dest_node_failures, test_source_node_inject, test_source_prepare_inject,
+    DestNodeInjectGuard, DestPrepareInjectGuard, MigrateCommandResult, MigrateDestAuth,
+    MigrateKeyInjectGuard, MigrateKeyOpts, MigrateOneOutcome, MigrateSlotError, MigrateSlotResult,
+    ReshardPlanEntry, ReshardSlotResult, SourceNodeInjectGuard, SourcePrepareInjectGuard,
 };
 pub use state::{
     ClusterNode, ClusterState, ManualFailoverMode, OwnershipApplyResult, OwnershipRange,

@@ -41,12 +41,13 @@ pub use cluster::{
     crc16, execute_reshard_plan, finish_slot_node, force_mark_fail, gossip_tick, key_hash_slot,
     keys_in_slot, meet_peer, migrate_keys_to, migrate_one_key_on_stream, migrate_slot_keys,
     migrate_slot_string_keys, plan_reshard, reshard_slot, reshard_slots, run_cluster_gossip,
-    string_keys_in_slot, test_acquire_dest_node_inject, test_acquire_migrate_key_inject,
-    test_inject_dest_node_failures, test_source_node_inject, ClusterState, DestNodeInjectGuard,
+    string_keys_in_slot, test_acquire_dest_node_inject, test_acquire_dest_prepare_inject,
+    test_acquire_migrate_key_inject, test_inject_dest_node_failures, test_source_node_inject,
+    test_source_prepare_inject, ClusterState, DestNodeInjectGuard, DestPrepareInjectGuard,
     MigrateCommandResult, MigrateDestAuth, MigrateKeyInjectGuard, MigrateKeyOpts, MigrateOneOutcome,
     MigrateSlotError, ManualFailoverMode, MigrateSlotResult, OwnershipApplyResult, OwnershipRange,
     ReshardPlanEntry, ReshardSlotResult, RoleMapEntry, SourceNodeInjectGuard,
-    DEFAULT_NODE_TIMEOUT_MS, SLOT_COUNT,
+    SourcePrepareInjectGuard, DEFAULT_NODE_TIMEOUT_MS, SLOT_COUNT,
 };
 pub use hashmap::{
     ActiveExpireResult, SweepResult, ACTIVE_EXPIRE_CONTINUE_RATIO, ACTIVE_EXPIRE_MAX_PASSES,
