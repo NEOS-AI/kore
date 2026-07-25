@@ -1,14 +1,24 @@
 //! Redis Sentinel–compatible **lite** (Batch EW) + multi-Sentinel **ODOWN** (Batch EX)
 //! + **config persistence** (Batch EZ) + **hello bus lite** (Batch FA)
-//! + **promote-success gate** (Batch FC).
+//! + **promote-success gate** (Batch FC) + **leader election** (Batch FE).
 //!
 //! - EW: subjective-down (`s_down`), MONITOR, GET-MASTER-ADDR, FAILOVER, auto-failover
 //! - EX: peer `SENTINEL MEET`, `IS-MASTER-DOWN-BY-ADDR` votes, `o_down` when votes ≥ quorum
 //! - EZ: `SENTINEL FLUSHCONFIG` / load `dir/sentinel.conf` on boot; autosave on topology change
 //! - FA: Redis-style hello CSV; `PUBLISH __sentinel__:hello` on masters; peer `SENTINEL HELLO`
 //! - FC: `promote_replica` requires real promote (FAILOVER / REPLICAOF / ROLE=master), never PING alone
+//! - FE: voted-leader on `IS-MASTER-DOWN-BY-ADDR` (epoch/runid); only elected leader auto-failovers
 //!
-//! Not a full Sentinel mesh (no long-lived SUBSCRIBE fan-in on masters; peer HELLO is primary).
+//! # Honesty vs full Redis Sentinel
+//!
+//! - **Leader election (FE):** first-seen sticky vote per epoch; higher epoch can re-vote.
+//!   Winner needs `max(quorum, floor(N/2)+1)` votes among self+peers. Manual `SENTINEL FAILOVER`
+//!   bypasses election (operator force). Not a full Raft/Sentinel state machine (no election
+//!   timeout abort, no subjective-leader lex-min runid pre-filter).
+//! - **Hello bus:** tick `PUBLISH __sentinel__:hello` + peer `SENTINEL HELLO` exchange.
+//!   No long-lived master `SUBSCRIBE` fan-in (residual).
+//! - **CKQUORUM:** peer-table size (`1 + peers`), not live reachability probes (residual).
+//! - **Promote order:** first reachable replica wins (no offset/priority rank).
 
 use crate::protocol::{RespParser, RespValue};
 use bytes::Bytes;
@@ -110,6 +120,10 @@ pub struct MasterInfo {
     /// True while manual or auto `try_failover` runs for this master (Batch FC).
     /// Prevents overlapping SENTINEL FAILOVER and tick auto-failover.
     pub failover_in_progress: bool,
+    /// Runid we voted for as failover leader this epoch (Batch FE). Empty = no vote yet.
+    pub leader_runid: String,
+    /// Epoch of [`Self::leader_runid`] (Batch FE). Sticky until a higher epoch arrives.
+    pub leader_epoch: u64,
 }
 
 impl MasterInfo {
@@ -258,6 +272,8 @@ impl SentinelState {
                 auto_failover: true,
                 failover_epoch: 0,
                 failover_in_progress: false,
+                leader_runid: String::new(),
+                leader_epoch: 0,
             },
         );
         drop(g);
@@ -299,20 +315,32 @@ impl SentinelState {
         v
     }
 
-    pub fn add_peer(&self, id: impl Into<String>, ip: impl Into<String>, port: u16) {
+    /// Learn or update a peer Sentinel. Returns `true` if the peer table changed
+    /// (new peer or ip/port update). Autosaves only on real change (Batch FE).
+    pub fn add_peer(&self, id: impl Into<String>, ip: impl Into<String>, port: u16) -> bool {
         let id = id.into();
         if id == self.my_id() {
-            return;
+            return false;
         }
-        self.peers.write().insert(
-            id.clone(),
-            PeerSentinel {
-                id,
-                ip: ip.into(),
-                port,
-            },
-        );
+        let ip = ip.into();
+        {
+            let mut g = self.peers.write();
+            if let Some(existing) = g.get(&id) {
+                if existing.ip == ip && existing.port == port {
+                    return false;
+                }
+            }
+            g.insert(
+                id.clone(),
+                PeerSentinel {
+                    id,
+                    ip,
+                    port,
+                },
+            );
+        }
         self.autosave_conf();
+        true
     }
 
     pub fn set_option(&self, name: &str, option: &str, value: &str) -> Result<(), String> {
@@ -364,6 +392,9 @@ impl SentinelState {
             m.s_down = false;
             m.o_down = false;
             m.down_votes = 0;
+            // Clear election vote when master is healthy again (Batch FE).
+            m.leader_runid.clear();
+            m.leader_epoch = 0;
             if let Some(r) = replicas {
                 m.replicas = r;
             }
@@ -389,29 +420,114 @@ impl SentinelState {
         false
     }
 
-    /// Local answer for `IS-MASTER-DOWN-BY-ADDR` (Batch EX).
+    /// Local answer for `IS-MASTER-DOWN-BY-ADDR` (Batch EX + FE).
     ///
     /// Returns `(down: 0|1, leader_runid, leader_epoch)`.
-    pub fn is_master_down_by_addr(&self, ip: &str, port: u16) -> (i64, String, u64) {
-        let g = self.masters.read();
-        for m in g.values() {
-            if m.ip == ip && m.port == port {
-                let down = if m.s_down { 1 } else { 0 };
-                // Lite: no leader election — empty leader, epoch 0 when not down.
-                let leader = if m.s_down {
-                    self.my_id()
-                } else {
-                    String::new()
-                };
-                let epoch = if m.s_down {
-                    self.current_epoch.load(Ordering::Relaxed)
-                } else {
-                    0
-                };
-                return (down, leader, epoch);
-            }
+    ///
+    /// # Voting (Batch FE)
+    ///
+    /// When the master is subjectively down (`s_down`) and `req_runid` is a real
+    /// candidate (not `"*"` / empty), this Sentinel casts a **sticky** vote for
+    /// that candidate at `req_epoch` if `req_epoch` is greater than any prior
+    /// vote epoch (Redis-style first-seen per epoch; higher epoch may re-vote).
+    ///
+    /// When `req_runid` is `"*"` (probe only): returns the existing vote if any;
+    /// if `s_down` and no vote yet, returns **self** as leader (sole-sentinel
+    /// convenience — Redis often returns `"*"` here; we document the difference).
+    ///
+    /// When not `s_down`: `(0, "", 0)`.
+    pub fn is_master_down_by_addr(
+        &self,
+        ip: &str,
+        port: u16,
+        req_epoch: u64,
+        req_runid: &str,
+    ) -> (i64, String, u64) {
+        // Find master name under a short read lock, then vote under write.
+        let master_name = {
+            let g = self.masters.read();
+            g.values()
+                .find(|m| m.ip == ip && m.port == port)
+                .map(|m| m.name.clone())
+        };
+        let Some(name) = master_name else {
+            return (0, String::new(), 0);
+        };
+        let Some(m) = self.master(&name) else {
+            return (0, String::new(), 0);
+        };
+        if !m.s_down {
+            return (0, String::new(), 0);
         }
-        (0, String::new(), 0)
+        let seeking_vote = !req_runid.is_empty() && req_runid != "*";
+        if seeking_vote {
+            let (leader, epoch) = self.vote_leader(&name, req_epoch, req_runid);
+            return (1, leader, epoch);
+        }
+        // Probe only: existing vote, or self for lite sole-sentinel UX.
+        if !m.leader_runid.is_empty() {
+            return (1, m.leader_runid, m.leader_epoch);
+        }
+        let epoch = self.current_epoch().max(1);
+        (1, self.my_id(), epoch)
+    }
+
+    /// Cast or read sticky failover-leader vote for `name` (Batch FE).
+    ///
+    /// If `req_epoch` is greater than the stored `leader_epoch`, vote for
+    /// `candidate` and advance process `current_epoch` when needed. Otherwise
+    /// return the prior vote unchanged.
+    pub fn vote_leader(&self, name: &str, req_epoch: u64, candidate: &str) -> (String, u64) {
+        if candidate.is_empty() || candidate == "*" {
+            if let Some(m) = self.master(name) {
+                return (m.leader_runid, m.leader_epoch);
+            }
+            return (String::new(), 0);
+        }
+        // Advance process epoch when peer requests a higher one.
+        let cur = self.current_epoch();
+        if req_epoch > cur {
+            self.current_epoch.store(req_epoch, Ordering::Relaxed);
+        }
+        let mut g = self.masters.write();
+        let Some(m) = g.get_mut(name) else {
+            return (String::new(), 0);
+        };
+        if req_epoch > m.leader_epoch {
+            m.leader_epoch = req_epoch;
+            m.leader_runid = candidate.to_string();
+            debug!(
+                "sentinel: +vote-for-leader {} epoch={} leader={}",
+                name, req_epoch, candidate
+            );
+        }
+        (m.leader_runid.clone(), m.leader_epoch)
+    }
+
+    /// Bump process config epoch and return the new value (election attempt).
+    pub fn next_election_epoch(&self) -> u64 {
+        self.current_epoch.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// True when this Sentinel holds the failover-leader vote for `name`
+    /// (or there is no competing vote yet / sole sentinel). Batch FE.
+    pub fn is_failover_leader(&self, name: &str) -> bool {
+        let Some(m) = self.master(name) else {
+            return false;
+        };
+        if m.leader_runid.is_empty() {
+            // No vote cast — sole sentinel path treats self as leader.
+            return self.peers().is_empty();
+        }
+        m.leader_runid == self.my_id()
+    }
+
+    /// Votes required to win leadership: `max(quorum, floor(N/2)+1)` (Batch FE).
+    pub fn leader_votes_needed(&self, name: &str) -> u32 {
+        let quorum = self.master(name).map(|m| m.quorum).unwrap_or(1);
+        let voters = self.known_sentinel_count() as u32;
+        let majority = voters / 2 + 1;
+        quorum.max(majority).max(1)
     }
 
     /// Recompute o_down from local s_down + peer votes (Batch EX).
@@ -461,6 +577,9 @@ impl SentinelState {
             m.last_ok = Instant::now();
             m.failover_epoch = m.failover_epoch.saturating_add(1);
             m.replicas.clear();
+            // Clear election state after successful switch (Batch FE).
+            m.leader_runid.clear();
+            m.leader_epoch = 0;
             // Leave failover_in_progress to the outer try_failover guard.
             self.current_epoch.fetch_add(1, Ordering::Relaxed);
         }
@@ -492,7 +611,9 @@ impl SentinelState {
         self.masters.read().keys().cloned().collect()
     }
 
-    /// Usable sentinels for CKQUORUM: self + reachable peers (best-effort count = 1 + peers).
+    /// Usable sentinels for CKQUORUM: self + known peers (table size, not live probe).
+    ///
+    /// Residual (Batch FE): does **not** PING peers; count is `1 + peers.len()`.
     pub fn known_sentinel_count(&self) -> usize {
         1 + self.peers.read().len()
     }
@@ -544,7 +665,7 @@ impl SentinelState {
         if msg.sentinel_port == 0 || msg.runid.len() < 8 {
             return false;
         }
-        // Learn peer (without recursive autosave storm — add_peer autosaves once).
+        // Learn peer; add_peer autosaves only when ip/port actually change (Batch FE).
         self.add_peer(&msg.runid, &msg.sentinel_ip, msg.sentinel_port);
 
         // Bump local epoch if peer is ahead (lite config epoch tracking).
@@ -763,14 +884,17 @@ async fn tick_all(sentinel: &SentinelState) {
         probe_one(sentinel, &name).await;
         let _ = sentinel.maybe_sdown(&name);
         // Batch FA: announce ourselves on the master hello channel (if master up).
+        // Residual: tick PUBLISH only — no long-lived master SUBSCRIBE fan-in.
         publish_hello_to_master(sentinel, &name).await;
-        // Batch EX: poll peers for is-master-down votes.
+        // Batch EX: poll peers for is-master-down votes (probe runid="*", no election).
         let peer_votes = collect_peer_down_votes(sentinel, &name).await;
         let _ = sentinel.apply_down_votes(&name, peer_votes);
         if let Some(m) = sentinel.master(&name) {
-            // Auto-failover only on objective down (quorum), not mere s_down.
-            if m.o_down && m.auto_failover {
-                let _ = try_failover(sentinel, &name).await;
+            // Auto-failover on o_down only; only elected leader promotes (Batch FE).
+            if m.o_down && m.auto_failover && !m.failover_in_progress {
+                if try_elect_leader(sentinel, &name).await {
+                    let _ = try_failover(sentinel, &name).await;
+                }
             }
         }
     }
@@ -858,6 +982,8 @@ async fn send_sentinel_hello(addr: &str, payload: &str) -> Result<(), String> {
 }
 
 /// Query peer sentinels: how many report this master's addr as down.
+///
+/// Uses runid `"*"` so ODOWN collection does **not** request a leader vote (Batch FE).
 async fn collect_peer_down_votes(sentinel: &SentinelState, name: &str) -> u32 {
     let Some(m) = sentinel.master(name) else {
         return 0;
@@ -867,26 +993,26 @@ async fn collect_peer_down_votes(sentinel: &SentinelState, name: &str) -> u32 {
         return 0;
     }
     let epoch = sentinel.current_epoch().to_string();
-    let runid = sentinel.my_id();
     let mut votes = 0u32;
     for p in peers {
         let addr = format!("{}:{}", p.ip, p.port);
-        match query_is_master_down(&addr, &m.ip, m.port, &epoch, &runid).await {
-            Ok(true) => votes += 1,
-            Ok(false) => {}
+        match query_is_master_down(&addr, &m.ip, m.port, &epoch, "*").await {
+            Ok((true, _, _)) => votes += 1,
+            Ok((false, _, _)) => {}
             Err(e) => debug!("sentinel: peer {} is-master-down failed: {}", addr, e),
         }
     }
     votes
 }
 
+/// Full `IS-MASTER-DOWN-BY-ADDR` reply: `(down, leader_runid, leader_epoch)`.
 async fn query_is_master_down(
     peer_addr: &str,
     ip: &str,
     port: u16,
     epoch: &str,
     runid: &str,
-) -> Result<bool, String> {
+) -> Result<(bool, String, u64), String> {
     let mut stream = connect(peer_addr).await?;
     let port_s = port.to_string();
     match resp_command(
@@ -903,14 +1029,108 @@ async fn query_is_master_down(
     )
     .await
     {
-        Ok(RespValue::Array(a)) if !a.is_empty() => match &a[0] {
-            RespValue::Integer(n) => Ok(*n != 0),
-            RespValue::BulkString(Some(b)) => Ok(b.as_ref() != b"0"),
-            _ => Ok(false),
-        },
-        Ok(RespValue::Integer(n)) => Ok(n != 0),
+        Ok(RespValue::Array(a)) if !a.is_empty() => {
+            let down = match a.first() {
+                Some(RespValue::Integer(n)) => *n != 0,
+                Some(RespValue::BulkString(Some(b))) => b.as_ref() != b"0",
+                _ => false,
+            };
+            let leader = match a.get(1) {
+                Some(RespValue::BulkString(Some(b))) => {
+                    String::from_utf8_lossy(b).into_owned()
+                }
+                Some(RespValue::SimpleString(b)) => String::from_utf8_lossy(b).into_owned(),
+                _ => String::new(),
+            };
+            let leader_epoch = match a.get(2) {
+                Some(RespValue::Integer(n)) if *n >= 0 => *n as u64,
+                Some(RespValue::BulkString(Some(b))) => {
+                    String::from_utf8_lossy(b).parse().unwrap_or(0)
+                }
+                _ => 0,
+            };
+            Ok((down, leader, leader_epoch))
+        }
+        Ok(RespValue::Integer(n)) => Ok((n != 0, String::new(), 0)),
         Ok(other) => Err(format!("unexpected is-master-down reply: {:?}", other)),
         Err(e) => Err(e),
+    }
+}
+
+/// Campaign for failover leadership and return whether we won (Batch FE).
+///
+/// - Sole sentinel (no peers): vote for self and return `true`.
+/// - Multi-sentinel: sticky vote for self at a campaign epoch; solicit peers via
+///   `IS-MASTER-DOWN-BY-ADDR` with our runid; win if votes ≥ `leader_votes_needed`.
+/// - If we already voted for another runid this epoch, abstain (`false`).
+///
+/// Manual `SENTINEL FAILOVER` does not call this (operator force).
+pub async fn try_elect_leader(sentinel: &SentinelState, name: &str) -> bool {
+    let Some(m) = sentinel.master(name) else {
+        return false;
+    };
+    let my_id = sentinel.my_id();
+
+    // Already committed to another leader this epoch → abstain.
+    if !m.leader_runid.is_empty() && m.leader_runid != my_id {
+        debug!(
+            "sentinel: abstain failover for {} (voted-leader={} epoch={})",
+            name, m.leader_runid, m.leader_epoch
+        );
+        return false;
+    }
+
+    // Sole sentinel: no cross-process race.
+    if sentinel.peers().is_empty() {
+        let epoch = if m.leader_epoch > 0 {
+            m.leader_epoch
+        } else {
+            sentinel.next_election_epoch().max(1)
+        };
+        let _ = sentinel.vote_leader(name, epoch, &my_id);
+        return true;
+    }
+
+    // Reuse campaign epoch if we already vote for ourselves; else open a new one.
+    let epoch = if m.leader_epoch > 0 && m.leader_runid == my_id {
+        m.leader_epoch
+    } else {
+        sentinel.next_election_epoch()
+    };
+    let _ = sentinel.vote_leader(name, epoch, &my_id);
+
+    let mut votes_for_me = 1u32; // self
+    let epoch_s = epoch.to_string();
+    for p in sentinel.peers() {
+        let addr = format!("{}:{}", p.ip, p.port);
+        match query_is_master_down(&addr, &m.ip, m.port, &epoch_s, &my_id).await {
+            Ok((_down, leader, leader_epoch)) => {
+                if leader_epoch == epoch && leader == my_id {
+                    votes_for_me = votes_for_me.saturating_add(1);
+                } else if leader_epoch == epoch && !leader.is_empty() && leader != "*" {
+                    debug!(
+                        "sentinel: peer {} voted for {} (epoch {}) not us",
+                        addr, leader, leader_epoch
+                    );
+                }
+            }
+            Err(e) => debug!("sentinel: elect query {} failed: {}", addr, e),
+        }
+    }
+
+    let need = sentinel.leader_votes_needed(name);
+    if votes_for_me >= need {
+        info!(
+            "sentinel: +elected-leader {} epoch={} votes={}/{}",
+            name, epoch, votes_for_me, need
+        );
+        true
+    } else {
+        debug!(
+            "sentinel: not elected for {} epoch={} votes={}/{}",
+            name, epoch, votes_for_me, need
+        );
+        false
     }
 }
 
@@ -976,6 +1196,9 @@ async fn probe_one(sentinel: &SentinelState, name: &str) {
 ///
 /// Serializes per master via [`SentinelState::begin_failover`] so manual
 /// `SENTINEL FAILOVER` and the tick auto-failover path cannot overlap (Batch FC).
+///
+/// Auto path only invokes this after [`try_elect_leader`] wins (Batch FE).
+/// Manual `SENTINEL FAILOVER` skips election (operator force).
 pub async fn try_failover(sentinel: &SentinelState, name: &str) -> Result<(), String> {
     let m = sentinel
         .master(name)
@@ -1266,6 +1489,13 @@ pub fn master_fields(m: &MasterInfo, other_sentinels: usize) -> RespValue {
     push(&mut f, "failover-timeout", "180000".into());
     push(&mut f, "parallel-syncs", "1".into());
     push(&mut f, "down-votes", m.down_votes.to_string());
+    // Batch FE: surface local voted-leader for this master.
+    push(&mut f, "voted-leader", m.leader_runid.clone());
+    push(
+        &mut f,
+        "voted-leader-epoch",
+        m.leader_epoch.to_string(),
+    );
     RespValue::Array(f)
 }
 
@@ -1367,14 +1597,82 @@ mod tests {
     fn is_master_down_by_addr_local() {
         let s = SentinelState::new();
         s.monitor("m", "10.0.0.9", 7000, 1).unwrap();
-        let (d, _, _) = s.is_master_down_by_addr("10.0.0.9", 7000);
+        let (d, _, _) = s.is_master_down_by_addr("10.0.0.9", 7000, 0, "*");
         assert_eq!(d, 0);
         s.set_option("m", "down-after-milliseconds", "20").unwrap();
         std::thread::sleep(Duration::from_millis(30));
         s.maybe_sdown("m");
-        let (d, leader, _) = s.is_master_down_by_addr("10.0.0.9", 7000);
+        // Probe-only when s_down: lite returns self as leader.
+        let (d, leader, epoch) = s.is_master_down_by_addr("10.0.0.9", 7000, 0, "*");
         assert_eq!(d, 1);
         assert_eq!(leader, s.my_id());
+        assert!(epoch >= 1);
+    }
+
+    /// Batch FE: sticky vote per epoch; higher epoch may re-vote.
+    #[test]
+    fn leader_vote_sticky_and_higher_epoch() {
+        let s = SentinelState::new();
+        s.monitor("m", "10.0.0.9", 7000, 2).unwrap();
+        s.set_option("m", "down-after-milliseconds", "20").unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        s.maybe_sdown("m");
+
+        let cand_a = "aa".repeat(20);
+        let cand_b = "bb".repeat(20);
+
+        let (d, leader, epoch) =
+            s.is_master_down_by_addr("10.0.0.9", 7000, 5, &cand_a);
+        assert_eq!(d, 1);
+        assert_eq!(leader, cand_a);
+        assert_eq!(epoch, 5);
+
+        // Same epoch, different candidate → sticky first vote.
+        let (_, leader2, epoch2) =
+            s.is_master_down_by_addr("10.0.0.9", 7000, 5, &cand_b);
+        assert_eq!(leader2, cand_a);
+        assert_eq!(epoch2, 5);
+
+        // Higher epoch → re-vote for B.
+        let (_, leader3, epoch3) =
+            s.is_master_down_by_addr("10.0.0.9", 7000, 6, &cand_b);
+        assert_eq!(leader3, cand_b);
+        assert_eq!(epoch3, 6);
+
+        assert!(!s.is_failover_leader("m"));
+        assert_eq!(s.master("m").unwrap().leader_runid, cand_b);
+    }
+
+    /// Batch FE: sole sentinel is failover leader; voted-for-other abstains.
+    #[test]
+    fn is_failover_leader_sole_and_voted_other() {
+        let s = SentinelState::new();
+        s.monitor("m", "10.0.0.1", 6379, 1).unwrap();
+        // No peers, no vote yet → sole leader.
+        assert!(s.is_failover_leader("m"));
+        assert_eq!(s.leader_votes_needed("m"), 1);
+
+        s.set_option("m", "down-after-milliseconds", "20").unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        s.maybe_sdown("m");
+        let other = "cc".repeat(20);
+        let _ = s.vote_leader("m", 3, &other);
+        assert!(!s.is_failover_leader("m"));
+        // Inject a peer so N=2 → majority 2, quorum 1 → need 2.
+        s.add_peer("dd".repeat(20), "10.0.0.2", 26380);
+        assert_eq!(s.leader_votes_needed("m"), 2);
+    }
+
+    /// Batch FE: add_peer only changes (and would autosave) when new/updated.
+    #[test]
+    fn add_peer_no_change_returns_false() {
+        let s = SentinelState::new();
+        let id = "ee".repeat(20);
+        assert!(s.add_peer(&id, "10.0.0.3", 26379));
+        assert!(!s.add_peer(&id, "10.0.0.3", 26379));
+        assert!(s.add_peer(&id, "10.0.0.4", 26379)); // ip change
+        assert_eq!(s.peers().len(), 1);
+        assert_eq!(s.peers()[0].ip, "10.0.0.4");
     }
 
     #[test]

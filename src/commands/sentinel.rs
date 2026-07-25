@@ -169,6 +169,7 @@ impl CommandHandler {
             }
             "IS-MASTER-DOWN-BY-ADDR" | "IS_MASTER_DOWN_BY_ADDR" => {
                 // SENTINEL IS-MASTER-DOWN-BY-ADDR <ip> <port> [epoch] [runid]
+                // Batch FE: epoch/runid drive sticky leader votes when s_down.
                 if args.len() < 3 || args.len() > 5 {
                     return Ok(RespValue::error(
                         "ERR wrong number of arguments for 'sentinel|is-master-down-by-addr' command",
@@ -182,7 +183,24 @@ impl CommandHandler {
                     Ok(p) if p > 0 && p <= u16::MAX as i64 => p as u16,
                     _ => return Ok(RespValue::error("ERR Invalid port")),
                 };
-                let (down, leader, epoch) = sentinel.is_master_down_by_addr(&ip, port);
+                let req_epoch = if args.len() >= 4 {
+                    match self.parse_integer(&args[3]) {
+                        Ok(e) if e >= 0 => e as u64,
+                        _ => 0,
+                    }
+                } else {
+                    0
+                };
+                let req_runid = if args.len() >= 5 {
+                    match args[4].as_bulk_string() {
+                        Some(b) => String::from_utf8_lossy(b).into_owned(),
+                        None => "*".into(),
+                    }
+                } else {
+                    "*".into()
+                };
+                let (down, leader, epoch) =
+                    sentinel.is_master_down_by_addr(&ip, port, req_epoch, &req_runid);
                 Ok(RespValue::Array(vec![
                     RespValue::Integer(down),
                     RespValue::BulkString(Some(Bytes::from(leader))),
@@ -477,7 +495,7 @@ fn sentinel_help() -> RespValue {
         b"SENTINELS <name> -- other known Sentinels (via MEET)",
         b"MEET <ip> <port> -- introduce a peer Sentinel",
         b"HELLO <csv>|fields -- apply peer hello (discover peer + optional switch-master)",
-        b"IS-MASTER-DOWN-BY-ADDR <ip> <port> [epoch] [runid] -- vote whether master is down",
+        b"IS-MASTER-DOWN-BY-ADDR <ip> <port> [epoch] [runid] -- down vote + optional leader vote",
         b"SET <name> <option> <value> -- down-after-milliseconds | quorum | auto-failover",
         b"FAILOVER <name> -- force failover to a reachable replica",
         b"FLUSHCONFIG -- write sentinel.conf under dir (also autosaved on topology changes)",

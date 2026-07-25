@@ -147,11 +147,12 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch EZ)*: `SENTINEL FLUSHCONFIG` → `{dir}/sentinel.conf`; load on boot (`load_or_new`); restore myid/monitors/peers/options; **autosave** on MONITOR/REMOVE/SET/MEET/switch_master.
   - *Done (Batch FA)*: Redis-style hello CSV; `SENTINEL HELLO`; tick **PUBLISH** `__sentinel__:hello` on reachable masters; peer `SENTINEL HELLO` exchange; `apply_hello` learns peers + higher-epoch **switch-master**. No long-lived master `SUBSCRIBE` fan-in (peer HELLO is primary discovery path).
   - *Done (Batch FC)*: `promote_replica` success gate — requires `FAILOVER` OK, `REPLICAOF NO ONE` OK, or post-attempt `ROLE=master`; **never** `switch_master` on PING alone. Per-master `failover_in_progress` serializes manual FAILOVER vs tick. Promote inject hooks for tests.
-  - *Residual (EN–FA / FC post-ship)* — see Phase D cluster + backlog table:
-    - **P2** no failover **leader election** / voted-leader — every o_down Sentinel with auto-failover may still race across processes (in-process gate only).
+  - *Done (Batch FE)*: voted-leader on `IS-MASTER-DOWN-BY-ADDR` (sticky first-seen per epoch; higher epoch re-votes); auto-failover only after `try_elect_leader` (≥ `max(quorum, floor(N/2)+1)`); ODOWN probes use runid `*`; `add_peer` autosave only on real change. Manual `SENTINEL FAILOVER` still force-bypasses election.
+  - *Residual (EN–FE post-ship)* — see Phase D cluster + backlog table:
     - **P3** promote walks replicas in discovery order (**first success wins**; no offset/priority).
     - **P3** `CKQUORUM` uses peer-table size, not live reachability.
-    - **P3** `apply_hello` → `add_peer` **autosaves every hello** (disk thrash under multi-master × multi-peer ticks).
+    - **P3** no long-lived master `__sentinel__:hello` SUBSCRIBE fan-in (tick PUBLISH + peer HELLO only).
+    - **P3** election lite (no full Redis election-timeout abort / subjective lex-min leader pre-filter).
 - [x] **`[P1]`** Client durability: `WAIT` + min-replicas write gate
   - *Done*: `WAIT numreplicas timeout_ms` freezes `master_repl_offset`, probes feed GETACK, returns count of replicas with ack ≥ offset (`timeout 0` = forever). `CONFIG GET|SET min-replicas-to-write` / `min-replicas-max-lag` (aliases `min-slaves-*`); writes return `NOREPLICAS` when good replica count is below threshold. INFO exposes `min_slaves_*`.
 
@@ -330,14 +331,13 @@ Also tracked in `docs/roadmap.md`.
   - [x] **`[P3]`** **Code review (FB post-ship nits):** prepare not re-checked at commit; dest prepare permissive; memory-only votes
     - *Found (scheduled review after FB/FC)*: see Batch FB residual bullets above. Accept for slice 1; fold re-check + prepare-epoch into **slice 2** / later if dual-end races matter under concurrent operators.
     - *Accepted (slice 1)*: dual-end path enforces prepare; operator NODE bypass for recovery; prepare not durable.
-  - [ ] **`[P2]`** **Code review (EX/FA post-ship):** Sentinel failover leader election (cross-process)
-    - *Found*: no voted-leader on `IS-MASTER-DOWN-BY-ADDR`; every o_down Sentinel with `auto-failover` may race `try_failover` **across processes**. (In-process manual-vs-tick gate done FC.)
-    - *Next*: Redis-style leader vote by epoch/runid; surface `voted-leader` in peer fields.
+  - [x] **`[P2]`** **Code review (EX/FA post-ship):** Sentinel failover leader election (cross-process)
+    - *Done (Batch FE)*: sticky voted-leader on `IS-MASTER-DOWN-BY-ADDR`; auto path elects before `try_failover`; `voted-leader` / `voted-leader-epoch` on MASTER fields. Residual: not full Redis election-timeout state machine.
   - [ ] **`[P3]`** **Code review (FC post-ship nit):** Sentinel promote still first-replica-wins
-    - *Found*: `try_failover` walks `replicas` in discovery order; no offset/priority ranking (unlike cluster election EA/EB). Acceptable lite; improve under FE if multi-replica quality matters.
-  - [ ] **`[P3]`** **Code review (EZ/FA post-ship):** hello-path autosave thrash + CKQUORUM reachability
-    - *Found*: `apply_hello` → `add_peer` → `autosave_conf` on every peer HELLO (1s tick × masters × peers). `CKQUORUM` uses `1 + peers.len()` (not live probe).
-    - *Next*: autosave only when peer table or master addr actually changes; optional peer ping for CKQUORUM.
+    - *Found*: `try_failover` walks `replicas` in discovery order; no offset/priority ranking (unlike cluster election EA/EB). Acceptable lite; optional later.
+  - [x] **`[P3]`** **Code review (EZ/FA post-ship):** hello-path autosave thrash (+ partial CKQUORUM)
+    - *Done (Batch FE, autosave)*: `add_peer` returns changed-only and autosaves only on new/updated peer.
+    - *Residual*: `CKQUORUM` still peer-table size (not live probe).
   - [ ] **`[P3]`** **Code review (EN/EO/EU post-ship):** `nodes.conf` omits live cluster flags
     - *Found*: SAVECONFIG / load restore id/peers/slots/epoch only. `cluster-require-full-coverage`, `cluster-allow-reads-when-down`, `cluster-announce-ip/port`, replica-priority are CLI/CONFIG only — reboot loses announce overrides unless re-applied. Gossip OWNERS merge does not autosave (already documented EO).
     - *Next*: optional extended conf lines, or document boot-flag requirement; optional autosave throttle after ownership merge.
@@ -709,11 +709,11 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
   - *Done (Batch BT)*: `bt_eval_select_persists_connection_db` — connection remains on selected DB after EVAL
 
-### Status snapshot (2026-07-25, post-FD)
+### Status snapshot (2026-07-25, post-FE)
 
-**Shipped through Batch FD** (cluster HA EN–EV; NODE RESP 2PC **FB**; Sentinel EW–EZ/FA + promote gate **FC**; measured benches **FD**). Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule).
+**Shipped through Batch FE** (cluster HA EN–EV; NODE RESP 2PC **FB**; Sentinel EW–EZ/FA + promote gate **FC** + leader election **FE**; measured benches **FD**). Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule).
 
-**Verification (FB/FC review):** `cluster_migrate_test` 39/39 · `cluster_gossip_test` 8/8 · `sentinel_lite_test` 8/8 · lib unit 321 pass / 1 ignored HNSW large-N. FD: warm-up + 3-pass median vs Valkey 9.0.0 on M3 Pro (see `docs/benchmarks.md`).
+**Verification (FE):** `sentinel_lite_test` (EW/EX/EZ/FA/FC + FE vote/elect paths) · lib sentinel unit tests. FD benches unchanged.
 
 **Open / deferred residuals** (track as next queue below):
 
@@ -721,9 +721,9 @@ Also tracked in `docs/roadmap.md`.
 |------|----------|----------|
 | Ops | Re-measure on other hosts / Redis non-Valkey; investigate pipelined SET gap | P2 (post-FD) |
 | Cluster | NODE 2PC **slice 2** (durable prepare / prepare-epoch / re-check at commit / bus) | P2 |
-| Sentinel | Cross-process **leader election** + long-lived hello SUBSCRIBE | P2 (Batch FE) |
-| Sentinel | Hello `add_peer` **autosave thrash**; CKQUORUM peer-table not live | P3 (Batch FE) |
-| Sentinel | Promote still **first-replica-wins** (no offset/priority rank) | P3 (FE optional) |
+| Sentinel | Long-lived hello SUBSCRIBE fan-in; full election-timeout SM | P3 (post-FE residual) |
+| Sentinel | CKQUORUM peer-table not live probe | P3 (post-FE residual) |
+| Sentinel | Promote still **first-replica-wins** (no offset/priority rank) | P3 |
 | Cluster | `nodes.conf` omits require-full / allow-reads / announce flags | P3 |
 | Cluster | Interactive redis-cli weight UI for reshard | P3 |
 | MIGRATE | Redis **DUMP/RESTORE wire** compatibility (Kore recreate-only / KDF1 today) | P3 (accepted) |
@@ -745,11 +745,9 @@ Recommended letter batches. Prefer **P1** before large differentiator polish. St
   - *Done (2026-07-25)*: `cargo build --release`; Kore `:6380 --save ""` (AOF off); Valkey 9.0.0 `:6378 --save "" --appendonly no` (6379 occupied by unrelated instance — Redis non-Valkey not measured)
   - Warm-up discarded + **3** passes median; filled `docs/benchmarks.md` environment / throughput / p50 tables (SET/GET P=1 & P=16, INCR, d=256)
   - Host: Apple M3 Pro / macOS arm64; Kore 0.6.0 git `1745294`; **no portable-win claims** — pipeline SET is the main Kore gap vs Valkey on this host
-- [ ] **`[P2]`** **Batch FE — Sentinel leader election depth**
-  - Voted-leader on `IS-MASTER-DOWN-BY-ADDR` (epoch/runid); serialize multi-Sentinel auto-failover
-  - Long-lived `__sentinel__:hello` SUBSCRIBE fan-in if not already covered by FA tick PUBLISH
-  - Hello autosave only on peer/master change; CKQUORUM optional live probe
-  - Optional: rank promote candidates by replica offset/priority (FC residual)
+- [x] **`[P2]`** **Batch FE — Sentinel leader election depth**
+  - *Done*: voted-leader on `IS-MASTER-DOWN-BY-ADDR`; multi-Sentinel auto-failover elect gate; `add_peer` autosave-on-change
+  - *Residual*: long-lived hello SUBSCRIBE; CKQUORUM live probe; promote offset/priority rank; full election-timeout SM
 - [ ] **`[P2]`** **Batch FF — HNSW multi-layer insert**
   - Level assignment + upper-layer SEARCH-LAYER / insert (move past all-layer-0 simplification)
   - Recall@k gate still green; update `docs/benchmarks.md` honesty notes
@@ -762,7 +760,7 @@ Recommended letter batches. Prefer **P1** before large differentiator polish. St
 
 ### Code review backlog
 
-**Batches CZ–FD shipped.** **Review 2026-07-25 (later):** FB/FC green (migrate 39, gossip 8, sentinel 8, lib 321); FD measured tables in `docs/benchmarks.md`. **Queue:** **FE** Sentinel election → **FF** HNSW multi-layer → **FG** unified keyspace; standing tests-for-phase P0.
+**Batches CZ–FE shipped.** **Review 2026-07-25:** FE leader election + autosave-on-change. **Queue:** **FF** HNSW multi-layer → **FG** unified keyspace; standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -884,12 +882,12 @@ Recommended letter batches. Prefer **P1** before large differentiator polish. St
 | P2 | EZ: Sentinel FLUSHCONFIG + sentinel.conf load/autosave | done (EZ) |
 | P2 | FA: Sentinel hello bus lite (HELLO + PUBLISH) | done (FA) |
 | P1 | EW post-ship: promote_replica PING-only still Ok → switch_master | **done** (Batch FC) |
-| P2 | EX/FA post-ship: failover leader election (cross-process); in-process gate done FC | **open** (Batch FE) |
-| P3 | EZ/FA post-ship: hello add_peer autosave thrash; CKQUORUM live count | **open** (Batch FE) |
+| P2 | EX/FA post-ship: failover leader election (cross-process); in-process gate done FC | **done** (Batch FE) |
+| P3 | EZ/FA post-ship: hello add_peer autosave thrash; CKQUORUM live count | **partial** (FE autosave; CKQUORUM residual) |
 | P3 | EN/EO/EU post-ship: nodes.conf omits require-full/announce flags | **open** (later / doc) |
 | P1 | dual-end NODE RESP 2PC prepare/commit (slice 1) | **done** (Batch FB) |
 | P3 | FB post-ship: prepare not re-checked at commit; dest prepare broad; mem-only | **accepted** (slice 1; slice 2 later) |
-| P3 | FC post-ship: first-replica-wins promote order | **open** (FE optional) |
+| P3 | FC post-ship: first-replica-wins promote order | **open** (later optional) |
 | P2 | dual-end NODE 2PC slice 2 (durable prepare / prepare-epoch / bus) | **open** (later) |
 | P3 | DP residual: no DUMP/RESTORE wire compatibility | open (recreate-only; accepted) |
 | P3 | DF post-ship: HTTP MVP gaps shared with metrics | done (DJ; shared admin_http) |
@@ -944,7 +942,7 @@ Highest urgency checklist (phase order preserved):
 - [x] Load from file on startup
 - [x] Async replication
 - [x] Timed SAVE policies (`--save` / CONFIG save)
-  - *Follow-ups*: long-lived master SUBSCRIBE hello fan-in; full Sentinel leader election + promote-success gate (EN–FA post-ship P1/P2 open)
+  - *Follow-ups*: long-lived master SUBSCRIBE hello fan-in; election-timeout SM polish (FE lite shipped; promote gate FC done)
 
 **C**
 

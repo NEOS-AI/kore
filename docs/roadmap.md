@@ -3,7 +3,7 @@
 ## Currently working on..
 
 - [x] Support for Redis Pub-Sub
-- **Post-FD queue** (FD measured Kore vs Valkey benches shipped): next is **Batch FE** (Sentinel leader election depth). Details in root `TODO.md` → *Next work queue (post-FC)*.
+- **Post-FE queue** (Sentinel leader election shipped): next is **Batch FF** (HNSW multi-layer insert), then **FG** unified keyspace. Details in root `TODO.md` → *Next work queue (post-FC)*.
 
 ## Persistence / search letter batches (recent)
 
@@ -73,7 +73,8 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Cluster automatic reshard / multi-type MIGRATE orchestration (MVP complete: PLAN/AUTO DX, epoch gossip DU, dest-first NODE DV, fail quorum DW, EY preflight, EP dest rollback, **FB RESP prepare/commit 2PC slice**)
 - [x] Sentinel promote-success gate (Batch FC: real promote required; in-process failover_in_progress)
 - [x] **FD** measured benchmarks vs Valkey (`docs/benchmarks.md`; single-host median of 3; no portable-win claims)
-- [ ] **Next (see `TODO.md` Next work queue post-FC):** **FE** Sentinel leader election · **FF** HNSW multi-layer · **FG** unified keyspace · later NODE 2PC slice 2
+- [x] Sentinel leader election depth (Batch FE: voted-leader / elect gate; residuals: hello SUBSCRIBE, CKQUORUM live)
+- [ ] **Next (see `TODO.md` Next work queue post-FC):** **FF** HNSW multi-layer · **FG** unified keyspace · later NODE 2PC slice 2
 - [x] 데드락 감지 고급 기능
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원
@@ -91,7 +92,7 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Sentinel multi-instance ODOWN lite (Batch EX: MEET peers + vote quorum)
 - [x] Sentinel FLUSHCONFIG / load-on-boot (Batch EZ)
 - [x] Sentinel hello bus lite (Batch FA: peer HELLO + PUBLISH on master)
-- [ ] Sentinel cross-process leader election residual (see `TODO.md` Batch FE)
+- [x] Sentinel cross-process leader election lite (Batch FE; residuals: election-timeout SM, hello SUBSCRIBE)
 - [x] Blocking `XREAD` / `XREADGROUP` (`BLOCK`)
 - [x] Multi-DB replication parity (SYNC/PSYNC all DBs + SELECT apply)
 - [x] AOF SELECT concurrency fix + atomic SELECT+cmd replication

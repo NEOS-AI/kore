@@ -1,12 +1,13 @@
 //! Batch EW: Sentinel-lite MONITOR / GET-MASTER-ADDR / s_down / FAILOVER.
 //! Batch FC: promote-success gate (no switch_master on PING-only).
+//! Batch FE: leader election on IS-MASTER-DOWN-BY-ADDR; only elected leader auto-failovers.
 
 use bytes::Bytes;
 use kore::config::Config;
 use kore::protocol::{RespParser, RespValue};
 use kore::{
-    test_promote_inject, test_set_promote_inject, try_failover, Cache, ReplicaInfo, Server,
-    PROMOTE_INJECT_FORCE_FAIL, PROMOTE_INJECT_FORCE_OK,
+    test_promote_inject, test_set_promote_inject, try_elect_leader, try_failover, Cache,
+    ReplicaInfo, Server, PROMOTE_INJECT_FORCE_FAIL, PROMOTE_INJECT_FORCE_OK,
 };
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -829,5 +830,452 @@ async fn sentinel_publishes_hello_to_master() {
     let _ = tx_s.send(true);
     hm.abort();
     hs.abort();
+    sleep(Duration::from_millis(50)).await;
+}
+
+/// Batch FE: IS-MASTER-DOWN-BY-ADDR returns non-empty leader when s_down / voting.
+#[tokio::test(flavor = "multi_thread")]
+async fn sentinel_is_master_down_returns_voted_leader() {
+    let master_port = 16940u16;
+    let sentinel_port = 16941u16;
+
+    let cache_m = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_m = Server::new(cache_m, make_config(master_port));
+    let (tx_m, rx_m) = watch::channel(false);
+    let hm = tokio::spawn(async move {
+        let _ = srv_m.run_with_shutdown(rx_m).await;
+    });
+    wait_listen(master_port).await;
+
+    let cache_s = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_s = Server::new(cache_s, make_config(sentinel_port));
+    let sentinel = Arc::clone(srv_s.sentinel());
+    let (tx_s, rx_s) = watch::channel(false);
+    let hs = tokio::spawn(async move {
+        let _ = srv_s.run_with_shutdown(rx_s).await;
+    });
+    wait_listen(sentinel_port).await;
+
+    let mut cli = TcpStream::connect(("127.0.0.1", sentinel_port)).await.unwrap();
+    assert!(is_ok(
+        &send_cmd(
+            &mut cli,
+            &[
+                "SENTINEL",
+                "MONITOR",
+                "mymaster",
+                "127.0.0.1",
+                &master_port.to_string(),
+                "1",
+            ],
+        )
+        .await
+    ));
+    assert!(is_ok(
+        &send_cmd(
+            &mut cli,
+            &[
+                "SENTINEL",
+                "SET",
+                "mymaster",
+                "down-after-milliseconds",
+                "80",
+            ],
+        )
+        .await
+    ));
+    assert!(is_ok(
+        &send_cmd(
+            &mut cli,
+            &["SENTINEL", "SET", "mymaster", "auto-failover", "no"],
+        )
+        .await
+    ));
+
+    let _ = tx_m.send(true);
+    hm.abort();
+    sleep(Duration::from_millis(1500)).await;
+    assert!(sentinel.master("mymaster").unwrap().s_down);
+
+    // Probe-only (`*`) when s_down → non-empty leader (self).
+    match send_cmd(
+        &mut cli,
+        &[
+            "SENTINEL",
+            "IS-MASTER-DOWN-BY-ADDR",
+            "127.0.0.1",
+            &master_port.to_string(),
+            "0",
+            "*",
+        ],
+    )
+    .await
+    {
+        RespValue::Array(a) => {
+            assert_eq!(a[0], RespValue::Integer(1));
+            let leader = as_bulk(&a[1]);
+            assert!(!leader.is_empty(), "expected voted leader, got empty");
+            assert_eq!(leader, sentinel.my_id());
+        }
+        other => panic!("{:?}", other),
+    }
+
+    // Explicit candidate vote.
+    let cand = "ff".repeat(20);
+    match send_cmd(
+        &mut cli,
+        &[
+            "SENTINEL",
+            "IS-MASTER-DOWN-BY-ADDR",
+            "127.0.0.1",
+            &master_port.to_string(),
+            "7",
+            &cand,
+        ],
+    )
+    .await
+    {
+        RespValue::Array(a) => {
+            assert_eq!(a[0], RespValue::Integer(1));
+            assert_eq!(as_bulk(&a[1]), cand);
+            assert_eq!(a[2], RespValue::Integer(7));
+        }
+        other => panic!("{:?}", other),
+    }
+    // Sticky same epoch.
+    match send_cmd(
+        &mut cli,
+        &[
+            "SENTINEL",
+            "IS-MASTER-DOWN-BY-ADDR",
+            "127.0.0.1",
+            &master_port.to_string(),
+            "7",
+            &sentinel.my_id(),
+        ],
+    )
+    .await
+    {
+        RespValue::Array(a) => {
+            assert_eq!(as_bulk(&a[1]), cand);
+        }
+        other => panic!("{:?}", other),
+    }
+
+    let _ = tx_s.send(true);
+    hs.abort();
+    sleep(Duration::from_millis(50)).await;
+}
+
+/// Batch FE: two Sentinels agree on a voted leader via IS-MASTER-DOWN-BY-ADDR.
+#[tokio::test(flavor = "multi_thread")]
+async fn sentinel_two_sentinels_vote_agreement() {
+    let master_port = 16942u16;
+    let s1_port = 16943u16;
+    let s2_port = 16944u16;
+
+    let cache_m = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_m = Server::new(cache_m, make_config(master_port));
+    let (tx_m, rx_m) = watch::channel(false);
+    let hm = tokio::spawn(async move {
+        let _ = srv_m.run_with_shutdown(rx_m).await;
+    });
+    wait_listen(master_port).await;
+
+    let cache_s1 = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_s1 = Server::new(cache_s1, make_config(s1_port));
+    let s1 = Arc::clone(srv_s1.sentinel());
+    let (tx_s1, rx_s1) = watch::channel(false);
+    let hs1 = tokio::spawn(async move {
+        let _ = srv_s1.run_with_shutdown(rx_s1).await;
+    });
+    wait_listen(s1_port).await;
+
+    let cache_s2 = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_s2 = Server::new(cache_s2, make_config(s2_port));
+    let s2 = Arc::clone(srv_s2.sentinel());
+    let (tx_s2, rx_s2) = watch::channel(false);
+    let hs2 = tokio::spawn(async move {
+        let _ = srv_s2.run_with_shutdown(rx_s2).await;
+    });
+    wait_listen(s2_port).await;
+
+    let mut c1 = TcpStream::connect(("127.0.0.1", s1_port)).await.unwrap();
+    let mut c2 = TcpStream::connect(("127.0.0.1", s2_port)).await.unwrap();
+
+    for cli in [&mut c1, &mut c2] {
+        assert!(is_ok(
+            &send_cmd(
+                cli,
+                &[
+                    "SENTINEL",
+                    "MONITOR",
+                    "mymaster",
+                    "127.0.0.1",
+                    &master_port.to_string(),
+                    "2",
+                ],
+            )
+            .await
+        ));
+        assert!(is_ok(
+            &send_cmd(
+                cli,
+                &[
+                    "SENTINEL",
+                    "SET",
+                    "mymaster",
+                    "down-after-milliseconds",
+                    "80",
+                ],
+            )
+            .await
+        ));
+        assert!(is_ok(
+            &send_cmd(
+                cli,
+                &["SENTINEL", "SET", "mymaster", "auto-failover", "no"],
+            )
+            .await
+        ));
+    }
+
+    assert!(is_ok(
+        &send_cmd(
+            &mut c1,
+            &["SENTINEL", "MEET", "127.0.0.1", &s2_port.to_string()],
+        )
+        .await
+    ));
+    assert!(is_ok(
+        &send_cmd(
+            &mut c2,
+            &["SENTINEL", "MEET", "127.0.0.1", &s1_port.to_string()],
+        )
+        .await
+    ));
+
+    let _ = tx_m.send(true);
+    hm.abort();
+    sleep(Duration::from_millis(1500)).await;
+    assert!(s1.master("mymaster").unwrap().s_down);
+    assert!(s2.master("mymaster").unwrap().s_down);
+
+    // s1 asks s2 to vote for s1 at epoch 11.
+    let s1_id = s1.my_id();
+    match send_cmd(
+        &mut c2,
+        &[
+            "SENTINEL",
+            "IS-MASTER-DOWN-BY-ADDR",
+            "127.0.0.1",
+            &master_port.to_string(),
+            "11",
+            &s1_id,
+        ],
+    )
+    .await
+    {
+        RespValue::Array(a) => {
+            assert_eq!(a[0], RespValue::Integer(1));
+            assert_eq!(as_bulk(&a[1]), s1_id);
+            assert_eq!(a[2], RespValue::Integer(11));
+        }
+        other => panic!("{:?}", other),
+    }
+    // s2's local vote matches.
+    assert_eq!(s2.master("mymaster").unwrap().leader_runid, s1_id);
+    assert_eq!(s2.master("mymaster").unwrap().leader_epoch, 11);
+
+    // s2 cannot steal same epoch for itself (sticky).
+    match send_cmd(
+        &mut c2,
+        &[
+            "SENTINEL",
+            "IS-MASTER-DOWN-BY-ADDR",
+            "127.0.0.1",
+            &master_port.to_string(),
+            "11",
+            &s2.my_id(),
+        ],
+    )
+    .await
+    {
+        RespValue::Array(a) => assert_eq!(as_bulk(&a[1]), s1_id),
+        other => panic!("{:?}", other),
+    }
+
+    // s1 also votes for itself; agreement.
+    let _ = s1.vote_leader("mymaster", 11, &s1_id);
+    assert!(s1.is_failover_leader("mymaster"));
+    assert!(!s2.is_failover_leader("mymaster"));
+
+    let _ = tx_s1.send(true);
+    let _ = tx_s2.send(true);
+    hs1.abort();
+    hs2.abort();
+    sleep(Duration::from_millis(50)).await;
+}
+
+/// Batch FE: non-leader abstains from try_elect_leader / does not promote while
+/// another sentinel holds the voted-leader (in-process + live peer vote).
+#[tokio::test(flavor = "multi_thread")]
+async fn sentinel_non_leader_does_not_elect() {
+    let master_port = 16945u16;
+    let promote_port = 16946u16;
+    let s1_port = 16947u16;
+    let s2_port = 16948u16;
+
+    // Dead master (never started). Live promote target for replica inject.
+    let cache_t = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_t = Server::new(cache_t, make_config(promote_port));
+    let (tx_t, rx_t) = watch::channel(false);
+    let ht = tokio::spawn(async move {
+        let _ = srv_t.run_with_shutdown(rx_t).await;
+    });
+    wait_listen(promote_port).await;
+
+    let cache_s1 = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_s1 = Server::new(cache_s1, make_config(s1_port));
+    let s1 = Arc::clone(srv_s1.sentinel());
+    let (tx_s1, rx_s1) = watch::channel(false);
+    let hs1 = tokio::spawn(async move {
+        let _ = srv_s1.run_with_shutdown(rx_s1).await;
+    });
+    wait_listen(s1_port).await;
+
+    let cache_s2 = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_s2 = Server::new(cache_s2, make_config(s2_port));
+    let s2 = Arc::clone(srv_s2.sentinel());
+    let (tx_s2, rx_s2) = watch::channel(false);
+    let hs2 = tokio::spawn(async move {
+        let _ = srv_s2.run_with_shutdown(rx_s2).await;
+    });
+    wait_listen(s2_port).await;
+
+    for (s, port) in [(&s1, s1_port), (&s2, s2_port)] {
+        s.set_listen_addr("127.0.0.1", port);
+        s.monitor("mymaster", "127.0.0.1", master_port, 2).unwrap();
+        s.set_option("mymaster", "down-after-milliseconds", "50")
+            .unwrap();
+        s.set_option("mymaster", "auto-failover", "yes").unwrap();
+        // Force s_down by aging last_ok.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        s.maybe_sdown("mymaster");
+        s.note_ok(
+            "mymaster",
+            Some(vec![ReplicaInfo {
+                ip: "127.0.0.1".into(),
+                port: promote_port,
+            }]),
+        );
+        // note_ok clears s_down — re-age.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        s.maybe_sdown("mymaster");
+        // Re-inject replicas without clearing s_down: write via internal state.
+        {
+            // Keep s_down by not calling note_ok; set replicas directly.
+            // MasterInfo is cloned from API — use vote path after forcing s_down.
+        }
+    }
+
+    // Re-setup s_down + replicas without clearing flags: use monitor path carefully.
+    // After maybe_sdown, inject replicas under write by switch-less update:
+    for s in [&s1, &s2] {
+        // Peer MEET so election is multi-sentinel.
+        let _ = s; // peers added below
+    }
+
+    // MEET both ways.
+    let mut c1 = TcpStream::connect(("127.0.0.1", s1_port)).await.unwrap();
+    let mut c2 = TcpStream::connect(("127.0.0.1", s2_port)).await.unwrap();
+    assert!(is_ok(
+        &send_cmd(
+            &mut c1,
+            &["SENTINEL", "MEET", "127.0.0.1", &s2_port.to_string()],
+        )
+        .await
+    ));
+    assert!(is_ok(
+        &send_cmd(
+            &mut c2,
+            &["SENTINEL", "MEET", "127.0.0.1", &s1_port.to_string()],
+        )
+        .await
+    ));
+
+    // Force s_down + o_down + replica list without going through note_ok clearing.
+    // Use is_master_down after aging: re-call maybe_sdown; set replicas via a helper path.
+    // Direct: vote_leader requires s_down only for is_master_down_by_addr; elect needs master.
+    for s in [&s1, &s2] {
+        // Age last_ok again if note_ok ran.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        s.maybe_sdown("mymaster");
+        // Inject replicas by temporarily note_ok then force s_down flags back.
+        s.note_ok(
+            "mymaster",
+            Some(vec![ReplicaInfo {
+                ip: "127.0.0.1".into(),
+                port: promote_port,
+            }]),
+        );
+    }
+    // Force s_down/o_down after replica inject by sleeping past down-after.
+    sleep(Duration::from_millis(80)).await;
+    for s in [&s1, &s2] {
+        s.maybe_sdown("mymaster");
+        // o_down via quorum 2: need peer vote — apply local peer_down manually.
+        let _ = s.apply_down_votes("mymaster", 1);
+        assert!(
+            s.master("mymaster").unwrap().s_down,
+            "expected s_down after age"
+        );
+        // Replicas must still be present (note_ok set them; maybe_sdown doesn't clear).
+        assert!(
+            !s.master("mymaster").unwrap().replicas.is_empty(),
+            "replicas should remain after s_down"
+        );
+    }
+
+    // s1 becomes voted leader on both at epoch 20.
+    let s1_id = s1.my_id();
+    let _ = s1.vote_leader("mymaster", 20, &s1_id);
+    let _ = s2.vote_leader("mymaster", 20, &s1_id);
+    assert!(s1.is_failover_leader("mymaster"));
+    assert!(!s2.is_failover_leader("mymaster"));
+
+    // Non-leader elect must fail (abstain).
+    assert!(
+        !try_elect_leader(&s2, "mymaster").await,
+        "s2 already voted for s1 — must not elect self"
+    );
+
+    // Leader elect succeeds (sole campaigner with peer sticky vote for s1).
+    assert!(
+        try_elect_leader(&s1, "mymaster").await,
+        "s1 should win leadership with s2's sticky vote"
+    );
+
+    // Non-leader must not switch_master even if try_failover were called only by leader.
+    let epoch_s2_before = s2.master("mymaster").unwrap().failover_epoch;
+    let port_s2_before = s2.master("mymaster").unwrap().port;
+    // s2 abstains: tick path would skip try_failover; we only check elect false again.
+    assert!(!try_elect_leader(&s2, "mymaster").await);
+    assert_eq!(s2.master("mymaster").unwrap().port, port_s2_before);
+    assert_eq!(
+        s2.master("mymaster").unwrap().failover_epoch,
+        epoch_s2_before
+    );
+
+    // Leader may promote (manual path also works without elect).
+    assert!(try_failover(&s1, "mymaster").await.is_ok());
+    assert_eq!(s1.master("mymaster").unwrap().port, promote_port);
+
+    let _ = tx_s1.send(true);
+    let _ = tx_s2.send(true);
+    let _ = tx_t.send(true);
+    hs1.abort();
+    hs2.abort();
+    ht.abort();
     sleep(Duration::from_millis(50)).await;
 }
