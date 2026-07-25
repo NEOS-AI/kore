@@ -1,10 +1,12 @@
 //! Redis Sentinel–compatible **lite** (Batch EW) + multi-Sentinel **ODOWN** (Batch EX)
-//! + **config persistence** (Batch EZ) + **hello bus lite** (Batch FA).
+//! + **config persistence** (Batch EZ) + **hello bus lite** (Batch FA)
+//! + **promote-success gate** (Batch FC).
 //!
 //! - EW: subjective-down (`s_down`), MONITOR, GET-MASTER-ADDR, FAILOVER, auto-failover
 //! - EX: peer `SENTINEL MEET`, `IS-MASTER-DOWN-BY-ADDR` votes, `o_down` when votes ≥ quorum
 //! - EZ: `SENTINEL FLUSHCONFIG` / load `dir/sentinel.conf` on boot; autosave on topology change
 //! - FA: Redis-style hello CSV; `PUBLISH __sentinel__:hello` on masters; peer `SENTINEL HELLO`
+//! - FC: `promote_replica` requires real promote (FAILOVER / REPLICAOF / ROLE=master), never PING alone
 //!
 //! Not a full Sentinel mesh (no long-lived SUBSCRIBE fan-in on masters; peer HELLO is primary).
 
@@ -12,13 +14,41 @@ use crate::protocol::{RespParser, RespValue};
 use bytes::Bytes;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
+
+// ── Batch FC: test inject for promote_replica ────────────────────────────────
+// 0 = normal; 1 = force fail after PING (no ROLE fallback); 2 = force OK after PING
+static PROMOTE_INJECT: AtomicU32 = AtomicU32::new(0);
+
+/// Force-fail promote after PING (cmds + ROLE treated as failed). Batch FC tests.
+pub const PROMOTE_INJECT_FORCE_FAIL: u32 = 1;
+/// Force-success promote after PING. Batch FC tests.
+pub const PROMOTE_INJECT_FORCE_OK: u32 = 2;
+
+/// Set promote inject mode (`0` / [`PROMOTE_INJECT_FORCE_FAIL`] / [`PROMOTE_INJECT_FORCE_OK`]).
+pub fn test_set_promote_inject(mode: u32) {
+    PROMOTE_INJECT.store(mode, Ordering::SeqCst);
+}
+
+/// Clears promote inject on drop (Batch FC).
+pub struct PromoteInjectGuard;
+
+impl Drop for PromoteInjectGuard {
+    fn drop(&mut self) {
+        PROMOTE_INJECT.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Acquire a promote-inject guard that resets mode when dropped.
+pub fn test_promote_inject() -> PromoteInjectGuard {
+    PromoteInjectGuard
+}
 
 /// Default subjective-down timeout (Redis-like 30s).
 pub const DEFAULT_DOWN_AFTER_MS: u64 = 30_000;
@@ -77,6 +107,9 @@ pub struct MasterInfo {
     pub auto_failover: bool,
     /// In-progress / completed failover epoch (monotonic counter for tests).
     pub failover_epoch: u64,
+    /// True while manual or auto `try_failover` runs for this master (Batch FC).
+    /// Prevents overlapping SENTINEL FAILOVER and tick auto-failover.
+    pub failover_in_progress: bool,
 }
 
 impl MasterInfo {
@@ -224,6 +257,7 @@ impl SentinelState {
                 replicas: Vec::new(),
                 auto_failover: true,
                 failover_epoch: 0,
+                failover_in_progress: false,
             },
         );
         drop(g);
@@ -427,10 +461,31 @@ impl SentinelState {
             m.last_ok = Instant::now();
             m.failover_epoch = m.failover_epoch.saturating_add(1);
             m.replicas.clear();
+            // Leave failover_in_progress to the outer try_failover guard.
             self.current_epoch.fetch_add(1, Ordering::Relaxed);
         }
         drop(g);
         self.autosave_conf();
+    }
+
+    /// Mark failover in-progress for `name` (Batch FC). Err if already running.
+    pub fn begin_failover(&self, name: &str) -> Result<(), String> {
+        let mut g = self.masters.write();
+        let m = g
+            .get_mut(name)
+            .ok_or_else(|| format!("ERR No such master with name '{}'", name))?;
+        if m.failover_in_progress {
+            return Err("ERR Failover already in progress for this master".into());
+        }
+        m.failover_in_progress = true;
+        Ok(())
+    }
+
+    /// Clear in-progress flag (Batch FC). Idempotent if master missing.
+    pub fn end_failover(&self, name: &str) {
+        if let Some(m) = self.masters.write().get_mut(name) {
+            m.failover_in_progress = false;
+        }
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -918,6 +973,9 @@ async fn probe_one(sentinel: &SentinelState, name: &str) {
 }
 
 /// Manual or auto: promote first reachable replica.
+///
+/// Serializes per master via [`SentinelState::begin_failover`] so manual
+/// `SENTINEL FAILOVER` and the tick auto-failover path cannot overlap (Batch FC).
 pub async fn try_failover(sentinel: &SentinelState, name: &str) -> Result<(), String> {
     let m = sentinel
         .master(name)
@@ -938,28 +996,60 @@ pub async fn try_failover(sentinel: &SentinelState, name: &str) -> Result<(), St
         return Err("ERR No good replica for failover".into());
     }
 
+    // Per-master in-progress gate (Batch FC).
+    sentinel.begin_failover(name)?;
+
     let old_ip = m.ip.clone();
     let old_port = m.port;
-    for r in &m.replicas {
-        let raddr = format!("{}:{}", r.ip, r.port);
-        // Prefer bare FAILOVER (Kore replica promote); fall back to REPLICAOF NO ONE.
-        if promote_replica(&raddr).await.is_ok() {
-            sentinel.switch_master(name, r.ip.clone(), r.port);
-            // Best-effort re-point old master as replica of new master.
-            let _ = replicaof_to(&format!("{}:{}", old_ip, old_port), &r.ip, r.port).await;
-            info!(
-                "sentinel: failover complete for {} -> {}:{}",
-                name, r.ip, r.port
-            );
-            return Ok(());
+    let replicas = m.replicas.clone();
+    let result = async {
+        for r in &replicas {
+            let raddr = format!("{}:{}", r.ip, r.port);
+            // Prefer bare FAILOVER (Kore replica promote); fall back to REPLICAOF NO ONE.
+            // promote_replica never succeeds on PING alone (Batch FC).
+            if promote_replica(&raddr).await.is_ok() {
+                sentinel.switch_master(name, r.ip.clone(), r.port);
+                // Best-effort re-point old master as replica of new master.
+                let _ = replicaof_to(&format!("{}:{}", old_ip, old_port), &r.ip, r.port).await;
+                info!(
+                    "sentinel: failover complete for {} -> {}:{}",
+                    name, r.ip, r.port
+                );
+                return Ok(());
+            }
         }
+        Err("ERR All replicas failed promote".into())
     }
-    Err("ERR All replicas failed promote".into())
+    .await;
+
+    sentinel.end_failover(name);
+    result
 }
 
+/// Promote a replica so callers may `switch_master` to it.
+///
+/// **Batch FC success gate** — `PING` alone is **never** enough. Success only if:
+/// 1. `FAILOVER` returns OK, **or**
+/// 2. `REPLICAOF NO ONE` returns OK, **or**
+/// 3. post-attempt `ROLE` reports `master` (already master / promote race)
+///
+/// On any other outcome returns `Err` so the failover loop tries the next
+/// replica or reports failure without re-pointing clients at a still-replica.
 async fn promote_replica(addr: &str) -> Result<(), String> {
-    // Reachability first (required for switch).
+    // Reachability first (required, but not sufficient for switch).
     connect_and_ping(addr).await?;
+
+    match PROMOTE_INJECT.load(Ordering::SeqCst) {
+        PROMOTE_INJECT_FORCE_FAIL => {
+            return Err(format!(
+                "promote inject: forced fail for {} (PING ok, no promote)",
+                addr
+            ));
+        }
+        PROMOTE_INJECT_FORCE_OK => return Ok(()),
+        _ => {}
+    }
+
     let mut stream = connect(addr).await?;
     // Kore / Redis: FAILOVER on replica promotes.
     match resp_command(&mut stream, &["FAILOVER"], IO_TIMEOUT).await {
@@ -977,9 +1067,32 @@ async fn promote_replica(addr: &str) -> Result<(), String> {
         Ok(RespValue::SimpleString(s)) if s.as_ref() == b"OK" => return Ok(()),
         Ok(RespValue::Error(_)) | Ok(_) | Err(_) => {}
     }
-    // Lite MVP: a PING-reachable node can still be switched to as the new
-    // master address (standalone target without persistence / already master).
-    Ok(())
+    // Optional hardening: accept already-master (standalone target, or promote
+    // that completed without a clean OK on this connection).
+    if role_is_master(addr).await {
+        return Ok(());
+    }
+    Err(format!(
+        "promote failed for {}: FAILOVER/REPLICAOF did not OK and ROLE is not master",
+        addr
+    ))
+}
+
+/// True when `ROLE` bulk role field is `master`.
+async fn role_is_master(addr: &str) -> bool {
+    let Ok(mut stream) = connect(addr).await else {
+        return false;
+    };
+    let Ok(reply) = resp_command(&mut stream, &["ROLE"], IO_TIMEOUT).await else {
+        return false;
+    };
+    match reply {
+        RespValue::Array(arr) if !arr.is_empty() => match &arr[0] {
+            RespValue::BulkString(Some(b)) => b.eq_ignore_ascii_case(b"master"),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 async fn replicaof_to(addr: &str, host: &str, port: u16) -> Result<(), String> {
@@ -1213,6 +1326,25 @@ mod tests {
         s.note_ok("m", None);
         assert!(!s.master("m").unwrap().s_down);
         assert!(!s.master("m").unwrap().o_down);
+    }
+
+    #[test]
+    fn failover_in_progress_gate() {
+        let s = SentinelState::new();
+        s.monitor("m", "127.0.0.1", 1, 1).unwrap();
+        assert!(!s.master("m").unwrap().failover_in_progress);
+        s.begin_failover("m").unwrap();
+        assert!(s.master("m").unwrap().failover_in_progress);
+        let err = s.begin_failover("m").unwrap_err();
+        assert!(
+            err.to_ascii_lowercase().contains("already in progress"),
+            "err={}",
+            err
+        );
+        s.end_failover("m");
+        assert!(!s.master("m").unwrap().failover_in_progress);
+        s.begin_failover("m").unwrap();
+        s.end_failover("m");
     }
 
     #[test]

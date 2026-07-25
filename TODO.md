@@ -142,14 +142,13 @@ Also tracked in `docs/roadmap.md`.
   - *Hardened (Batch AC)*: full-resync holds a gate across RDB snapshot + feed register so concurrent `propagate_raw` cannot drop writes; sibling FAILOVER test waits for both `master_link_up` + `WAIT` before asserting
   - *Done (minimal + coordinated MVP-lite)*: honest promote via `REPLICAOF NO ONE` / bare `FAILOVER` on replica — new replid, offset 0, backlog clear, drop feeds, clear replica metadata, `master_replid2` in INFO; idempotent when already master.
   - *Coordinated* `FAILOVER TO <host> <port> [TIMEOUT ms] [FORCE]` (master only, default timeout 5000ms): write pause, soft match against REPLCONF `listening-port`/`ip-address` when tracked, wait until target ack ≥ frozen `master_repl_offset` (unless **FORCE**), then TCP bare `FAILOVER`, best-effort sibling re-follow (`REPLICAOF` on feeds + client-port TCP), demote self via `set_replicaof`. Replicas honor in-stream `REPLICAOF` and reconnect on `primary_link_epoch` / primary addr change. Catch-up sources: live-link tracked ACK (`REPLCONF ACK` on feed + periodic feed GETACK probe), then client-port GETACK fallback. Replica offset uses exact wire bytes via `parse_with_consumed` and replies to master GETACK on the repl link. Catch-up timeout leaves master writable.
-  - *Done (Batch EW, Sentinel-lite)*: `SENTINEL MONITOR|REMOVE|GET-MASTER-ADDR-BY-NAME|MASTERS|MASTER|REPLICAS|SET|FAILOVER|CKQUORUM|HELP`. Background PING + ROLE replica discover; **s_down** after `down-after-milliseconds` (default 30s); auto-failover (toggle via `SET auto-failover`) promotes first reachable replica (`FAILOVER` / `REPLICAOF NO ONE` / PING-reachable switch).
+  - *Done (Batch EW, Sentinel-lite)*: `SENTINEL MONITOR|REMOVE|GET-MASTER-ADDR-BY-NAME|MASTERS|MASTER|REPLICAS|SET|FAILOVER|CKQUORUM|HELP`. Background PING + ROLE replica discover; **s_down** after `down-after-milliseconds` (default 30s); auto-failover (toggle via `SET auto-failover`) promotes first reachable replica.
   - *Done (Batch EX, ODOWN lite)*: `SENTINEL MYID|MEET|MEETPEER|SENTINELS|IS-MASTER-DOWN-BY-ADDR`. Peer table; vote count = self s_down + peer is-master-down replies; **o_down** when votes ≥ quorum; auto-failover gated on **o_down** (not bare s_down). CKQUORUM checks known_sentinel_count ≥ quorum. No full leader election races.
   - *Done (Batch EZ)*: `SENTINEL FLUSHCONFIG` → `{dir}/sentinel.conf`; load on boot (`load_or_new`); restore myid/monitors/peers/options; **autosave** on MONITOR/REMOVE/SET/MEET/switch_master.
   - *Done (Batch FA)*: Redis-style hello CSV; `SENTINEL HELLO`; tick **PUBLISH** `__sentinel__:hello` on reachable masters; peer `SENTINEL HELLO` exchange; `apply_hello` learns peers + higher-epoch **switch-master**. No long-lived master `SUBSCRIBE` fan-in (peer HELLO is primary discovery path).
-  - *Residual (EN–FA post-ship code review)* — see Phase D cluster + backlog table:
-    - **P1** `promote_replica` falls through to `Ok(())` after failed `FAILOVER`/`REPLICAOF` if PING works (can `switch_master` to a node that never promoted).
-    - **P2** no failover **leader election** / voted-leader — every o_down Sentinel with auto-failover may race `try_failover`.
-    - **P2** no **in-progress failover gate** (manual `SENTINEL FAILOVER` vs tick can overlap).
+  - *Done (Batch FC)*: `promote_replica` success gate — requires `FAILOVER` OK, `REPLICAOF NO ONE` OK, or post-attempt `ROLE=master`; **never** `switch_master` on PING alone. Per-master `failover_in_progress` serializes manual FAILOVER vs tick. Promote inject hooks for tests.
+  - *Residual (EN–FA / FC post-ship)* — see Phase D cluster + backlog table:
+    - **P2** no failover **leader election** / voted-leader — every o_down Sentinel with auto-failover may still race across processes (in-process gate only).
     - **P3** `CKQUORUM` uses peer-table size, not live reachability.
     - **P3** `apply_hello` → `add_peer` **autosaves every hello** (disk thrash under multi-master × multi-peer ticks).
 - [x] **`[P1]`** Client durability: `WAIT` + min-replicas write gate
@@ -320,12 +319,11 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch DU)*: per-slot config epoch on `SETSLOT NODE` / reassign / failover claim; `CLUSTER OWNERS` + `CLUSTER EPOCH`; gossip/MEET pull+merge higher-epoch-wins (skip local MIGRATING/IMPORTING); third-node learns owner after NODE.
   - *Done (Batch DV)*: dest-first dual-end NODE (source skipped if dest fails → no MOVED-to-IMPORTING window); `partial_dest_node` when source `skipped:`; stale lower-epoch gossip cannot flip post-reshard ownership.
   - *Done (Batch DX)*: `CLUSTER RESHARD PLAN <dest> <n>` greedy donors; `AUTO` plans then executes local `reshard_slot` + remote RESP `CLUSTER RESHARD` (abort-on-partial).
-  - [ ] **`[P1]`** **Code review (EW post-ship):** `promote_replica` succeeds on PING alone
-    - *Found (scheduled review after EN–FA)*: after `FAILOVER` and `REPLICAOF NO ONE` both fail, `promote_replica` still returns `Ok(())` if the target answered PING (`src/sentinel/mod.rs`). `try_failover` then calls `switch_master` — multi-Sentinel o_down can re-point clients at a node that never became master.
-    - *Next*: require promote command success (or ROLE=`master` post-promote); keep PING-only path behind an explicit opt-in / document as accepted lite if retained.
-  - [ ] **`[P2]`** **Code review (EX/FA post-ship):** Sentinel failover leader election + in-progress gate
-    - *Found*: no voted-leader on `IS-MASTER-DOWN-BY-ADDR`; every o_down Sentinel with `auto-failover` may race `try_failover`. Manual `SENTINEL FAILOVER` and the 1s tick can overlap (no `failover_state`).
-    - *Next*: Redis-style leader vote by epoch/runid; serialize failover per master; surface `voted-leader` in peer fields.
+  - [x] **`[P1]`** **Code review (EW post-ship):** `promote_replica` succeeds on PING alone
+    - *Done (Batch FC)*: `promote_replica` requires `FAILOVER` OK / `REPLICAOF NO ONE` OK / post-attempt `ROLE=master`; never PING-only. Per-master `failover_in_progress`. Tests: inject fail → no switch; inject OK + real ROLE path still switch.
+  - [ ] **`[P2]`** **Code review (EX/FA post-ship):** Sentinel failover leader election (cross-process)
+    - *Found*: no voted-leader on `IS-MASTER-DOWN-BY-ADDR`; every o_down Sentinel with `auto-failover` may race `try_failover` **across processes**. (In-process manual-vs-tick gate done FC.)
+    - *Next*: Redis-style leader vote by epoch/runid; surface `voted-leader` in peer fields.
   - [ ] **`[P3]`** **Code review (EZ/FA post-ship):** hello-path autosave thrash + CKQUORUM reachability
     - *Found*: `apply_hello` → `add_peer` → `autosave_conf` on every peer HELLO (1s tick × masters × peers). `CKQUORUM` uses `1 + peers.len()` (not live probe).
     - *Next*: autosave only when peer table or master addr actually changes; optional peer ping for CKQUORUM.
@@ -702,16 +700,15 @@ Also tracked in `docs/roadmap.md`.
 
 ### Status snapshot (2026-07-25)
 
-**Shipped through Batch FB** (cluster HA EN–EV, Sentinel EW–EZ/FA, dual-end NODE RESP 2PC slice FB). Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule).
+**Shipped through Batch FC** (cluster HA EN–EV, Sentinel EW–EZ/FA/FC, dual-end NODE RESP 2PC slice FB). Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule).
 
 **Open / deferred residuals** (track as next queue below):
 
 | Area | Residual | Priority |
 |------|----------|----------|
-| Sentinel | **`promote_replica` PING-only still succeeds** → can `switch_master` without promote | **P1** (Batch FC) |
 | Cluster | NODE 2PC **slice 2** (durable prepare across crash / prepare-epoch / bus 2PC) | P2 |
 | Ops | Measured **benchmark tables** vs Redis/Valkey (`docs/benchmarks.md` methodology only) | P1 (Batch FD) |
-| Sentinel | Full **leader election** + in-progress gate + long-lived hello SUBSCRIBE | P2 (Batch FE) |
+| Sentinel | Full **leader election** + long-lived hello SUBSCRIBE (in-process failover gate done FC) | P2 (Batch FE) |
 | Sentinel | Hello `add_peer` **autosave thrash**; CKQUORUM peer-table not live | P3 (Batch FE) |
 | Cluster | `nodes.conf` omits require-full / allow-reads / announce flags | P3 |
 | Cluster | Interactive redis-cli weight UI for reshard | P3 |
@@ -730,9 +727,9 @@ Recommended letter batches. Prefer **P1** correctness before large differentiato
   - Prepare / vote / commit (or explicit abort) across source+dest for `SETSLOT NODE`
   - Honest statuses if prepare fails mid-flight; range RESHARD uses prepare gate
   - Integration tests: inject dest prepare fail, source commit fail, happy path + FINISH recovery
-- [ ] **`[P1]`** **Batch FC — Sentinel promote-success gate**
+- [x] **`[P1]`** **Batch FC — Sentinel promote-success gate**
   - `promote_replica`: require `FAILOVER` or `REPLICAOF NO ONE` **OK**, or post-promote `ROLE` = master; drop silent PING-only success
-  - Optional: per-master in-progress flag so manual FAILOVER and tick do not overlap
+  - Per-master `failover_in_progress` so manual FAILOVER and tick do not overlap (in-process)
   - Tests: inject promote-cmd fail + PING ok → no `switch_master`; happy promote still switches
 - [ ] **`[P1]`** **Batch FD — Benchmarks: measured numbers vs Redis/Valkey**
   - Run `redis-benchmark` (or equivalent) on same host for SET/GET/INCR/LPUSH/…; fill `docs/benchmarks.md` result tables
@@ -753,7 +750,7 @@ Recommended letter batches. Prefer **P1** correctness before large differentiato
 
 ### Code review backlog
 
-**Batches CZ–FB shipped** (FB = dual-end NODE RESP prepare/commit). **Queue:** **FC** promote-success → **FD** benches → **FE** Sentinel election → **FF** HNSW multi-layer → **FG** unified keyspace; standing tests-for-phase P0.
+**Batches CZ–FC shipped** (FC = Sentinel promote-success gate). **Queue:** **FD** benches → **FE** Sentinel election → **FF** HNSW multi-layer → **FG** unified keyspace; standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -874,8 +871,8 @@ Recommended letter batches. Prefer **P1** correctness before large differentiato
 | P2 | EY: dual-end NODE preflight / failed_preflight | done (EY) |
 | P2 | EZ: Sentinel FLUSHCONFIG + sentinel.conf load/autosave | done (EZ) |
 | P2 | FA: Sentinel hello bus lite (HELLO + PUBLISH) | done (FA) |
-| P1 | EW post-ship: promote_replica PING-only still Ok → switch_master | **open** (Batch FC) |
-| P2 | EX/FA post-ship: failover leader election + in-progress gate | **open** (Batch FE) |
+| P1 | EW post-ship: promote_replica PING-only still Ok → switch_master | **done** (Batch FC) |
+| P2 | EX/FA post-ship: failover leader election (cross-process); in-process gate done FC | **open** (Batch FE) |
 | P3 | EZ/FA post-ship: hello add_peer autosave thrash; CKQUORUM live count | **open** (Batch FE) |
 | P3 | EN/EO/EU post-ship: nodes.conf omits require-full/announce flags | **open** (later / doc) |
 | P1 | dual-end NODE RESP 2PC prepare/commit (slice 1) | **done** (Batch FB) |

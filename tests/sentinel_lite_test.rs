@@ -1,9 +1,13 @@
 //! Batch EW: Sentinel-lite MONITOR / GET-MASTER-ADDR / s_down / FAILOVER.
+//! Batch FC: promote-success gate (no switch_master on PING-only).
 
 use bytes::Bytes;
 use kore::config::Config;
 use kore::protocol::{RespParser, RespValue};
-use kore::{Cache, ReplicaInfo, Server};
+use kore::{
+    test_promote_inject, test_set_promote_inject, try_failover, Cache, ReplicaInfo, Server,
+    PROMOTE_INJECT_FORCE_FAIL, PROMOTE_INJECT_FORCE_OK,
+};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -287,6 +291,151 @@ async fn sentinel_manual_failover_switches_addr() {
         other => panic!("expected switched master: {:?}", other),
     }
     assert!(sentinel.master("mymaster").unwrap().failover_epoch >= 1);
+    // Batch FC: in-progress flag cleared after successful failover.
+    assert!(!sentinel.master("mymaster").unwrap().failover_in_progress);
+
+    let _ = tx_s.send(true);
+    let _ = tx_t.send(true);
+    hs.abort();
+    ht.abort();
+    sleep(Duration::from_millis(50)).await;
+}
+
+/// Batch FC: when promote cmds are forced to fail (target still PING-ok), do **not**
+/// `switch_master` — master address stays on the old (dead) master.
+#[tokio::test(flavor = "multi_thread")]
+async fn sentinel_failover_no_switch_on_promote_fail() {
+    let dead_master_port = 16906u16; // never started
+    let ping_ok_port = 16907u16;
+    let sentinel_port = 16908u16;
+
+    let cache_t = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_t = Server::new(cache_t, make_config(ping_ok_port));
+    let (tx_t, rx_t) = watch::channel(false);
+    let ht = tokio::spawn(async move {
+        let _ = srv_t.run_with_shutdown(rx_t).await;
+    });
+    wait_listen(ping_ok_port).await;
+
+    let cache_s = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_s = Server::new(cache_s, make_config(sentinel_port));
+    let sentinel = Arc::clone(srv_s.sentinel());
+    let (tx_s, rx_s) = watch::channel(false);
+    let hs = tokio::spawn(async move {
+        let _ = srv_s.run_with_shutdown(rx_s).await;
+    });
+    wait_listen(sentinel_port).await;
+
+    sentinel
+        .monitor("mymaster", "127.0.0.1", dead_master_port, 1)
+        .unwrap();
+    sentinel.note_ok(
+        "mymaster",
+        Some(vec![ReplicaInfo {
+            ip: "127.0.0.1".into(),
+            port: ping_ok_port,
+        }]),
+    );
+
+    let epoch_before = sentinel.master("mymaster").unwrap().failover_epoch;
+
+    let _guard = test_promote_inject();
+    test_set_promote_inject(PROMOTE_INJECT_FORCE_FAIL);
+
+    let mut cli = TcpStream::connect(("127.0.0.1", sentinel_port)).await.unwrap();
+    let reply = send_cmd(&mut cli, &["SENTINEL", "FAILOVER", "mymaster"]).await;
+    match &reply {
+        RespValue::Error(e) => {
+            let s = String::from_utf8_lossy(e);
+            assert!(
+                s.to_ascii_lowercase().contains("failed promote")
+                    || s.to_ascii_lowercase().contains("promote"),
+                "expected promote-fail error, got {}",
+                s
+            );
+        }
+        other => panic!("expected ERR on promote fail, got {:?}", other),
+    }
+
+    let m = sentinel.master("mymaster").unwrap();
+    assert_eq!(m.ip, "127.0.0.1");
+    assert_eq!(
+        m.port, dead_master_port,
+        "master addr must not switch on PING-only / promote fail"
+    );
+    assert_eq!(
+        m.failover_epoch, epoch_before,
+        "failover_epoch must not advance without switch_master"
+    );
+    assert!(
+        !m.failover_in_progress,
+        "in-progress flag must clear after failed failover"
+    );
+
+    let addr = send_cmd(
+        &mut cli,
+        &["SENTINEL", "GET-MASTER-ADDR-BY-NAME", "mymaster"],
+    )
+    .await;
+    match addr {
+        RespValue::Array(a) => {
+            assert_eq!(as_bulk(&a[0]), "127.0.0.1");
+            assert_eq!(as_bulk(&a[1]), dead_master_port.to_string());
+        }
+        other => panic!("expected unchanged master: {:?}", other),
+    }
+
+    let _ = tx_s.send(true);
+    let _ = tx_t.send(true);
+    hs.abort();
+    ht.abort();
+    sleep(Duration::from_millis(50)).await;
+}
+
+/// Batch FC: injected promote OK still switches master (happy inject path).
+#[tokio::test(flavor = "multi_thread")]
+async fn sentinel_failover_switches_on_inject_ok() {
+    let dead_master_port = 16913u16;
+    let target_port = 16914u16;
+    let sentinel_port = 16915u16;
+
+    let cache_t = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_t = Server::new(cache_t, make_config(target_port));
+    let (tx_t, rx_t) = watch::channel(false);
+    let ht = tokio::spawn(async move {
+        let _ = srv_t.run_with_shutdown(rx_t).await;
+    });
+    wait_listen(target_port).await;
+
+    let cache_s = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_s = Server::new(cache_s, make_config(sentinel_port));
+    let sentinel = Arc::clone(srv_s.sentinel());
+    let (tx_s, rx_s) = watch::channel(false);
+    let hs = tokio::spawn(async move {
+        let _ = srv_s.run_with_shutdown(rx_s).await;
+    });
+    wait_listen(sentinel_port).await;
+
+    sentinel
+        .monitor("mymaster", "127.0.0.1", dead_master_port, 1)
+        .unwrap();
+    sentinel.note_ok(
+        "mymaster",
+        Some(vec![ReplicaInfo {
+            ip: "127.0.0.1".into(),
+            port: target_port,
+        }]),
+    );
+
+    let _guard = test_promote_inject();
+    test_set_promote_inject(PROMOTE_INJECT_FORCE_OK);
+
+    assert!(try_failover(&sentinel, "mymaster").await.is_ok());
+
+    let m = sentinel.master("mymaster").unwrap();
+    assert_eq!(m.port, target_port);
+    assert!(m.failover_epoch >= 1);
+    assert!(!m.failover_in_progress);
 
     let _ = tx_s.send(true);
     let _ = tx_t.send(true);

@@ -3,7 +3,7 @@
 ## Currently working on..
 
 - [x] Support for Redis Pub-Sub
-- **Post-FB queue** (through dual-end NODE RESP 2PC slice): next is **Batch FC** (Sentinel promote-success gate). Details in root `TODO.md` → *Next work queue (post-FB)*.
+- **Post-FC queue** (through Sentinel promote-success gate FC): next is **Batch FD** (benchmarks vs Redis/Valkey). Details in root `TODO.md` → *Next work queue (post-FB)*.
 
 ## Persistence / search letter batches (recent)
 
