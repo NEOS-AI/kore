@@ -207,14 +207,20 @@ impl Cache {
         }
         match c.key_type {
             KeyType::String => {
-                if let Some(entry) = self.map.remove(&c.key) {
-                    let size = entry.size();
-                    self.memory_usage.fetch_sub(size, Ordering::Relaxed);
-                    self.memory_tracker.deallocate(size, MemoryCategory::Cache);
-                    self.auto_remove_from_indices(&c.key);
-                    Some(size)
-                } else {
-                    None
+                match self.key_values.remove(&c.key) {
+                    Some(super::KeyValue::String(entry)) => {
+                        let size = entry.size();
+                        self.memory_usage.fetch_sub(size, Ordering::Relaxed);
+                        self.memory_tracker.deallocate(size, MemoryCategory::Cache);
+                        self.auto_remove_from_indices(&c.key);
+                        Some(size)
+                    }
+                    Some(other) => {
+                        // Race: type changed under us — put back.
+                        self.key_values.insert(c.key.clone(), other);
+                        None
+                    }
+                    None => None,
                 }
             }
             KeyType::ZSet => {
@@ -284,64 +290,45 @@ impl Cache {
 
         let mut out = Vec::with_capacity(sample_size.saturating_mul(2));
 
-        // --- String keys (LRU/LFU/TTL metadata available) ---
-        for _ in 0..4 {
-            for (k, e) in self.map.get_n_random(draw) {
-                if e.is_expired() {
-                    continue;
-                }
-                if volatile_only && e.expires_at.is_none() {
-                    continue;
-                }
-                let decay = self.lfu_decay_time.load(Ordering::Relaxed);
-                out.push(EvictCandidate {
-                    key: k,
-                    key_type: KeyType::String,
-                    size: e.size(),
-                    last_access: e.last_access_time(),
-                    lfu_freq: e.lfu_freq(decay),
-                    expires_at: e.expires_at,
-                    search_index: None,
-                });
-                if out.len() >= sample_size && volatile_only {
-                    return out;
-                }
-            }
-            if volatile_only {
-                if out.len() >= sample_size {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-
-        // --- Typed keys (FG-3: sample unified key_values) ---
-        // allkeys always; volatile only when they have a TTL.
+        // --- Unified key_values (FG-4: strings + typed) ---
         {
-            let typed_n = sample_size.max(1);
-            let push_typed = |out: &mut Vec<EvictCandidate>,
-                              k: Bytes,
-                              kt: KeyType,
-                              size: usize,
-                              expires_at: Option<Instant>| {
-                if volatile_only && expires_at.is_none() {
-                    return;
-                }
-                // Skip already-expired typed keys (lazy purge will clean later).
-                if expires_at.map(|e| e <= Instant::now()).unwrap_or(false) {
-                    return;
-                }
-                out.push(typed_candidate(k, kt, size, expires_at));
-            };
+            let n = draw.max(sample_size).max(1);
+            let decay = self.lfu_decay_time.load(Ordering::Relaxed);
 
-            for (k, kv) in self.key_values.get_n_random(typed_n) {
-                let size = crate::memory::estimate_keyed_object(
-                    k.len(),
-                    kv.content_memory_size(),
-                );
-                let exp = self.typed_expires_at(&k);
-                push_typed(&mut out, k, kv.key_type(), size, exp);
+            for (k, kv) in self.key_values.get_n_random(n) {
+                match &kv {
+                    super::KeyValue::String(e) => {
+                        if e.is_expired() {
+                            continue;
+                        }
+                        if volatile_only && e.expires_at.is_none() {
+                            continue;
+                        }
+                        out.push(EvictCandidate {
+                            key: k,
+                            key_type: KeyType::String,
+                            size: e.size(),
+                            last_access: e.last_access_time(),
+                            lfu_freq: e.lfu_freq(decay),
+                            expires_at: e.expires_at,
+                            search_index: None,
+                        });
+                    }
+                    other => {
+                        let exp = self.typed_expires_at(&k);
+                        if volatile_only && exp.is_none() {
+                            continue;
+                        }
+                        if exp.map(|e| e <= Instant::now()).unwrap_or(false) {
+                            continue;
+                        }
+                        let size = crate::memory::estimate_keyed_object(
+                            k.len(),
+                            other.content_memory_size(),
+                        );
+                        out.push(typed_candidate(k, other.key_type(), size, exp));
+                    }
+                }
             }
 
             // Search index documents only under allkeys (no TTL) — residual
@@ -440,7 +427,7 @@ impl Cache {
                 continue;
             }
 
-            let result = self.map.active_expire_cycle(
+            let result = self.string_active_expire_cycle(
                 crate::hashmap::ACTIVE_EXPIRE_SAMPLES_PER_PASS,
                 crate::hashmap::ACTIVE_EXPIRE_MAX_PASSES,
                 Duration::from_millis(1),
@@ -475,7 +462,7 @@ impl Cache {
 
     /// Manually trigger a **full** sweep of all shards (admin / SWEEP command).
     pub fn sweep(&self) -> usize {
-        let result = self.map.sweep_expired();
+        let result = self.string_sweep_expired();
         if result.count > 0 {
             self.apply_expire_accounting(result.count, result.bytes_freed);
         }
@@ -486,7 +473,11 @@ impl Cache {
 
     /// Run one Redis-style active expire cycle (sampling). Returns keys deleted.
     pub fn active_expire(&self) -> usize {
-        let result = self.map.active_expire_default();
+        let result = self.string_active_expire_cycle(
+            crate::hashmap::ACTIVE_EXPIRE_SAMPLES_PER_PASS,
+            crate::hashmap::ACTIVE_EXPIRE_MAX_PASSES,
+            Duration::from_millis(1),
+        );
         if result.count > 0 {
             self.apply_expire_accounting(result.count, result.bytes_freed);
         }
@@ -500,15 +491,112 @@ impl Cache {
         max_passes: usize,
         time_budget: Duration,
     ) -> crate::hashmap::ActiveExpireResult {
-        let mut result = self
-            .map
-            .active_expire_cycle(samples_per_pass, max_passes, time_budget);
+        let mut result =
+            self.string_active_expire_cycle(samples_per_pass, max_passes, time_budget);
         if result.count > 0 {
             self.apply_expire_accounting(result.count, result.bytes_freed);
         }
         let typed = self.active_expire_typed(samples_per_pass);
         result.count += typed;
         result
+    }
+
+    /// Full scan: remove expired string keys from the unified map.
+    fn string_sweep_expired(&self) -> crate::hashmap::SweepResult {
+        let mut count = 0usize;
+        let mut bytes_freed = 0usize;
+        let expired: Vec<Bytes> = {
+            let mut keys = Vec::new();
+            self.key_values.for_each(|k, kv| {
+                if let super::KeyValue::String(e) = kv {
+                    if e.is_expired() {
+                        keys.push(k.clone());
+                    }
+                }
+            });
+            keys
+        };
+        for key in expired {
+            if let Some(super::KeyValue::String(e)) = self.key_values.remove(&key) {
+                if e.is_expired() {
+                    bytes_freed += e.size();
+                    count += 1;
+                } else {
+                    // Renewed between scan and remove — put back.
+                    self.key_values
+                        .insert(key, super::KeyValue::String(e));
+                }
+            }
+        }
+        crate::hashmap::SweepResult { count, bytes_freed }
+    }
+
+    /// Redis-style active expire sampling for string keys in `key_values`.
+    fn string_active_expire_cycle(
+        &self,
+        samples_per_pass: usize,
+        max_passes: usize,
+        time_budget: Duration,
+    ) -> crate::hashmap::ActiveExpireResult {
+        use std::time::Instant as StdInstant;
+
+        let start = StdInstant::now();
+        let mut total = crate::hashmap::ActiveExpireResult::default();
+        if samples_per_pass == 0 || max_passes == 0 {
+            return total;
+        }
+
+        for pass in 0..max_passes {
+            if start.elapsed() >= time_budget {
+                break;
+            }
+            let mut pass_sampled = 0usize;
+            let mut pass_expired = 0usize;
+            let max_attempts = samples_per_pass.saturating_mul(5).max(samples_per_pass);
+
+            for _ in 0..max_attempts {
+                if pass_sampled >= samples_per_pass || start.elapsed() >= time_budget {
+                    break;
+                }
+                let Some((k, kv)) = self.key_values.get_random() else {
+                    break;
+                };
+                let super::KeyValue::String(entry) = kv else {
+                    continue;
+                };
+                if entry.expires_at.is_none() {
+                    continue;
+                }
+                pass_sampled += 1;
+                total.sampled += 1;
+                if !entry.is_expired() {
+                    continue;
+                }
+                // Re-check under write: remove only if still expired string.
+                match self.key_values.remove(&k) {
+                    Some(super::KeyValue::String(cur)) if cur.is_expired() => {
+                        let size = cur.size();
+                        total.count += 1;
+                        total.bytes_freed += size;
+                        pass_expired += 1;
+                    }
+                    Some(other) => {
+                        self.key_values.insert(k, other);
+                    }
+                    None => {}
+                }
+            }
+
+            total.passes = pass + 1;
+            if pass_sampled == 0 {
+                break;
+            }
+            let ratio = pass_expired as f64 / pass_sampled as f64;
+            if ratio <= crate::hashmap::ACTIVE_EXPIRE_CONTINUE_RATIO {
+                break;
+            }
+        }
+        total
     }
 
     /// Delete all typed keys whose expire Instant is in the past.

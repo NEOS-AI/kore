@@ -118,7 +118,7 @@ impl Cache {
         match self.key_type(key) {
             KeyType::None => Ok(None),
             KeyType::String => {
-                let Some(entry) = self.map.get(key) else {
+                let Some(entry) = self.get_string_entry(key) else {
                     return Ok(None);
                 };
                 if entry.is_expired() {
@@ -146,7 +146,7 @@ impl Cache {
     pub fn pfadd(&self, key: &Bytes, elements: &[Bytes]) -> Result<i64> {
         self.ensure_string_or_absent(key)?;
         // Existing non-HLL string is an error
-        if let Some(entry) = self.map.get(key) {
+        if let Some(entry) = self.get_string_entry(key) {
             if !entry.is_expired() && !entry.value.is_empty() && !is_hll(&entry.value) {
                 return Err(Error::InvalidArgument(
                     "WRONGTYPE Key is not a valid HyperLogLog string value.".into(),
@@ -159,7 +159,7 @@ impl Cache {
         if projected > max_entry_size {
             return Err(Error::EntryTooLarge);
         }
-        let old = self.map.get(key);
+        let old = self.get_string_entry(key);
         let old_size = old
             .as_ref()
             .filter(|e| !e.is_expired())
@@ -176,7 +176,7 @@ impl Cache {
             TooLarge,
         }
 
-        let outcome = self.map.mutate(key, |current, next_cas| {
+        let outcome = match self.mutate_string(key, |current, next_cas| {
             let (mut bytes, expires_at, flags, old_size) = match current {
                 Some(entry) if !entry.is_expired() => {
                     if !entry.value.is_empty() && !is_hll(&entry.value) {
@@ -238,7 +238,10 @@ impl Cache {
                     new_size,
                 },
             )
-        });
+        }) {
+            Ok(o) => o,
+            Err(e) => return Err(e),
+        };
 
         match outcome {
             Out::BadType => Err(Error::InvalidArgument(
@@ -303,7 +306,7 @@ impl Cache {
             ));
         }
         self.ensure_string_or_absent(dest)?;
-        if let Some(entry) = self.map.get(dest) {
+        if let Some(entry) = self.get_string_entry(dest) {
             if !entry.is_expired() && !entry.value.is_empty() && !is_hll(&entry.value) {
                 return Err(Error::InvalidArgument(
                     "WRONGTYPE Key is not a valid HyperLogLog string value.".into(),
@@ -330,7 +333,7 @@ impl Cache {
         if projected > max_entry_size {
             return Err(Error::EntryTooLarge);
         }
-        let old = self.map.get(dest);
+        let old = self.get_string_entry(dest);
         let old_size = old
             .as_ref()
             .filter(|e| !e.is_expired())
@@ -339,7 +342,7 @@ impl Cache {
         let net = projected.saturating_sub(old_size);
         self.ensure_capacity(net)?;
 
-        let outcome = self.map.mutate(dest, |current, next_cas| {
+        let outcome = match self.mutate_string(dest, |current, next_cas| {
             let old_size = match current {
                 Some(e) => e.size(),
                 None => 0,
@@ -347,7 +350,10 @@ impl Cache {
             let entry = Entry::new(dest.clone(), Bytes::from(merged.clone())).with_cas(next_cas);
             let new_size = entry.size();
             (EntryAction::Set(Arc::new(entry)), (old_size, new_size))
-        });
+        }) {
+            Ok(o) => o,
+            Err(e) => return Err(e),
+        };
         self.account_replace(outcome.0, outcome.1);
         Ok(())
     }

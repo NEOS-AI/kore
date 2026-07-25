@@ -1,4 +1,4 @@
-//! Unified keyspace facade + physical `KeyValue` map (Batch FG / FG-2 / FG-3).
+//! Unified keyspace facade + physical `KeyValue` map (Batch FG / FG-2 / FG-3 / FG-4).
 //!
 //! # Design target
 //!
@@ -6,11 +6,11 @@
 //! types in separate maps (`map` for strings, `sorted_sets`, `geo_sets`,
 //! hashes/lists/sets/streams) plus a side `typed_expires` table.
 //!
-//! The long-term shape is one sharded map of name → [`KeyValue`]:
+//! The physical shape is one sharded map of name → [`KeyValue`]:
 //!
 //! ```text
 //! enum KeyValue {
-//!     String(SharedEntry),   // TTL on Entry — still on Cache::map (residual)
+//!     String(SharedEntry),   // TTL on Entry
 //!     Hash(SharedHash),
 //!     List(SharedList),
 //!     Set(SharedSet),
@@ -20,8 +20,8 @@
 //! }
 //! ```
 //!
-//! Typed (non-string) absolute expiry may stay a side map for a while, or move
-//! onto a thin header wrapping `KeyValue` (`struct KeySlot { value, expires_at }`).
+//! Typed (non-string) absolute expiry remains a side map for now
+//! (`typed_expires`); folding into a slot header is an accepted residual.
 //!
 //! # How cross-type ops work on the unified map
 //!
@@ -31,21 +31,20 @@
 //! | **WRONGTYPE** | `ensure_type(k, expected)` compares `key_type` vs expected |
 //! | **DEL / UNLINK** | `remove_key_value_raw` frees memory for that variant, clears expire, search index, WATCH |
 //! | **EXISTS** | `get_key_value(k).is_some()` after lazy expire |
-//! | **SCAN / KEYS / DBSIZE / RANDOMKEY** | Iterate string map + `key_values` |
+//! | **SCAN / KEYS / DBSIZE / RANDOMKEY** | Iterate `key_values` (single map) |
 //! | **RENAME** | Atomic take of `KeyValue` + expire metadata, insert under new name (overwrite dest) |
 //! | **TTL / EXPIRE** | String: `Entry.expires_at`; typed: `typed_expires` (or future slot header) |
-//! | **Memory / eviction** | Per-variant size estimate; eviction samples typed keys from `key_values` |
+//! | **Memory / eviction** | Per-variant size estimate; eviction samples all keys from `key_values` |
 //!
 //! # Migration plan
 //!
 //! 1. **FG (slice A, done):** Introduce [`KeyValue`] + facade.
 //! 2. **FG-2 (done):** Physical **hashes** in [`Cache::key_values`].
-//! 3. **FG-3 (this batch):** Physical **list / set / zset / geo / stream** in
-//!    `key_values`; legacy per-type maps removed; [`KeyspacePayload`] drains
-//!    `key_values` as one stream; eviction samples typed victims from that map.
-//!    **Strings** remain on [`Cache::map`] (separate residual → optional FG-4).
-//! 4. **FG-4 (optional):** Merge strings into `key_values` and/or fold
-//!    `typed_expires` into a slot header.
+//! 3. **FG-3 (done):** Physical **list / set / zset / geo / stream** in
+//!    `key_values`; legacy per-type maps removed.
+//! 4. **FG-4 (this batch):** Merge **strings** into `key_values` as
+//!    [`KeyValue::String`]; collapse [`KeyspacePayload`] to one
+//!    `key_values` stream. `typed_expires` side map residual remains.
 //!
 //! # Invariants preserved
 //!
@@ -70,12 +69,9 @@ use super::Cache;
 
 /// Typed value for one key name in the logical Redis keyspace.
 ///
-/// **Storage (FG-3):** all non-string types are **physically** stored as
-/// variants of this enum in [`Cache::key_values`]. [`KeyValue::String`] is a
-/// *view* over [`Cache::map`] only (not stored in `key_values`).
-///
-/// Dropping a view Arc does not remove the key; use [`Cache::delete`] /
-/// type-specific `remove_*`.
+/// **Storage (FG-4):** every type — including strings — is **physically** stored
+/// as a variant of this enum in [`Cache::key_values`]. Dropping a cloned Arc
+/// does not remove the key; use [`Cache::delete`] / type-specific `remove_*`.
 #[derive(Clone)]
 pub enum KeyValue {
     String(SharedEntry),
@@ -159,25 +155,26 @@ impl Cache {
     /// key was purged). Used by TYPE / EXISTS / `key_type` and as the stable
     /// cross-type lookup API.
     ///
-    /// Probe order: string map → typed expire purge → **`key_values`** (all
-    /// non-string types).
+    /// Single map: purge typed expire when due, then probe [`Self::key_values`].
+    /// Expired strings are treated as absent (physical cleanup by load/sweep).
     pub fn get_key_value(&self, key: &Bytes) -> Option<KeyValue> {
-        // Strings: expire is on Entry (lazy delete path lives in load/mutate).
-        if let Some(entry) = self.map.get(key) {
-            if !entry.is_expired() {
-                return Some(KeyValue::String(entry));
-            }
-            // Expired string: treat as absent for type resolution. Physical
-            // cleanup is handled by load/sweep paths (same as historical
-            // key_type).
-        }
-
-        // Typed keys: purge past-due TTL then probe unified map.
+        // Typed TTL may be past due even when the value is still present.
         if self.purge_typed_if_expired(key) {
             return None;
         }
 
-        self.key_values.get(key)
+        match self.key_values.get(key) {
+            Some(KeyValue::String(entry)) if entry.is_expired() => None,
+            other => other,
+        }
+    }
+
+    /// Borrow the string entry when `key` is a live (non-expired) string.
+    pub(super) fn get_string_entry(&self, key: &Bytes) -> Option<SharedEntry> {
+        match self.key_values.get(key) {
+            Some(KeyValue::String(e)) if !e.is_expired() => Some(e),
+            _ => None,
+        }
     }
 
     /// Remove any key type without clearing `typed_expires` or search indices.
@@ -187,22 +184,23 @@ impl Cache {
     ///
     /// Returns `true` if a value was removed.
     pub(crate) fn remove_key_value_raw(&self, key: &Bytes) -> bool {
-        if let Some(entry) = self.map.remove(key) {
-            let size = entry.size();
-            self.memory_usage.fetch_sub(size, Ordering::Relaxed);
-            self.memory_tracker.deallocate(size, MemoryCategory::Cache);
-            return true;
-        }
-        // FG-3: all non-string types live in key_values.
+        // FG-4: all types (including strings) live in key_values.
         if let Some(kv) = self.key_values.remove(key) {
-            debug_assert!(
-                kv.is_typed_container(),
-                "String must not be stored in key_values"
-            );
-            let size =
-                crate::memory::estimate_keyed_object(key.len(), kv.content_memory_size());
-            self.memory_tracker
-                .deallocate(size, kv.memory_category());
+            match &kv {
+                KeyValue::String(entry) => {
+                    let size = entry.size();
+                    self.memory_usage.fetch_sub(size, Ordering::Relaxed);
+                    self.memory_tracker.deallocate(size, MemoryCategory::Cache);
+                }
+                _ => {
+                    let size = crate::memory::estimate_keyed_object(
+                        key.len(),
+                        kv.content_memory_size(),
+                    );
+                    self.memory_tracker
+                        .deallocate(size, kv.memory_category());
+                }
+            }
             return true;
         }
         false
@@ -361,9 +359,9 @@ mod tests {
         assert!(c.ensure_type(&b("missing"), KeyType::List).is_ok());
     }
 
-    /// FG-3: all non-string types are physically in `key_values`.
+    /// FG-4: all types (including strings) are physically in `key_values`.
     #[test]
-    fn all_typed_live_in_unified_key_values() {
+    fn all_types_live_in_unified_key_values() {
         let c = cache();
         let _ = c.get_or_create_hash(&b("h")).unwrap();
         let _ = c.get_or_create_list(&b("l")).unwrap();
@@ -393,11 +391,37 @@ mod tests {
             Err(crate::error::Error::WrongType)
         ));
 
-        // Strings stay on map, not key_values
+        // FG-4: strings live in key_values as KeyValue::String
         c.store(b("str"), Bytes::from_static(b"x"), store_opts())
             .unwrap();
-        assert!(c.key_values.get(&b("str")).is_none());
+        assert!(matches!(
+            c.key_values.get(&b("str")),
+            Some(KeyValue::String(_))
+        ));
         assert_eq!(c.dbsize(), 7);
+        assert_eq!(c.key_values.len(), 7);
+    }
+
+    #[test]
+    fn strings_live_in_unified_key_values() {
+        let c = cache();
+        c.store(b("s"), Bytes::from_static(b"v"), store_opts())
+            .unwrap();
+        assert_eq!(c.key_values.len(), 1);
+        match c.key_values.get(&b("s")) {
+            Some(KeyValue::String(e)) => {
+                assert_eq!(e.value.as_ref(), b"v");
+            }
+            other => panic!("expected String in key_values, got {:?}", other.map(|v| v.key_type())),
+        }
+        // WRONGTYPE: cannot create hash over string
+        assert!(matches!(
+            c.get_or_create_hash(&b("s")),
+            Err(crate::error::Error::WrongType)
+        ));
+        // Cross-type DEL
+        assert!(c.delete(&b("s")).unwrap());
+        assert_eq!(c.key_values.len(), 0);
     }
 
     #[test]
@@ -423,6 +447,8 @@ mod tests {
     #[test]
     fn take_install_payload_roundtrip_all_types() {
         let c = cache();
+        c.store(b("str1"), Bytes::from_static(b"hello"), store_opts())
+            .unwrap();
         let h = c.get_or_create_hash(&b("h1")).unwrap();
         h.write()
             .hset(Bytes::from_static(b"f"), Bytes::from_static(b"1"));
@@ -439,23 +465,29 @@ mod tests {
 
         let before_hash = c.category_memory(MemoryCategory::Hashes);
         assert!(before_hash > 0);
-        assert_eq!(c.key_values.len(), 6);
+        assert_eq!(c.key_values.len(), 7);
 
         let payload = c.take_keyspace_payload();
         assert_eq!(c.key_values.len(), 0);
+        assert!(c.get_string_entry(&b("str1")).is_none());
         assert!(c.get_hash(&b("h1")).is_none());
         assert!(c.get_list(&b("l1")).is_none());
         assert!(c.get_set(&b("set1")).is_none());
 
         c.install_keyspace_payload(payload);
+        assert_eq!(c.key_type(&b("str1")), KeyType::String);
         assert_eq!(c.key_type(&b("h1")), KeyType::Hash);
         assert_eq!(c.key_type(&b("l1")), KeyType::List);
         assert_eq!(c.key_type(&b("set1")), KeyType::Set);
         assert_eq!(c.key_type(&b("z1")), KeyType::ZSet);
         assert_eq!(c.key_type(&b("g1")), KeyType::Geo);
         assert_eq!(c.key_type(&b("st1")), KeyType::Stream);
-        assert_eq!(c.key_values.len(), 6);
+        assert_eq!(c.key_values.len(), 7);
         assert_eq!(c.category_memory(MemoryCategory::Hashes), before_hash);
+        assert_eq!(
+            c.get_string_entry(&b("str1")).unwrap().value.as_ref(),
+            b"hello"
+        );
     }
 
     #[test]

@@ -25,25 +25,25 @@ src/cache/
 └── config.rs       - max_entry_size, eviction sample, …
 ```
 
-## 3. Unified keyspace (Batch FG / FG-2)
+## 3. Unified keyspace (Batch FG / FG-2 / FG-3 / FG-4)
 
-### Today (FG-3: typed containers unified)
+### Today (FG-4: true single map)
 
 `Cache` holds:
 
 | Field | Type |
 |-------|------|
-| `map` | strings (`SharedEntry`) — residual separate map |
-| `key_values` | `ShardedKeyMap<KeyValue>` — **Hash / List / Set / ZSet / Geo / Stream** |
-| `typed_expires` | absolute `Instant` for non-string keys |
+| `key_values` | `ShardedKeyMap<KeyValue>` — **String / Hash / List / Set / ZSet / Geo / Stream** |
+| `typed_expires` | absolute `Instant` for non-string keys (slot-header fold residual) |
 | `list_blockers` / `stream_blockers` | blocking waiters (not key storage) |
 
-Logical invariant: **one name → at most one type** (`ensure_type` / WRONGTYPE).
+Logical invariant: **one name → at most one type** (`ensure_type` / WRONGTYPE).  
+**No dual-residence:** a name lives in exactly one place (`key_values`).
 
 ```text
 enum KeyValue {
-    String(SharedEntry),  // view over Cache::map only (not stored in key_values)
-    Hash(SharedHash),     // physically in key_values
+    String(SharedEntry),  // physically in key_values; TTL on Entry
+    Hash(SharedHash),
     List(SharedList),
     Set(SharedSet),
     ZSet(SharedSortedSet),
@@ -51,26 +51,21 @@ enum KeyValue {
     Stream(SharedStream),
 }
 
-Cache::get_key_value(key) -> Option<KeyValue>   // string map → key_values
+Cache::get_key_value(key) -> Option<KeyValue>   // single map (+ lazy expire)
 Cache::key_type / exists                         // via get_key_value
 Cache::delete / remove_key_value_raw             // unified remove + memory free
-```
-
-### Target (true single map — optional FG-4)
-
-```text
-ShardedKeyMap<KeyValue>   // include String; or KeySlot { value, expires_at }
+Cache::mutate_string                             // RMW under shard lock (SET/INCR/…)
 ```
 
 | Op | On unified map |
 |----|----------------|
 | **TYPE** | `get` → `KeyValue::key_type()` → Redis TYPE string |
-| **WRONGTYPE** | `ensure_type` vs existing variant |
+| **WRONGTYPE** | `ensure_type` / `ensure_string_or_absent` / `mutate_string` |
 | **DEL / EXISTS** | remove / `is_some` on one map |
-| **SCAN / KEYS / DBSIZE / RANDOMKEY** | iterate string map + `key_values` (today) |
+| **SCAN / KEYS / DBSIZE / RANDOMKEY** | iterate `key_values` only |
 | **RENAME** | take value + expire meta, insert under new name |
-| **TTL / EXPIRE** | string: `Entry`; typed: side map or slot header |
-| **Memory / eviction** | per-variant size; typed victims sampled from `key_values` |
+| **TTL / EXPIRE** | string: `Entry`; typed: `typed_expires` side map (residual) |
+| **Memory / eviction** | per-variant size; all victims sampled from `key_values` |
 
 ### Migration plan
 
@@ -78,10 +73,12 @@ ShardedKeyMap<KeyValue>   // include String; or KeySlot { value, expires_at }
 2. **FG-2 (done, hashes):** Physical hashes in `ShardedKeyMap<KeyValue>`.
 3. **FG-3 (done):** list/set/zset/geo/stream into `key_values`; legacy per-type
    maps removed; `KeyspacePayload` drains `map` + `key_values` streams; eviction
-   samples typed keys from one map. **No dual-write leftover** for migrated types.
-4. **FG-4 (optional):** Merge strings into `key_values`; fold `typed_expires`
-   into slot header; search-doc eviction remains special.
+   samples typed keys from one map.
+4. **FG-4 (done):** Merge strings into `key_values` as `KeyValue::String`;
+   collapse `KeyspacePayload` to one `key_values` stream. **Residual:**
+   `typed_expires` side map (not slot header); search-doc eviction special;
+   legacy `ShardedHashMap` retained for tests/API only.
 
-**Load/install (`KeyspacePayload`):** `map: Vec<(Bytes, SharedEntry)>` +
-`key_values: Vec<(Bytes, KeyValue)>` + expires / WATCH / search / memory counters.
-Epoch install semantics (DR/DS) unchanged.
+**Load/install (`KeyspacePayload`):** `key_values: Vec<(Bytes, KeyValue)>` +
+expires / WATCH / search / memory counters. Epoch install semantics (DR/DS)
+unchanged.

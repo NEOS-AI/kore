@@ -3,7 +3,7 @@
 ## Currently working on..
 
 - [x] Support for Redis Pub-Sub
-- **Primary queue complete through FG-3; FH + FI + FI-2 done.** Optional next: FG-4 strings, FK Sentinel promote rank, FL `nodes.conf` flags. See root `TODO.md` → *Next work queue (post-FG-3)*.
+- **Primary through FG-4 done (strings unified); FH + FI + FI-2 done.** Optional next (P3): **FK** Sentinel promote rank → **FL** `nodes.conf` flags. See root `TODO.md` → *Next work queue (post-FG-4)*.
 
 ## Persistence / search letter batches (recent)
 
@@ -81,11 +81,13 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Unified keyspace design + `KeyValue` facade (Batch FG slice A; multi-map storage)
 - [x] **FG-2** physical hashes in `ShardedKeyMap<KeyValue>` (`Cache::key_values`)
 - [x] **FG-3** remaining typed containers (list/set/zset/geo/stream) + `KeyspacePayload` collapse; eviction samples typed from one map
-- [x] **Primary FB–FG-3 queue complete** (typed keyspace unified; strings still on `map`)
+- [x] **FG-4** strings into unified `KeyValue` map; `KeyspacePayload` single `key_values` stream; dual-map removed
+- [x] **Primary FB–FG-4 queue complete** (true single keyspace map; `typed_expires` residual)
 - [x] **FH** NODE 2PC slice 2 (prepare-epoch + TTL + commit re-check + boot clear)
 - [x] **FI** pipeline SET perf (~+25% P=16 on M3 Pro; residual FI-2 backlog / AOF-off multi-DB)
 - [x] **FI-2** AOF-off multi-DB SELECT ordering (`propagate_write`; backlog serialize residual remains)
-- [ ] **Next (see `TODO.md` post-FG-3):** optional **FG-4**/FJ strings · **FK** Sentinel promote rank · **FL** `nodes.conf` flags
+- [x] **P2 follow-ons complete** (FH 2PC slice 2 · FI pipeline SET · FI-2 AOF-off SELECT)
+- [ ] **Next (see `TODO.md` post-FG-4):** optional **FK** Sentinel promote rank · **FL** `nodes.conf` flags
 - [x] 데드락 감지 고급 기능
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원

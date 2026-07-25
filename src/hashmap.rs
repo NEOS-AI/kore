@@ -15,6 +15,16 @@ pub enum EntryAction {
     Remove,
 }
 
+/// Generic RMW action for [`ShardedKeyMap`] (Batch FG-4).
+pub enum MapAction<V> {
+    /// Leave the map unchanged
+    Keep,
+    /// Insert or replace with this value
+    Set(V),
+    /// Remove the key
+    Remove,
+}
+
 /// Result of sweeping expired entries: (count removed, bytes freed).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SweepResult {
@@ -567,13 +577,16 @@ impl ShardedHashMap {
     }
 }
 
-/// Sharded key → value map for non-string Redis types (zsets, geo, …).
+/// Sharded key → value map for the unified Redis keyspace (`KeyValue`, …).
 ///
 /// Same sharding idea as [`ShardedHashMap`]: keys hash to independent
 /// `parking_lot::RwLock` shards so concurrent ops on different keys do not
-/// contend on one global lock.
+/// contend on one global lock. Per-shard CAS counters support string RMW
+/// (SET NX / INCR / CAS) when values are [`crate::cache::KeyValue::String`].
 pub struct ShardedKeyMap<V> {
     shards: Vec<RwLock<HashMap<Bytes, V, RandomState>>>,
+    /// Per-shard CAS counters for string Entry.cas (Batch FG-4).
+    cas_counters: Vec<AtomicU64>,
     num_shards: usize,
     hasher: RandomState,
 }
@@ -582,11 +595,14 @@ impl<V: Clone> ShardedKeyMap<V> {
     pub fn new(num_shards: usize) -> Self {
         let n = num_shards.max(1);
         let mut shards = Vec::with_capacity(n);
+        let mut cas_counters = Vec::with_capacity(n);
         for _ in 0..n {
             shards.push(RwLock::new(HashMap::with_hasher(RandomState::new())));
+            cas_counters.push(AtomicU64::new(1));
         }
         Self {
             shards,
+            cas_counters,
             num_shards: n,
             hasher: RandomState::new(),
         }
@@ -604,6 +620,12 @@ impl<V: Clone> ShardedKeyMap<V> {
         &self.shards[self.shard_index(key)]
     }
 
+    /// Next CAS value for the shard that owns `key`.
+    pub fn next_cas(&self, key: &Bytes) -> u64 {
+        let idx = self.shard_index(key);
+        self.cas_counters[idx].fetch_add(1, Ordering::Relaxed)
+    }
+
     pub fn get(&self, key: &Bytes) -> Option<V> {
         self.shard(key).read().get(key).cloned()
     }
@@ -618,6 +640,34 @@ impl<V: Clone> ShardedKeyMap<V> {
 
     pub fn remove(&self, key: &Bytes) -> Option<V> {
         self.shard(key).write().remove(key)
+    }
+
+    /// Atomic read-modify-write under the shard write lock.
+    ///
+    /// Callback receives the current value (if any) and a fresh CAS id.
+    pub fn mutate<F, R>(&self, key: &Bytes, f: F) -> R
+    where
+        F: FnOnce(Option<&V>, u64) -> (MapAction<V>, R),
+    {
+        let mut map = self.shard(key).write();
+        let next_cas = {
+            let idx = self.shard_index(key);
+            self.cas_counters[idx].fetch_add(1, Ordering::Relaxed)
+        };
+        let (action, result) = {
+            let current = map.get(key);
+            f(current, next_cas)
+        };
+        match action {
+            MapAction::Keep => {}
+            MapAction::Set(v) => {
+                map.insert(key.clone(), v);
+            }
+            MapAction::Remove => {
+                map.remove(key);
+            }
+        }
+        result
     }
 
     /// Return existing value, or insert via `f` and return the new one.

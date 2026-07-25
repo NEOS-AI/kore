@@ -1,6 +1,6 @@
 use crate::entry::{Entry, LoadOptions, SharedEntry, StoreOptions};
 use crate::error::{Error, Result};
-use crate::hashmap::EntryAction;
+use crate::hashmap::{EntryAction, MapAction};
 use crate::memory::MemoryCategory;
 use crate::search_index::SearchIndex;
 use bytes::Bytes;
@@ -18,13 +18,11 @@ use super::Cache;
 /// Built by [`Cache::take_keyspace_payload`]; consumed by
 /// [`Cache::install_keyspace_payload`]. Not part of the public API.
 ///
-/// **FG-3:** strings remain a separate drained `map`; all non-string types are
-/// one `key_values` stream (Hash/List/Set/ZSet/Geo/Stream). Expires / WATCH /
-/// search schema / memory counters are still sibling fields (slot-header
-/// merge is optional FG-4).
+/// **FG-4:** one `key_values` stream holds every type (String + typed).
+/// Expires / WATCH / search schema / memory counters are sibling fields
+/// (`typed_expires` slot-header fold remains residual).
 pub(crate) struct KeyspacePayload {
-    map: Vec<(Bytes, SharedEntry)>,
-    /// All non-string typed keys from [`Cache::key_values`].
+    /// All keys from [`Cache::key_values`] (String / Hash / List / Set / ZSet / Geo / Stream).
     key_values: Vec<(Bytes, KeyValue)>,
     expires: HashMap<Bytes, Instant>,
     watch: HashMap<Bytes, u64>,
@@ -102,17 +100,51 @@ impl Cache {
 
     /// Ensure `key` is absent or a string (for SET/GET-family commands).
     ///
-    /// Hot-path optimized (Batch FI): only probes the typed `key_values` map.
-    /// String keys live in `map` and never conflict with SET; a full
-    /// `get_key_value` would Arc-clone the existing string entry on every SET.
+    /// Hot-path optimized (Batch FI / FG-4): probes `key_values` without a full
+    /// facade walk. Non-string variants → WRONGTYPE; expired strings count as
+    /// absent (same as SET overwrite semantics).
     pub fn ensure_string_or_absent(&self, key: &Bytes) -> Result<()> {
         if self.purge_typed_if_expired(key) {
             return Ok(());
         }
-        if self.key_values.contains_key(key) {
-            return Err(Error::WrongType);
+        match self.key_values.get(key) {
+            None => Ok(()),
+            Some(KeyValue::String(e)) if e.is_expired() => Ok(()),
+            Some(KeyValue::String(_)) => Ok(()),
+            Some(_) => Err(Error::WrongType),
         }
-        Ok(())
+    }
+
+    /// Atomic string RMW under the key_values shard lock.
+    ///
+    /// If a non-string typed value occupies `key`, returns `Err(WrongType)`
+    /// without calling `f` (no dual-residence / silent overwrite).
+    pub(super) fn mutate_string<F, R>(&self, key: &Bytes, f: F) -> Result<R>
+    where
+        F: FnOnce(Option<&SharedEntry>, u64) -> (EntryAction, R),
+    {
+        self.key_values.mutate(key, |current, next_cas| {
+            match current {
+                Some(KeyValue::String(entry)) => {
+                    let (action, r) = f(Some(entry), next_cas);
+                    (Self::string_map_action(action), Ok(r))
+                }
+                Some(_) => (MapAction::Keep, Err(Error::WrongType)),
+                None => {
+                    let (action, r) = f(None, next_cas);
+                    (Self::string_map_action(action), Ok(r))
+                }
+            }
+        })
+    }
+
+    #[inline]
+    fn string_map_action(action: EntryAction) -> MapAction<KeyValue> {
+        match action {
+            EntryAction::Keep => MapAction::Keep,
+            EntryAction::Set(e) => MapAction::Set(KeyValue::String(e)),
+            EntryAction::Remove => MapAction::Remove,
+        }
     }
 
     /// Update both memory_usage and memory_tracker after a successful map mutation.
@@ -222,7 +254,10 @@ impl Cache {
         let net_memory_change = if max_memory == 0 {
             entry_size
         } else {
-            let existing_size = self.map.get(&key).map(|e| e.size()).unwrap_or(0);
+            let existing_size = self
+                .get_string_entry(&key)
+                .map(|e| e.size())
+                .unwrap_or(0);
             entry_size.saturating_sub(existing_size)
         };
         self.ensure_capacity(net_memory_change)?;
@@ -239,7 +274,7 @@ impl Cache {
         // Build entry shell outside the shard lock when we do not need keepttl
         // (expires resolved above). CAS/NX/XX still decide under the lock.
         // Moving `value` in avoids a second clone under the write lock (Batch FI).
-        let outcome = self.map.mutate(&key, |current, next_cas| {
+        let outcome = match self.mutate_string(&key, |current, next_cas| {
             // NX: only set if not exists (treat expired as absent)
             if nx {
                 if let Some(existing) = current {
@@ -303,7 +338,11 @@ impl Cache {
                     new_size,
                 },
             )
-        });
+        }) {
+            Ok(o) => o,
+            Err(Error::WrongType) => return Err(Error::WrongType),
+            Err(e) => return Err(e),
+        };
 
         match outcome {
             StoreOutcome::Exists(existing) => Ok(Some(existing)),
@@ -336,12 +375,12 @@ impl Cache {
     pub fn load(&self, key: &Bytes, opts: LoadOptions) -> Result<Option<SharedEntry>> {
         self.stats.incr(&self.stats.cmd_get);
 
-        match self.map.get(key) {
-            Some(entry) => {
+        match self.key_values.get(key) {
+            Some(KeyValue::String(entry)) => {
                 if entry.is_expired() {
                     // Remove expired entry and free both counters
                     let size = entry.size();
-                    if self.map.remove(key).is_some() {
+                    if let Some(KeyValue::String(_)) = self.key_values.remove(key) {
                         self.memory_usage.fetch_sub(size, Ordering::Relaxed);
                         self.memory_tracker
                             .deallocate(size, MemoryCategory::Cache);
@@ -360,6 +399,12 @@ impl Cache {
                     self.stats.incr(&self.stats.hits);
                     Ok(Some(entry))
                 }
+            }
+            Some(_) => {
+                // Key exists as a non-string type — GET-family returns WrongType
+                // at the command layer; treat as miss here for raw load.
+                self.stats.incr(&self.stats.misses);
+                Ok(None)
             }
             None => {
                 self.stats.incr(&self.stats.misses);
@@ -406,8 +451,8 @@ impl Cache {
 
     /// Get database size (all key types)
     pub fn dbsize(&self) -> usize {
-        // FG-3: strings + unified typed map
-        self.map.len() + self.key_values.len()
+        // FG-4: single unified map (includes strings)
+        self.key_values.len()
     }
 
     /// String-KV atomic counter (kept for replace/evict paths; prefer `tracked_memory`).
@@ -488,8 +533,7 @@ impl Cache {
     /// any target is mutated — a panic while draining later DBs leaves all
     /// targets intact. Single-DB [`replace_keyspace_from`] uses the same path.
     pub(crate) fn take_keyspace_payload(&self) -> KeyspacePayload {
-        let map = self.map.drain_all();
-        // FG-3: one typed stream (Hash/List/Set/ZSet/Geo/Stream).
+        // FG-4: one stream for all types (String + typed).
         let key_values = self.key_values.drain_all();
         let expires = std::mem::take(&mut *self.typed_expires.write());
         let watch = std::mem::take(&mut *self.watch_gens.lock());
@@ -497,7 +541,6 @@ impl Cache {
         let counts = self.memory_tracker.take_keyspace_counts();
         let mem = self.memory_usage.swap(0, Ordering::Relaxed);
         KeyspacePayload {
-            map,
             key_values,
             expires,
             watch,
@@ -522,8 +565,8 @@ impl Cache {
     ///
     /// A panic **inside** this method (after drain, mid-fill) still leaves a
     /// single-DB tear; discards are only returned after fill completes.
-    /// Command path relies on `-LOADING` for that window. Strings remain a
-    /// separate map from `key_values` (optional FG-4 merge).
+    /// Command path relies on `-LOADING` for that window. FG-4: single
+    /// `key_values` fill (no separate string map stream).
     pub(crate) fn install_keyspace_payload_retaining_discard(
         &self,
         payload: KeyspacePayload,
@@ -531,7 +574,6 @@ impl Cache {
         let pre_watch_keys: Vec<Bytes> = self.watch_gens.lock().keys().cloned().collect();
 
         // Drain target into discard, then install staged state.
-        let discard_map = self.map.drain_all();
         let discard_key_values = self.key_values.drain_all();
         let discard_expires = std::mem::take(&mut *self.typed_expires.write());
         let discard_watch = std::mem::take(&mut *self.watch_gens.lock());
@@ -539,8 +581,7 @@ impl Cache {
         let discard_counts = self.memory_tracker.take_keyspace_counts();
         let discard_mem = self.memory_usage.load(Ordering::Relaxed);
 
-        // Maps already drained into discard_* above — fill only (no second drain).
-        self.map.fill_all(payload.map);
+        // Map already drained into discard_* above — fill only (no second drain).
         self.key_values.fill_all(payload.key_values);
         *self.typed_expires.write() = payload.expires;
         // Install scratch watch map and bump pre-swap keys under one lock so
@@ -560,7 +601,6 @@ impl Cache {
         self.memory_usage.store(payload.mem, Ordering::Relaxed);
 
         KeyspacePayload {
-            map: discard_map,
             key_values: discard_key_values,
             expires: discard_expires,
             watch: discard_watch,
@@ -587,7 +627,7 @@ impl Cache {
     /// cannot race map/counter install. Intended only for AOF/RDB scratch-load
     /// commit after a successful decode/replay into `other`.
     ///
-    /// Swaps: string map, `key_values` (all typed containers), typed_expires,
+    /// Swaps: `key_values` (all types including strings), typed_expires,
     /// watch_gens, search indices/aliases, MemoryTracker keyspace category
     /// counts, and `memory_usage`. Memory is moved only via tracker take/install
     /// + `memory_usage` store (never per-key `account` after map replace).
@@ -618,12 +658,12 @@ impl Cache {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let mut out = Vec::new();
-        for key in self.map.keys(None) {
-            let Some(entry) = self.map.get(&key) else {
-                continue;
+        self.key_values.for_each(|_key, kv| {
+            let KeyValue::String(entry) = kv else {
+                return;
             };
             if entry.is_expired() {
-                continue;
+                return;
             }
             let expire_unix_ms = match entry.ttl_millis() {
                 Some(ttl) if ttl > 0 => now + ttl,
@@ -635,53 +675,46 @@ impl Cache {
                 entry.flags,
                 expire_unix_ms,
             ));
-        }
+        });
         out
     }
 
-    /// Clear all typed key maps / expires (not search schema).
+    /// Clear the unified key map / expires (not search schema).
     fn flush_keyspace(&self) {
-        self.map.clear();
         self.key_values.clear();
         self.typed_expires.write().clear();
     }
 
-    /// All non-expired string keys in the sharded map (for persistence).
+    /// All non-expired string keys in the unified map (for persistence / migrate).
     pub fn map_keys_all(&self) -> Vec<Bytes> {
-        self.map
-            .keys(None)
-            .into_iter()
-            .filter(|k| self.map.get(k).map(|e| !e.is_expired()).unwrap_or(false))
-            .collect()
-    }
-
-    /// Get all keys matching a pattern across all key-type maps.
-    pub fn keys(&self, pattern: Option<&str>) -> Vec<Bytes> {
-        use std::collections::HashSet;
-
-        let mut seen: HashSet<Bytes> = HashSet::new();
-        let mut result = Vec::new();
-
-        // String keys (skip expired)
-        for key in self.map.keys(pattern) {
-            if let Some(entry) = self.map.get(&key) {
-                if entry.is_expired() {
-                    continue;
+        let mut out = Vec::new();
+        self.key_values.for_each(|key, kv| {
+            if let KeyValue::String(e) = kv {
+                if !e.is_expired() {
+                    out.push(key.clone());
                 }
             }
-            if seen.insert(key.clone()) {
-                result.push(key);
-            }
-        }
+        });
+        out
+    }
 
-        // FG-3: all typed keys in key_values
+    /// Get all keys matching a pattern across the unified keyspace.
+    pub fn keys(&self, pattern: Option<&str>) -> Vec<Bytes> {
+        let mut result = Vec::new();
+
+        // FG-4: single map — skip expired strings and purge expired typed.
         for key in self.key_values.keys(pattern) {
-            if self.purge_typed_if_expired(&key) {
-                continue;
+            match self.key_values.get(&key) {
+                Some(KeyValue::String(e)) if e.is_expired() => continue,
+                Some(kv) if kv.is_typed_container() => {
+                    if self.purge_typed_if_expired(&key) {
+                        continue;
+                    }
+                }
+                None => continue,
+                _ => {}
             }
-            if seen.insert(key.clone()) {
-                result.push(key);
-            }
+            result.push(key);
         }
 
         result

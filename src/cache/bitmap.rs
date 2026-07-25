@@ -3,7 +3,6 @@
 use crate::entry::Entry;
 use crate::error::{Error, Result};
 use crate::hashmap::EntryAction;
-use crate::memory::MemoryCategory;
 use bytes::Bytes;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -69,7 +68,7 @@ impl Cache {
         let max_entry_size = self.max_entry_size.load(Ordering::Relaxed);
 
         // Capacity pre-check for growth
-        let existing = self.map.get(key);
+        let existing = self.get_string_entry(key);
         let old_val_len = existing
             .as_ref()
             .filter(|e| !e.is_expired())
@@ -77,7 +76,6 @@ impl Cache {
             .unwrap_or(0);
         let old_size = existing
             .as_ref()
-            .filter(|e| !e.is_expired())
             .map(|e| e.size())
             .unwrap_or(0);
         let new_len = needed_len.max(old_val_len);
@@ -93,7 +91,7 @@ impl Cache {
             TooLarge,
         }
 
-        let outcome = self.map.mutate(key, |current, next_cas| {
+        let outcome = match self.mutate_string(key, |current, next_cas| {
             let (mut bytes, expires_at, flags, old_size) = match current {
                 Some(entry) if !entry.is_expired() => {
                     let mut v = entry.value.to_vec();
@@ -134,7 +132,10 @@ impl Cache {
                     new_size,
                 },
             )
-        });
+        }) {
+            Ok(o) => o,
+            Err(e) => return Err(e),
+        };
 
         match outcome {
             Out::TooLarge => Err(Error::EntryTooLarge),
@@ -159,7 +160,7 @@ impl Cache {
             KeyType::String => {}
             _ => return Err(Error::WrongType),
         }
-        let Some(entry) = self.map.get(key) else {
+        let Some(entry) = self.get_string_entry(key) else {
             return Ok(0);
         };
         if entry.is_expired() {
@@ -191,7 +192,7 @@ impl Cache {
             KeyType::String => {}
             _ => return Err(Error::WrongType),
         }
-        let Some(entry) = self.map.get(key) else {
+        let Some(entry) = self.get_string_entry(key) else {
             return Ok(0);
         };
         if entry.is_expired() {
@@ -278,7 +279,7 @@ impl Cache {
             KeyType::String => {}
             _ => return Err(Error::WrongType),
         }
-        let Some(entry) = self.map.get(key) else {
+        let Some(entry) = self.get_string_entry(key) else {
             return Ok(if bit == 0 { 0 } else { -1 });
         };
         if entry.is_expired() {
@@ -386,7 +387,7 @@ impl Cache {
                     sources.push(Vec::new());
                 }
                 KeyType::String => {
-                    if let Some(e) = self.map.get(k) {
+                    if let Some(e) = self.get_string_entry(k) {
                         if e.is_expired() {
                             sources.push(Vec::new());
                         } else {
@@ -445,16 +446,15 @@ impl Cache {
             return Err(Error::EntryTooLarge);
         }
 
-        let old = self.map.get(dest);
+        let old = self.get_string_entry(dest);
         let old_size = old
             .as_ref()
-            .filter(|e| !e.is_expired())
             .map(|e| e.size())
             .unwrap_or(0);
         // If empty result, delete dest (Redis BITOP empty → delete)
         if result.is_empty() {
             if old_size > 0 {
-                let _ = self.map.mutate(dest, |_c, _cas| (EntryAction::Remove, ()));
+                let _ = self.mutate_string(dest, |_c, _cas| (EntryAction::Remove, ()))?;
                 self.account_replace(old_size, 0);
             }
             return Ok(0);
@@ -463,7 +463,7 @@ impl Cache {
         let net = projected.saturating_sub(old_size);
         self.ensure_capacity(net)?;
 
-        let outcome = self.map.mutate(dest, |current, next_cas| {
+        let outcome = self.mutate_string(dest, |current, next_cas| {
             let old_size = match current {
                 Some(e) if !e.is_expired() => e.size(),
                 Some(e) => e.size(),
@@ -480,7 +480,7 @@ impl Cache {
                 EntryAction::Set(Arc::new(entry)),
                 (old_size, new_size),
             )
-        });
+        })?;
         self.account_replace(outcome.0, outcome.1);
         Ok(new_len)
     }
@@ -540,7 +540,7 @@ impl Cache {
         let max_entry_size = self.max_entry_size.load(Ordering::Relaxed);
 
         if any_write {
-            let existing = self.map.get(key);
+            let existing = self.get_string_entry(key);
             let old_val_len = existing
                 .as_ref()
                 .filter(|e| !e.is_expired())
@@ -585,7 +585,7 @@ impl Cache {
         let ops = ops.to_vec();
         let overflow_mode = overflow;
 
-        let outcome = self.map.mutate(key, |current, next_cas| {
+        let outcome = match self.mutate_string(key, |current, next_cas| {
             let (mut bytes, expires_at, flags, old_size) = match current {
                 Some(entry) if !entry.is_expired() => {
                     let mut v = entry.value.to_vec();
@@ -696,7 +696,10 @@ impl Cache {
                     wrote: true,
                 },
             )
-        });
+        }) {
+            Ok(o) => o,
+            Err(e) => return Err(e),
+        };
 
         match outcome {
             Out::TooLarge => Err(Error::EntryTooLarge),

@@ -6,6 +6,7 @@ use bytes::Bytes;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use super::keyspace::KeyValue;
 use super::Cache;
 
 impl Cache {
@@ -35,7 +36,7 @@ impl Cache {
             Nan,
         }
 
-        let outcome = self.map.mutate(key, |current, next_cas| {
+        let outcome = match self.mutate_string(key, |current, next_cas| {
             let (current_val, expires_at, flags) = match current {
                 Some(entry) if !entry.is_expired() => {
                     let parsed = std::str::from_utf8(&entry.value)
@@ -81,7 +82,10 @@ impl Cache {
                     new_size,
                 },
             )
-        });
+        }) {
+            Ok(o) => o,
+            Err(e) => return Err(e),
+        };
 
         match outcome {
             Outcome::NotFloat => Err(Error::InvalidArgument(
@@ -123,7 +127,7 @@ impl Cache {
             NotInteger,
         }
 
-        let outcome = self.map.mutate(key, |current, next_cas| {
+        let outcome = match self.mutate_string(key, |current, next_cas| {
             let (current_val, expires_at, flags) = match current {
                 Some(entry) if !entry.is_expired() => {
                     let parsed = std::str::from_utf8(&entry.value)
@@ -159,7 +163,10 @@ impl Cache {
                     new_size,
                 },
             )
-        });
+        }) {
+            Ok(o) => o,
+            Err(e) => return Err(e),
+        };
 
         match outcome {
             IncrOutcome::NotInteger => Err(Error::InvalidArgument(
@@ -203,17 +210,9 @@ impl Cache {
         }
 
         // Pre-check capacity using worst-case growth (suffix only if key missing)
-        let existing = self.map.get(key);
-        let existing_size = existing
-            .as_ref()
-            .filter(|e| !e.is_expired())
-            .map(|e| e.size())
-            .unwrap_or(0);
-        let existing_val_len = existing
-            .as_ref()
-            .filter(|e| !e.is_expired())
-            .map(|e| e.value.len())
-            .unwrap_or(0);
+        let existing = self.get_string_entry(key);
+        let existing_size = existing.as_ref().map(|e| e.size()).unwrap_or(0);
+        let existing_val_len = existing.as_ref().map(|e| e.value.len()).unwrap_or(0);
         let entry_sz = std::mem::size_of::<Entry>();
         let logical = crate::memory::logical_string_entry(
             key.len(),
@@ -232,7 +231,7 @@ impl Cache {
         let net = projected.saturating_sub(existing_size);
         self.ensure_capacity(net)?;
 
-        let outcome = self.map.mutate(key, |current, next_cas| {
+        let outcome = match self.mutate_string(key, |current, next_cas| {
             let (old_val, expires_at, flags, old_size) = match current {
                 Some(entry) if !entry.is_expired() => (
                     entry.value.clone(),
@@ -272,7 +271,10 @@ impl Cache {
                     new_size,
                 },
             )
-        });
+        }) {
+            Ok(o) => o,
+            Err(e) => return Err(e),
+        };
 
         match outcome {
             AppendOutcome::TooLarge => Err(Error::EntryTooLarge),
@@ -312,17 +314,9 @@ impl Cache {
             TooLarge,
         }
 
-        let existing = self.map.get(key);
-        let existing_size = existing
-            .as_ref()
-            .filter(|e| !e.is_expired())
-            .map(|e| e.size())
-            .unwrap_or(0);
-        let existing_val_len = existing
-            .as_ref()
-            .filter(|e| !e.is_expired())
-            .map(|e| e.value.len())
-            .unwrap_or(0);
+        let existing = self.get_string_entry(key);
+        let existing_size = existing.as_ref().map(|e| e.size()).unwrap_or(0);
+        let existing_val_len = existing.as_ref().map(|e| e.value.len()).unwrap_or(0);
         let new_len = (offset + value.len()).max(existing_val_len);
         let entry_sz = std::mem::size_of::<Entry>();
         let logical = crate::memory::logical_string_entry(key.len(), new_len, entry_sz);
@@ -335,7 +329,7 @@ impl Cache {
         let net = projected.saturating_sub(existing_size);
         self.ensure_capacity(net)?;
 
-        let outcome = self.map.mutate(key, |current, next_cas| {
+        let outcome = match self.mutate_string(key, |current, next_cas| {
             let (old_val, expires_at, flags, old_size) = match current {
                 Some(entry) if !entry.is_expired() => (
                     entry.value.clone(),
@@ -375,7 +369,10 @@ impl Cache {
                     new_size,
                 },
             )
-        });
+        }) {
+            Ok(o) => o,
+            Err(e) => return Err(e),
+        };
 
         match outcome {
             SetRangeOutcome::TooLarge => Err(Error::EntryTooLarge),
@@ -426,17 +423,26 @@ impl Cache {
             self.delete(dst)?;
         }
 
+        // FG-4: all types live in key_values.
         match src_type {
+            super::KeyType::None => {
+                return Err(Error::InvalidArgument("no such key".into()));
+            }
             super::KeyType::String => {
-                let entry = self
-                    .map
+                let kv = self
+                    .key_values
                     .remove(src)
                     .ok_or_else(|| Error::InvalidArgument("no such key".into()))?;
+                let KeyValue::String(entry) = kv else {
+                    self.key_values.insert(src.clone(), kv);
+                    return Err(Error::InvalidArgument("no such key".into()));
+                };
                 let old_size = entry.size();
                 let mut new_entry = (*entry).clone();
                 new_entry.key = dst.clone();
                 let new_size = new_entry.size();
-                self.map.insert(dst.clone(), Arc::new(new_entry));
+                self.key_values
+                    .insert(dst.clone(), KeyValue::String(Arc::new(new_entry)));
                 // Adjust memory for key-length delta
                 if new_size > old_size {
                     let delta = new_size - old_size;
@@ -450,13 +456,7 @@ impl Cache {
                         .deallocate(delta, MemoryCategory::Cache);
                 }
             }
-            // FG-3: all non-string types live in key_values.
-            super::KeyType::Hash
-            | super::KeyType::List
-            | super::KeyType::Set
-            | super::KeyType::ZSet
-            | super::KeyType::Geo
-            | super::KeyType::Stream => {
+            _ => {
                 let kv = self
                     .key_values
                     .remove(src)
@@ -470,15 +470,9 @@ impl Cache {
                 let cat = kv.memory_category();
                 self.account_typed_key_rename(src, dst, content, cat);
                 self.key_values.insert(dst.clone(), kv);
+                // Carry typed-key TTL with the rename (Redis keeps expire on RENAME).
+                self.move_typed_expire(src, dst);
             }
-            super::KeyType::None => {
-                return Err(Error::InvalidArgument("no such key".into()));
-            }
-        }
-
-        // Carry typed-key TTL with the rename (Redis keeps expire on RENAME).
-        if src_type != super::KeyType::String {
-            self.move_typed_expire(src, dst);
         }
 
         Ok(true)

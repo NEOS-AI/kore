@@ -18,7 +18,7 @@ mod keyspace;
 pub use bitmap::{BitOpKind, BitfieldOp, BitfieldOverflow};
 pub use keyspace::KeyValue;
 
-use crate::hashmap::{ShardedHashMap, ShardedKeyMap};
+use crate::hashmap::ShardedKeyMap;
 use crate::list_block::ListBlockers;
 use crate::stats::Stats;
 use crate::pubsub::PubSub;
@@ -39,27 +39,25 @@ pub use eviction::EvictionPolicy;
 
 /// The main cache structure.
 ///
-/// # Keyspace layout (Batch FG / FG-2 / FG-3)
+/// # Keyspace layout (Batch FG / FG-2 / FG-3 / FG-4)
 ///
 /// Logical Redis keyspace is **one name → one typed value**. Cross-type ops use
 /// the [`KeyValue`] facade ([`Cache::get_key_value`]).
 ///
-/// **Physical storage (FG-3):** all non-string types live in [`Self::key_values`]
-/// as [`KeyValue`] variants (Hash, List, Set, ZSet, Geo, Stream). Strings stay
-/// on [`Self::map`] (merge residual → optional FG-4). See `keyspace` module
-/// docs and `docs/module_architectures.md`.
+/// **Physical storage (FG-4):** **all** types — including strings — live in
+/// [`Self::key_values`] as [`KeyValue`] variants. See `keyspace` module docs and
+/// `docs/module_architectures.md`.
 pub struct Cache {
-    /// Sharded hashmap for string entries (`KeyValue::String` views)
-    pub(super) map: ShardedHashMap,
-    /// Unified typed value map: Hash / List / Set / ZSet / Geo / Stream.
+    /// Unified keyspace map: String / Hash / List / Set / ZSet / Geo / Stream.
     pub(super) key_values: ShardedKeyMap<KeyValue>,
     /// Clients blocked on empty lists (BLPOP / BRPOP) for this keyspace.
     pub list_blockers: ListBlockers,
     /// Clients blocked on streams (XREAD / XREADGROUP BLOCK) for this keyspace.
     pub stream_blockers: ListBlockers,
     /// Absolute Instant expiry for non-string keys (Redis expires-dict style).
-    /// Strings keep TTL on `Entry`; typed keys store it here.
-    pub(super) typed_expires: RwLock<HashMap<Bytes, Instant>>,    /// Pub/Sub system
+    /// Strings keep TTL on `Entry`; typed keys store it here (slot-header fold residual).
+    pub(super) typed_expires: RwLock<HashMap<Bytes, Instant>>,
+    /// Pub/Sub system
     pub pubsub: Arc<PubSub>,
     /// Search index manager
     pub(super) search_index_manager: Arc<SearchIndexManager>,
@@ -133,8 +131,11 @@ impl Cache {
         // capacity_per_shard ≈ 1024 / loadfactor (clamped); denser tables start smaller
         let cap = ((1024.0 / loadfactor.max(0.55)) as usize).max(16);
 
+        // `cap` reserved for future ShardedKeyMap capacity hint (loadfactor still
+        // stored for empty_keyspace_like parity).
+        let _ = cap;
+
         let cache = Arc::new(Self {
-            map: ShardedHashMap::new(num_shards, cap),
             key_values: ShardedKeyMap::new(num_shards),
             list_blockers: ListBlockers::new(),
             stream_blockers: ListBlockers::new(),
@@ -203,10 +204,9 @@ impl Cache {
         stats: Arc<Stats>,
     ) -> Arc<Self> {
         let memory_tracker = Arc::new(MemoryTracker::new(max_memory, 1024 * 1024));
-        let cap = ((1024.0 / loadfactor.max(0.55)) as usize).max(16);
+        let _cap = ((1024.0 / loadfactor.max(0.55)) as usize).max(16);
 
         let cache = Arc::new(Self {
-            map: ShardedHashMap::new(num_shards, cap),
             key_values: ShardedKeyMap::new(num_shards),
             list_blockers: ListBlockers::new(),
             stream_blockers: ListBlockers::new(),
@@ -271,7 +271,7 @@ impl Cache {
     pub fn empty_keyspace_like(&self) -> Arc<Self> {
         let scratch = Self::new_keyspace_sharing_with_stats(
             self,
-            self.map.num_shards(),
+            self.key_values.num_shards(),
             self.max_memory.load(std::sync::atomic::Ordering::Relaxed),
             self.max_entry_size
                 .load(std::sync::atomic::Ordering::Relaxed),

@@ -76,7 +76,8 @@ Example: fix EXAT (`A` / `P0`) before RESP3 (`D` / `P1`) or HNSW benchmarks (`E`
   - *Done pragmatically*: separate maps + type registry / cross-type ops
   - *Batch FG (slice A)*: `KeyValue` view enum + facade for TYPE/DEL/EXISTS/`key_type`; design + migration plan documented
   - *Batch FG-2*: **hashes** physically stored as `KeyValue::Hash` in `Cache::key_values` (`ShardedKeyMap`); legacy global hash map removed
-  - *Batch FG-3*: **list / set / zset / geo / stream** in `key_values`; legacy per-type maps removed; `KeyspacePayload` is `map` + `key_values` streams; strings still on `Cache::map` (optional FG-4)
+  - *Batch FG-3*: **list / set / zset / geo / stream** in `key_values`; legacy per-type maps removed; `KeyspacePayload` is `map` + `key_values` streams
+  - *Batch FG-4*: **strings** as `KeyValue::String` in `key_values`; dual `Cache::map` removed; `KeyspacePayload` is one `key_values` stream; `typed_expires` side map residual
 - [x] **`[P0]`** **Type safety**: Redis-style type errors when a key exists with a different type
 - [x] **`[P0]`** **Cross-type ops**: `DEL`, `EXISTS`, `KEYS`/`SCAN`, `DBSIZE`, `TTL`/`EXPIRE`, `TYPE` work for all types
   - *Done*: `SCAN` implemented (cursor-based, sorted key index); `KEYS`/`DBSIZE`/`DEL`/`EXISTS`/`TYPE`/`FLUSH` cover all types
@@ -717,31 +718,30 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
   - *Done (Batch BT)*: `bt_eval_select_persists_connection_db` — connection remains on selected DB after EVAL
 
-### Status snapshot (2026-07-25, post-FI-2)
+### Status snapshot (2026-07-25, post-FG-4 — strings unified)
 
-**Primary letter queue finished through FG-3; P2 FH + FI + FI-2 shipped.** Shipped: FB–FE, **FF**, **FG**–**FG-3**, **FH** NODE 2PC slice 2, **FI** pipeline SET ~+25%, **FI-2** AOF-off multi-DB SELECT ordering. Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed).
+**All planned P0–P2 letter work through FI-2 + optional FG-4 is finished.** Shipped: FB–FE, **FF**, **FG**–**FG-4**, **FH** NODE 2PC slice 2, **FI** pipeline SET ~+25%, **FI-2** AOF-off multi-DB SELECT ordering. Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed). Only untracked `data/` expected.
 
-**What remains** is **optional / polish** (no open P0–P1 feature blockers). Next picks: **P3** **FG-4** / **FK** / **FL**.
+**What remains** is **optional P3 polish** only (no open P0–P2 feature blockers). **Recommended next:** **FK** (Sentinel promote rank) → **FL** (`nodes.conf` flags).
 
 | Area | Residual | Priority | Planned batch |
 |------|----------|----------|---------------|
-| Ops | Global **repl backlog** still serializes writers (FI residual; not solved by FI-2) | P3 | later optional |
-| Ops | AOF-off multi-DB SELECT stream race | — | **done FI-2** |
-| Cluster | NODE 2PC durable-on-disk prepare / bus / atomic COMMITPREPARE | P3 residual (FH) | later |
-| Keyspace | Strings still on `Cache::map`; dual-map TYPE probe | P3 | **FG-4** / **FJ** |
-| Keyspace | `typed_expires` side map (not slot header) | P3 | **FG-4** |
-| Keyspace | Typed RENAME remove+insert; create ensure_type→insert TOCTOU (historical) | P3 accepted | — |
-| Sentinel | Promote **first-replica-wins** (open review) | P3 | **FK** |
+| Sentinel | Promote **first-replica-wins** (open review checkbox) | **P3 next** | **FK** |
 | Cluster | `nodes.conf` omits require-full / allow-reads / announce (open review) | P3 | **FL** |
+| Keyspace | `typed_expires` side map (not slot header) | P3 residual (FG-4) | later optional |
+| Ops | Global **repl backlog** still serializes writers (FI residual; FI-2 keeps CS for SELECT correctness) | P3 | later optional |
+| Ops | Dual SELECT trackers (AOF vs `ReplBacklog`); `propagate_raw` skips stream-DB | P3 accepted | — |
+| Cluster | NODE 2PC durable-on-disk prepare / bus / atomic COMMITPREPARE | P3 residual (FH) | later |
+| Keyspace | Typed RENAME remove+insert; create ensure_type→insert TOCTOU (historical) | P3 accepted | — |
 | Sentinel | election-timeout/cooldown; CKQUORUM live probe; hello SUBSCRIBE | P3 | with **FK** or later |
 | Search | HNSW edges/levels not AOF/RDB durable; `max_m=1` spanning | P3 accepted / later | — |
 | MIGRATE / UI / load | DUMP wire; reshard weight UI; Arc-swap mid-fill | P3 accepted | — |
 
-### Next work queue (post-FG-3)
+### Next work queue (post-FG-4)
 
-**Primary FB–FG-3 queue: done. FH + FI + FI-2 done.** Optional follow-ons below. Prefer FG-4 / FK / FL when resuming. Standing rule: land tests with each batch.
+**Primary FB–FG-4 + FH + FI + FI-2 done.** Optional P3 follow-ons below. Prefer **FK → FL**. Standing rule: land tests with each batch.
 
-#### Completed (FB–FG-3 + FH + FI + FI-2)
+#### Completed (FB–FG-4 + FH + FI + FI-2)
 
 - [x] **`[P1]`** **Batch FB — Cluster dual-end NODE wire 2PC (slice 1)**
 - [x] **`[P1]`** **Batch FC — Sentinel promote-success gate**
@@ -755,6 +755,12 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Batch FG-3 — Remaining typed types + payload collapse** (`1db780e`)
   - list/set/zset/geo/stream in `key_values`; legacy typed maps removed; payload = `map` + `key_values` stream
   - *Post-ship review:* no dual-write leftover; typed RENAME is remove+insert (accepted); strings dual-map residual → FG-4
+- [x] **`[P3]`** **Batch FG-4 / FJ — Strings into unified map**
+  - `KeyValue::String` physically in `Cache::key_values`; `Cache::map` removed; `mutate_string` RMW + CAS on `ShardedKeyMap`
+  - `KeyspacePayload` collapsed to single `key_values` stream (+ expires/WATCH/search/memory)
+  - Eviction / active expire / SCAN / KEYS / DBSIZE / RENAME sample or walk one map
+  - Residual: `typed_expires` side map (not slot header); search-doc eviction special; legacy `ShardedHashMap` kept for unit API
+  - Tests: keyspace unit (strings live in map + payload roundtrip); string_ops / keyspace / typed_ttl / eviction / phase_a / persistence multi-DB green
 - [x] **`[P2]`** **Batch FH — NODE 2PC slice 2** (`b078988`)
   - Prepare-epoch + TTL fence; `CHECKPREPARE` + dual-end commit re-check; boot clear fail-closed
   - Tests: stale epoch / cleared / TTL / boot; e2e recheck inject no half-apply; happy path complete (41 migrate tests)
@@ -765,31 +771,33 @@ Also tracked in `docs/roadmap.md`.
   - Re-measure (same host/method as FD): SET c=50 P=16 median **~621k** ops/s (FD **~498k**, **+~25%**); Valkey still ~1.59M
   - Residual **FI-2** (correctness race fixed; backlog serialize remains):
     - Global repl backlog still serializes all writers
-- [x] **`[P2/P3]`** **Batch FI-2 — AOF-off multi-DB SELECT ordering**
+- [x] **`[P2/P3]`** **Batch FI-2 — AOF-off multi-DB SELECT ordering** (`f88e83d`)
   - Root cause: FI unlocked encode/propagate outside AOF mutex; `selected_db` update was not ordered with backlog append → concurrent multi-DB writers could land SELECT-less cmds before another thread’s SELECT
-  - Fix: `ReplicationManager::propagate_write` — stream `selected_db` + lazy SELECT + backlog append under one critical section (`fullsync_gate` + backlog); AOF-off path skips `aof` lock entirely; AOF-on still holds AOF lock across append + `propagate_write`
-  - Tests: `aof_off_concurrent_multidb_*`, `propagate_write_concurrent_multidb_feed_replay`, lazy SELECT serial, promote resets stream DB
-  - Residual: global backlog still serializes writers (no Valkey parity claim; re-measure skipped — hot path lock shape ~same for single-DB)
+  - Fix: `ReplicationManager::propagate_write` — encode cmd outside locks; under `fullsync_gate`+backlog decide lazy SELECT, append SELECT+cmd (one payload) or cmd, update `ReplBacklog.selected_db`; AOF-off skips `aof` lock; AOF-on still holds AOF across disk append + `propagate_write` (disk/stream order)
+  - Tests: `aof_select_concurrency_test` 8/8; unit `propagate_write_*` + `promote_resets_stream_selected_db`; multi-DB + TCP repl green
+  - *Post-ship review:* correctness fix holds; residual global backlog serialize (P3); dual SELECT trackers (AOF vs stream) intentional; `propagate_raw` still no stream-DB update (low-level/tests only)
 
-#### Open optional queue (pick when resuming)
+#### Open optional queue (P3 only — pick when resuming)
 
-- [ ] **`[P3]`** **Batch FG-4 / FJ — Strings into unified map (optional)**
-  - Merge `Cache::map` string entries into `KeyValue::String` in `key_values` (or keep dual-map + document forever)
-  - Optional: fold `typed_expires` into per-key slot header; keep LOADING/epoch install correct
-  - Tests: SET/GET/expire/evict/RDB/AOF/multi-DB parity with FG-3
-- [ ] **`[P3]`** **Batch FK — Sentinel promote ranking + lite SM polish**
+- [ ] **`[P3]`** **Batch FK — Sentinel promote ranking + lite SM polish** ← **recommended next**
   - Rank replicas by priority then offset (mirror cluster EA/EB) instead of discovery order
-  - Optional: elect cooldown; CKQUORUM/majority live probe; probe self-vs-`*` honesty
+  - Close open review: *FC post-ship nit first-replica-wins*
+  - Optional same batch: elect cooldown; CKQUORUM/majority live probe; probe self-vs-`*` honesty
+  - Tests: multi-replica failover prefers higher priority / offset; discovery-order no longer wins alone
 - [ ] **`[P3]`** **Batch FL — `nodes.conf` live cluster flags**
   - Persist/restore require-full-coverage, allow-reads-when-down, announce-ip/port, replica-priority
   - Or document boot-flag-only requirement and close as accepted
+  - Close open review: *EN/EO/EU post-ship nodes.conf omits live flags*
+  - Tests: SAVECONFIG → reboot restores flags; CONFIG SET then autosave round-trip
 - [ ] **`[P3]`** **Later / backlog**
   - DUMP/RESTORE Redis wire; cluster reshard weight UI; admin_http auth/TLS
   - HNSW durable graph; hello SUBSCRIBE fan-in; single-DB Arc-swap mid-fill; NODE durable prepare
+  - Global repl backlog write serialization (FI residual; no Valkey parity claim)
+  - Fold `typed_expires` into per-key slot header (FG-4 residual)
 
 ### Code review backlog
 
-**Batches CZ–FG-3 + FH + FI + FI-2 shipped.** FI-2 fixed AOF-off multi-DB SELECT race; backlog serialize residual remains (P3). Next optional: **FG-4** / **FK** / **FL**. Standing tests-for-phase P0.
+**Batches CZ–FG-4 + FH + FI + FI-2 shipped.** Next optional: **FK** (recommended) → **FL**. Standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -917,9 +925,11 @@ Also tracked in `docs/roadmap.md`.
 | P3 | EZ/FA post-ship: hello add_peer autosave thrash; CKQUORUM live count | **partial** (FE autosave; CKQUORUM residual) |
 | P3 | EN/EO/EU post-ship: nodes.conf omits require-full/announce flags | **open** → planned **FL** |
 | P1 | dual-end NODE RESP 2PC prepare/commit (slice 1) | **done** (Batch FB) |
-| P3 | FB post-ship: prepare not re-checked at commit; dest prepare broad; mem-only | **accepted** slice 1 → **FH** slice 2 |
-| P3 | FC post-ship: first-replica-wins promote order | **open** → planned **FK** |
-| P2 | dual-end NODE 2PC slice 2 (durable prepare / prepare-epoch / bus) | **open** → planned **FH** |
+| P3 | FB post-ship: prepare not re-checked at commit; dest prepare broad; mem-only | **done FH** epoch/TTL/recheck; durable/bus residual later |
+| P3 | FC post-ship: first-replica-wins promote order | **open** → planned **FK** (recommended next) |
+| P2 | dual-end NODE 2PC slice 2 (prepare-epoch / TTL / commit re-check) | **done** (Batch FH) |
+| P2 | FI pipeline SET perf | **done** (Batch FI; ~+25% P=16) |
+| P2/P3 | FI-2 AOF-off multi-DB SELECT ordering | **done** (Batch FI-2) |
 | P3 | DP residual: no DUMP/RESTORE wire compatibility | open (recreate-only; accepted) |
 | P3 | DF post-ship: HTTP MVP gaps shared with metrics | done (DJ; shared admin_http) |
 | P3 | DK post-ship: thin r@10 headroom / cross-arch flake risk | done (DL; r@10 0.95→0.93) |
@@ -963,7 +973,7 @@ Highest urgency checklist (phase order preserved):
   - *Done (Batch AE)*: typed-key TTL (`EXPIRE`/`PEXPIRE`/`TTL`/`PTTL`) via side `typed_expires` map; lazy + active expire; volatile policies sample typed keys with TTL; RDB v4 + AOF rewrite `PEXPIREAT`
   - *Done (Batch AF)*: full expire command family (`PERSIST`, `EXPIREAT`/`PEXPIREAT`, `EXPIRETIME`/`PEXPIRETIME`)
   - *Done (Batch AG)*: `MOVE` / `COPY` / `RANDOMKEY` / `TOUCH`
-  - *Follow-ups*: true single-map keyspace — **typed done FG-3**; strings optional FG-4
+  - *Follow-ups*: true single-map keyspace — **done FG-4** (strings + typed); `typed_expires` residual
 - [x] Phase A concurrency / memory / EXAT / network tests (incl. AUTH)
 
 **B**
@@ -984,4 +994,4 @@ Highest urgency checklist (phase order preserved):
 - [x] Eviction policies (`maxmemory-policy`)
   - *Follow-ups*: Streams, bitmaps/HLL, RESP3 (done elsewhere); LFU decay done in Batch AB
 
-**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB–FG-3** primary queue complete; **FH**/**FI** shipped. Resume from **Next work queue (post-FG-3)** — optional **FI-2** / **FG-4** / **FK** / **FL**.
+**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB–FG-4** + **FH**/**FI**/**FI-2** complete. Resume from **Next work queue (post-FG-4)** — optional **FK** (recommended) → **FL**.

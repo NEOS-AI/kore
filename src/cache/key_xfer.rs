@@ -270,10 +270,12 @@ impl Cache {
 
     /// Return a random existing key, or None if the DB is empty.
     pub fn random_key(&self) -> Option<Bytes> {
-        // Prefer string map random (O(1)-ish); fall back to keys() sample.
-        if let Some((k, e)) = self.map.get_random() {
-            if !e.is_expired() {
-                return Some(k);
+        // Prefer O(1)-ish sample from the unified map; fall back to keys() sample.
+        if let Some((k, kv)) = self.key_values.get_random() {
+            match kv {
+                super::KeyValue::String(e) if !e.is_expired() => return Some(k),
+                super::KeyValue::String(_) => {} // expired string — fall through
+                _ => return Some(k),
             }
         }
         let all = self.keys(None);
@@ -294,11 +296,9 @@ impl Cache {
             match self.key_type(key) {
                 KeyType::None => {}
                 KeyType::String => {
-                    if let Some(entry) = self.map.get(key) {
-                        if !entry.is_expired() {
-                            entry.touch(log_factor, decay);
-                            n += 1;
-                        }
+                    if let Some(entry) = self.get_string_entry(key) {
+                        entry.touch(log_factor, decay);
+                        n += 1;
                     }
                 }
                 // Typed keys: existence counts (no LRU metadata yet).

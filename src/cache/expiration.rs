@@ -24,14 +24,15 @@ impl Cache {
         }
         match kt {
             KeyType::None => Ok(false),
-            KeyType::String => match self.map.get(key) {
-                Some(entry) if !entry.is_expired() => {
+            KeyType::String => match self.get_string_entry(key) {
+                Some(entry) => {
                     let mut new_entry = (*entry).clone();
                     new_entry.expires_at = Some(Instant::now() + Duration::from_millis(ttl_ms));
-                    self.map.insert(key.clone(), Arc::new(new_entry));
+                    self.key_values
+                        .insert(key.clone(), super::KeyValue::String(Arc::new(new_entry)));
                     Ok(true)
                 }
-                _ => Ok(false),
+                None => Ok(false),
             },
             _ => {
                 self.typed_expires
@@ -72,11 +73,12 @@ impl Cache {
     pub fn persist(&self, key: &Bytes) -> bool {
         match self.key_type(key) {
             KeyType::None => false,
-            KeyType::String => match self.map.get(key) {
-                Some(entry) if !entry.is_expired() && entry.expires_at.is_some() => {
+            KeyType::String => match self.get_string_entry(key) {
+                Some(entry) if entry.expires_at.is_some() => {
                     let mut new_entry = (*entry).clone();
                     new_entry.expires_at = None;
-                    self.map.insert(key.clone(), Arc::new(new_entry));
+                    self.key_values
+                        .insert(key.clone(), super::KeyValue::String(Arc::new(new_entry)));
                     true
                 }
                 _ => false,
@@ -88,10 +90,8 @@ impl Cache {
     /// Get TTL in milliseconds (-1 = no expiration, -2 = expired/not found).
     pub fn ttl(&self, key: &Bytes) -> i64 {
         // String path first (includes lazy string expire via is_expired).
-        if let Some(entry) = self.map.get(key) {
-            if !entry.is_expired() {
-                return entry.ttl_millis().unwrap_or(-1);
-            }
+        if let Some(entry) = self.get_string_entry(key) {
+            return entry.ttl_millis().unwrap_or(-1);
         }
 
         // Typed: purge if past due, then report remaining or -1.
@@ -211,8 +211,11 @@ impl Cache {
 
     /// Whether a typed (non-string) key is present, without purging.
     fn typed_key_present_raw(&self, key: &Bytes) -> bool {
-        // FG-3: all non-string types live in key_values.
-        self.key_values.contains_key(key)
+        // FG-4: strings share key_values — only non-string variants count.
+        matches!(
+            self.key_values.get(key),
+            Some(kv) if kv.is_typed_container()
+        )
     }
 
     /// Delete any key type without touching typed_expires (caller manages expire).
