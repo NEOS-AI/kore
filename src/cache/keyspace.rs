@@ -1,12 +1,12 @@
-//! Unified keyspace facade (Batch FG, slice A).
+//! Unified keyspace facade + physical `KeyValue` map (Batch FG / FG-2).
 //!
 //! # Design target
 //!
 //! Redis presents a single name → typed value namespace. Kore historically stores
 //! types in separate maps (`map` for strings, `sorted_sets`, `geo_sets`,
-//! `hashes`, `lists`, `sets`, `streams`) plus a side `typed_expires` table.
-//! That multi-map model already provides TYPE / WRONGTYPE / cross-type DEL and
-//! SCAN, but every cross-type op reimplements “walk the maps.”
+//! hashes/lists/sets/streams) plus a side `typed_expires` table. That multi-map
+//! model already provides TYPE / WRONGTYPE / cross-type DEL and SCAN, but every
+//! cross-type op reimplements “walk the maps.”
 //!
 //! The long-term shape is one sharded map of name → [`KeyValue`]:
 //!
@@ -40,25 +40,29 @@
 //!
 //! # Migration plan
 //!
-//! 1. **FG (this batch, slice A):** Introduce [`KeyValue`] + facade
+//! 1. **FG (slice A, done):** Introduce [`KeyValue`] + facade
 //!    ([`Cache::get_key_value`], [`Cache::remove_key_value_raw`], `key_type` /
-//!    `exists` / `delete` routed through it). Storage stays multi-map.
-//! 2. **FG-2:** Move one typed container (prefer **hashes** or **sets** — single
-//!    `HashMap` today, not already sharded) into a new `ShardedKeyMap<KeyValue>`
-//!    *or* co-locate with strings; dual-read facade during transition.
-//! 3. **FG-3:** Migrate remaining types; collapse `KeyspacePayload` to one
-//!    drain/fill; eviction samples all types from one map.
+//!    `exists` / `delete` routed through it). Storage multi-map.
+//! 2. **FG-2 (this batch, done for hashes):** Physical storage for **hashes**
+//!    is [`Cache::key_values`] (`ShardedKeyMap<KeyValue>` holding only
+//!    [`KeyValue::Hash`]). No dual-write leftover for hashes. Legacy global
+//!    `hashes` map removed. Facade probes `key_values` before remaining typed
+//!    maps.
+//! 3. **FG-3:** Migrate remaining types into `key_values`; collapse
+//!    `KeyspacePayload` to one drain/fill; eviction samples all types from
+//!    one map.
 //! 4. **FG-4:** Optional: merge `typed_expires` into slot header; drop type
 //!    registry walks entirely.
 //!
-//! Load/install (`take_keyspace_payload` / `install_keyspace_payload`) stays
-//! multi-field until FG-3 so RDB/AOF/LOADING semantics stay honest.
+//! Load/install (`take_keyspace_payload` / `install_keyspace_payload`) still
+//! multi-field: hashes are extracted/re-wrapped as `KeyValue::Hash` so
+//! RDB/AOF/LOADING semantics stay honest until FG-3.
 //!
 //! # Invariants preserved
 //!
 //! - At most one type per name (enforced by `ensure_type` on creates).
 //! - Lazy + active expire for typed keys; string expire on `Entry`.
-//! - MemoryTracker categories unchanged until storage migrates.
+//! - MemoryTracker categories unchanged (`MemoryCategory::Hashes` still used).
 //! - Geo TYPE string remains `"zset"`.
 
 use crate::entry::SharedEntry;
@@ -77,12 +81,12 @@ use super::Cache;
 
 /// Typed value for one key name in the logical Redis keyspace.
 ///
-/// **Storage (FG slice A):** this is a *view* over the multi-map layout. Holds
-/// are `Arc` clones of the live containers; dropping a `KeyValue` does not
-/// remove the key.
+/// **Storage (FG-2):** hashes are **physically** stored as [`KeyValue::Hash`]
+/// in [`Cache::key_values`]. Other variants are still *views* over legacy maps
+/// (Arc clones); dropping a view does not remove those keys.
 ///
-/// **Future (FG-2+):** values may live directly in a single sharded map of this
-/// enum (or a header wrapping it).
+/// **Future (FG-3+):** remaining types move into `key_values` as well (or a
+/// slot header wrapping this enum).
 #[derive(Clone)]
 pub enum KeyValue {
     String(SharedEntry),
@@ -114,6 +118,15 @@ impl KeyValue {
     pub fn as_redis_type_str(&self) -> &'static str {
         self.key_type().as_redis_str()
     }
+
+    /// Borrow the hash container when this is [`KeyValue::Hash`].
+    #[inline]
+    pub fn as_hash(&self) -> Option<&SharedHash> {
+        match self {
+            KeyValue::Hash(h) => Some(h),
+            _ => None,
+        }
+    }
 }
 
 impl Cache {
@@ -121,7 +134,10 @@ impl Cache {
     ///
     /// Returns `None` if the name is absent or its TTL has elapsed (and the
     /// key was purged). Used by TYPE / EXISTS / `key_type` and as the stable
-    /// cross-type lookup API for future single-map storage.
+    /// cross-type lookup API.
+    ///
+    /// Probe order: string map → typed expire purge → **`key_values` (hashes)**
+    /// → remaining legacy typed maps.
     pub fn get_key_value(&self, key: &Bytes) -> Option<KeyValue> {
         // Strings: expire is on Entry (lazy delete path lives in load/mutate).
         if let Some(entry) = self.map.get(key) {
@@ -138,14 +154,16 @@ impl Cache {
             return None;
         }
 
+        // FG-2: hashes live in the unified map.
+        if let Some(kv) = self.key_values.get(key) {
+            return Some(kv);
+        }
+
         if let Some(z) = self.sorted_sets.get(key) {
             return Some(KeyValue::ZSet(z));
         }
         if let Some(g) = self.geo_sets.get(key) {
             return Some(KeyValue::Geo(g));
-        }
-        if let Some(h) = self.hashes.read().get(key).cloned() {
-            return Some(KeyValue::Hash(h));
         }
         if let Some(l) = self.lists.read().get(key).cloned() {
             return Some(KeyValue::List(l));
@@ -172,13 +190,15 @@ impl Cache {
             self.memory_tracker.deallocate(size, MemoryCategory::Cache);
             return true;
         }
+        // FG-2 unified map (hashes only today). Prefer remove_hash so accounting
+        // stays in one place; it only removes KeyValue::Hash.
+        if self.remove_hash(key) {
+            return true;
+        }
         if self.remove_sorted_set(key) {
             return true;
         }
         if self.remove_geo_set(key) {
-            return true;
-        }
-        if self.remove_hash(key) {
             return true;
         }
         if self.remove_list(key) {
@@ -327,5 +347,75 @@ mod tests {
             Err(crate::error::Error::WrongType)
         ));
         assert!(c.ensure_type(&b("missing"), KeyType::List).is_ok());
+    }
+
+    /// FG-2: hashes are physically in `key_values`, not a side HashMap.
+    #[test]
+    fn hash_lives_in_unified_key_values() {
+        let c = cache();
+        let h = c.get_or_create_hash(&b("myhash")).unwrap();
+        h.write()
+            .hset(Bytes::from_static(b"f"), Bytes::from_static(b"v"));
+
+        assert_eq!(c.key_values.len(), 1);
+        assert!(c.hash_exists(&b("myhash")));
+        match c.key_values.get(&b("myhash")) {
+            Some(KeyValue::Hash(shared)) => {
+                assert_eq!(
+                    shared.read().hget(&Bytes::from_static(b"f")),
+                    Some(Bytes::from_static(b"v"))
+                );
+            }
+            other => panic!("expected Hash in key_values, got {:?}", other.map(|v| v.key_type())),
+        }
+
+        // WRONGTYPE still enforced vs strings / other maps
+        c.store(b("s"), Bytes::from_static(b"x"), store_opts())
+            .unwrap();
+        assert!(matches!(
+            c.get_or_create_hash(&b("s")),
+            Err(crate::error::Error::WrongType)
+        ));
+
+        assert!(c.remove_hash(&b("myhash")));
+        assert_eq!(c.key_values.len(), 0);
+        assert!(c.get_hash(&b("myhash")).is_none());
+        assert_eq!(c.key_type(&b("myhash")), KeyType::None);
+    }
+
+    #[test]
+    fn hash_rename_moves_within_key_values() {
+        let c = cache();
+        let h = c.get_or_create_hash(&b("src")).unwrap();
+        h.write()
+            .hset(Bytes::from_static(b"a"), Bytes::from_static(b"1"));
+        assert!(c.rename(&b("src"), &b("dst"), false).unwrap());
+        assert!(c.get_hash(&b("src")).is_none());
+        assert!(c.get_hash(&b("dst")).is_some());
+        assert_eq!(c.key_type(&b("dst")), KeyType::Hash);
+        assert_eq!(c.key_values.len(), 1);
+    }
+
+    #[test]
+    fn hash_take_install_payload_roundtrip() {
+        let c = cache();
+        let h = c.get_or_create_hash(&b("h1")).unwrap();
+        h.write()
+            .hset(Bytes::from_static(b"f"), Bytes::from_static(b"1"));
+        let before_mem = c.category_memory(MemoryCategory::Hashes);
+        assert!(before_mem > 0);
+
+        let payload = c.take_keyspace_payload();
+        assert_eq!(c.key_values.len(), 0);
+        assert!(c.get_hash(&b("h1")).is_none());
+
+        c.install_keyspace_payload(payload);
+        assert_eq!(c.key_type(&b("h1")), KeyType::Hash);
+        let restored = c.get_hash(&b("h1")).expect("hash restored");
+        assert_eq!(
+            restored.read().hget(&Bytes::from_static(b"f")),
+            Some(Bytes::from_static(b"1"))
+        );
+        assert_eq!(c.category_memory(MemoryCategory::Hashes), before_mem);
     }
 }

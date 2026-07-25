@@ -352,13 +352,16 @@ impl Cache {
                 push_typed(&mut out, k, KeyType::Geo, size, exp);
             }
 
-            // Global maps (hash / list / set / stream)
-            sample_map_keys(&self.hashes, per_type, |k, h| {
-                let size =
-                    crate::memory::estimate_keyed_object(k.len(), h.read().memory_size());
-                let exp = self.typed_expires_at(&k);
-                push_typed(&mut out, k, KeyType::Hash, size, exp);
-            });
+            // FG-2: hashes in unified key_values (sharded sampling like zset/geo)
+            for (k, kv) in self.key_values.get_n_random(per_type) {
+                if let super::KeyValue::Hash(h) = kv {
+                    let size =
+                        crate::memory::estimate_keyed_object(k.len(), h.read().memory_size());
+                    let exp = self.typed_expires_at(&k);
+                    push_typed(&mut out, k, KeyType::Hash, size, exp);
+                }
+            }
+            // Global maps (list / set / stream)
             sample_map_keys(&self.lists, per_type, |k, l| {
                 let size =
                     crate::memory::estimate_keyed_object(k.len(), l.read().memory_size());

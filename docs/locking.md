@@ -26,17 +26,19 @@ Never invert these (deadlock risk):
 | Multi-DB load | Pause autosweep on **all** DBs before any `replace_keyspaces_from` |
 | Multi-DB epoch | `keyspace_epoch_lock`: **write** = install loop; **read** = multi-DB export / `with_stable_keyspace_view` (never invert with per-shard map locks held across the epoch lock) |
 
-## Unified keyspace facade (Batch FG)
+## Unified keyspace facade (Batch FG / FG-2)
 
 - Cross-type **TYPE / EXISTS / `key_type`** go through `Cache::get_key_value`
-  (multi-map probe today). Prefer that over ad-hoc per-map `contains_key`
-  walks in new code.
+  (string map → `key_values` → remaining typed maps). Prefer that over ad-hoc
+  per-map `contains_key` walks in new code.
 - **DEL** uses `remove_key_value_raw` then clears `typed_expires` / search
   docs. Typed expire purge paths use the same remove helper without clearing
   expire (caller owns the side map).
-- Physical layout is still multi-map until **FG-2+**; do not assume a single
-  shard lock covers hash+string of the same name (names must not dual-reside).
-  Design detail: `docs/module_architectures.md` § Unified keyspace +
+- **FG-2:** hashes are physical `KeyValue::Hash` entries in
+  `Cache::key_values` (`ShardedKeyMap`). Other types remain on legacy maps
+  until FG-3. Do not assume a single shard lock covers hash+string of the same
+  name (names must not dual-reside). Design detail:
+  `docs/module_architectures.md` § Unified keyspace +
   `src/cache/keyspace.rs` rustdoc.
 
 ## Keyspace replace / load commit

@@ -213,7 +213,7 @@ impl Cache {
     fn typed_key_present_raw(&self, key: &Bytes) -> bool {
         self.sorted_sets.contains_key(key)
             || self.geo_sets.contains_key(key)
-            || self.hashes.read().contains_key(key)
+            || self.key_values.contains_key(key) // FG-2: hashes
             || self.lists.read().contains_key(key)
             || self.sets.read().contains_key(key)
             || self.streams.read().contains_key(key)

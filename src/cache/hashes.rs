@@ -1,3 +1,10 @@
+//! Redis Hash storage (Batch FG-2: physical home is [`Cache::key_values`]).
+//!
+//! Hashes are stored as [`KeyValue::Hash`] in the unified sharded map — not the
+//! legacy global `RwLock<HashMap>`. Command APIs (`get_or_create_hash`, …)
+//! remain type-specific for H* handlers; cross-type TYPE/DEL/EXISTS use the
+//! keyspace facade.
+
 use crate::error::Result;
 use crate::hash_type::{RedisHash, SharedHash};
 use crate::memory::MemoryCategory;
@@ -5,6 +12,7 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
+use super::keyspace::KeyValue;
 use super::storage::KeyType;
 use super::Cache;
 
@@ -30,48 +38,76 @@ impl Cache {
     }
 
     /// Get or create a hash. WrongType if key holds a different type.
+    ///
+    /// Physical insert goes into [`Self::key_values`] as [`KeyValue::Hash`].
     pub fn get_or_create_hash(&self, key: &Bytes) -> Result<SharedHash> {
         self.ensure_type(key, KeyType::Hash)?;
-        let hashes = self.hashes.write();
-        if let Some(existing) = hashes.get(key) {
-            return Ok(existing.clone());
+        if let Some(h) = self.hash_from_key_values(key) {
+            return Ok(h);
         }
         let base = crate::memory::estimate_keyed_object(
             key.len(),
             RedisHash::new().memory_size(),
         );
-        drop(hashes);
         self.ensure_non_string_capacity(base)?;
-        let mut hashes = self.hashes.write();
-        Ok(hashes
-            .entry(key.clone())
-            .or_insert_with(|| {
-                self.memory_tracker
-                    .account(base, MemoryCategory::Hashes);
-                Arc::new(RwLock::new(RedisHash::new()))
-            })
-            .clone())
+        let kv = self.key_values.get_or_insert_with(key.clone(), || {
+            self.memory_tracker
+                .account(base, MemoryCategory::Hashes);
+            KeyValue::Hash(Arc::new(RwLock::new(RedisHash::new())))
+        });
+        match kv {
+            KeyValue::Hash(h) => Ok(h),
+            other => {
+                // FG-2: only Hash is stored in key_values. Reinsert if raced.
+                debug_assert!(
+                    false,
+                    "key_values held non-Hash during get_or_create_hash: {:?}",
+                    other.key_type()
+                );
+                self.key_values.insert(key.clone(), other);
+                Err(crate::error::Error::WrongType)
+            }
+        }
+    }
+
+    /// Resolve a hash from the unified map (no create).
+    #[inline]
+    fn hash_from_key_values(&self, key: &Bytes) -> Option<SharedHash> {
+        match self.key_values.get(key) {
+            Some(KeyValue::Hash(h)) => Some(h),
+            _ => None,
+        }
     }
 
     pub fn get_hash(&self, key: &Bytes) -> Option<SharedHash> {
-        let hashes = self.hashes.read();
-        hashes.get(key).cloned()
+        self.hash_from_key_values(key)
     }
 
     pub fn remove_hash(&self, key: &Bytes) -> bool {
-        let mut hashes = self.hashes.write();
-        if let Some(h) = hashes.remove(key) {
-            let size = crate::memory::estimate_keyed_object(key.len(), h.read().memory_size());
-            self.memory_tracker
-                .deallocate(size, MemoryCategory::Hashes);
-            true
-        } else {
-            false
+        match self.key_values.remove(key) {
+            Some(KeyValue::Hash(h)) => {
+                let size =
+                    crate::memory::estimate_keyed_object(key.len(), h.read().memory_size());
+                self.memory_tracker
+                    .deallocate(size, MemoryCategory::Hashes);
+                true
+            }
+            Some(other) => {
+                // Defensive: unexpected variant must not be lost (FG-3 prep).
+                debug_assert!(
+                    false,
+                    "remove_hash saw non-Hash in key_values: {:?}",
+                    other.key_type()
+                );
+                self.key_values.insert(key.clone(), other);
+                false
+            }
+            None => false,
         }
     }
 
     pub fn hash_exists(&self, key: &Bytes) -> bool {
-        self.hashes.read().contains_key(key)
+        matches!(self.key_values.get(key), Some(KeyValue::Hash(_)))
     }
 
     /// Remove empty hash key after mutations that may empty it.
@@ -88,15 +124,17 @@ impl Cache {
     /// Export all hashes: (key, [(field, value), ...]).
     /// Skips keys whose typed TTL has already elapsed (no revive without TTL).
     pub fn export_hashes(&self) -> Vec<(Bytes, Vec<(Bytes, Bytes)>)> {
-        let hashes = self.hashes.read();
-        let mut out = Vec::with_capacity(hashes.len());
-        for (key, h) in hashes.iter() {
+        let mut out = Vec::with_capacity(self.key_values.len());
+        self.key_values.for_each(|key, kv| {
+            let KeyValue::Hash(h) = kv else {
+                return;
+            };
             if !self.typed_key_exportable(key) {
-                continue;
+                return;
             }
             let hash = h.read();
             out.push((key.clone(), hash.iter_fields().collect()));
-        }
+        });
         out
     }
 }

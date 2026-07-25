@@ -3,7 +3,7 @@
 ## Currently working on..
 
 - [x] Support for Redis Pub-Sub
-- **Post-FG queue** (unified keyspace facade shipped): next is **Batch FG-2** (physical single-map migrate, one type first). Details in root `TODO.md` → *Next work queue (post-FE)*.
+- **Post-FG / FG-2:** hashes → physical `key_values` map is **green in working tree** (commit pending per latest review); next after commit is **FG-3** (remaining types + `KeyspacePayload` collapse). Details in root `TODO.md`.
 
 ## Persistence / search letter batches (recent)
 
@@ -77,7 +77,8 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Sentinel leader election depth (Batch FE: voted-leader / elect gate; residuals: election-timeout, hello SUBSCRIBE, CKQUORUM live)
 - [x] HNSW multi-layer insert (Batch FF)
 - [x] Unified keyspace design + `KeyValue` facade (Batch FG slice A; multi-map storage)
-- [ ] **Next (see `TODO.md` Next work queue post-FE):** **FG-2** physical single-map migrate · later NODE 2PC slice 2 / Sentinel promote rank / `nodes.conf` flags
+- [~] **FG-2** physical migrate of **hashes** into `ShardedKeyMap<KeyValue>` (`Cache::key_values`) — WIP/tests green; commit pending
+- [ ] **Next (see `TODO.md`):** **commit FG-2** → **FG-3** remaining types + payload collapse · later NODE 2PC slice 2
 - [x] 데드락 감지 고급 기능
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원

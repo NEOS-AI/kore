@@ -451,10 +451,15 @@ impl Cache {
                 }
             }
             super::KeyType::Hash => {
-                let mut hashes = self.hashes.write();
-                let h = hashes
-                    .remove(src)
-                    .ok_or_else(|| Error::InvalidArgument("no such key".into()))?;
+                // FG-2: hashes live in key_values as KeyValue::Hash
+                let h = match self.key_values.remove(src) {
+                    Some(super::KeyValue::Hash(h)) => h,
+                    Some(other) => {
+                        self.key_values.insert(src.clone(), other);
+                        return Err(Error::InvalidArgument("no such key".into()));
+                    }
+                    None => return Err(Error::InvalidArgument("no such key".into())),
+                };
                 let content = h.read().memory_size();
                 if src.len() != dst.len() {
                     let old = crate::memory::estimate_keyed_object(src.len(), content);
@@ -463,7 +468,8 @@ impl Cache {
                         .deallocate(old, MemoryCategory::Hashes);
                     self.memory_tracker.account(new, MemoryCategory::Hashes);
                 }
-                hashes.insert(dst.clone(), h);
+                self.key_values
+                    .insert(dst.clone(), super::KeyValue::Hash(h));
             }
             super::KeyType::List => {
                 let mut lists = self.lists.write();

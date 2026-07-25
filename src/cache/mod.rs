@@ -21,7 +21,6 @@ pub use keyspace::KeyValue;
 use crate::hashmap::{ShardedHashMap, ShardedKeyMap};
 use crate::sorted_set::SharedSortedSet;
 use crate::geospatial::GeoSet;
-use crate::hash_type::SharedHash;
 use crate::list_block::ListBlockers;
 use crate::list_type::SharedList;
 use crate::set_type::SharedSet;
@@ -45,13 +44,15 @@ pub use eviction::EvictionPolicy;
 
 /// The main cache structure.
 ///
-/// # Keyspace layout (Batch FG)
+/// # Keyspace layout (Batch FG / FG-2)
 ///
-/// Logical Redis keyspace is **one name → one typed value**. Today that is
-/// implemented as a **multi-map** (fields below) with a facade
-/// ([`KeyValue`], [`Cache::get_key_value`]) so TYPE / DEL / EXISTS share one
-/// lookup path. See `keyspace` module docs and `docs/module_architectures.md`
-/// for the migration plan toward a single `KeyValue` map (FG-2+).
+/// Logical Redis keyspace is **one name → one typed value**. Cross-type ops use
+/// the [`KeyValue`] facade ([`Cache::get_key_value`]).
+///
+/// **Physical storage (FG-2):** hashes live in [`Self::key_values`] as
+/// [`KeyValue::Hash`]. Strings stay on [`Self::map`]; zset/geo remain on their
+/// sharded maps; list/set/stream remain on global `RwLock<HashMap>` maps until
+/// FG-3. See `keyspace` module docs and `docs/module_architectures.md`.
 pub struct Cache {
     /// Sharded hashmap for string entries (`KeyValue::String`)
     pub(super) map: ShardedHashMap,
@@ -59,8 +60,11 @@ pub struct Cache {
     pub(super) sorted_sets: ShardedKeyMap<SharedSortedSet>,
     /// Sharded map for geospatial sets (key → SharedGeoSet)
     pub(super) geo_sets: ShardedKeyMap<Arc<RwLock<GeoSet>>>,
-    /// Redis Hash keys
-    pub(super) hashes: Arc<RwLock<HashMap<Bytes, SharedHash>>>,
+    /// Unified typed value map (FG-2: currently **only** [`KeyValue::Hash`]).
+    ///
+    /// Other types remain on legacy maps until FG-3 expands this map and
+    /// collapses `KeyspacePayload` to a single stream.
+    pub(super) key_values: ShardedKeyMap<KeyValue>,
     /// Redis List keys
     pub(super) lists: Arc<RwLock<HashMap<Bytes, SharedList>>>,
     /// Clients blocked on empty lists (BLPOP / BRPOP) for this keyspace.
@@ -152,7 +156,7 @@ impl Cache {
             map: ShardedHashMap::new(num_shards, cap),
             sorted_sets: ShardedKeyMap::new(num_shards),
             geo_sets: ShardedKeyMap::new(num_shards),
-            hashes: Arc::new(RwLock::new(HashMap::new())),
+            key_values: ShardedKeyMap::new(num_shards),
             lists: Arc::new(RwLock::new(HashMap::new())),
             list_blockers: ListBlockers::new(),
             stream_blockers: ListBlockers::new(),
@@ -229,7 +233,7 @@ impl Cache {
             map: ShardedHashMap::new(num_shards, cap),
             sorted_sets: ShardedKeyMap::new(num_shards),
             geo_sets: ShardedKeyMap::new(num_shards),
-            hashes: Arc::new(RwLock::new(HashMap::new())),
+            key_values: ShardedKeyMap::new(num_shards),
             lists: Arc::new(RwLock::new(HashMap::new())),
             list_blockers: ListBlockers::new(),
             stream_blockers: ListBlockers::new(),

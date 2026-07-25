@@ -25,27 +25,30 @@ src/cache/
 └── config.rs       - max_entry_size, eviction sample, …
 ```
 
-## 3. Unified keyspace (Batch FG)
+## 3. Unified keyspace (Batch FG / FG-2)
 
-### Today (pragmatic multi-map + facade)
+### Today (partial physical unify + facade)
 
-`Cache` still holds **separate** containers per Redis type:
+`Cache` holds containers per Redis type; **hashes** have migrated into the
+unified map:
 
 | Field | Type |
 |-------|------|
 | `map` | strings (`SharedEntry`) |
-| `sorted_sets` / `geo_sets` | sharded typed maps |
-| `hashes` / `lists` / `sets` / `streams` | `RwLock<HashMap<…>>` |
+| `key_values` | `ShardedKeyMap<KeyValue>` — **FG-2: only `KeyValue::Hash`** |
+| `sorted_sets` / `geo_sets` | sharded typed maps (legacy) |
+| `lists` / `sets` / `streams` | `RwLock<HashMap<…>>` (legacy) |
 | `typed_expires` | absolute `Instant` for non-string keys |
 
 Logical invariant: **one name → at most one type** (`ensure_type` / WRONGTYPE).
 
-**FG slice A** adds a view type and facade so cross-type ops share one path:
+**FG slice A** added the view type and facade; **FG-2** put hash **physical**
+storage into `key_values` (no dual-write leftover for hashes):
 
 ```text
 enum KeyValue {
     String(SharedEntry),  // TTL on Entry
-    Hash(SharedHash),
+    Hash(SharedHash),     // physically in key_values (FG-2)
     List(SharedList),
     Set(SharedSet),
     ZSet(SharedSortedSet),
@@ -53,7 +56,7 @@ enum KeyValue {
     Stream(SharedStream),
 }
 
-Cache::get_key_value(key) -> Option<KeyValue>   // lazy expire + multi-map probe
+Cache::get_key_value(key) -> Option<KeyValue>   // string → key_values → legacy maps
 Cache::key_type / exists                         // via get_key_value
 Cache::delete / remove_key_value_raw             // unified remove + memory free
 ```
@@ -77,14 +80,15 @@ ShardedKeyMap<KeyValue>   // or KeySlot { value: KeyValue, expires_at: Option<In
 ### Migration plan
 
 1. **FG (done, slice A):** `KeyValue` + facade; storage multi-map; tests for lookup/delete/WRONGTYPE.
-2. **FG-2:** Move **one** container (prefer hashes or sets) into a sharded `KeyValue` map or dual-read path; keep facade; full command + load paths green.
-3. **FG-3:** Remaining types; collapse `KeyspacePayload` drain/fill to one value stream; eviction samples all types.
+2. **FG-2 (done, hashes):** Physical hashes in `ShardedKeyMap<KeyValue>`; facade + H* + RENAME + take/install + eviction sampling; no dual-write for hashes.
+3. **FG-3:** Remaining types; collapse `KeyspacePayload` drain/fill to one value stream; eviction samples all types from one map.
 4. **FG-4 (optional):** Merge `typed_expires` into slot header.
 
-**Load/install:** keep multi-field payload until FG-3 so LOADING / epoch install stays honest (no half-migrated take/install).
+**Load/install:** still multi-field payload (`hashes: HashMap` extracted from /
+re-wrapped into `KeyValue::Hash`) until FG-3 so LOADING / epoch install stays honest.
 
-### Residuals (FG-2+)
+### Residuals (FG-3+)
 
-- Physical single map (not just facade)
-- Eviction sampling beyond string KV for allkeys-* (policy-dependent)
+- Migrate list / set / zset / geo / stream (and eventually strings) into `key_values`
 - `KeyspacePayload` single-stream serialization
+- Eviction sampling fully from one map

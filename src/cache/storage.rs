@@ -22,10 +22,16 @@ use super::Cache;
 ///
 /// Built by [`Cache::take_keyspace_payload`]; consumed by
 /// [`Cache::install_keyspace_payload`]. Not part of the public API.
+///
+/// **FG-2:** live hashes sit in [`Cache::key_values`] as
+/// [`crate::cache::KeyValue::Hash`]; this payload still stages them as a
+/// plain `HashMap` (extract on take / re-wrap on install) so multi-DB epoch
+/// install stays multi-field until FG-3 collapses to one value stream.
 pub(crate) struct KeyspacePayload {
     map: Vec<(Bytes, SharedEntry)>,
     zsets: Vec<(Bytes, SharedSortedSet)>,
     geos: Vec<(Bytes, Arc<RwLock<GeoSet>>)>,
+    /// Staged hashes (from / into `key_values` as `KeyValue::Hash`).
     hashes: HashMap<Bytes, SharedHash>,
     lists: HashMap<Bytes, SharedList>,
     sets: HashMap<Bytes, SharedSet>,
@@ -389,7 +395,8 @@ impl Cache {
         let strings = self.map.len();
         let zsets = self.sorted_sets.len();
         let geos = self.geo_sets.len();
-        let hashes = self.hashes.read().len();
+        // FG-2: hashes live in key_values
+        let hashes = self.key_values.len();
         let lists = self.lists.read().len();
         let sets = self.sets.read().len();
         let streams = self.streams.read().len();
@@ -477,7 +484,9 @@ impl Cache {
         let map = self.map.drain_all();
         let zsets = self.sorted_sets.drain_all();
         let geos = self.geo_sets.drain_all();
-        let hashes = std::mem::take(&mut *self.hashes.write());
+        // FG-2: physical hashes live in key_values; payload field stays multi-map
+        // shaped (SharedHash map) until FG-3 collapses KeyspacePayload.
+        let hashes = Self::drain_hashes_from_key_values(&self.key_values);
         let lists = std::mem::take(&mut *self.lists.write());
         let sets = std::mem::take(&mut *self.sets.write());
         let streams = std::mem::take(&mut *self.streams.write());
@@ -501,6 +510,47 @@ impl Cache {
             counts,
             mem,
         }
+    }
+
+    /// Drain [`Cache::key_values`] into a legacy-shaped hash map for payload staging.
+    fn drain_hashes_from_key_values(
+        key_values: &crate::hashmap::ShardedKeyMap<super::KeyValue>,
+    ) -> HashMap<Bytes, SharedHash> {
+        let drained = key_values.drain_all();
+        let mut hashes = HashMap::with_capacity(drained.len());
+        for (k, v) in drained {
+            match v {
+                super::KeyValue::Hash(h) => {
+                    hashes.insert(k, h);
+                }
+                other => {
+                    // FG-2: only Hash is stored. Do not drop unexpected data.
+                    debug_assert!(
+                        false,
+                        "key_values held non-Hash during take: {:?}",
+                        other.key_type()
+                    );
+                    key_values.insert(k, other);
+                }
+            }
+        }
+        hashes
+    }
+
+    /// Install staged hashes into [`Cache::key_values`] as [`super::KeyValue::Hash`].
+    fn install_hashes_into_key_values(
+        key_values: &crate::hashmap::ShardedKeyMap<super::KeyValue>,
+        hashes: HashMap<Bytes, SharedHash>,
+    ) {
+        debug_assert!(
+            key_values.is_empty(),
+            "install_hashes requires empty key_values (caller must drain first)"
+        );
+        let entries: Vec<_> = hashes
+            .into_iter()
+            .map(|(k, h)| (k, super::KeyValue::Hash(h)))
+            .collect();
+        key_values.fill_all(entries);
     }
 
     /// Install a staged keyspace payload into `self`, returning the prior state.
@@ -528,7 +578,7 @@ impl Cache {
         let discard_map = self.map.drain_all();
         let discard_zsets = self.sorted_sets.drain_all();
         let discard_geos = self.geo_sets.drain_all();
-        let discard_hashes = std::mem::take(&mut *self.hashes.write());
+        let discard_hashes = Self::drain_hashes_from_key_values(&self.key_values);
         let discard_lists = std::mem::take(&mut *self.lists.write());
         let discard_sets = std::mem::take(&mut *self.sets.write());
         let discard_streams = std::mem::take(&mut *self.streams.write());
@@ -542,7 +592,7 @@ impl Cache {
         self.map.fill_all(payload.map);
         self.sorted_sets.fill_all(payload.zsets);
         self.geo_sets.fill_all(payload.geos);
-        *self.hashes.write() = payload.hashes;
+        Self::install_hashes_into_key_values(&self.key_values, payload.hashes);
         *self.lists.write() = payload.lists;
         *self.sets.write() = payload.sets;
         *self.streams.write() = payload.streams;
@@ -654,7 +704,7 @@ impl Cache {
         self.map.clear();
         self.sorted_sets.clear();
         self.geo_sets.clear();
-        self.hashes.write().clear();
+        self.key_values.clear();
         self.lists.write().clear();
         self.sets.write().clear();
         self.streams.write().clear();
@@ -712,17 +762,9 @@ impl Cache {
         for key in self.geo_sets.keys(pattern) {
             push_typed(key, &mut seen, &mut result);
         }
-        {
-            let keys: Vec<Bytes> = self
-                .hashes
-                .read()
-                .keys()
-                .filter(|k| matches(k))
-                .cloned()
-                .collect();
-            for key in keys {
-                push_typed(key, &mut seen, &mut result);
-            }
+        // FG-2: hashes in key_values
+        for key in self.key_values.keys(pattern) {
+            push_typed(key, &mut seen, &mut result);
         }
         {
             let keys: Vec<Bytes> = self
