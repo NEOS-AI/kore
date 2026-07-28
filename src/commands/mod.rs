@@ -276,12 +276,8 @@ impl CommandHandler {
         self.protocol_version
     }
 
-    /// CONFIG GET style key/value reply: flat array (RESP2) or map (RESP3).
-    pub(super) fn config_kv_reply(&self, key: &str, value: &str) -> RespValue {
-        self.config_kvs_reply(vec![(key.to_string(), value.to_string())])
-    }
-
     /// Multi-pair CONFIG GET reply (RESP2 flat array or RESP3 map).
+    /// Single-pair CONFIG GET uses the same path with a one-element `pairs` vec.
     pub(super) fn config_kvs_reply(&self, pairs: Vec<(String, String)>) -> RespValue {
         if self.protocol_version >= 3 {
             let map: Vec<(RespValue, RespValue)> = pairs

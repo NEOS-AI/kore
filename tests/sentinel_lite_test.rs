@@ -17,9 +17,33 @@ use kore::{
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::time::{sleep, Duration};
+
+/// Reserve `n` distinct OS-assigned localhost ports (hold listeners, then release).
+/// Same pattern as `pipeline_unix_test::free_port` / admin_http tests — avoids hard-coded
+/// bind collisions under parallel `cargo test`.
+async fn free_ports(n: usize) -> Vec<u16> {
+    let mut listeners = Vec::with_capacity(n);
+    for _ in 0..n {
+        listeners.push(
+            TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind ephemeral"),
+        );
+    }
+    let ports: Vec<u16> = listeners
+        .iter()
+        .map(|l| l.local_addr().expect("local_addr").port())
+        .collect();
+    drop(listeners);
+    ports
+}
+
+async fn free_port() -> u16 {
+    free_ports(1).await[0]
+}
 
 fn make_config(port: u16) -> Arc<Config> {
     // Unique dir per process so Batch EZ sentinel.conf load/autosave cannot
@@ -153,8 +177,9 @@ fn as_bulk(v: &RespValue) -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sentinel_monitor_get_addr_and_sdown() {
-    let master_port = 16901u16;
-    let sentinel_port = 16902u16;
+    let ports = free_ports(2).await;
+    let master_port = ports[0];
+    let sentinel_port = ports[1];
 
     let cache_m = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
     let srv_m = Server::new(cache_m, make_config(master_port));
@@ -276,9 +301,10 @@ async fn sentinel_monitor_get_addr_and_sdown() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sentinel_manual_failover_switches_addr() {
-    let dead_master_port = 16903u16; // never started
-    let promote_port = 16904u16;
-    let sentinel_port = 16905u16;
+    let ports = free_ports(3).await;
+    let dead_master_port = ports[0]; // never started
+    let promote_port = ports[1];
+    let sentinel_port = ports[2];
 
     let cache_t = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
     let srv_t = Server::new(cache_t, make_config(promote_port));
@@ -338,9 +364,10 @@ async fn sentinel_manual_failover_switches_addr() {
 /// `switch_master` — master address stays on the old (dead) master.
 #[tokio::test(flavor = "multi_thread")]
 async fn sentinel_failover_no_switch_on_promote_fail() {
-    let dead_master_port = 16906u16; // never started
-    let ping_ok_port = 16907u16;
-    let sentinel_port = 16908u16;
+    let ports = free_ports(3).await;
+    let dead_master_port = ports[0]; // never started
+    let ping_ok_port = ports[1];
+    let sentinel_port = ports[2];
 
     let cache_t = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
     let srv_t = Server::new(cache_t, make_config(ping_ok_port));
@@ -425,9 +452,10 @@ async fn sentinel_failover_no_switch_on_promote_fail() {
 /// Batch FC: injected promote OK still switches master (happy inject path).
 #[tokio::test(flavor = "multi_thread")]
 async fn sentinel_failover_switches_on_inject_ok() {
-    let dead_master_port = 16913u16;
-    let target_port = 16914u16;
-    let sentinel_port = 16915u16;
+    let ports = free_ports(3).await;
+    let dead_master_port = ports[0];
+    let target_port = ports[1];
+    let sentinel_port = ports[2];
 
     let cache_t = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
     let srv_t = Server::new(cache_t, make_config(target_port));
@@ -474,9 +502,10 @@ async fn sentinel_failover_switches_on_inject_ok() {
 /// Batch EX: two Sentinels MEET; IS-MASTER-DOWN-BY-ADDR votes; o_down needs quorum 2.
 #[tokio::test(flavor = "multi_thread")]
 async fn sentinel_meet_and_odown_quorum() {
-    let master_port = 16910u16;
-    let s1_port = 16911u16;
-    let s2_port = 16912u16;
+    let ports = free_ports(3).await;
+    let master_port = ports[0];
+    let s1_port = ports[1];
+    let s2_port = ports[2];
 
     let cache_m = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
     let srv_m = Server::new(cache_m, make_config(master_port));
@@ -612,7 +641,7 @@ async fn sentinel_meet_and_odown_quorum() {
 /// Batch EZ: FLUSHCONFIG writes sentinel.conf; load_or_new restores monitors.
 #[tokio::test(flavor = "multi_thread")]
 async fn sentinel_flushconfig_and_load() {
-    let port = 16920u16;
+    let port = free_port().await;
     let dir = std::env::temp_dir().join(format!(
         "kore-sent-ez-{}",
         std::time::SystemTime::now()
@@ -675,8 +704,9 @@ async fn sentinel_flushconfig_and_load() {
 /// Batch FA: SENTINEL HELLO discovers peer and can switch-master on higher epoch.
 #[tokio::test(flavor = "multi_thread")]
 async fn sentinel_hello_discovers_peer_and_switch_master() {
-    let s1_port = 16930u16;
-    let s2_port = 16931u16;
+    let ports = free_ports(2).await;
+    let s1_port = ports[0];
+    let s2_port = ports[1];
 
     let cache1 = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
     let srv1 = Server::new(cache1, make_config(s1_port));
@@ -744,8 +774,9 @@ async fn sentinel_hello_discovers_peer_and_switch_master() {
 /// Batch FA: PUBLISH __sentinel__:hello on a live master succeeds.
 #[tokio::test(flavor = "multi_thread")]
 async fn sentinel_publishes_hello_to_master() {
-    let master_port = 16932u16;
-    let sent_port = 16933u16;
+    let ports = free_ports(2).await;
+    let master_port = ports[0];
+    let sent_port = ports[1];
 
     let cache_m = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
     let srv_m = Server::new(cache_m, make_config(master_port));
@@ -781,7 +812,7 @@ async fn sentinel_publishes_hello_to_master() {
     ));
 
     // Subscribe on master to receive hello publishes from sentinel tick.
-    let mut mcli = TcpStream::connect(("127.0.0.1", master_port)).await.unwrap();
+    let mcli = TcpStream::connect(("127.0.0.1", master_port)).await.unwrap();
     // Use a second connection for SUBSCRIBE (blocks).
     let mut sub = TcpStream::connect(("127.0.0.1", master_port)).await.unwrap();
     let sub_cmd = RespValue::Array(vec![
@@ -862,8 +893,9 @@ async fn sentinel_publishes_hello_to_master() {
 /// Batch FE: IS-MASTER-DOWN-BY-ADDR returns non-empty leader when s_down / voting.
 #[tokio::test(flavor = "multi_thread")]
 async fn sentinel_is_master_down_returns_voted_leader() {
-    let master_port = 16940u16;
-    let sentinel_port = 16941u16;
+    let ports = free_ports(2).await;
+    let master_port = ports[0];
+    let sentinel_port = ports[1];
 
     let cache_m = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
     let srv_m = Server::new(cache_m, make_config(master_port));
@@ -995,9 +1027,10 @@ async fn sentinel_is_master_down_returns_voted_leader() {
 /// Batch FE: two Sentinels agree on a voted leader via IS-MASTER-DOWN-BY-ADDR.
 #[tokio::test(flavor = "multi_thread")]
 async fn sentinel_two_sentinels_vote_agreement() {
-    let master_port = 16942u16;
-    let s1_port = 16943u16;
-    let s2_port = 16944u16;
+    let ports = free_ports(3).await;
+    let master_port = ports[0];
+    let s1_port = ports[1];
+    let s2_port = ports[2];
 
     let cache_m = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
     let srv_m = Server::new(cache_m, make_config(master_port));
@@ -1146,10 +1179,11 @@ async fn sentinel_two_sentinels_vote_agreement() {
 /// another sentinel holds the voted-leader (in-process + live peer vote).
 #[tokio::test(flavor = "multi_thread")]
 async fn sentinel_non_leader_does_not_elect() {
-    let master_port = 16945u16;
-    let promote_port = 16946u16;
-    let s1_port = 16947u16;
-    let s2_port = 16948u16;
+    let ports = free_ports(4).await;
+    let master_port = ports[0];
+    let promote_port = ports[1];
+    let s1_port = ports[2];
+    let s2_port = ports[3];
 
     // Dead master (never started). Live promote target for replica inject.
     let cache_t = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
@@ -1323,10 +1357,11 @@ fn rank_replicas_for_promote_order() {
 /// Batch FK: multi-replica failover prefers higher priority over discovery order.
 #[tokio::test(flavor = "multi_thread")]
 async fn sentinel_failover_prefers_higher_priority() {
-    let dead_master_port = 16950u16;
-    let low_pri_port = 16951u16; // listed first (would win under first-replica-wins)
-    let high_pri_port = 16952u16;
-    let sentinel_port = 16953u16;
+    let ports = free_ports(4).await;
+    let dead_master_port = ports[0];
+    let low_pri_port = ports[1]; // listed first (would win under first-replica-wins)
+    let high_pri_port = ports[2];
+    let sentinel_port = ports[3];
 
     let cache_lo = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
     let srv_lo = Server::new(cache_lo, make_config(low_pri_port));
@@ -1387,10 +1422,11 @@ async fn sentinel_failover_prefers_higher_priority() {
 /// Batch FK: when priority ties, prefer higher replication offset.
 #[tokio::test(flavor = "multi_thread")]
 async fn sentinel_failover_prefers_higher_offset() {
-    let dead_master_port = 16954u16;
-    let low_off_port = 16955u16; // listed first
-    let high_off_port = 16956u16;
-    let sentinel_port = 16957u16;
+    let ports = free_ports(4).await;
+    let dead_master_port = ports[0];
+    let low_off_port = ports[1]; // listed first
+    let high_off_port = ports[2];
+    let sentinel_port = ports[3];
 
     let cache_lo = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
     let srv_lo = Server::new(cache_lo, make_config(low_off_port));
@@ -1450,10 +1486,11 @@ async fn sentinel_failover_prefers_higher_offset() {
 /// Batch FK: priority 0 is never selected when another eligible replica exists.
 #[tokio::test(flavor = "multi_thread")]
 async fn sentinel_failover_skips_priority_zero() {
-    let dead_master_port = 16958u16;
-    let never_port = 16959u16; // listed first, priority 0
-    let ok_port = 16960u16;
-    let sentinel_port = 16961u16;
+    let ports = free_ports(4).await;
+    let dead_master_port = ports[0];
+    let never_port = ports[1]; // listed first, priority 0
+    let ok_port = ports[2];
+    let sentinel_port = ports[3];
 
     let cache_never = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
     let srv_never = Server::new(cache_never, make_config(never_port));
@@ -1513,9 +1550,10 @@ async fn sentinel_failover_skips_priority_zero() {
 /// Batch FK: all priority-0 replicas → no good replica (no switch_master).
 #[tokio::test(flavor = "multi_thread")]
 async fn sentinel_failover_all_priority_zero_fails() {
-    let dead_master_port = 16962u16;
-    let never_port = 16963u16;
-    let sentinel_port = 16964u16;
+    let ports = free_ports(3).await;
+    let dead_master_port = ports[0];
+    let never_port = ports[1];
+    let sentinel_port = ports[2];
 
     let cache_t = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
     let srv_t = Server::new(cache_t, make_config(never_port));
@@ -1576,10 +1614,11 @@ fn parse_info_slave_priority_unit() {
 /// Batch FM: live INFO `slave_priority` (150) beats discovery-order peer at default 100.
 #[tokio::test(flavor = "multi_thread")]
 async fn sentinel_info_priority_refresh_prefers_higher() {
-    let dead_master_port = 16970u16;
-    let discovery_first_port = 16971u16; // default priority 100, listed first
-    let info_high_port = 16972u16; // CONFIG priority 150
-    let sentinel_port = 16973u16;
+    let ports = free_ports(4).await;
+    let dead_master_port = ports[0];
+    let discovery_first_port = ports[1]; // default priority 100, listed first
+    let info_high_port = ports[2]; // CONFIG priority 150
+    let sentinel_port = ports[3];
 
     let (srv_lo, _) = make_persisted_server(discovery_first_port);
     let (tx_lo, rx_lo) = watch::channel(false);
@@ -1659,10 +1698,11 @@ async fn sentinel_info_priority_refresh_prefers_higher() {
 /// Batch FM: INFO priority 0 is never promoted when an eligible peer exists.
 #[tokio::test(flavor = "multi_thread")]
 async fn sentinel_info_priority_zero_skipped() {
-    let dead_master_port = 16974u16;
-    let never_port = 16975u16;
-    let ok_port = 16976u16;
-    let sentinel_port = 16977u16;
+    let ports = free_ports(4).await;
+    let dead_master_port = ports[0];
+    let never_port = ports[1];
+    let ok_port = ports[2];
+    let sentinel_port = ports[3];
 
     let (srv_n, _) = make_persisted_server(never_port);
     let (tx_n, rx_n) = watch::channel(false);
@@ -1729,9 +1769,10 @@ async fn sentinel_info_priority_zero_skipped() {
 /// Manual path is not blocked by cooldown (operator force).
 #[tokio::test(flavor = "multi_thread")]
 async fn sentinel_failover_cooldown_after_attempt() {
-    let dead_master_port = 16978u16;
-    let target_port = 16979u16;
-    let sentinel_port = 16980u16;
+    let ports = free_ports(3).await;
+    let dead_master_port = ports[0];
+    let target_port = ports[1];
+    let sentinel_port = ports[2];
 
     let cache_t = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
     let srv_t = Server::new(cache_t, make_config(target_port));
@@ -1810,10 +1851,12 @@ async fn sentinel_failover_cooldown_after_attempt() {
 /// Batch FN: CKQUORUM uses live PING; dead peer table entries do not inflate usable.
 #[tokio::test(flavor = "multi_thread")]
 async fn sentinel_ckquorum_live_probe_skips_dead_peers() {
-    let sentinel_port = 16990u16;
-    let live_peer_port = 16991u16;
+    let ports = free_ports(4).await;
+    let sentinel_port = ports[0];
+    let live_peer_port = ports[1];
     // Never started — listed in peer table only.
-    let dead_peer_port = 16992u16;
+    let dead_peer_port = ports[2];
+    let unused_master_port = ports[3];
 
     let cache_s = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
     let srv_s = Server::new(cache_s, make_config(sentinel_port));
@@ -1842,7 +1885,7 @@ async fn sentinel_ckquorum_live_probe_skips_dead_peers() {
                 "MONITOR",
                 "mymaster",
                 "127.0.0.1",
-                "16999", // unused master addr; CKQUORUM only needs known master
+                &unused_master_port.to_string(), // unused master addr; CKQUORUM only needs known master
                 "2",
             ],
         )
@@ -1900,8 +1943,11 @@ async fn sentinel_ckquorum_live_probe_skips_dead_peers() {
 /// Batch FN: dead peers do not inflate elect majority — sole live sentinel elects self.
 #[tokio::test(flavor = "multi_thread")]
 async fn sentinel_elect_ignores_dead_peers_for_majority() {
-    let sentinel_port = 16993u16;
-    let dead_peer_port = 16994u16; // never started
+    let ports = free_ports(4).await;
+    let sentinel_port = ports[0];
+    let dead_peer_port = ports[1]; // never started
+    let dead_peer_port2 = ports[2];
+    let unused_master_port = ports[3];
 
     let cache_s = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
     let srv_s = Server::new(cache_s, make_config(sentinel_port));
@@ -1913,11 +1959,11 @@ async fn sentinel_elect_ignores_dead_peers_for_majority() {
     wait_listen(sentinel_port).await;
 
     sentinel
-        .monitor("mymaster", "127.0.0.1", 16995, 1)
+        .monitor("mymaster", "127.0.0.1", unused_master_port, 1)
         .unwrap();
     // Two dead table peers would force majority 2 under table-size N=3.
     sentinel.add_peer("dead1".repeat(8), "127.0.0.1", dead_peer_port);
-    sentinel.add_peer("dead2".repeat(8), "127.0.0.1", dead_peer_port.wrapping_add(1));
+    sentinel.add_peer("dead2".repeat(8), "127.0.0.1", dead_peer_port2);
     assert_eq!(sentinel.known_sentinel_count(), 3);
     assert_eq!(sentinel.leader_votes_needed("mymaster"), 2);
     assert_eq!(count_reachable_sentinels(&sentinel).await, 1);
@@ -1938,8 +1984,9 @@ async fn sentinel_elect_ignores_dead_peers_for_majority() {
 /// Batch FN: after casting a vote, probe `*` returns that sticky leader (not "*").
 #[tokio::test(flavor = "multi_thread")]
 async fn sentinel_probe_star_returns_sticky_vote() {
-    let master_port = 16996u16;
-    let sentinel_port = 16997u16;
+    let ports = free_ports(2).await;
+    let master_port = ports[0];
+    let sentinel_port = ports[1];
 
     let cache_m = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
     let srv_m = Server::new(cache_m, make_config(master_port));

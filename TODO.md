@@ -733,13 +733,13 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
   - *Done (Batch BT)*: `bt_eval_select_persists_connection_db` — connection remains on selected DB after EVAL
 
-### Status snapshot (2026-07-29, post-FQ)
+### Status snapshot (2026-07-29, post-FR)
 
-**Committed through Batch FQ.** FB–FE, **FF**, **FG**–**FG-4**, **FH**, **FI**, **FI-2**, **FK**, **FL**, **FM**, **FN**, **FO**, **FP**, **FQ** (string + typed key-level expire on `KeySlot`). Letter queue empty; **Later/backlog only**. Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed). Git: `main` ahead of origin (do not push); untracked `data/` only.
+**Committed through Batch FR** (P3 hygiene from Later/backlog). Letter queue through FQ was already empty; FR continues Later/backlog only. Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed). Git: `main` ahead of origin (do not push); untracked `data/` only.
 
 **Verification:**
-- **FQ:** string TTL on `KeySlot`; unified EXPIRE/TTL/PERSIST; active expire + volatile sample read slot; take/install string expire unit; `typed_ttl_test` / `string_ops_test` / `active_expire_test` / `keyspace_test`.
-- **FP:** `typed_ttl_test` **12/12**; cache keyspace unit (incl. take/install expire round-trip); multi-DB replace / load quiesce green.
+- **FR:** compiler nits cleared (`config_kv_reply`, SkipList dead APIs, sentinel `unused_mut`); `sentinel_lite_test` **23/23** on ephemeral ports (`--test-threads=4` / `8`); lib `sorted_set` **16/16**, lib `sentinel` **16/16**.
+- **FQ:** string TTL on `KeySlot`; unified EXPIRE/TTL/PERSIST; active expire + volatile sample read slot.
 - Hello SUBSCRIBE fan-in remains **accepted residual** (tick PUBLISH + peer HELLO only).
 
 **What remains:** Later/backlog only (no more letter batches).
@@ -748,6 +748,8 @@ Also tracked in `docs/roadmap.md`.
 |------|----------|----------|---------------|
 | Sentinel | live INFO `slave_priority` + failover cooldown | **done** | **FM** |
 | Sentinel | CKQUORUM / elect majority live probe; probe self-vs-`*` | **done** | **FN** |
+| Sentinel | suite ephemeral ports (parallel bind flake risk) | **done** | **FR** |
+| Hygiene | compiler nits (`config_kv_reply`, SkipList dead APIs, sentinel unused_mut) | **done** | **FR** |
 | Sentinel | long-lived `__sentinel__:hello` SUBSCRIBE fan-in | P3 accepted | — |
 | Sentinel | election-timeout SM (pre-attempt campaign epoch thrash) | P3 | later |
 | Cluster | NODE 2PC durable prepare + atomic COMMITPREPARE | **done** | **FO** |
@@ -762,11 +764,10 @@ Also tracked in `docs/roadmap.md`.
 | Keyspace | RENAME remove+insert; create ensure_type→insert TOCTOU (historical) | P3 accepted | — |
 | Search | HNSW edges/levels not AOF/RDB durable; `max_m=1` spanning | P3 accepted / later | — |
 | MIGRATE / UI / load | DUMP wire; reshard weight UI; Arc-swap mid-fill | P3 accepted | — |
-| Tests | Sentinel suite hard-coded ports (flake risk under parallel bind) | P3 | later |
 
-### Next work queue (post-FQ)
+### Next work queue (post-FR)
 
-**Committed letter queue through FQ is empty.** No further letter batches planned. Standing rule: land tests with each change. Resume from **Later / backlog** only.
+**Committed letter queue through FQ is empty; Batch FR (Later hygiene) done.** Standing rule: land tests with each change. Resume from **Later / backlog** only.
 
 #### Completed (FB–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP)
 
@@ -833,7 +834,7 @@ Also tracked in `docs/roadmap.md`.
   - Probe `runid=*` with no prior vote returns leader `"*"` / epoch 0 (Redis-honest); sticky vote still returned on probe; sole-sentinel auto path via `is_failover_leader` / live≤1 elect
   - Hello SUBSCRIBE fan-in **not** implemented (accepted residual; tick PUBLISH + peer HELLO remains primary discovery)
   - Tests: unit probe/`leader_votes_needed_for`; e2e CKQUORUM dead→NOQUORUM / live→OK; elect ignores dead peers; probe sticky vote
-  - Residual: election-timeout SM (pre-attempt epoch thrash); optional parallel INFO enrich; ephemeral ports
+  - Residual: election-timeout SM (pre-attempt epoch thrash); optional parallel INFO enrich; ephemeral ports → **FR**
 
 - [x] **`[P3]`** **Batch FO — NODE 2PC durable prepare** (`1ad6e6f`)
   - `nodes.conf` header `# prepare <slot> <target> <epoch> <unix_ms>`; SAVECONFIG / autosave write non-expired votes; load restores; expired/malformed skipped (fail-closed)
@@ -860,6 +861,14 @@ Also tracked in `docs/roadmap.md`.
   - RENAME moves whole string slot (value + expire); take/install preserves string TTL
   - Residual: `Entry.expires_at` still mirrored for string RMW transport + legacy `ShardedHashMap`; search-doc eviction special
 
+- [x] **`[P3]`** **Batch FR — Compiler nits + Sentinel ephemeral ports** (`PENDING_HASH`)
+  - Deleted unused `config_kv_reply` (CONFIG GET uses `config_kvs_reply`); removed dead private SkipList/`SkipNode` APIs (`len` / `is_empty` / `level`)
+  - Fixed `unused_mut` in `sentinel_lite_test`; known FR nits clean under `cargo build --lib` / sentinel test build
+  - Sentinel suite: `free_port` / `free_ports` (bind `127.0.0.1:0`, hold then release) replaces hard-coded `169xx` ports — parallel-safe under `cargo test`
+  - Tests: `sentinel_lite_test` **23/23**; lib sorted_set **16/16**; lib sentinel **16/16**
+  - Out of scope (documented residual warnings): unused imports (`bitmap` Bytes, replication Cache), `entered_replica_feed` assignment, search `weight` param
+  - Residual: election-timeout SM; optional parallel INFO enrich; other Later items unchanged
+
 
 #### Later / backlog (no letter batch)
 
@@ -867,16 +876,15 @@ Also tracked in `docs/roadmap.md`.
   - DUMP/RESTORE Redis wire; cluster reshard weight UI; admin_http auth/TLS
   - HNSW durable graph; single-DB Arc-swap mid-fill
   - Global repl backlog write serialization (FI residual; no Valkey parity claim)
-  - Sentinel suite ephemeral ports (flake risk under parallel bind)
   - Optional parallelize `enrich_replica_priorities` / `count_reachable_sentinels` (serial probes today)
   - Cluster binary bus 2PC; dest prepare breadth; remote CHECK→COMMITPREPARE two-RPC window
   - Sentinel election-timeout SM (pre-attempt campaign epoch thrash while o_down)
-  - Compiler nits (dead_code: `config_kv_reply`, SkipList `len`/`is_empty`/`level`; unused_mut in sentinel_lite; search unused_mut fixed in FQ)
   - `Entry.expires_at` RMW mirror (optional full drop once ShardedHashMap retired); search-doc eviction special
+  - Pre-existing lib warnings (unused imports / `entered_replica_feed` / search `weight`) — not FR scope
 
 ### Code review backlog
 
-**Batches CZ–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP + FQ shipped.** Letter queue empty; Later/backlog only. Standing tests-for-phase P0.
+**Batches CZ–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP + FQ + FR shipped.** Letter queue empty; Later/backlog only. Standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -1081,4 +1089,4 @@ Highest urgency checklist (phase order preserved):
 - [x] Eviction policies (`maxmemory-policy`)
   - *Follow-ups*: Streams, bitmaps/HLL, RESP3 (done elsewhere); LFU decay done in Batch AB
 
-**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB–FQ** letter work is committed complete. Resume from **Next work queue (post-FQ)** — Later/backlog only (no more letter batches).
+**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB–FQ** letter work is committed complete; **FR** is Later/backlog hygiene. Resume from **Next work queue (post-FR)** — Later/backlog only.

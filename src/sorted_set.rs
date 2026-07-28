@@ -239,10 +239,6 @@ impl SkipNode {
             span: vec![0; level],
         }
     }
-
-    fn level(&self) -> usize {
-        self.forward.len()
-    }
 }
 
 /// Span skiplist for ordered members.
@@ -265,14 +261,6 @@ impl SkipList {
             level: 0,
             length: 0,
         }
-    }
-
-    fn len(&self) -> usize {
-        self.length
-    }
-
-    fn is_empty(&self) -> bool {
-        self.length == 0
     }
 
     fn random_level() -> usize {
