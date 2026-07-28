@@ -2,11 +2,8 @@ use crate::error::Result;
 use crate::hashmap::MapAction;
 use bytes::Bytes;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::keyspace::KeySlot;
-use super::storage::KeyType;
 use super::Cache;
 
 impl Cache {
@@ -14,51 +11,48 @@ impl Cache {
     /// Returns true if the timeout was set (or key deleted for `ttl_ms == 0`).
     ///
     /// Redis: `EXPIRE key 0` / zero ms deletes the key immediately.
+    ///
+    /// Batch FQ: all types store absolute expire on [`super::KeySlot::expires_at`].
+    /// Strings also mirror onto `Entry.expires_at` so RMW / load APIs stay consistent.
     pub fn expire(&self, key: &Bytes, ttl_ms: u64) -> Result<bool> {
         // Lazy-delete if already past expiry so we don't revive a ghost key.
         let kt = self.key_type(key);
-        if kt == KeyType::None {
+        if kt == super::KeyType::None {
             return Ok(false);
         }
         if ttl_ms == 0 {
             let _ = self.delete(key);
             return Ok(true);
         }
-        match kt {
-            KeyType::None => Ok(false),
-            KeyType::String => match self.get_string_entry(key) {
-                Some(entry) => {
-                    let mut new_entry = (*entry).clone();
-                    new_entry.expires_at = Some(Instant::now() + Duration::from_millis(ttl_ms));
-                    self.key_values
-                        .insert(key.clone(), KeySlot::string(Arc::new(new_entry)));
-                    Ok(true)
-                }
-                None => Ok(false),
-            },
-            _ => {
-                // Batch FP: typed expire lives on KeySlot.
-                let set = self.key_values.mutate(key, |cur, _| {
-                    match cur {
-                        Some(slot) if slot.value.is_typed_container() => {
-                            let mut s = slot.clone();
-                            s.expires_at =
-                                Some(Instant::now() + Duration::from_millis(ttl_ms));
-                            (MapAction::Set(s), true)
-                        }
-                        _ => (MapAction::Keep, false),
+        let exp = Instant::now() + Duration::from_millis(ttl_ms);
+        let set = self.key_values.mutate(key, |cur, _| match cur {
+            Some(slot) => {
+                let value = match &slot.value {
+                    super::KeyValue::String(e) => {
+                        let mut ne = (**e).clone();
+                        ne.expires_at = Some(exp);
+                        super::KeyValue::String(std::sync::Arc::new(ne))
                     }
-                });
-                Ok(set)
+                    other => other.clone(),
+                };
+                (
+                    MapAction::Set(super::KeySlot {
+                        expires_at: Some(exp),
+                        value,
+                    }),
+                    true,
+                )
             }
-        }
+            None => (MapAction::Keep, false),
+        });
+        Ok(set)
     }
 
     /// Set absolute Unix-epoch-millisecond expiration (all key types).
     /// Past or equal timestamps delete the key (Redis EXPIREAT/PEXPIREAT).
     pub fn expire_at_unix_ms(&self, key: &Bytes, expire_unix_ms: i64) -> Result<bool> {
         let kt = self.key_type(key);
-        if kt == KeyType::None {
+        if kt == super::KeyType::None {
             return Ok(false);
         }
         let now = now_unix_ms();
@@ -81,46 +75,43 @@ impl Cache {
     }
 
     /// Remove any expiration from a key. Returns true if a timeout was removed.
+    ///
+    /// Batch FQ: clears [`super::KeySlot::expires_at`] for every type; mirrors
+    /// clear onto string `Entry.expires_at`.
     pub fn persist(&self, key: &Bytes) -> bool {
-        match self.key_type(key) {
-            KeyType::None => false,
-            KeyType::String => match self.get_string_entry(key) {
-                Some(entry) if entry.expires_at.is_some() => {
-                    let mut new_entry = (*entry).clone();
-                    new_entry.expires_at = None;
-                    self.key_values
-                        .insert(key.clone(), KeySlot::string(Arc::new(new_entry)));
-                    true
-                }
-                _ => false,
-            },
-            _ => self.key_values.mutate(key, |cur, _| {
-                match cur {
-                    Some(slot) if slot.expires_at.is_some() && slot.value.is_typed_container() => {
-                        let mut s = slot.clone();
-                        s.expires_at = None;
-                        (MapAction::Set(s), true)
+        self.key_values.mutate(key, |cur, _| match cur {
+            Some(slot) if slot.expires().is_some() => {
+                let value = match &slot.value {
+                    super::KeyValue::String(e) if e.expires_at.is_some() => {
+                        let mut ne = (**e).clone();
+                        ne.expires_at = None;
+                        super::KeyValue::String(std::sync::Arc::new(ne))
                     }
-                    _ => (MapAction::Keep, false),
-                }
-            }),
-        }
+                    other => other.clone(),
+                };
+                (
+                    MapAction::Set(super::KeySlot {
+                        expires_at: None,
+                        value,
+                    }),
+                    true,
+                )
+            }
+            _ => (MapAction::Keep, false),
+        })
     }
 
     /// Get TTL in milliseconds (-1 = no expiration, -2 = expired/not found).
+    ///
+    /// Batch FQ: single path via slot expire for all key types.
     pub fn ttl(&self, key: &Bytes) -> i64 {
-        // String path first (includes lazy string expire via is_expired).
-        if let Some(entry) = self.get_string_entry(key) {
-            return entry.ttl_millis().unwrap_or(-1);
-        }
-
-        // Typed: purge if past due, then report remaining or -1.
-        if self.purge_typed_if_expired(key) {
+        // Purge if past due (all types), then report remaining or -1 / -2.
+        if self.purge_if_expired(key) {
             return -2;
         }
 
         match self.key_values.get(key) {
-            Some(slot) if slot.value.is_typed_container() => match slot.expires_at {
+            Some(slot) => match slot.expires() {
                 Some(exp) => {
                     let now = Instant::now();
                     if exp <= now {
@@ -132,7 +123,7 @@ impl Cache {
                 }
                 None => -1,
             },
-            _ => -2,
+            None => -2,
         }
     }
 
@@ -142,10 +133,7 @@ impl Cache {
     /// revived without TTL if exported). Keys with no expire record are live.
     pub(super) fn typed_key_exportable(&self, key: &Bytes) -> bool {
         match self.key_values.get(key) {
-            Some(slot) if slot.value.is_typed_container() => match slot.expires_at {
-                Some(exp) if exp <= Instant::now() => false,
-                _ => true,
-            },
+            Some(slot) if slot.value.is_typed_container() => !slot.is_expired(),
             _ => true,
         }
     }
@@ -162,7 +150,7 @@ impl Cache {
             if !slot.value.is_typed_container() {
                 return;
             }
-            let Some(exp) = slot.expires_at else {
+            let Some(exp) = slot.expires() else {
                 return;
             };
             if exp <= now {
@@ -189,27 +177,28 @@ impl Cache {
             return;
         }
         let remaining = (expire_unix_ms - now_unix) as u64;
-        // Only set if typed key still exists (skip strings).
-        let _ = self.key_values.mutate(key, |cur, _| {
-            match cur {
-                Some(slot) if slot.value.is_typed_container() => {
-                    let mut s = slot.clone();
-                    s.expires_at = Some(Instant::now() + Duration::from_millis(remaining));
-                    (MapAction::Set(s), ())
-                }
-                _ => (MapAction::Keep, ()),
+        // Only set if typed key still exists (skip strings — they use store TTL).
+        let _ = self.key_values.mutate(key, |cur, _| match cur {
+            Some(slot) if slot.value.is_typed_container() => {
+                let mut s = slot.clone();
+                s.expires_at = Some(Instant::now() + Duration::from_millis(remaining));
+                (MapAction::Set(s), ())
             }
+            _ => (MapAction::Keep, ()),
         });
     }
 
-    /// If `key` is a typed key past its expire, delete it and return true.
-    pub(super) fn purge_typed_if_expired(&self, key: &Bytes) -> bool {
+    /// If `key` is past its slot expire, delete it and return true.
+    ///
+    /// Batch FQ: applies to **all** types (strings + typed). Formerly
+    /// `purge_typed_if_expired` (typed only).
+    pub(super) fn purge_if_expired(&self, key: &Bytes) -> bool {
         let exp = match self.key_values.get(key) {
-            Some(slot) if slot.value.is_typed_container() => match slot.expires_at {
+            Some(slot) => match slot.expires() {
                 Some(e) => e,
                 None => return false,
             },
-            _ => return false,
+            None => return false,
         };
         if Instant::now() < exp {
             return false;
@@ -229,14 +218,15 @@ impl Cache {
         Ok(deleted)
     }
 
-    /// Sample expired typed keys and delete them (active expire companion).
-    /// Returns keys deleted count (typed accounting is in remove_*).
+    /// Sample expired **typed** keys and delete them (active expire companion).
+    /// String keys are handled by the string active-expire cycle (memory
+    /// accounting differs). Both paths read expire from the slot (Batch FQ).
     pub(super) fn active_expire_typed(&self, samples: usize) -> usize {
         if samples == 0 {
             return 0;
         }
         let now = Instant::now();
-        // Sample random slots; collect keys whose typed expire is past due.
+        // Sample random slots; collect typed keys whose expire is past due.
         let mut candidates = Vec::with_capacity(samples);
         let attempts = samples.saturating_mul(5).max(samples);
         for _ in 0..attempts {
@@ -249,7 +239,7 @@ impl Cache {
             if !slot.value.is_typed_container() {
                 continue;
             }
-            if let Some(exp) = slot.expires_at {
+            if let Some(exp) = slot.expires() {
                 if exp <= now {
                     candidates.push(k);
                 }
@@ -260,9 +250,7 @@ impl Cache {
         for key in candidates {
             // Re-check under write path.
             let still_expired = match self.key_values.get(&key) {
-                Some(slot) if slot.value.is_typed_container() => {
-                    slot.expires_at.map(|e| e <= Instant::now()).unwrap_or(false)
-                }
+                Some(slot) if slot.value.is_typed_container() => slot.is_expired(),
                 _ => false,
             };
             if still_expired {

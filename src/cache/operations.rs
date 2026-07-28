@@ -429,20 +429,28 @@ impl Cache {
                 return Err(Error::InvalidArgument("no such key".into()));
             }
             super::KeyType::String => {
+                // Batch FQ: move whole KeySlot (value + expire); rewrite Entry key.
                 let slot = self
                     .key_values
                     .remove(src)
                     .ok_or_else(|| Error::InvalidArgument("no such key".into()))?;
-                let KeyValue::String(entry) = slot.value.clone() else {
+                let KeyValue::String(entry) = slot.value else {
                     self.key_values.insert(src.clone(), slot);
                     return Err(Error::InvalidArgument("no such key".into()));
                 };
                 let old_size = entry.size();
                 let mut new_entry = (*entry).clone();
                 new_entry.key = dst.clone();
+                // Keep Entry expire mirror in sync with slot.
+                new_entry.expires_at = slot.expires_at.or(new_entry.expires_at);
                 let new_size = new_entry.size();
-                self.key_values
-                    .insert(dst.clone(), KeySlot::string(Arc::new(new_entry)));
+                self.key_values.insert(
+                    dst.clone(),
+                    KeySlot {
+                        expires_at: slot.expires_at.or(new_entry.expires_at),
+                        value: KeyValue::String(Arc::new(new_entry)),
+                    },
+                );
                 // Adjust memory for key-length delta
                 if new_size > old_size {
                     let delta = new_size - old_size;
@@ -457,7 +465,7 @@ impl Cache {
                 }
             }
             _ => {
-                // Batch FP: whole KeySlot moves (value + typed expire).
+                // Batch FP/FQ: whole KeySlot moves (value + expire).
                 let slot = self
                     .key_values
                     .remove(src)

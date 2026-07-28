@@ -95,7 +95,8 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] **FM** Sentinel residual polish (live INFO `slave_priority` refresh; auto-failover 15s cooldown; manual FAILOVER force-bypasses)
 - [x] **FO** durable NODE prepare + COMMITPREPARE (`nodes.conf` `# prepare`; dual-end atomic commit)
 - [x] **FP** expire slot header — typed TTL on `KeySlot.expires_at`; side `typed_expires` removed
-- [ ] **Next (see `TODO.md` post-FP):** Later/backlog only (letter queue empty)
+- [x] **FQ** unify string TTL onto `KeySlot.expires_at` (EXPIRE/TTL/active expire/volatile sample)
+- [ ] **Next (see `TODO.md` post-FQ):** Later/backlog only (letter queue empty)
 - [x] 데드락 감지 고급 기능
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원

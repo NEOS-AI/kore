@@ -31,15 +31,15 @@ Never invert these (deadlock risk):
 - Cross-type **TYPE / EXISTS / `key_type`** go through `Cache::get_key_value`
   (single `key_values` map of `KeySlot`). Prefer that over ad-hoc
   `contains_key` walks.
-- **DEL** uses `remove_key_value_raw` (drops the whole slot: value + typed
-  expire) then search docs. Typed expire purge removes the slot the same way.
-- **FG-4 / FP:** **all** types (including strings) are physical `KeyValue`
+- **DEL** uses `remove_key_value_raw` (drops the whole slot: value + expire)
+  then search docs. Slot expire purge removes the key the same way.
+- **FG-4 / FP / FQ:** **all** types (including strings) are physical `KeyValue`
   variants inside `KeySlot` in `Cache::key_values` (`ShardedKeyMap`). String RMW
-  uses `Cache::mutate_string` (shard write lock + CAS). Typed TTL is
-  `KeySlot.expires_at` (Batch FP); strings keep TTL on `Entry`.
-  Residual: search-doc eviction special; string TTL not unified onto the slot.
-  Design detail: `docs/module_architectures.md` § Unified keyspace +
-  `src/cache/keyspace.rs` rustdoc.
+  uses `Cache::mutate_string` (shard write lock + CAS). Key-level TTL for every
+  type is `KeySlot.expires_at` (Batch FP typed; Batch FQ strings).
+  Residual: search-doc eviction special; `Entry.expires_at` mirrored for string
+  RMW transport. Design detail: `docs/module_architectures.md` § Unified
+  keyspace + `src/cache/keyspace.rs` rustdoc.
 
 ## Keyspace replace / load commit
 

@@ -299,33 +299,27 @@ impl Cache {
             let decay = self.lfu_decay_time.load(Ordering::Relaxed);
 
             for (k, slot) in self.key_values.get_n_random(n) {
+                // Batch FQ: key-level expire is on the slot for all types.
+                let exp = slot.expires();
+                if slot.is_expired() {
+                    continue;
+                }
+                if volatile_only && exp.is_none() {
+                    continue;
+                }
                 match &slot.value {
                     super::KeyValue::String(e) => {
-                        if e.is_expired() {
-                            continue;
-                        }
-                        if volatile_only && e.expires_at.is_none() {
-                            continue;
-                        }
                         out.push(EvictCandidate {
                             key: k,
                             key_type: KeyType::String,
                             size: e.size(),
                             last_access: e.last_access_time(),
                             lfu_freq: e.lfu_freq(decay),
-                            expires_at: e.expires_at,
+                            expires_at: exp,
                             search_index: None,
                         });
                     }
                     other => {
-                        // Batch FP: typed expire is on the slot header.
-                        let exp = slot.expires_at;
-                        if volatile_only && exp.is_none() {
-                            continue;
-                        }
-                        if exp.map(|e| e <= Instant::now()).unwrap_or(false) {
-                            continue;
-                        }
                         let size = crate::memory::estimate_keyed_object(
                             k.len(),
                             other.content_memory_size(),
@@ -505,34 +499,29 @@ impl Cache {
         result
     }
 
-    /// Full scan: remove expired string keys from the unified map.
+    /// Full scan: remove expired string keys from the unified map (slot TTL).
     fn string_sweep_expired(&self) -> crate::hashmap::SweepResult {
         let mut count = 0usize;
         let mut bytes_freed = 0usize;
         let expired: Vec<Bytes> = {
             let mut keys = Vec::new();
             self.key_values.for_each(|k, slot| {
-                if let super::KeyValue::String(e) = &slot.value {
-                    if e.is_expired() {
-                        keys.push(k.clone());
-                    }
+                if matches!(slot.value, super::KeyValue::String(_)) && slot.is_expired() {
+                    keys.push(k.clone());
                 }
             });
             keys
         };
         for key in expired {
-            if let Some(super::KeySlot {
-                value: super::KeyValue::String(e),
-                ..
-            }) = self.key_values.remove(&key)
-            {
-                if e.is_expired() {
+            if let Some(slot) = self.key_values.remove(&key) {
+                if !matches!(slot.value, super::KeyValue::String(_)) || !slot.is_expired() {
+                    // Wrong type or renewed between scan and remove — put back.
+                    self.key_values.insert(key, slot);
+                    continue;
+                }
+                if let super::KeyValue::String(e) = slot.value {
                     bytes_freed += e.size();
                     count += 1;
-                } else {
-                    // Renewed between scan and remove — put back.
-                    self.key_values
-                        .insert(key, super::KeySlot::string(e));
                 }
             }
         }
@@ -540,6 +529,7 @@ impl Cache {
     }
 
     /// Redis-style active expire sampling for string keys in `key_values`.
+    /// Batch FQ: samples keys with slot expire (not Entry-only).
     fn string_active_expire_cycle(
         &self,
         samples_per_pass: usize,
@@ -569,24 +559,26 @@ impl Cache {
                 let Some((k, slot)) = self.key_values.get_random() else {
                     break;
                 };
-                let super::KeyValue::String(entry) = slot.value else {
+                if !matches!(slot.value, super::KeyValue::String(_)) {
                     continue;
-                };
-                if entry.expires_at.is_none() {
+                }
+                if slot.expires().is_none() {
                     continue;
                 }
                 pass_sampled += 1;
                 total.sampled += 1;
-                if !entry.is_expired() {
+                if !slot.is_expired() {
                     continue;
                 }
                 // Re-check under write: remove only if still expired string.
                 match self.key_values.remove(&k) {
-                    Some(super::KeySlot {
-                        value: super::KeyValue::String(cur),
-                        ..
-                    }) if cur.is_expired() => {
-                        let size = cur.size();
+                    Some(cur)
+                        if matches!(cur.value, super::KeyValue::String(_)) && cur.is_expired() =>
+                    {
+                        let size = match &cur.value {
+                            super::KeyValue::String(e) => e.size(),
+                            _ => 0,
+                        };
                         total.count += 1;
                         total.bytes_freed += size;
                         pass_expired += 1;
@@ -612,21 +604,16 @@ impl Cache {
 
     /// Delete all typed keys whose slot expire Instant is in the past.
     fn sweep_typed_expired(&self) -> usize {
-        let now = Instant::now();
         let mut expired = Vec::new();
         self.key_values.for_each(|k, slot| {
-            if slot.value.is_typed_container() {
-                if let Some(exp) = slot.expires_at {
-                    if exp <= now {
-                        expired.push(k.clone());
-                    }
-                }
+            if slot.value.is_typed_container() && slot.is_expired() {
+                expired.push(k.clone());
             }
         });
         let mut count = 0usize;
         for key in expired {
-            // purge_typed_if_expired re-checks and deletes without cmd_del bump.
-            if self.purge_typed_if_expired(&key) {
+            // purge_if_expired re-checks and deletes without cmd_del bump.
+            if self.purge_if_expired(&key) {
                 count += 1;
                 self.stats
                     .evicted_expired

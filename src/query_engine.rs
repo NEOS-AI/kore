@@ -176,7 +176,7 @@ impl QueryExecutor {
         document_data: &HashMap<Bytes, HashMap<String, DocumentField>>,
     ) -> Vec<(Bytes, Option<f32>)> {
         // Step 1: Apply filters to get candidate documents
-        let mut candidates = if let Some(ref filter) = query.filter {
+        let candidates = if let Some(ref filter) = query.filter {
             Self::apply_filter(index, filter)
         } else {
             // No filter: return all documents

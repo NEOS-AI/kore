@@ -18,9 +18,9 @@ use super::Cache;
 /// Built by [`Cache::take_keyspace_payload`]; consumed by
 /// [`Cache::install_keyspace_payload`]. Not part of the public API.
 ///
-/// **FG-4 / FP:** one `key_values` stream holds every type as [`KeySlot`]
-/// (value + optional typed expire). WATCH / search schema / memory counters
-/// remain sibling fields. Typed TTL no longer uses a side expires map.
+/// **FG-4 / FP / FQ:** one `key_values` stream holds every type as [`KeySlot`]
+/// (value + optional key-level expire). WATCH / search schema / memory counters
+/// remain sibling fields. TTL lives on the slot for all types (no side map).
 pub(crate) struct KeyspacePayload {
     /// All keys from [`Cache::key_values`] as slots (String + typed + expire).
     key_values: Vec<(Bytes, KeySlot)>,
@@ -103,19 +103,12 @@ impl Cache {
     /// facade walk. Non-string variants → WRONGTYPE; expired strings count as
     /// absent (same as SET overwrite semantics).
     pub fn ensure_string_or_absent(&self, key: &Bytes) -> Result<()> {
-        if self.purge_typed_if_expired(key) {
+        if self.purge_if_expired(key) {
             return Ok(());
         }
         match self.key_values.get(key) {
             None => Ok(()),
-            Some(KeySlot {
-                value: KeyValue::String(e),
-                ..
-            }) if e.is_expired() => Ok(()),
-            Some(KeySlot {
-                value: KeyValue::String(_),
-                ..
-            }) => Ok(()),
+            Some(slot) if matches!(slot.value, KeyValue::String(_)) => Ok(()),
             Some(_) => Err(Error::WrongType),
         }
     }
@@ -124,6 +117,11 @@ impl Cache {
     ///
     /// If a non-string typed value occupies `key`, returns `Err(WrongType)`
     /// without calling `f` (no dual-residence / silent overwrite).
+    ///
+    /// Batch FQ: slot expire is the key-level SoT. When presenting the current
+    /// entry to `f`, injects [`KeySlot::expires`] onto `Entry.expires_at` so
+    /// KEEPTTL / INCR / APPEND preserve TTL via the existing entry field.
+    /// [`Self::string_map_action`] lifts `Entry.expires_at` back onto the slot.
     pub(super) fn mutate_string<F, R>(&self, key: &Bytes, f: F) -> Result<R>
     where
         F: FnOnce(Option<&SharedEntry>, u64) -> (EntryAction, R),
@@ -132,9 +130,18 @@ impl Cache {
             match current {
                 Some(KeySlot {
                     value: KeyValue::String(entry),
-                    ..
+                    expires_at,
                 }) => {
-                    let (action, r) = f(Some(entry), next_cas);
+                    // Present entry with slot expire as SoT (FQ inject).
+                    let slot_exp = expires_at.or(entry.expires_at);
+                    let (action, r) = if entry.expires_at != slot_exp {
+                        let mut e = (**entry).clone();
+                        e.expires_at = slot_exp;
+                        let arc = Arc::new(e);
+                        f(Some(&arc), next_cas)
+                    } else {
+                        f(Some(entry), next_cas)
+                    };
                     (Self::string_map_action(action), Ok(r))
                 }
                 Some(_) => (MapAction::Keep, Err(Error::WrongType)),
@@ -146,6 +153,8 @@ impl Cache {
         })
     }
 
+    /// Lift string `EntryAction` onto a [`KeySlot`], copying expire onto the
+    /// slot header (Batch FQ).
     #[inline]
     fn string_map_action(action: EntryAction) -> MapAction<KeySlot> {
         match action {
@@ -384,42 +393,52 @@ impl Cache {
         self.stats.incr(&self.stats.cmd_get);
 
         match self.key_values.get(key) {
-            Some(KeySlot {
-                value: KeyValue::String(entry),
-                ..
-            }) => {
-                if entry.is_expired() {
-                    // Remove expired entry and free both counters
-                    let size = entry.size();
-                    if let Some(KeySlot {
-                        value: KeyValue::String(_),
-                        ..
-                    }) = self.key_values.remove(key)
-                    {
-                        self.memory_usage.fetch_sub(size, Ordering::Relaxed);
-                        self.memory_tracker
-                            .deallocate(size, MemoryCategory::Cache);
-                        self.stats.incr(&self.stats.evicted_expired);
+            Some(slot) => {
+                let expired = slot.is_expired();
+                let exp = slot.expires();
+                match slot.value {
+                    KeyValue::String(entry) => {
+                        if expired {
+                            // Remove expired entry and free both counters
+                            let size = entry.size();
+                            if let Some(KeySlot {
+                                value: KeyValue::String(_),
+                                ..
+                            }) = self.key_values.remove(key)
+                            {
+                                self.memory_usage.fetch_sub(size, Ordering::Relaxed);
+                                self.memory_tracker
+                                    .deallocate(size, MemoryCategory::Cache);
+                                self.stats.incr(&self.stats.evicted_expired);
+                            }
+                            self.stats.incr(&self.stats.misses);
+                            Ok(None)
+                        } else {
+                            // Update last access (LRU) and Redis-style LFU
+                            if opts.touch {
+                                entry.touch(
+                                    self.lfu_log_factor.load(Ordering::Relaxed),
+                                    self.lfu_decay_time.load(Ordering::Relaxed),
+                                );
+                            }
+                            self.stats.incr(&self.stats.hits);
+                            // Ensure returned entry mirrors slot expire (API / tests).
+                            if entry.expires_at != exp {
+                                let mut e = (*entry).clone();
+                                e.expires_at = exp;
+                                Ok(Some(Arc::new(e)))
+                            } else {
+                                Ok(Some(entry))
+                            }
+                        }
                     }
-                    self.stats.incr(&self.stats.misses);
-                    Ok(None)
-                } else {
-                    // Update last access (LRU) and Redis-style LFU
-                    if opts.touch {
-                        entry.touch(
-                            self.lfu_log_factor.load(Ordering::Relaxed),
-                            self.lfu_decay_time.load(Ordering::Relaxed),
-                        );
+                    _ => {
+                        // Key exists as a non-string type — GET-family returns WrongType
+                        // at the command layer; treat as miss here for raw load.
+                        self.stats.incr(&self.stats.misses);
+                        Ok(None)
                     }
-                    self.stats.incr(&self.stats.hits);
-                    Ok(Some(entry))
                 }
-            }
-            Some(_) => {
-                // Key exists as a non-string type — GET-family returns WrongType
-                // at the command layer; treat as miss here for raw load.
-                self.stats.incr(&self.stats.misses);
-                Ok(None)
             }
             None => {
                 self.stats.incr(&self.stats.misses);
@@ -430,12 +449,12 @@ impl Cache {
 
     /// Delete a key of any type (unified keyspace facade).
     ///
-    /// Removes the slot via [`Cache::remove_key_value_raw`] (value + typed
-    /// expire) and drops search-index documents for the name.
+    /// Removes the slot via [`Cache::remove_key_value_raw`] (value + expire)
+    /// and drops search-index documents for the name.
     pub fn delete(&self, key: &Bytes) -> Result<bool> {
         self.stats.incr(&self.stats.cmd_del);
 
-        // Slot remove drops typed expire with the value (Batch FP).
+        // Slot remove drops expire with the value (Batch FP / FQ).
         let deleted = self.remove_key_value_raw(key);
 
         // DEL/UNLINK: remove key from any matching search indices
@@ -546,7 +565,7 @@ impl Cache {
     /// any target is mutated — a panic while draining later DBs leaves all
     /// targets intact. Single-DB [`replace_keyspace_from`] uses the same path.
     pub(crate) fn take_keyspace_payload(&self) -> KeyspacePayload {
-        // FG-4 / FP: one stream for all types; typed expire on each KeySlot.
+        // FG-4 / FP / FQ: one stream for all types; key-level expire on each KeySlot.
         let key_values = self.key_values.drain_all();
         let watch = std::mem::take(&mut *self.watch_gens.lock());
         let (indices, aliases) = self.search_index_manager.take_all();
@@ -576,8 +595,8 @@ impl Cache {
     ///
     /// A panic **inside** this method (after drain, mid-fill) still leaves a
     /// single-DB tear; discards are only returned after fill completes.
-    /// Command path relies on `-LOADING` for that window. FG-4 / FP: single
-    /// `key_values` fill (slots carry typed expire; no side expires map).
+    /// Command path relies on `-LOADING` for that window. FG-4 / FP / FQ: single
+    /// `key_values` fill (slots carry key-level expire; no side expires map).
     pub(crate) fn install_keyspace_payload_retaining_discard(
         &self,
         payload: KeyspacePayload,
@@ -635,7 +654,7 @@ impl Cache {
     /// cannot race map/counter install. Intended only for AOF/RDB scratch-load
     /// commit after a successful decode/replay into `other`.
     ///
-    /// Swaps: `key_values` (all types including strings; typed expire on slots),
+    /// Swaps: `key_values` (all types including strings; key-level expire on slots),
     /// watch_gens, search indices/aliases, MemoryTracker keyspace category
     /// counts, and `memory_usage`. Memory is moved only via tracker take/install
     /// + `memory_usage` store (never per-key `account` after map replace).
@@ -665,17 +684,21 @@ impl Cache {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
+        let now_instant = Instant::now();
         let mut out = Vec::new();
         self.key_values.for_each(|_key, slot| {
             let KeyValue::String(entry) = &slot.value else {
                 return;
             };
-            if entry.is_expired() {
+            if slot.is_expired() {
                 return;
             }
-            let expire_unix_ms = match entry.ttl_millis() {
-                Some(ttl) if ttl > 0 => now + ttl,
-                _ => -1,
+            let expire_unix_ms = match slot.expires() {
+                Some(exp) if exp > now_instant => {
+                    now + exp.duration_since(now_instant).as_millis() as i64
+                }
+                Some(_) => return, // past due
+                None => -1,
             };
             out.push((
                 entry.key.clone(),
@@ -687,7 +710,7 @@ impl Cache {
         out
     }
 
-    /// Clear the unified key map (slots include typed expires; not search schema).
+    /// Clear the unified key map (slots include key-level expires; not search schema).
     fn flush_keyspace(&self) {
         self.key_values.clear();
     }
@@ -696,10 +719,8 @@ impl Cache {
     pub fn map_keys_all(&self) -> Vec<Bytes> {
         let mut out = Vec::new();
         self.key_values.for_each(|key, slot| {
-            if let KeyValue::String(e) = &slot.value {
-                if !e.is_expired() {
-                    out.push(key.clone());
-                }
+            if matches!(slot.value, KeyValue::String(_)) && !slot.is_expired() {
+                out.push(key.clone());
             }
         });
         out
@@ -709,20 +730,13 @@ impl Cache {
     pub fn keys(&self, pattern: Option<&str>) -> Vec<Bytes> {
         let mut result = Vec::new();
 
-        // FG-4 / FP: single map — skip expired strings and purge expired typed.
+        // FG-4 / FP / FQ: single map — purge expired keys (all types) via slot TTL.
         for key in self.key_values.keys(pattern) {
-            match self.key_values.get(&key) {
-                Some(KeySlot {
-                    value: KeyValue::String(e),
-                    ..
-                }) if e.is_expired() => continue,
-                Some(slot) if slot.value.is_typed_container() => {
-                    if self.purge_typed_if_expired(&key) {
-                        continue;
-                    }
-                }
-                None => continue,
-                _ => {}
+            if self.purge_if_expired(&key) {
+                continue;
+            }
+            if self.key_values.get(&key).is_none() {
+                continue;
             }
             result.push(key);
         }
