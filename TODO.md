@@ -77,7 +77,7 @@ Example: fix EXAT (`A` / `P0`) before RESP3 (`D` / `P1`) or HNSW benchmarks (`E`
   - *Batch FG (slice A)*: `KeyValue` view enum + facade for TYPE/DEL/EXISTS/`key_type`; design + migration plan documented
   - *Batch FG-2*: **hashes** physically stored as `KeyValue::Hash` in `Cache::key_values` (`ShardedKeyMap`); legacy global hash map removed
   - *Batch FG-3*: **list / set / zset / geo / stream** in `key_values`; legacy per-type maps removed; `KeyspacePayload` is `map` + `key_values` streams
-  - *Batch FG-4*: **strings** as `KeyValue::String` in `key_values`; dual `Cache::map` removed; `KeyspacePayload` is one `key_values` stream; `typed_expires` side map residual
+  - *Batch FG-4*: **strings** as `KeyValue::String` in `key_values`; dual `Cache::map` removed; `KeyspacePayload` is one `key_values` stream; `typed_expires` residual closed by **FP**
 - [x] **`[P0]`** **Type safety**: Redis-style type errors when a key exists with a different type
 - [x] **`[P0]`** **Cross-type ops**: `DEL`, `EXISTS`, `KEYS`/`SCAN`, `DBSIZE`, `TTL`/`EXPIRE`, `TYPE` work for all types
   - *Done*: `SCAN` implemented (cursor-based, sorted key index); `KEYS`/`DBSIZE`/`DEL`/`EXISTS`/`TYPE`/`FLUSH` cover all types
@@ -324,10 +324,11 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch FO)*: durable prepare votes in `nodes.conf` (`# prepare <slot> <target> <epoch> <unix_ms>`); wall-clock unix-ms TTL (survives restart); load restores non-expired votes (expired/malformed dropped); autosave on PREPARE/ABORT/COMMIT when dir set; `SETSLOT COMMITPREPARE` atomic check+NODE under one write lock; dual-end commit uses COMMITPREPARE (dest RESP + source local). Tests: nodes.conf prepare round-trip / expired not restored / COMMITPREPARE; migrate **42/42**.
   - *Residual (FH / FB / FO)*:
     - **done FO** prepare durable on disk (`nodes.conf` `# prepare` lines + restore).
-    - **done FO** atomic `COMMITPREPARE` (dual-end path); bare `SETSLOT NODE` still operator bypass.
+    - **done FO** atomic local `COMMITPREPARE` (dual-end path); bare `SETSLOT NODE` still operator bypass.
     - **P3** no Redis **binary cluster bus** 2PC (RESP-only prepare/commit).
     - **P3** dest-side `set_prepare_node(myself)` accepts unbound **or any known-peer owner** (broad vote; intentional for mid-reshard but weak fencing).
     - **P3** operator `SETSLOT NODE` still bypasses prepare (FINISH/recovery intentional; dual-end path enforces prepare + COMMITPREPARE).
+    - **P3** remote dest still CHECKPREPARE then COMMITPREPARE as **two RPCs** (local source commit atomic; wire window accepted lite).
     - **P3** per-slot config epochs still not fully persisted in nodes.conf (load stamps owned slots with file epoch; prepare epoch fence fails closed when mismatch).
   - *Done (Batch EP)*: when dest NODE ok but source NODE fails: EH re-asserts MIGRATING; **compensate** dest with `SETSLOT NODE <source>` + `IMPORTING` → status `rolled_back` (both sides agree source owns; retry FINISH). Rollback failure keeps `partial_source_node` + warning. Range aborts on `rolled_back`. Source NODE inject hook for tests.
   - *Done (Batch EQ)*: Redis `cluster-require-full-coverage` (default yes) — `CLUSTER INFO cluster_state:ok|fail`; key commands get `CLUSTERDOWN The cluster is down` when any slot is unbound or fail-owned; CONFIG GET/SET + `--cluster-require-full-coverage`; ASKING+IMPORTING still allowed for reshard.
@@ -633,7 +634,7 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BX nit):** `clear_documents` does not adjust `MemoryTracker` Search bytes by itself — safe only because `flush` always `memory_tracker.reset()` afterward; document or pair with deallocate if reused outside flush
   - *Done (Batch CH)*: rustdoc on `SearchIndexManager::clear_documents` documents MemoryTracker coupling (flush resets).
 - [x] **`[P1]`** **Code review (CB):** wire full keyspace swap under quiesce (not just sharded maps)
-  - *Done (Batch CB)*: `Cache::empty_keyspace_like` / `replace_keyspace_from` move strings + sorted_sets + geo_sets + hashes/lists/sets/streams + typed_expires + watch_gens + search take/install + tracker keyspace counts + `memory_usage`; leave pubsub/stats/blockers/maxmemory. Scratch uses `start_sweep: false`; helpers document exclusive-access / load-time quiesce. `Databases::empty_like` / `replace_keyspaces_from` wrap per-DB swap.
+  - *Done (Batch CB)*: `Cache::empty_keyspace_like` / `replace_keyspace_from` move keyspace slots (all types; typed expire on slot post-FP) + watch_gens + search take/install + tracker keyspace counts + `memory_usage`; leave pubsub/stats/blockers/maxmemory. Scratch uses `start_sweep: false`; helpers document exclusive-access / load-time quiesce. `Databases::empty_like` / `replace_keyspaces_from` wrap per-DB swap.
 - [x] **`[P1]`** **Code review (CB):** keep `Cache.memory_usage` in sync with tracker on swap
   - *Done (Batch CB)*: `replace_keyspace_from` pairs tracker take/install with `memory_usage` store; no per-key `account` after `replace_all`. Drain scratch first, then drain target to discard + install (map-level mem::replace style).
 - [x] **`[P0]`** **Code review (CB post-ship):** production load does not quiesce target `background_sweep` during `replace_keyspace_from`
@@ -732,24 +733,28 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
   - *Done (Batch BT)*: `bt_eval_select_persists_connection_db` — connection remains on selected DB after EVAL
 
-### Status snapshot (2026-07-29, post-FN)
+### Status snapshot (2026-07-29, post-FP)
 
-**Committed through Batch FN.** FB–FE, **FF**, **FG**–**FG-4**, **FH**, **FI**, **FI-2**, **FK**, **FL**, **FM**, **FN** (CKQUORUM live PING + probe `*` honesty). Letter queue empty; only optional **FO**/**FP** + Later/backlog remain. Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed). Git: `main` clean except untracked `data/` (runtime conf).
+**Committed through Batch FP.** FB–FE, **FF**, **FG**–**FG-4**, **FH**, **FI**, **FI-2**, **FK**, **FL**, **FM**, **FN**, **FO**, **FP** (typed expire on `KeySlot`; side `typed_expires` removed). Letter queue empty; **Later/backlog only**. Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed). Git: `main` ahead of origin (do not push); untracked `data/` only.
 
 **Verification:**
-- **FN:** lib sentinel **16/16** unit; `sentinel_lite_test` **23/23** (CKQUORUM dead peer NOQUORUM / live OK; elect ignores dead peers; probe `*` / sticky vote).
+- **FP:** `typed_ttl_test` **12/12**; cache keyspace unit (incl. take/install expire round-trip); `keyspace_test` **12/12**; `active_expire_test` **6/6**; `cd_watch_atomic_and_typed_export_test` **4/4**; multi-DB replace / load quiesce green.
+- **FO/FN:** prepare / CKQUORUM paths unchanged by FP.
 - Hello SUBSCRIBE fan-in remains **accepted residual** (tick PUBLISH + peer HELLO only).
 
-**What remains:** optional **FP** + Later/backlog (no mandatory letter batch).
+**What remains:** Later/backlog only (no more letter batches).
 
 | Area | Residual | Priority | Planned batch |
 |------|----------|----------|---------------|
 | Sentinel | live INFO `slave_priority` + failover cooldown | **done** | **FM** |
 | Sentinel | CKQUORUM / elect majority live probe; probe self-vs-`*` | **done** | **FN** |
 | Sentinel | long-lived `__sentinel__:hello` SUBSCRIBE fan-in | P3 accepted | — |
+| Sentinel | election-timeout SM (pre-attempt campaign epoch thrash) | P3 | later |
 | Cluster | NODE 2PC durable prepare + atomic COMMITPREPARE | **done** | **FO** |
 | Cluster | binary bus 2PC; dest prepare breadth; operator NODE bypass | P3 accepted / later | — |
-| Keyspace | `typed_expires` side map (not slot header); search-doc eviction special | P3 | **FP** optional |
+| Cluster | remote dest CHECKPREPARE→COMMITPREPARE two-RPC window | P3 accepted lite | — |
+| Keyspace | expire slot header (`typed_expires` fold) | **done** | **FP** |
+| Keyspace | string TTL still on `Entry` (not slot header); search-doc eviction special | P3 residual | later |
 | Sentinel | Kore **higher** priority wins vs Redis Sentinel **lower** (documented honesty) | P3 accepted | — |
 | Ops | Global **repl backlog** still serializes writers | P3 | later (hard) |
 | Ops | Dual SELECT trackers; `propagate_raw` skips stream-DB | P3 accepted | — |
@@ -758,11 +763,12 @@ Also tracked in `docs/roadmap.md`.
 | MIGRATE / UI / load | DUMP wire; reshard weight UI; Arc-swap mid-fill | P3 accepted | — |
 | Tests | Sentinel suite hard-coded ports (flake risk under parallel bind) | P3 | later |
 
-### Next work queue (post-FO)
+### Next work queue (post-FP)
 
-**Committed letter queue through FO is empty.** Optional **FP** next. Standing rule: land tests with each batch.
+**Committed letter queue through FP is empty.** No further letter batches planned. Standing rule: land tests with each change. Resume from **Later / backlog** only.
 
-#### Completed (FB–FG-4 + FH + FI + FI-2 + FK + FL + FM)
+#### Completed (FB–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP)
+
 
 - [x] **`[P1]`** **Batch FB — Cluster dual-end NODE wire 2PC (slice 1)**
 - [x] **`[P1]`** **Batch FC — Sentinel promote-success gate**
@@ -780,7 +786,7 @@ Also tracked in `docs/roadmap.md`.
   - `KeyValue::String` physically in `Cache::key_values`; dual `Cache::map` removed; `mutate_string` RMW under shard lock + CAS
   - `KeyspacePayload` collapsed to single `key_values` stream (+ expires/WATCH/search/memory)
   - Eviction / active expire / SCAN / KEYS / DBSIZE / RENAME sample or walk one map
-  - *Post-ship review:* true single-map keyspace for all Redis types; residual `typed_expires` side map + search-doc eviction special
+  - *Post-ship review:* true single-map keyspace for all Redis types; residual closed by **FP** (`typed_expires` → slot); search-doc eviction special remains
   - Tests: keyspace / string_ops / typed_ttl / phase_a / eviction / persistence green
 - [x] **`[P2]`** **Batch FH — NODE 2PC slice 2** (`b078988`)
   - Prepare-epoch + TTL fence; `CHECKPREPARE` + dual-end commit re-check; soft clear fail-closed
@@ -797,8 +803,6 @@ Also tracked in `docs/roadmap.md`.
   - Fix: `ReplicationManager::propagate_write` — encode cmd outside locks; under `fullsync_gate`+backlog decide lazy SELECT, append SELECT+cmd (one payload) or cmd, update `ReplBacklog.selected_db`; AOF-off skips `aof` lock; AOF-on still holds AOF across disk append + `propagate_write` (disk/stream order)
   - Tests: `aof_select_concurrency_test` 8/8; unit `propagate_write_*` + `promote_resets_stream_selected_db`; multi-DB + TCP repl green
   - *Post-ship review:* correctness fix holds; residual global backlog serialize (P3); dual SELECT trackers (AOF vs stream) intentional; `propagate_raw` still no stream-DB update (low-level/tests only)
-
-#### Open optional queue (P3 only — pick when resuming)
 
 - [x] **`[P3]`** **Batch FK — Sentinel promote ranking + lite SM polish** (`78730ca`)
   - Rank: highest priority (0 never) → highest ROLE offset → greatest `ip:port` (mirrors cluster EA/EB)
@@ -830,31 +834,40 @@ Also tracked in `docs/roadmap.md`.
   - Tests: unit probe/`leader_votes_needed_for`; e2e CKQUORUM dead→NOQUORUM / live→OK; elect ignores dead peers; probe sticky vote
   - Residual: election-timeout SM (pre-attempt epoch thrash); optional parallel INFO enrich; ephemeral ports
 
-- [x] **`[P3]`** **Batch FO — NODE 2PC durable prepare**
+- [x] **`[P3]`** **Batch FO — NODE 2PC durable prepare** (`1ad6e6f`)
   - `nodes.conf` header `# prepare <slot> <target> <epoch> <unix_ms>`; SAVECONFIG / autosave write non-expired votes; load restores; expired/malformed skipped (fail-closed)
   - Prepare stamps wall-clock **unix-ms** (not process `Instant`) so TTL survives restart
   - Autosave on PREPARE / ABORTPREPARE / COMMITPREPARE when dir configured (dual-end local prepare too)
   - `SETSLOT COMMITPREPARE <node-id>` atomic check+NODE under one write lock; dual-end dest RESP + source local use it (NODE fallback for older peers; operator NODE still bypasses)
   - Closed FL residual (prepare not in conf) + FH residual (durable + atomic commit)
   - Tests: state prepare round-trip / expired not restored / COMMITPREPARE; migrate unit + **42/42** e2e; `cluster_test` Config compile fix
+  - *Post-ship review (2026-07-29):* dual-end dest-first COMMITPREPARE + source local atomic path green; recheck inject still fail-closed; remote dest still two RPCs (CHECKPREPARE then COMMITPREPARE) — accepted lite; no correctness bug
   - Residual: binary cluster bus 2PC; dest prepare breadth; operator NODE bypass (intentional); per-slot epochs not fully persisted in nodes.conf (file-epoch stamp + prepare fence)
+- [x] **`[P3]`** **Batch FP — Expire slot header** (`9ae7fac`)
+  - Folded side `typed_expires` into [`KeySlot::expires_at`] on the unified `key_values` map
+  - Map type: `ShardedKeyMap<KeySlot>`; `KeyspacePayload` carries slots only (no sibling expires map)
+  - EXPIRE/TTL/PERSIST/active expire/volatile sample/RENAME use slot expire; RDB/AOF still export/import via `export_typed_expires_unix_ms` / `set_typed_expire_unix_ms` (wire format unchanged)
+  - LOADING / take-install / multi-DB replace: typed TTL rides with each key through epoch install
+  - Tests: `typed_ttl_test` 12/12; keyspace take/install expire unit; active_expire / keyspace / multi-DB load green
+  - Residual: string TTL remains on `Entry` (not slot); search-doc eviction special
 
-#### Open optional queue (post-FO)
-- [ ] **`[P3]`** **Batch FP — Expire slot header (optional)**
-  - Fold `typed_expires` into per-key metadata on `KeyValue` / slot header; keep LOADING/epoch install correct
+
+#### Later / backlog (no letter batch)
+
 - [ ] **`[P3]`** **Later / backlog**
   - DUMP/RESTORE Redis wire; cluster reshard weight UI; admin_http auth/TLS
   - HNSW durable graph; single-DB Arc-swap mid-fill
   - Global repl backlog write serialization (FI residual; no Valkey parity claim)
   - Sentinel suite ephemeral ports (flake risk under parallel bind)
-  - Optional parallelize `enrich_replica_priorities` (serial INFO today)
-  - Cluster binary bus 2PC; dest prepare vote breadth
+  - Optional parallelize `enrich_replica_priorities` / `count_reachable_sentinels` (serial probes today)
+  - Cluster binary bus 2PC; dest prepare breadth; remote CHECK→COMMITPREPARE two-RPC window
   - Sentinel election-timeout SM (pre-attempt campaign epoch thrash while o_down)
   - Compiler nits (dead_code: `config_kv_reply`, SkipList `len`/`is_empty`/`level`; unused_mut in search + sentinel_lite)
+  - String TTL still on `Entry` (not unified onto `KeySlot`); search-doc eviction special
 
 ### Code review backlog
 
-**Batches CZ–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN shipped.** Optional **FO**/**FP** next. Standing tests-for-phase P0.
+**Batches CZ–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP shipped.** Letter queue empty; Later/backlog only. Standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -988,6 +1001,8 @@ Also tracked in `docs/roadmap.md`.
 | P3 | FM post-ship: serial INFO enrich; cooldown arms on success; begin_failover no-arm | **accepted lite** (no correctness bug) |
 | P3 | FN: CKQUORUM live PING + probe `*` honesty | **done** (Batch FN; hello SUBSCRIBE residual accepted) |
 | P3 | FO: durable NODE prepare + atomic COMMITPREPARE | **done** (Batch FO) |
+| P3 | FO post-ship: remote CHECK→COMMITPREPARE two-RPC; dest prepare breadth; bus | **accepted lite** (local commit atomic; operator NODE intentional) |
+| P3 | FN post-ship: serial peer PING; pre-attempt election epoch thrash | **accepted lite** / later SM |
 | P2 | dual-end NODE 2PC slice 2 (prepare-epoch / TTL / commit re-check) | **done** (Batch FH) |
 | P2 | FI pipeline SET perf | **done** (Batch FI; ~+25% P=16) |
 | P2/P3 | FI-2 AOF-off multi-DB SELECT ordering | **done** (Batch FI-2) |
@@ -1033,10 +1048,10 @@ Highest urgency checklist (phase order preserved):
 - [x] Unified keyspace + type safety + cross-type ops + maxmemory for all types
   - *Done (Batch X)*: cross-type eviction samples string/hash/list/set/zset/geo/stream victims
   - *Done (Batch AD)*: search documents are allkeys eviction victims
-  - *Done (Batch AE)*: typed-key TTL (`EXPIRE`/`PEXPIRE`/`TTL`/`PTTL`) via side `typed_expires` map; lazy + active expire; volatile policies sample typed keys with TTL; RDB v4 + AOF rewrite `PEXPIREAT`
+  - *Done (Batch AE)*: typed-key TTL (`EXPIRE`/`PEXPIRE`/`TTL`/`PTTL`); lazy + active expire; volatile policies sample typed keys with TTL; RDB v4 + AOF rewrite `PEXPIREAT` (side map → **FP** slot header)
   - *Done (Batch AF)*: full expire command family (`PERSIST`, `EXPIREAT`/`PEXPIREAT`, `EXPIRETIME`/`PEXPIRETIME`)
   - *Done (Batch AG)*: `MOVE` / `COPY` / `RANDOMKEY` / `TOUCH`
-  - *Follow-ups*: true single-map keyspace — **done FG-4** (strings + typed); `typed_expires` residual
+  - *Follow-ups*: true single-map keyspace — **done FG-4**; typed expire slot header — **done FP**
 - [x] Phase A concurrency / memory / EXAT / network tests (incl. AUTH)
 
 **B**
@@ -1057,4 +1072,4 @@ Highest urgency checklist (phase order preserved):
 - [x] Eviction policies (`maxmemory-policy`)
   - *Follow-ups*: Streams, bitmaps/HLL, RESP3 (done elsewhere); LFU decay done in Batch AB
 
-**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB–FN** letter work is committed complete. Resume from **Next work queue (post-FN)** — optional **FO**/**FP** (P3 only) or Later/backlog.
+**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB–FP** letter work is committed complete. Resume from **Next work queue (post-FP)** — Later/backlog only (no more letter batches).

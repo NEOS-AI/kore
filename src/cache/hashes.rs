@@ -11,7 +11,7 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
-use super::keyspace::KeyValue;
+use super::keyspace::{KeySlot, KeyValue};
 use super::storage::KeyType;
 use super::Cache;
 
@@ -49,12 +49,12 @@ impl Cache {
             RedisHash::new().memory_size(),
         );
         self.ensure_non_string_capacity(base)?;
-        let kv = self.key_values.get_or_insert_with(key.clone(), || {
+        let slot = self.key_values.get_or_insert_with(key.clone(), || {
             self.memory_tracker
                 .account(base, MemoryCategory::Hashes);
-            KeyValue::Hash(Arc::new(RwLock::new(RedisHash::new())))
+            KeySlot::new(KeyValue::Hash(Arc::new(RwLock::new(RedisHash::new()))))
         });
-        match kv {
+        match slot.value {
             KeyValue::Hash(h) => Ok(h),
             _ => Err(crate::error::Error::WrongType),
         }
@@ -64,7 +64,10 @@ impl Cache {
     #[inline]
     fn hash_from_key_values(&self, key: &Bytes) -> Option<SharedHash> {
         match self.key_values.get(key) {
-            Some(KeyValue::Hash(h)) => Some(h),
+            Some(KeySlot {
+                value: KeyValue::Hash(h),
+                ..
+            }) => Some(h),
             _ => None,
         }
     }
@@ -75,7 +78,10 @@ impl Cache {
 
     pub fn remove_hash(&self, key: &Bytes) -> bool {
         match self.key_values.remove(key) {
-            Some(KeyValue::Hash(h)) => {
+            Some(KeySlot {
+                value: KeyValue::Hash(h),
+                ..
+            }) => {
                 let size =
                     crate::memory::estimate_keyed_object(key.len(), h.read().memory_size());
                 self.memory_tracker
@@ -91,7 +97,13 @@ impl Cache {
     }
 
     pub fn hash_exists(&self, key: &Bytes) -> bool {
-        matches!(self.key_values.get(key), Some(KeyValue::Hash(_)))
+        matches!(
+            self.key_values.get(key),
+            Some(KeySlot {
+                value: KeyValue::Hash(_),
+                ..
+            })
+        )
     }
 
     /// Remove empty hash key after mutations that may empty it.
@@ -109,8 +121,8 @@ impl Cache {
     /// Skips keys whose typed TTL has already elapsed (no revive without TTL).
     pub fn export_hashes(&self) -> Vec<(Bytes, Vec<(Bytes, Bytes)>)> {
         let mut out = Vec::new();
-        self.key_values.for_each(|key, kv| {
-            let KeyValue::Hash(h) = kv else {
+        self.key_values.for_each(|key, slot| {
+            let KeyValue::Hash(h) = &slot.value else {
                 return;
             };
             if !self.typed_key_exportable(key) {

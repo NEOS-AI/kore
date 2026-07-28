@@ -7,7 +7,7 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
-use super::keyspace::KeyValue;
+use super::keyspace::{KeySlot, KeyValue};
 use super::storage::KeyType;
 use super::Cache;
 
@@ -61,12 +61,12 @@ impl Cache {
             SortedSet::new().memory_size(),
         );
         self.ensure_non_string_capacity(base)?;
-        let kv = self.key_values.get_or_insert_with(key.clone(), || {
+        let slot = self.key_values.get_or_insert_with(key.clone(), || {
             self.memory_tracker
                 .account(base, MemoryCategory::SortedSets);
-            KeyValue::ZSet(Arc::new(RwLock::new(SortedSet::new())))
+            KeySlot::new(KeyValue::ZSet(Arc::new(RwLock::new(SortedSet::new()))))
         });
-        match kv {
+        match slot.value {
             KeyValue::ZSet(z) => Ok(z),
             _ => Err(Error::WrongType),
         }
@@ -75,7 +75,10 @@ impl Cache {
     #[inline]
     fn sorted_set_from_key_values(&self, key: &Bytes) -> Option<SharedSortedSet> {
         match self.key_values.get(key) {
-            Some(KeyValue::ZSet(z)) => Some(z),
+            Some(KeySlot {
+                value: KeyValue::ZSet(z),
+                ..
+            }) => Some(z),
             _ => None,
         }
     }
@@ -88,7 +91,10 @@ impl Cache {
     /// Remove a sorted set and free its tracked memory
     pub fn remove_sorted_set(&self, key: &Bytes) -> bool {
         match self.key_values.remove(key) {
-            Some(KeyValue::ZSet(set)) => {
+            Some(KeySlot {
+                value: KeyValue::ZSet(set),
+                ..
+            }) => {
                 let size =
                     crate::memory::estimate_keyed_object(key.len(), set.read().memory_size());
                 self.memory_tracker
@@ -105,15 +111,21 @@ impl Cache {
 
     /// Check if a sorted set exists
     pub fn sorted_set_exists(&self, key: &Bytes) -> bool {
-        matches!(self.key_values.get(key), Some(KeyValue::ZSet(_)))
+        matches!(
+            self.key_values.get(key),
+            Some(KeySlot {
+                value: KeyValue::ZSet(_),
+                ..
+            })
+        )
     }
 
     /// Export all sorted sets for persistence: (key, [(member, score), ...]).
     /// Skips keys whose typed TTL has already elapsed (no revive without TTL).
     pub fn export_zsets(&self) -> Vec<(Bytes, Vec<(Bytes, f64)>)> {
         let mut out = Vec::new();
-        self.key_values.for_each(|key, kv| {
-            let KeyValue::ZSet(zset) = kv else {
+        self.key_values.for_each(|key, slot| {
+            let KeyValue::ZSet(zset) = &slot.value else {
                 return;
             };
             if !self.typed_key_exportable(key) {

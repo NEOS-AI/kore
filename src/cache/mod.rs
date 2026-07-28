@@ -16,7 +16,7 @@ mod key_xfer;
 mod keyspace;
 
 pub use bitmap::{BitOpKind, BitfieldOp, BitfieldOverflow};
-pub use keyspace::KeyValue;
+pub use keyspace::{KeySlot, KeyValue};
 
 use crate::hashmap::ShardedKeyMap;
 use crate::list_block::ListBlockers;
@@ -27,11 +27,10 @@ use crate::search_index::SearchIndexManager;
 use crate::slowlog::SlowLog;
 use crate::acl_log::AclLog;
 use bytes::Bytes;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
 use std::sync::Arc;
-use std::time::Instant;
 
 pub use storage::KeyType;
 pub(crate) use storage::KeyspacePayload;
@@ -39,24 +38,22 @@ pub use eviction::EvictionPolicy;
 
 /// The main cache structure.
 ///
-/// # Keyspace layout (Batch FG / FG-2 / FG-3 / FG-4)
+/// # Keyspace layout (Batch FG / FG-2 / FG-3 / FG-4 / FP)
 ///
 /// Logical Redis keyspace is **one name → one typed value**. Cross-type ops use
 /// the [`KeyValue`] facade ([`Cache::get_key_value`]).
 ///
-/// **Physical storage (FG-4):** **all** types — including strings — live in
-/// [`Self::key_values`] as [`KeyValue`] variants. See `keyspace` module docs and
-/// `docs/module_architectures.md`.
+/// **Physical storage (FG-4 / FP):** **all** types — including strings — live in
+/// [`Self::key_values`] as [`KeySlot`] `{ expires_at, value }`. Typed-key TTL is
+/// on the slot (Batch FP); strings keep TTL on `Entry`. See `keyspace` module
+/// docs and `docs/module_architectures.md`.
 pub struct Cache {
-    /// Unified keyspace map: String / Hash / List / Set / ZSet / Geo / Stream.
-    pub(super) key_values: ShardedKeyMap<KeyValue>,
+    /// Unified keyspace map: KeySlot (value + optional typed expire).
+    pub(super) key_values: ShardedKeyMap<KeySlot>,
     /// Clients blocked on empty lists (BLPOP / BRPOP) for this keyspace.
     pub list_blockers: ListBlockers,
     /// Clients blocked on streams (XREAD / XREADGROUP BLOCK) for this keyspace.
     pub stream_blockers: ListBlockers,
-    /// Absolute Instant expiry for non-string keys (Redis expires-dict style).
-    /// Strings keep TTL on `Entry`; typed keys store it here (slot-header fold residual).
-    pub(super) typed_expires: RwLock<HashMap<Bytes, Instant>>,
     /// Pub/Sub system
     pub pubsub: Arc<PubSub>,
     /// Search index manager
@@ -139,7 +136,6 @@ impl Cache {
             key_values: ShardedKeyMap::new(num_shards),
             list_blockers: ListBlockers::new(),
             stream_blockers: ListBlockers::new(),
-            typed_expires: RwLock::new(HashMap::new()),
             pubsub: PubSub::new(),
             search_index_manager: Arc::new(SearchIndexManager::new()),
             memory_tracker,
@@ -210,7 +206,6 @@ impl Cache {
             key_values: ShardedKeyMap::new(num_shards),
             list_blockers: ListBlockers::new(),
             stream_blockers: ListBlockers::new(),
-            typed_expires: RwLock::new(HashMap::new()),
             pubsub: Arc::clone(&shared.pubsub),
             search_index_manager: Arc::new(SearchIndexManager::new()),
             memory_tracker,

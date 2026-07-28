@@ -582,7 +582,7 @@ impl ShardedHashMap {
 /// Same sharding idea as [`ShardedHashMap`]: keys hash to independent
 /// `parking_lot::RwLock` shards so concurrent ops on different keys do not
 /// contend on one global lock. Per-shard CAS counters support string RMW
-/// (SET NX / INCR / CAS) when values are [`crate::cache::KeyValue::String`].
+/// (SET NX / INCR / CAS) when values are string slots (`KeySlot` / `KeyValue::String`).
 pub struct ShardedKeyMap<V> {
     shards: Vec<RwLock<HashMap<Bytes, V, RandomState>>>,
     /// Per-shard CAS counters for string Entry.cas (Batch FG-4).

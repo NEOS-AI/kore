@@ -1,9 +1,11 @@
 use crate::error::Result;
+use crate::hashmap::MapAction;
 use bytes::Bytes;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::keyspace::KeySlot;
 use super::storage::KeyType;
 use super::Cache;
 
@@ -29,16 +31,25 @@ impl Cache {
                     let mut new_entry = (*entry).clone();
                     new_entry.expires_at = Some(Instant::now() + Duration::from_millis(ttl_ms));
                     self.key_values
-                        .insert(key.clone(), super::KeyValue::String(Arc::new(new_entry)));
+                        .insert(key.clone(), KeySlot::string(Arc::new(new_entry)));
                     Ok(true)
                 }
                 None => Ok(false),
             },
             _ => {
-                self.typed_expires
-                    .write()
-                    .insert(key.clone(), Instant::now() + Duration::from_millis(ttl_ms));
-                Ok(true)
+                // Batch FP: typed expire lives on KeySlot.
+                let set = self.key_values.mutate(key, |cur, _| {
+                    match cur {
+                        Some(slot) if slot.value.is_typed_container() => {
+                            let mut s = slot.clone();
+                            s.expires_at =
+                                Some(Instant::now() + Duration::from_millis(ttl_ms));
+                            (MapAction::Set(s), true)
+                        }
+                        _ => (MapAction::Keep, false),
+                    }
+                });
+                Ok(set)
             }
         }
     }
@@ -78,12 +89,21 @@ impl Cache {
                     let mut new_entry = (*entry).clone();
                     new_entry.expires_at = None;
                     self.key_values
-                        .insert(key.clone(), super::KeyValue::String(Arc::new(new_entry)));
+                        .insert(key.clone(), KeySlot::string(Arc::new(new_entry)));
                     true
                 }
                 _ => false,
             },
-            _ => self.typed_expires.write().remove(key).is_some(),
+            _ => self.key_values.mutate(key, |cur, _| {
+                match cur {
+                    Some(slot) if slot.expires_at.is_some() && slot.value.is_typed_container() => {
+                        let mut s = slot.clone();
+                        s.expires_at = None;
+                        (MapAction::Set(s), true)
+                    }
+                    _ => (MapAction::Keep, false),
+                }
+            }),
         }
     }
 
@@ -99,11 +119,11 @@ impl Cache {
             return -2;
         }
 
-        if self.typed_key_present_raw(key) {
-            return match self.typed_expires.read().get(key) {
+        match self.key_values.get(key) {
+            Some(slot) if slot.value.is_typed_container() => match slot.expires_at {
                 Some(exp) => {
                     let now = Instant::now();
-                    if *exp <= now {
+                    if exp <= now {
                         // Race: treat as gone; next access purges.
                         0
                     } else {
@@ -111,61 +131,47 @@ impl Cache {
                     }
                 }
                 None => -1,
-            };
-        }
-
-        -2
-    }
-
-    /// Absolute Instant expiry for a typed key, if any.
-    pub(super) fn typed_expires_at(&self, key: &Bytes) -> Option<Instant> {
-        self.typed_expires.read().get(key).copied()
-    }
-
-    /// Clear typed expire metadata (call when deleting/overwriting a typed key).
-    pub(super) fn clear_typed_expire(&self, key: &Bytes) {
-        self.typed_expires.write().remove(key);
-    }
-
-    /// Move typed expire from `src` to `dst` (RENAME).
-    pub(super) fn move_typed_expire(&self, src: &Bytes, dst: &Bytes) {
-        let mut g = self.typed_expires.write();
-        if let Some(exp) = g.remove(src) {
-            g.insert(dst.clone(), exp);
-        } else {
-            // Destination may have had its own expire; src had none → clear dst.
-            g.remove(dst);
+            },
+            _ => -2,
         }
     }
 
     /// Whether a typed key should be included in persistence export.
     ///
-    /// Returns false when the key has a past `typed_expires` entry (would be
+    /// Returns false when the key has a past expire on its slot (would be
     /// revived without TTL if exported). Keys with no expire record are live.
     pub(super) fn typed_key_exportable(&self, key: &Bytes) -> bool {
-        match self.typed_expires.read().get(key) {
-            Some(exp) if *exp <= Instant::now() => false,
+        match self.key_values.get(key) {
+            Some(slot) if slot.value.is_typed_container() => match slot.expires_at {
+                Some(exp) if exp <= Instant::now() => false,
+                _ => true,
+            },
             _ => true,
         }
     }
 
-    /// Export typed expires as absolute Unix ms for persistence.
+    /// Export typed expires as absolute Unix ms for persistence (RDB section).
     pub fn export_typed_expires_unix_ms(&self) -> Vec<(Bytes, i64)> {
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let now = Instant::now();
-        let g = self.typed_expires.read();
-        g.iter()
-            .filter_map(|(k, exp)| {
-                if *exp <= now {
-                    return None;
-                }
-                let remaining_ms = exp.duration_since(now).as_millis() as i64;
-                Some((k.clone(), now_unix + remaining_ms))
-            })
-            .collect()
+        let mut out = Vec::new();
+        self.key_values.for_each(|k, slot| {
+            if !slot.value.is_typed_container() {
+                return;
+            }
+            let Some(exp) = slot.expires_at else {
+                return;
+            };
+            if exp <= now {
+                return;
+            }
+            let remaining_ms = exp.duration_since(now).as_millis() as i64;
+            out.push((k.clone(), now_unix + remaining_ms));
+        });
+        out
     }
 
     /// Restore a typed-key expire from absolute Unix epoch ms (load path).
@@ -184,41 +190,36 @@ impl Cache {
         }
         let remaining = (expire_unix_ms - now_unix) as u64;
         // Only set if typed key still exists (skip strings).
-        match self.key_type(key) {
-            KeyType::None | KeyType::String => {}
-            _ => {
-                self.typed_expires
-                    .write()
-                    .insert(key.clone(), Instant::now() + Duration::from_millis(remaining));
+        let _ = self.key_values.mutate(key, |cur, _| {
+            match cur {
+                Some(slot) if slot.value.is_typed_container() => {
+                    let mut s = slot.clone();
+                    s.expires_at = Some(Instant::now() + Duration::from_millis(remaining));
+                    (MapAction::Set(s), ())
+                }
+                _ => (MapAction::Keep, ()),
             }
-        }
+        });
     }
 
     /// If `key` is a typed key past its expire, delete it and return true.
     pub(super) fn purge_typed_if_expired(&self, key: &Bytes) -> bool {
-        let exp = match self.typed_expires.read().get(key).copied() {
-            Some(e) => e,
-            None => return false,
+        let exp = match self.key_values.get(key) {
+            Some(slot) if slot.value.is_typed_container() => match slot.expires_at {
+                Some(e) => e,
+                None => return false,
+            },
+            _ => return false,
         };
         if Instant::now() < exp {
             return false;
         }
-        // Past due: remove expire first to avoid re-entry, then delete value.
-        self.typed_expires.write().remove(key);
+        // Past due: remove the whole slot (value + expire).
         let _ = self.delete_without_clearing_expire(key);
         true
     }
 
-    /// Whether a typed (non-string) key is present, without purging.
-    fn typed_key_present_raw(&self, key: &Bytes) -> bool {
-        // FG-4: strings share key_values — only non-string variants count.
-        matches!(
-            self.key_values.get(key),
-            Some(kv) if kv.is_typed_container()
-        )
-    }
-
-    /// Delete any key type without touching typed_expires (caller manages expire).
+    /// Delete any key type; expire is on the slot and drops with remove.
     fn delete_without_clearing_expire(&self, key: &Bytes) -> Result<bool> {
         let deleted = self.remove_key_value_raw(key);
         if deleted {
@@ -229,48 +230,42 @@ impl Cache {
     }
 
     /// Sample expired typed keys and delete them (active expire companion).
-    /// Returns (keys_deleted, approx_bytes — always 0; typed accounting is in remove_*).
+    /// Returns keys deleted count (typed accounting is in remove_*).
     pub(super) fn active_expire_typed(&self, samples: usize) -> usize {
-        use rand::Rng;
         if samples == 0 {
             return 0;
         }
         let now = Instant::now();
-        // Snapshot candidate keys under read lock.
-        let candidates: Vec<Bytes> = {
-            let g = self.typed_expires.read();
-            if g.is_empty() {
-                return 0;
+        // Sample random slots; collect keys whose typed expire is past due.
+        let mut candidates = Vec::with_capacity(samples);
+        let attempts = samples.saturating_mul(5).max(samples);
+        for _ in 0..attempts {
+            if candidates.len() >= samples {
+                break;
             }
-            let mut rng = rand::thread_rng();
-            let len = g.len();
-            let mut out = Vec::with_capacity(samples.min(len));
-            let attempts = samples.saturating_mul(3).max(samples);
-            for _ in 0..attempts {
-                if out.len() >= samples {
-                    break;
-                }
-                let idx = rng.gen_range(0..len);
-                if let Some((k, exp)) = g.iter().nth(idx) {
-                    if *exp <= now {
-                        out.push(k.clone());
-                    }
+            let Some((k, slot)) = self.key_values.get_random() else {
+                break;
+            };
+            if !slot.value.is_typed_container() {
+                continue;
+            }
+            if let Some(exp) = slot.expires_at {
+                if exp <= now {
+                    candidates.push(k);
                 }
             }
-            out
-        };
+        }
 
         let mut count = 0usize;
         for key in candidates {
             // Re-check under write path.
-            let still_expired = self
-                .typed_expires
-                .read()
-                .get(&key)
-                .map(|e| *e <= Instant::now())
-                .unwrap_or(false);
+            let still_expired = match self.key_values.get(&key) {
+                Some(slot) if slot.value.is_typed_container() => {
+                    slot.expires_at.map(|e| e <= Instant::now()).unwrap_or(false)
+                }
+                _ => false,
+            };
             if still_expired {
-                self.typed_expires.write().remove(&key);
                 if self.delete_without_clearing_expire(&key).unwrap_or(false) {
                     count += 1;
                     self.stats

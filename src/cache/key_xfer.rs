@@ -271,8 +271,8 @@ impl Cache {
     /// Return a random existing key, or None if the DB is empty.
     pub fn random_key(&self) -> Option<Bytes> {
         // Prefer O(1)-ish sample from the unified map; fall back to keys() sample.
-        if let Some((k, kv)) = self.key_values.get_random() {
-            match kv {
+        if let Some((k, slot)) = self.key_values.get_random() {
+            match slot.value {
                 super::KeyValue::String(e) if !e.is_expired() => return Some(k),
                 super::KeyValue::String(_) => {} // expired string — fall through
                 _ => return Some(k),

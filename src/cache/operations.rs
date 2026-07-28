@@ -6,7 +6,7 @@ use bytes::Bytes;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use super::keyspace::KeyValue;
+use super::keyspace::{KeySlot, KeyValue};
 use super::Cache;
 
 impl Cache {
@@ -429,12 +429,12 @@ impl Cache {
                 return Err(Error::InvalidArgument("no such key".into()));
             }
             super::KeyType::String => {
-                let kv = self
+                let slot = self
                     .key_values
                     .remove(src)
                     .ok_or_else(|| Error::InvalidArgument("no such key".into()))?;
-                let KeyValue::String(entry) = kv else {
-                    self.key_values.insert(src.clone(), kv);
+                let KeyValue::String(entry) = slot.value.clone() else {
+                    self.key_values.insert(src.clone(), slot);
                     return Err(Error::InvalidArgument("no such key".into()));
                 };
                 let old_size = entry.size();
@@ -442,7 +442,7 @@ impl Cache {
                 new_entry.key = dst.clone();
                 let new_size = new_entry.size();
                 self.key_values
-                    .insert(dst.clone(), KeyValue::String(Arc::new(new_entry)));
+                    .insert(dst.clone(), KeySlot::string(Arc::new(new_entry)));
                 // Adjust memory for key-length delta
                 if new_size > old_size {
                     let delta = new_size - old_size;
@@ -457,21 +457,20 @@ impl Cache {
                 }
             }
             _ => {
-                let kv = self
+                // Batch FP: whole KeySlot moves (value + typed expire).
+                let slot = self
                     .key_values
                     .remove(src)
                     .ok_or_else(|| Error::InvalidArgument("no such key".into()))?;
-                if kv.key_type() != src_type {
+                if slot.value.key_type() != src_type {
                     // Defensive: put back if type mismatch (should not happen).
-                    self.key_values.insert(src.clone(), kv);
+                    self.key_values.insert(src.clone(), slot);
                     return Err(Error::InvalidArgument("no such key".into()));
                 }
-                let content = kv.content_memory_size();
-                let cat = kv.memory_category();
+                let content = slot.value.content_memory_size();
+                let cat = slot.value.memory_category();
                 self.account_typed_key_rename(src, dst, content, cat);
-                self.key_values.insert(dst.clone(), kv);
-                // Carry typed-key TTL with the rename (Redis keeps expire on RENAME).
-                self.move_typed_expire(src, dst);
+                self.key_values.insert(dst.clone(), slot);
             }
         }
 

@@ -10,7 +10,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::keyspace::KeyValue;
+use super::keyspace::{KeySlot, KeyValue};
 use super::Cache;
 
 /// Drained keyspace held between multi-DB stage and install.
@@ -18,13 +18,12 @@ use super::Cache;
 /// Built by [`Cache::take_keyspace_payload`]; consumed by
 /// [`Cache::install_keyspace_payload`]. Not part of the public API.
 ///
-/// **FG-4:** one `key_values` stream holds every type (String + typed).
-/// Expires / WATCH / search schema / memory counters are sibling fields
-/// (`typed_expires` slot-header fold remains residual).
+/// **FG-4 / FP:** one `key_values` stream holds every type as [`KeySlot`]
+/// (value + optional typed expire). WATCH / search schema / memory counters
+/// remain sibling fields. Typed TTL no longer uses a side expires map.
 pub(crate) struct KeyspacePayload {
-    /// All keys from [`Cache::key_values`] (String / Hash / List / Set / ZSet / Geo / Stream).
-    key_values: Vec<(Bytes, KeyValue)>,
-    expires: HashMap<Bytes, Instant>,
+    /// All keys from [`Cache::key_values`] as slots (String + typed + expire).
+    key_values: Vec<(Bytes, KeySlot)>,
     watch: HashMap<Bytes, u64>,
     indices: HashMap<String, Arc<RwLock<SearchIndex>>>,
     aliases: HashMap<String, String>,
@@ -109,8 +108,14 @@ impl Cache {
         }
         match self.key_values.get(key) {
             None => Ok(()),
-            Some(KeyValue::String(e)) if e.is_expired() => Ok(()),
-            Some(KeyValue::String(_)) => Ok(()),
+            Some(KeySlot {
+                value: KeyValue::String(e),
+                ..
+            }) if e.is_expired() => Ok(()),
+            Some(KeySlot {
+                value: KeyValue::String(_),
+                ..
+            }) => Ok(()),
             Some(_) => Err(Error::WrongType),
         }
     }
@@ -125,7 +130,10 @@ impl Cache {
     {
         self.key_values.mutate(key, |current, next_cas| {
             match current {
-                Some(KeyValue::String(entry)) => {
+                Some(KeySlot {
+                    value: KeyValue::String(entry),
+                    ..
+                }) => {
                     let (action, r) = f(Some(entry), next_cas);
                     (Self::string_map_action(action), Ok(r))
                 }
@@ -139,10 +147,10 @@ impl Cache {
     }
 
     #[inline]
-    fn string_map_action(action: EntryAction) -> MapAction<KeyValue> {
+    fn string_map_action(action: EntryAction) -> MapAction<KeySlot> {
         match action {
             EntryAction::Keep => MapAction::Keep,
-            EntryAction::Set(e) => MapAction::Set(KeyValue::String(e)),
+            EntryAction::Set(e) => MapAction::Set(KeySlot::string(e)),
             EntryAction::Remove => MapAction::Remove,
         }
     }
@@ -376,11 +384,18 @@ impl Cache {
         self.stats.incr(&self.stats.cmd_get);
 
         match self.key_values.get(key) {
-            Some(KeyValue::String(entry)) => {
+            Some(KeySlot {
+                value: KeyValue::String(entry),
+                ..
+            }) => {
                 if entry.is_expired() {
                     // Remove expired entry and free both counters
                     let size = entry.size();
-                    if let Some(KeyValue::String(_)) = self.key_values.remove(key) {
+                    if let Some(KeySlot {
+                        value: KeyValue::String(_),
+                        ..
+                    }) = self.key_values.remove(key)
+                    {
                         self.memory_usage.fetch_sub(size, Ordering::Relaxed);
                         self.memory_tracker
                             .deallocate(size, MemoryCategory::Cache);
@@ -415,15 +430,13 @@ impl Cache {
 
     /// Delete a key of any type (unified keyspace facade).
     ///
-    /// Removes the value via [`Cache::remove_key_value_raw`], clears typed
-    /// expire metadata, and drops search-index documents for the name.
+    /// Removes the slot via [`Cache::remove_key_value_raw`] (value + typed
+    /// expire) and drops search-index documents for the name.
     pub fn delete(&self, key: &Bytes) -> Result<bool> {
         self.stats.incr(&self.stats.cmd_del);
 
+        // Slot remove drops typed expire with the value (Batch FP).
         let deleted = self.remove_key_value_raw(key);
-
-        // Always drop typed expire metadata (no-op if absent).
-        self.clear_typed_expire(key);
 
         // DEL/UNLINK: remove key from any matching search indices
         if deleted {
@@ -533,16 +546,14 @@ impl Cache {
     /// any target is mutated — a panic while draining later DBs leaves all
     /// targets intact. Single-DB [`replace_keyspace_from`] uses the same path.
     pub(crate) fn take_keyspace_payload(&self) -> KeyspacePayload {
-        // FG-4: one stream for all types (String + typed).
+        // FG-4 / FP: one stream for all types; typed expire on each KeySlot.
         let key_values = self.key_values.drain_all();
-        let expires = std::mem::take(&mut *self.typed_expires.write());
         let watch = std::mem::take(&mut *self.watch_gens.lock());
         let (indices, aliases) = self.search_index_manager.take_all();
         let counts = self.memory_tracker.take_keyspace_counts();
         let mem = self.memory_usage.swap(0, Ordering::Relaxed);
         KeyspacePayload {
             key_values,
-            expires,
             watch,
             indices,
             aliases,
@@ -565,8 +576,8 @@ impl Cache {
     ///
     /// A panic **inside** this method (after drain, mid-fill) still leaves a
     /// single-DB tear; discards are only returned after fill completes.
-    /// Command path relies on `-LOADING` for that window. FG-4: single
-    /// `key_values` fill (no separate string map stream).
+    /// Command path relies on `-LOADING` for that window. FG-4 / FP: single
+    /// `key_values` fill (slots carry typed expire; no side expires map).
     pub(crate) fn install_keyspace_payload_retaining_discard(
         &self,
         payload: KeyspacePayload,
@@ -575,7 +586,6 @@ impl Cache {
 
         // Drain target into discard, then install staged state.
         let discard_key_values = self.key_values.drain_all();
-        let discard_expires = std::mem::take(&mut *self.typed_expires.write());
         let discard_watch = std::mem::take(&mut *self.watch_gens.lock());
         let (discard_indices, discard_aliases) = self.search_index_manager.take_all();
         let discard_counts = self.memory_tracker.take_keyspace_counts();
@@ -583,7 +593,6 @@ impl Cache {
 
         // Map already drained into discard_* above — fill only (no second drain).
         self.key_values.fill_all(payload.key_values);
-        *self.typed_expires.write() = payload.expires;
         // Install scratch watch map and bump pre-swap keys under one lock so
         // `watch_generation` cannot observe a clean empty map mid-replace.
         {
@@ -602,7 +611,6 @@ impl Cache {
 
         KeyspacePayload {
             key_values: discard_key_values,
-            expires: discard_expires,
             watch: discard_watch,
             indices: discard_indices,
             aliases: discard_aliases,
@@ -627,7 +635,7 @@ impl Cache {
     /// cannot race map/counter install. Intended only for AOF/RDB scratch-load
     /// commit after a successful decode/replay into `other`.
     ///
-    /// Swaps: `key_values` (all types including strings), typed_expires,
+    /// Swaps: `key_values` (all types including strings; typed expire on slots),
     /// watch_gens, search indices/aliases, MemoryTracker keyspace category
     /// counts, and `memory_usage`. Memory is moved only via tracker take/install
     /// + `memory_usage` store (never per-key `account` after map replace).
@@ -658,8 +666,8 @@ impl Cache {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let mut out = Vec::new();
-        self.key_values.for_each(|_key, kv| {
-            let KeyValue::String(entry) = kv else {
+        self.key_values.for_each(|_key, slot| {
+            let KeyValue::String(entry) = &slot.value else {
                 return;
             };
             if entry.is_expired() {
@@ -679,17 +687,16 @@ impl Cache {
         out
     }
 
-    /// Clear the unified key map / expires (not search schema).
+    /// Clear the unified key map (slots include typed expires; not search schema).
     fn flush_keyspace(&self) {
         self.key_values.clear();
-        self.typed_expires.write().clear();
     }
 
     /// All non-expired string keys in the unified map (for persistence / migrate).
     pub fn map_keys_all(&self) -> Vec<Bytes> {
         let mut out = Vec::new();
-        self.key_values.for_each(|key, kv| {
-            if let KeyValue::String(e) = kv {
+        self.key_values.for_each(|key, slot| {
+            if let KeyValue::String(e) = &slot.value {
                 if !e.is_expired() {
                     out.push(key.clone());
                 }
@@ -702,11 +709,14 @@ impl Cache {
     pub fn keys(&self, pattern: Option<&str>) -> Vec<Bytes> {
         let mut result = Vec::new();
 
-        // FG-4: single map — skip expired strings and purge expired typed.
+        // FG-4 / FP: single map — skip expired strings and purge expired typed.
         for key in self.key_values.keys(pattern) {
             match self.key_values.get(&key) {
-                Some(KeyValue::String(e)) if e.is_expired() => continue,
-                Some(kv) if kv.is_typed_container() => {
+                Some(KeySlot {
+                    value: KeyValue::String(e),
+                    ..
+                }) if e.is_expired() => continue,
+                Some(slot) if slot.value.is_typed_container() => {
                     if self.purge_typed_if_expired(&key) {
                         continue;
                     }

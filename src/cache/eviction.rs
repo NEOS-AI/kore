@@ -208,7 +208,10 @@ impl Cache {
         match c.key_type {
             KeyType::String => {
                 match self.key_values.remove(&c.key) {
-                    Some(super::KeyValue::String(entry)) => {
+                    Some(super::KeySlot {
+                        value: super::KeyValue::String(entry),
+                        ..
+                    }) => {
                         let size = entry.size();
                         self.memory_usage.fetch_sub(size, Ordering::Relaxed);
                         self.memory_tracker.deallocate(size, MemoryCategory::Cache);
@@ -295,8 +298,8 @@ impl Cache {
             let n = draw.max(sample_size).max(1);
             let decay = self.lfu_decay_time.load(Ordering::Relaxed);
 
-            for (k, kv) in self.key_values.get_n_random(n) {
-                match &kv {
+            for (k, slot) in self.key_values.get_n_random(n) {
+                match &slot.value {
                     super::KeyValue::String(e) => {
                         if e.is_expired() {
                             continue;
@@ -315,7 +318,8 @@ impl Cache {
                         });
                     }
                     other => {
-                        let exp = self.typed_expires_at(&k);
+                        // Batch FP: typed expire is on the slot header.
+                        let exp = slot.expires_at;
                         if volatile_only && exp.is_none() {
                             continue;
                         }
@@ -507,8 +511,8 @@ impl Cache {
         let mut bytes_freed = 0usize;
         let expired: Vec<Bytes> = {
             let mut keys = Vec::new();
-            self.key_values.for_each(|k, kv| {
-                if let super::KeyValue::String(e) = kv {
+            self.key_values.for_each(|k, slot| {
+                if let super::KeyValue::String(e) = &slot.value {
                     if e.is_expired() {
                         keys.push(k.clone());
                     }
@@ -517,14 +521,18 @@ impl Cache {
             keys
         };
         for key in expired {
-            if let Some(super::KeyValue::String(e)) = self.key_values.remove(&key) {
+            if let Some(super::KeySlot {
+                value: super::KeyValue::String(e),
+                ..
+            }) = self.key_values.remove(&key)
+            {
                 if e.is_expired() {
                     bytes_freed += e.size();
                     count += 1;
                 } else {
                     // Renewed between scan and remove — put back.
                     self.key_values
-                        .insert(key, super::KeyValue::String(e));
+                        .insert(key, super::KeySlot::string(e));
                 }
             }
         }
@@ -558,10 +566,10 @@ impl Cache {
                 if pass_sampled >= samples_per_pass || start.elapsed() >= time_budget {
                     break;
                 }
-                let Some((k, kv)) = self.key_values.get_random() else {
+                let Some((k, slot)) = self.key_values.get_random() else {
                     break;
                 };
-                let super::KeyValue::String(entry) = kv else {
+                let super::KeyValue::String(entry) = slot.value else {
                     continue;
                 };
                 if entry.expires_at.is_none() {
@@ -574,7 +582,10 @@ impl Cache {
                 }
                 // Re-check under write: remove only if still expired string.
                 match self.key_values.remove(&k) {
-                    Some(super::KeyValue::String(cur)) if cur.is_expired() => {
+                    Some(super::KeySlot {
+                        value: super::KeyValue::String(cur),
+                        ..
+                    }) if cur.is_expired() => {
                         let size = cur.size();
                         total.count += 1;
                         total.bytes_freed += size;
@@ -599,16 +610,19 @@ impl Cache {
         total
     }
 
-    /// Delete all typed keys whose expire Instant is in the past.
+    /// Delete all typed keys whose slot expire Instant is in the past.
     fn sweep_typed_expired(&self) -> usize {
         let now = Instant::now();
-        let expired: Vec<Bytes> = self
-            .typed_expires
-            .read()
-            .iter()
-            .filter(|(_, exp)| **exp <= now)
-            .map(|(k, _)| k.clone())
-            .collect();
+        let mut expired = Vec::new();
+        self.key_values.for_each(|k, slot| {
+            if slot.value.is_typed_container() {
+                if let Some(exp) = slot.expires_at {
+                    if exp <= now {
+                        expired.push(k.clone());
+                    }
+                }
+            }
+        });
         let mut count = 0usize;
         for key in expired {
             // purge_typed_if_expired re-checks and deletes without cmd_del bump.

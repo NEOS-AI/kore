@@ -7,7 +7,7 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
-use super::keyspace::KeyValue;
+use super::keyspace::{KeySlot, KeyValue};
 use super::storage::KeyType;
 use super::Cache;
 
@@ -36,12 +36,12 @@ impl Cache {
             RedisList::new().memory_size(),
         );
         self.ensure_non_string_capacity(base)?;
-        let kv = self.key_values.get_or_insert_with(key.clone(), || {
+        let slot = self.key_values.get_or_insert_with(key.clone(), || {
             self.memory_tracker
                 .account(base, MemoryCategory::Lists);
-            KeyValue::List(Arc::new(RwLock::new(RedisList::new())))
+            KeySlot::new(KeyValue::List(Arc::new(RwLock::new(RedisList::new()))))
         });
-        match kv {
+        match slot.value {
             KeyValue::List(l) => Ok(l),
             _ => Err(crate::error::Error::WrongType),
         }
@@ -50,7 +50,10 @@ impl Cache {
     #[inline]
     fn list_from_key_values(&self, key: &Bytes) -> Option<SharedList> {
         match self.key_values.get(key) {
-            Some(KeyValue::List(l)) => Some(l),
+            Some(KeySlot {
+                value: KeyValue::List(l),
+                ..
+            }) => Some(l),
             _ => None,
         }
     }
@@ -61,7 +64,10 @@ impl Cache {
 
     pub fn remove_list(&self, key: &Bytes) -> bool {
         match self.key_values.remove(key) {
-            Some(KeyValue::List(l)) => {
+            Some(KeySlot {
+                value: KeyValue::List(l),
+                ..
+            }) => {
                 let size =
                     crate::memory::estimate_keyed_object(key.len(), l.read().memory_size());
                 self.memory_tracker
@@ -77,7 +83,13 @@ impl Cache {
     }
 
     pub fn list_exists(&self, key: &Bytes) -> bool {
-        matches!(self.key_values.get(key), Some(KeyValue::List(_)))
+        matches!(
+            self.key_values.get(key),
+            Some(KeySlot {
+                value: KeyValue::List(_),
+                ..
+            })
+        )
     }
 
     pub fn remove_list_if_empty(&self, key: &Bytes) {
@@ -94,8 +106,8 @@ impl Cache {
     /// Skips keys whose typed TTL has already elapsed (no revive without TTL).
     pub fn export_lists(&self) -> Vec<(Bytes, Vec<Bytes>)> {
         let mut out = Vec::new();
-        self.key_values.for_each(|key, kv| {
-            let KeyValue::List(l) = kv else {
+        self.key_values.for_each(|key, slot| {
+            let KeyValue::List(l) = &slot.value else {
                 return;
             };
             if !self.typed_key_exportable(key) {

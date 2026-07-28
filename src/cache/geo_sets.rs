@@ -7,7 +7,7 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
-use super::keyspace::KeyValue;
+use super::keyspace::{KeySlot, KeyValue};
 use super::storage::KeyType;
 use super::Cache;
 
@@ -34,7 +34,10 @@ impl Cache {
     #[inline]
     fn geo_from_key_values(&self, key: &Bytes) -> Option<SharedGeoSet> {
         match self.key_values.get(key) {
-            Some(KeyValue::Geo(g)) => Some(g),
+            Some(KeySlot {
+                value: KeyValue::Geo(g),
+                ..
+            }) => Some(g),
             _ => None,
         }
     }
@@ -51,12 +54,12 @@ impl Cache {
             GeoSet::new().memory_usage(),
         );
         self.ensure_non_string_capacity(base)?;
-        let kv = self.key_values.get_or_insert_with(key.clone(), || {
+        let slot = self.key_values.get_or_insert_with(key.clone(), || {
             self.memory_tracker
                 .account(base, MemoryCategory::GeoSets);
-            KeyValue::Geo(Arc::new(RwLock::new(GeoSet::new())))
+            KeySlot::new(KeyValue::Geo(Arc::new(RwLock::new(GeoSet::new()))))
         });
-        match kv {
+        match slot.value {
             KeyValue::Geo(g) => Ok(g),
             _ => Err(crate::error::Error::WrongType),
         }
@@ -65,7 +68,10 @@ impl Cache {
     /// Remove a geospatial set and free its tracked memory
     pub fn remove_geo_set(&self, key: &Bytes) -> bool {
         match self.key_values.remove(key) {
-            Some(KeyValue::Geo(set)) => {
+            Some(KeySlot {
+                value: KeyValue::Geo(set),
+                ..
+            }) => {
                 let size =
                     crate::memory::estimate_keyed_object(key.len(), set.read().memory_usage());
                 self.memory_tracker
@@ -83,8 +89,8 @@ impl Cache {
     /// Get the number of geospatial sets
     pub fn geo_set_count(&self) -> usize {
         let mut n = 0usize;
-        self.key_values.for_each(|_, kv| {
-            if matches!(kv, KeyValue::Geo(_)) {
+        self.key_values.for_each(|_, slot| {
+            if matches!(slot.value, KeyValue::Geo(_)) {
                 n += 1;
             }
         });
@@ -94,8 +100,8 @@ impl Cache {
     /// Calculate total memory usage of all geospatial sets
     pub fn geo_sets_memory(&self) -> usize {
         let mut total = 0usize;
-        self.key_values.for_each(|key, kv| {
-            if let KeyValue::Geo(geo_set) = kv {
+        self.key_values.for_each(|key, slot| {
+            if let KeyValue::Geo(geo_set) = &slot.value {
                 let set = geo_set.read();
                 total += crate::memory::estimate_keyed_object(key.len(), set.memory_usage());
             }
@@ -106,8 +112,8 @@ impl Cache {
     /// Clear all geospatial sets
     pub fn clear_geo_sets(&self) {
         let mut keys = Vec::new();
-        self.key_values.for_each(|k, kv| {
-            if matches!(kv, KeyValue::Geo(_)) {
+        self.key_values.for_each(|k, slot| {
+            if matches!(slot.value, KeyValue::Geo(_)) {
                 keys.push(k.clone());
             }
         });
@@ -120,8 +126,8 @@ impl Cache {
     /// Skips keys whose typed TTL has already elapsed (no revive without TTL).
     pub fn export_geos(&self) -> Vec<(Bytes, Vec<(Bytes, f64, f64)>)> {
         let mut out = Vec::new();
-        self.key_values.for_each(|key, kv| {
-            let KeyValue::Geo(geoset) = kv else {
+        self.key_values.for_each(|key, slot| {
+            let KeyValue::Geo(geoset) = &slot.value else {
                 return;
             };
             if !self.typed_key_exportable(key) {

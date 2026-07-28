@@ -16,33 +16,38 @@ src/commands/
 ```
 src/cache/
 ├── mod.rs          - Cache struct + constructors
-├── keyspace.rs     - KeyValue enum + unified lookup/remove facade (Batch FG)
+├── keyspace.rs     - KeySlot + KeyValue + unified lookup/remove facade (FG / FP)
 ├── storage.rs      - store, load, delete, exists, keys/scan, load install
 ├── operations.rs   - incr/decr, RENAME, …
-├── expiration.rs   - expire, ttl, typed_expires, active expire
+├── expiration.rs   - expire, ttl, KeySlot expire, active expire
 ├── eviction.rs     - maxmemory policies, sample/evict, sweep
 ├── sorted_sets.rs / geo_sets.rs / hashes.rs / lists.rs / sets.rs / streams.rs
 └── config.rs       - max_entry_size, eviction sample, …
 ```
 
-## 3. Unified keyspace (Batch FG / FG-2 / FG-3 / FG-4)
+## 3. Unified keyspace (Batch FG / FG-2 / FG-3 / FG-4 / FP)
 
-### Today (FG-4: true single map)
+### Today (FP: single map + per-slot typed expire)
 
 `Cache` holds:
 
 | Field | Type |
 |-------|------|
-| `key_values` | `ShardedKeyMap<KeyValue>` — **String / Hash / List / Set / ZSet / Geo / Stream** |
-| `typed_expires` | absolute `Instant` for non-string keys (slot-header fold residual) |
+| `key_values` | `ShardedKeyMap<KeySlot>` — value + optional typed expire |
 | `list_blockers` / `stream_blockers` | blocking waiters (not key storage) |
 
 Logical invariant: **one name → at most one type** (`ensure_type` / WRONGTYPE).  
-**No dual-residence:** a name lives in exactly one place (`key_values`).
+**No dual-residence:** a name lives in exactly one place (`key_values`).  
+**No side expire map:** typed TTL is `KeySlot.expires_at` (Batch FP).
 
 ```text
+struct KeySlot {
+    expires_at: Option<Instant>,  // typed keys only
+    value: KeyValue,
+}
+
 enum KeyValue {
-    String(SharedEntry),  // physically in key_values; TTL on Entry
+    String(SharedEntry),  // TTL on Entry (slot.expires_at always None)
     Hash(SharedHash),
     List(SharedList),
     Set(SharedSet),
@@ -53,7 +58,7 @@ enum KeyValue {
 
 Cache::get_key_value(key) -> Option<KeyValue>   // single map (+ lazy expire)
 Cache::key_type / exists                         // via get_key_value
-Cache::delete / remove_key_value_raw             // unified remove + memory free
+Cache::delete / remove_key_value_raw             // unified remove (slot drops expire)
 Cache::mutate_string                             // RMW under shard lock (SET/INCR/…)
 ```
 
@@ -63,8 +68,8 @@ Cache::mutate_string                             // RMW under shard lock (SET/IN
 | **WRONGTYPE** | `ensure_type` / `ensure_string_or_absent` / `mutate_string` |
 | **DEL / EXISTS** | remove / `is_some` on one map |
 | **SCAN / KEYS / DBSIZE / RANDOMKEY** | iterate `key_values` only |
-| **RENAME** | take value + expire meta, insert under new name |
-| **TTL / EXPIRE** | string: `Entry`; typed: `typed_expires` side map (residual) |
+| **RENAME** | take whole `KeySlot` (value + expire), insert under new name |
+| **TTL / EXPIRE** | string: `Entry`; typed: `KeySlot.expires_at` |
 | **Memory / eviction** | per-variant size; all victims sampled from `key_values` |
 
 ### Migration plan
@@ -75,10 +80,12 @@ Cache::mutate_string                             // RMW under shard lock (SET/IN
    maps removed; `KeyspacePayload` drains `map` + `key_values` streams; eviction
    samples typed keys from one map.
 4. **FG-4 (done):** Merge strings into `key_values` as `KeyValue::String`;
-   collapse `KeyspacePayload` to one `key_values` stream. **Residual:**
-   `typed_expires` side map (not slot header); search-doc eviction special;
-   legacy `ShardedHashMap` retained for tests/API only.
+   collapse `KeyspacePayload` to one `key_values` stream.
+5. **FP (done):** Fold typed TTL into `KeySlot.expires_at`; remove side
+   `typed_expires` map. **Residual:** strings still keep TTL on `Entry`
+   (not slot header); search-doc eviction special; legacy `ShardedHashMap`
+   retained for tests/API only.
 
-**Load/install (`KeyspacePayload`):** `key_values: Vec<(Bytes, KeyValue)>` +
-expires / WATCH / search / memory counters. Epoch install semantics (DR/DS)
-unchanged.
+**Load/install (`KeyspacePayload`):** `key_values: Vec<(Bytes, KeySlot)>` +
+WATCH / search / memory counters (typed expire rides on each slot). Epoch
+install semantics (DR/DS) unchanged.
