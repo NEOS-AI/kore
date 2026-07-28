@@ -852,7 +852,7 @@ Also tracked in `docs/roadmap.md`.
   - Tests: `typed_ttl_test` 12/12; keyspace take/install expire unit; active_expire / keyspace / multi-DB load green
   - Residual closed by **FQ**: string TTL on slot
 
-- [x] **`[P3]`** **Batch FQ — Unify string TTL onto KeySlot** (`65a70a8`)
+- [x] **`[P3]`** **Batch FQ — Unify string TTL onto KeySlot** (`51bfc7e`)
   - String key-level expire stored on [`KeySlot::expires_at`] (same header as typed keys)
   - Unified EXPIRE/TTL/PERSIST/`purge_if_expired` for all types via slot
   - SET EX/PX/EXAT/PXAT/KEEPTTL + INCR/APPEND/… lift `Entry.expires_at` onto the slot (`KeySlot::string` / `mutate_string`)
