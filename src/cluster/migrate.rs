@@ -30,14 +30,16 @@
 //! 2. **Commit re-check (FH):** both sides re-validate prepare (epoch/TTL/
 //!    topology / MYID) via local + `SETSLOT CHECKPREPARE` before any NODE.
 //!    Fail → `failed_prepare:recheck:…` without half-apply.
-//! 3. **Commit** only after re-check: **dest** `SETSLOT NODE <dest>` first,
-//!    then **source** (Batch DV — no MOVED-to-IMPORTING if dest fails). Source
-//!    re-checks prepare again immediately before its NODE.
+//! 3. **Commit** only after re-check: **dest** `SETSLOT COMMITPREPARE <dest>`
+//!    first (atomic check+NODE, Batch FO), then **source**
+//!    `commit_prepare_node` (Batch DV — no MOVED-to-IMPORTING if dest fails).
+//!    Source re-checks prepare again atomically at commit.
 //! 4. If dest owns but source NODE fails: EH re-asserts MIGRATING; EP rolls
 //!    dest back to source (`NODE <source>` + `IMPORTING`) → `rolled_back`.
 //! 5. Both ok → EJ post-commit dual verify (`partial_verify` on drift).
-//! Ownership epochs (DU) fence stale gossip after NODE. Prepares are memory-only
-//! (empty on boot / soft restart — fail-closed; not in `nodes.conf`).
+//! Ownership epochs (DU) fence stale gossip after NODE. Prepare votes are durable
+//! in `nodes.conf` (`# prepare …`; Batch FO) with wall-clock TTL — expired /
+//! missing votes fail closed on commit re-check.
 //!
 //! **Redis `MIGRATE` (Batch DP/DQ):** key-level transfer reuses
 //! [`snapshot_key`] / [`recreate_commands`] / ASKING / RESP I/O. Options:
@@ -1863,12 +1865,12 @@ fn summarize_dual_end_status(source_node: &str, dest_node: &str) -> String {
 /// `failed_prepare` without NODE; both sides ABORTPREPARE.
 ///
 /// **Commit re-check (Batch FH):** source `check_prepare_valid` + dest
-/// `SETSLOT CHECKPREPARE` before any NODE; source re-checks again immediately
-/// before its NODE. Fail → `failed_prepare:recheck:…` without half-apply.
+/// `SETSLOT CHECKPREPARE` before any NODE. Fail → `failed_prepare:recheck:…`
+/// without half-apply.
 ///
-/// **Commit order (Batch DV):** dest NODE first, then source. Source is skipped
-/// when dest does not verify as owner — avoids MOVED while dest is still
-/// IMPORTING.
+/// **Commit (Batch FO/DV):** dest `SETSLOT COMMITPREPARE` (atomic check+NODE)
+/// first, then source `commit_prepare_node`. Source is skipped when dest does
+/// not verify as owner — avoids MOVED while dest is still IMPORTING.
 ///
 /// **Batch EH:** if dest NODE ok but source NODE fails while we still own the
 /// slot, re-assert `MIGRATING → dest` so clients receive ASK (keys may already
@@ -1934,15 +1936,12 @@ async fn dual_end_setslot_node(
         );
     }
 
-    // Phase 2: commit — dest NODE first, then source (Batch DV).
+    // Phase 2: commit — dest COMMITPREPARE first, then source (Batch DV/FO).
     let mut dest_node =
         apply_dest_node_with_retry(slot, dest_node_id, dest_ip, dest_port).await;
     let mut source_node = if dest_node == "ok" {
-        // Source re-check immediately before NODE (epoch / abort race, Batch FH).
-        match cluster.check_prepare_valid(slot, dest_node_id) {
-            Ok(()) => apply_source_node_with_retry(cluster, slot, dest_node_id).await,
-            Err(e) => format!("recheck:{}", e),
-        }
+        // Atomic re-check + NODE on source (Batch FO; closes FH recheck→NODE race).
+        apply_source_node_with_retry(cluster, slot, dest_node_id).await
     } else {
         // Do not flip source ownership if dest never took the slot stably.
         String::from("skipped:dest NODE incomplete")
@@ -2240,10 +2239,11 @@ async fn post_commit_verify_dual_end(
     }
 }
 
-/// Local `SETSLOT NODE` + ownership verify, with retries.
+/// Local `SETSLOT COMMITPREPARE` + ownership verify, with retries (Batch FO).
 ///
-/// Source NODE inject lives on [`ClusterState::set_node`] (Batch EP) so retries
-/// and direct operator SETSLOT share the same failure path.
+/// Uses atomic check+apply ([`ClusterState::commit_prepare_node`]). Source NODE
+/// inject lives on that path (Batch EP) so retries share the dual-end failure
+/// path. Operator bare `SETSLOT NODE` still bypasses prepare (FINISH/recovery).
 async fn apply_source_node_with_retry(
     cluster: &ClusterState,
     slot: u16,
@@ -2251,12 +2251,12 @@ async fn apply_source_node_with_retry(
 ) -> String {
     let mut last_err = String::from("source NODE not attempted");
     for attempt in 0..NODE_SET_ATTEMPTS {
-        match cluster.set_node(slot, dest_node_id) {
+        match cluster.commit_prepare_node(slot, dest_node_id) {
             Ok(()) => {
                 if source_owns_as(cluster, slot, dest_node_id) {
                     return "ok".to_string();
                 }
-                last_err = "verify: local owner is not dest after SETSLOT NODE".into();
+                last_err = "verify: local owner is not dest after COMMITPREPARE".into();
             }
             Err(e) => last_err = e,
         }
@@ -2274,7 +2274,10 @@ fn source_owns_as(cluster: &ClusterState, slot: u16, node_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Remote dest `SETSLOT NODE` + CLUSTER SLOTS verify, with retries.
+/// Remote dest `SETSLOT COMMITPREPARE` + CLUSTER SLOTS verify, with retries (Batch FO).
+///
+/// Falls back to bare `SETSLOT NODE` only if dest rejects unknown subcommand
+/// (older peer without FO) — still verifies ownership after either path.
 async fn apply_dest_node_with_retry(
     slot: u16,
     dest_node_id: &str,
@@ -2295,12 +2298,30 @@ async fn apply_dest_node_with_retry(
 
         match connect_dest(dest_ip, dest_port).await {
             Ok(mut stream) => {
-                match dest_setslot(
+                // Prefer atomic COMMITPREPARE (Batch FO); fall back to NODE.
+                let applied = match dest_setslot(
                     &mut stream,
-                    &["CLUSTER", "SETSLOT", &slot_s, "NODE", dest_node_id],
+                    &[
+                        "CLUSTER",
+                        "SETSLOT",
+                        &slot_s,
+                        "COMMITPREPARE",
+                        dest_node_id,
+                    ],
                 )
                 .await
                 {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.to_ascii_uppercase().contains("UNKNOWN SUBCOMMAND") => {
+                        dest_setslot(
+                            &mut stream,
+                            &["CLUSTER", "SETSLOT", &slot_s, "NODE", dest_node_id],
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                };
+                match applied {
                     Ok(()) => match verify_remote_slot_owner(&mut stream, slot, dest_node_id).await
                     {
                         Ok(()) => return "ok".to_string(),
@@ -2657,7 +2678,7 @@ mod tests {
         assert!(cs.owns_slot(0));
     }
 
-    /// Batch FH: boot / soft-reset clears prepares (fail-closed; not durable).
+    /// Batch FH/FO: soft-reset clears prepares; legacy conf without `# prepare` stays empty.
     #[test]
     fn prepare_boot_clear_fail_closed() {
         let cs = ClusterState::single_node("127.0.0.1", 7000);
@@ -2669,7 +2690,7 @@ mod tests {
         cs.clear_all_prepares();
         assert!(!cs.is_prepared(0));
         assert!(cs.check_prepare_valid(0, &dest).is_err());
-        // nodes.conf load path starts with empty prepare map (documented FH).
+        // Pre-FO / no prepare lines → empty map (FO restores only `# prepare` lines).
         let conf = format!(
             "# Kore cluster nodes.conf\n# epoch {}\n{}",
             cs.current_epoch(),

@@ -42,16 +42,19 @@
 //! **SLOT-STATS (Batch EV):** `CLUSTER SLOT-STATS SLOTSRANGE` local key counts.
 //! **NODE preflight (Batch EY):** dual-end NODE prepare (MYID + owner check)
 //! before commit; `failed_preflight` without half-apply.
-//! **NODE 2PC slice (Batch FB/FH):** `SETSLOT PREPARE` / `ABORTPREPARE` /
-//! `CHECKPREPARE` votes on source+dest; prepare-epoch + TTL fence; commit
-//! re-check before NODE; dest-first NODE; EP rollback on source commit fail;
-//! status `failed_prepare` / `failed_prepare:recheck:…` without half-apply.
-//! Prepares memory-only (boot clear / fail-closed; not in `nodes.conf`).
-//! **Persistence (Batch EM/EN/EO/FL):** CLUSTER SAVECONFIG → dir/nodes.conf; load on
+//! **NODE 2PC slice (Batch FB/FH/FO):** `SETSLOT PREPARE` / `ABORTPREPARE` /
+//! `CHECKPREPARE` / `COMMITPREPARE` on source+dest; prepare-epoch + wall-clock
+//! TTL fence; commit re-check; atomic COMMITPREPARE (check+NODE); dest-first
+//! commit; EP rollback on source commit fail; status `failed_prepare` /
+//! `failed_prepare:recheck:…` without half-apply. Prepare votes persist in
+//! `nodes.conf` as `# prepare <slot> <target> <epoch> <unix_ms>` (Batch FO);
+//! expired/malformed lines dropped on load (fail-closed).
+//! **Persistence (Batch EM/EN/EO/FL/FO):** CLUSTER SAVECONFIG → dir/nodes.conf; load on
 //! boot via [`ClusterState::load_or_single_node`]; best-effort autosave after
-//! topology-mutating CLUSTER ops, failover claim, and live-flag CONFIG SET.
-//! Header `# key value` comments carry require-full / allow-reads / announce /
-//! replica-priority (legacy files without keys keep defaults).
+//! topology-mutating CLUSTER ops, failover claim, live-flag CONFIG SET, and
+//! prepare set/abort/commit. Header `# key value` comments carry require-full /
+//! allow-reads / announce / replica-priority / prepare votes (legacy files
+//! without keys keep defaults / empty prepare map).
 //!
 //! Slot migration (thin MVP): `CLUSTER MIGRATEKEYS` moves all key types over RESP.
 //! Orchestration: `CLUSTER RESHARD` runs the documented SETSLOT + MIGRATEKEYS flow

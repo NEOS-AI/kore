@@ -320,13 +320,15 @@ Also tracked in `docs/roadmap.md`.
   - *Gaps*: no interactive redis-cli weight UI. MIGRATE: no Redis DUMP/RESTORE wire compatibility (recreate-only); ASKING probe / REPLACE pre-DEL semantics documented in module rustdoc (Batch DP). Dual-end NODE has RESP prepare/commit (Batch FB); not Redis binary cluster-bus 2PC.
   - *Done (Batch EY)*: dual-end NODE **preflight** before any SETSLOT NODE — local owns/already-dest; dest reachable + `CLUSTER MYID` matches dest-id; dest `CLUSTER SLOTS` owner is source or dest (or unbound). Failure → `failed_preflight` (no half-apply). Idempotent complete when both already own dest.
   - *Done (Batch FB)*: dual-end NODE **wire 2PC slice 1** — `SETSLOT PREPARE`/`ABORTPREPARE` votes on source+dest (extends EY); commit only after both prepares (dest-first NODE, DV); EP rollback on source commit fail; status `failed_prepare` without half-apply; range aborts on prepare fail. Tests: happy path, dest prepare inject, source commit→rolled_back + FINISH, range abort.
-  - *Done (Batch FH)*: dual-end NODE **wire 2PC slice 2** — prepare votes stamp **slot config epoch** + wall-clock **TTL** (`PREPARE_VOTE_TTL`); `SETSLOT CHECKPREPARE` + local `check_prepare_valid` before dest NODE; source re-checks again immediately before its NODE; stale epoch / cleared / expired prepare → `failed_prepare:recheck:…` without half-apply; boot/`from_nodes_conf` empty prepare map (fail-closed soft restart). Tests: unit epoch/TTL/clear/boot; e2e recheck inject + happy path; FB suite green.
-  - *Residual (FH / FB)*:
-    - **P3** prepare still **not durable on disk** (`nodes.conf` omits votes) — intentional slice-2 choice (TTL + boot clear + epoch fence). Full durable prepare residual if crash-window votes must survive hard restart without re-PREPARE.
+  - *Done (Batch FH)*: dual-end NODE **wire 2PC slice 2** — prepare votes stamp **slot config epoch** + wall-clock **TTL** (`PREPARE_VOTE_TTL`); `SETSLOT CHECKPREPARE` + local `check_prepare_valid` before dest NODE; source re-checks again immediately before its NODE; stale epoch / cleared / expired prepare → `failed_prepare:recheck:…` without half-apply; soft clear fail-closed. Tests: unit epoch/TTL/clear/boot; e2e recheck inject + happy path; FB suite green.
+  - *Done (Batch FO)*: durable prepare votes in `nodes.conf` (`# prepare <slot> <target> <epoch> <unix_ms>`); wall-clock unix-ms TTL (survives restart); load restores non-expired votes (expired/malformed dropped); autosave on PREPARE/ABORT/COMMIT when dir set; `SETSLOT COMMITPREPARE` atomic check+NODE under one write lock; dual-end commit uses COMMITPREPARE (dest RESP + source local). Tests: nodes.conf prepare round-trip / expired not restored / COMMITPREPARE; migrate **42/42**.
+  - *Residual (FH / FB / FO)*:
+    - **done FO** prepare durable on disk (`nodes.conf` `# prepare` lines + restore).
+    - **done FO** atomic `COMMITPREPARE` (dual-end path); bare `SETSLOT NODE` still operator bypass.
     - **P3** no Redis **binary cluster bus** 2PC (RESP-only prepare/commit).
     - **P3** dest-side `set_prepare_node(myself)` accepts unbound **or any known-peer owner** (broad vote; intentional for mid-reshard but weak fencing).
-    - **P3** operator `SETSLOT NODE` still bypasses prepare (FINISH/recovery intentional; dual-end path enforces prepare + re-check).
-    - **P3** CHECKPREPARE→NODE race on dest remains (no single atomic COMMITPREPARE opcode).
+    - **P3** operator `SETSLOT NODE` still bypasses prepare (FINISH/recovery intentional; dual-end path enforces prepare + COMMITPREPARE).
+    - **P3** per-slot config epochs still not fully persisted in nodes.conf (load stamps owned slots with file epoch; prepare epoch fence fails closed when mismatch).
   - *Done (Batch EP)*: when dest NODE ok but source NODE fails: EH re-asserts MIGRATING; **compensate** dest with `SETSLOT NODE <source>` + `IMPORTING` → status `rolled_back` (both sides agree source owns; retry FINISH). Rollback failure keeps `partial_source_node` + warning. Range aborts on `rolled_back`. Source NODE inject hook for tests.
   - *Done (Batch EQ)*: Redis `cluster-require-full-coverage` (default yes) — `CLUSTER INFO cluster_state:ok|fail`; key commands get `CLUSTERDOWN The cluster is down` when any slot is unbound or fail-owned; CONFIG GET/SET + `--cluster-require-full-coverage`; ASKING+IMPORTING still allowed for reshard.
   - *Done (Batch ER)*: connection `READONLY`/`READWRITE` wired into cluster redirect gate — replicas serve **reads** for slots owned by their master; writes still `MOVED`; without READONLY all key cmds `MOVED` (Redis-compatible).
@@ -341,7 +343,8 @@ Also tracked in `docs/roadmap.md`.
   - [x] **`[P1]`** **Code review (EW post-ship):** `promote_replica` succeeds on PING alone
     - *Done (Batch FC)*: `promote_replica` requires `FAILOVER` OK / `REPLICAOF NO ONE` OK / post-attempt `ROLE=master`; never PING-only. Per-master `failover_in_progress`. Tests: inject fail → no switch; inject OK + real ROLE path still switch.
   - [x] **`[P3]`** **Code review (FB post-ship nits):** prepare not re-checked at commit; dest prepare permissive; memory-only votes
-    - *Done (Batch FH)*: commit re-check + prepare-epoch + TTL + boot clear. Residual: durable-on-disk prepare; bus 2PC; atomic COMMITPREPARE; dest vote breadth; operator NODE bypass (intentional).
+    - *Done (Batch FH)*: commit re-check + prepare-epoch + TTL + soft clear.
+    - *Done (Batch FO)*: durable prepare in nodes.conf; atomic COMMITPREPARE. Residual: bus 2PC; dest vote breadth; operator NODE bypass (intentional).
   - *Post-ship review (FI, 2026-07-25):* AOF-off multi-DB SELECT interleave race under concurrent writers → **fixed Batch FI-2** (`propagate_write` atomic SELECT+append).
   - [x] **`[P2]`** **Code review (EX/FA post-ship):** Sentinel failover leader election (cross-process)
     - *Done (Batch FE)*: sticky voted-leader on `IS-MASTER-DOWN-BY-ADDR`; auto path elects before `try_failover`; `voted-leader` / `voted-leader-epoch` on MASTER fields. Residual: not full Redis election-timeout state machine.
@@ -737,14 +740,15 @@ Also tracked in `docs/roadmap.md`.
 - **FN:** lib sentinel **16/16** unit; `sentinel_lite_test` **23/23** (CKQUORUM dead peer NOQUORUM / live OK; elect ignores dead peers; probe `*` / sticky vote).
 - Hello SUBSCRIBE fan-in remains **accepted residual** (tick PUBLISH + peer HELLO only).
 
-**What remains:** optional **FO**/**FP** + Later/backlog (no mandatory letter batch).
+**What remains:** optional **FP** + Later/backlog (no mandatory letter batch).
 
 | Area | Residual | Priority | Planned batch |
 |------|----------|----------|---------------|
 | Sentinel | live INFO `slave_priority` + failover cooldown | **done** | **FM** |
 | Sentinel | CKQUORUM / elect majority live probe; probe self-vs-`*` | **done** | **FN** |
 | Sentinel | long-lived `__sentinel__:hello` SUBSCRIBE fan-in | P3 accepted | — |
-| Cluster | NODE 2PC durable-on-disk prepare / bus / atomic COMMITPREPARE | P3 | **FO** optional |
+| Cluster | NODE 2PC durable prepare + atomic COMMITPREPARE | **done** | **FO** |
+| Cluster | binary bus 2PC; dest prepare breadth; operator NODE bypass | P3 accepted / later | — |
 | Keyspace | `typed_expires` side map (not slot header); search-doc eviction special | P3 | **FP** optional |
 | Sentinel | Kore **higher** priority wins vs Redis Sentinel **lower** (documented honesty) | P3 accepted | — |
 | Ops | Global **repl backlog** still serializes writers | P3 | later (hard) |
@@ -754,9 +758,9 @@ Also tracked in `docs/roadmap.md`.
 | MIGRATE / UI / load | DUMP wire; reshard weight UI; Arc-swap mid-fill | P3 accepted | — |
 | Tests | Sentinel suite hard-coded ports (flake risk under parallel bind) | P3 | later |
 
-### Next work queue (post-FN)
+### Next work queue (post-FO)
 
-**Committed letter queue through FN is empty.** Optional **FO**/**FP** next. Standing rule: land tests with each batch.
+**Committed letter queue through FO is empty.** Optional **FP** next. Standing rule: land tests with each batch.
 
 #### Completed (FB–FG-4 + FH + FI + FI-2 + FK + FL + FM)
 
@@ -779,9 +783,9 @@ Also tracked in `docs/roadmap.md`.
   - *Post-ship review:* true single-map keyspace for all Redis types; residual `typed_expires` side map + search-doc eviction special
   - Tests: keyspace / string_ops / typed_ttl / phase_a / eviction / persistence green
 - [x] **`[P2]`** **Batch FH — NODE 2PC slice 2** (`b078988`)
-  - Prepare-epoch + TTL fence; `CHECKPREPARE` + dual-end commit re-check; boot clear fail-closed
+  - Prepare-epoch + TTL fence; `CHECKPREPARE` + dual-end commit re-check; soft clear fail-closed
   - Tests: stale epoch / cleared / TTL / boot; e2e recheck inject no half-apply; happy path complete (41 migrate tests)
-  - Residual: durable-on-disk prepare; bus 2PC; atomic COMMITPREPARE; dest prepare breadth; operator NODE bypass (intentional)
+  - Residual closed by **FO**: durable prepare + COMMITPREPARE; remaining: bus 2PC; dest prepare breadth; operator NODE bypass
 - [x] **`[P2]`** **Batch FI — Pipeline SET perf investigation** (`bb97e7f`)
   - Root causes ranked in `docs/benchmarks.md` → *Pipeline SET analysis*
   - Wins: AOF-off unlock encode/propagate; direct `encode_command`; skip empty replica lock; slowlog/argv/`+OK` alloc cuts; typed-only WRONGTYPE; store value move
@@ -808,7 +812,7 @@ Also tracked in `docs/roadmap.md`.
   - CONFIG SET of live flags best-effort autosaves when `dir` set; boot CLI overrides only **non-default** values (plain restart keeps saved)
   - Closed open review: *EN/EO/EU post-ship nodes.conf omits live flags*
   - *Post-ship review:* migrate **42/42**; live-flags unit + legacy defaults green; flags as `#` comments (node-line parsers stay compatible)
-  - Residual: prepare votes still not in nodes.conf (FO); only live cluster flags
+  - Residual closed by **FO**: prepare votes in nodes.conf
 - [x] **`[P3]`** **Batch FM — Sentinel residual polish (FK leftovers)** (`bbebfef`)
   - Live `INFO replication` `slave_priority` refresh on master probe + before `try_failover` rank
   - `ReplicationManager::slave_priority` + CONFIG GET/SET `replica-priority` / `slave-priority`; INFO emits `slave_priority`
@@ -819,16 +823,23 @@ Also tracked in `docs/roadmap.md`.
   - *Post-ship review (2026-07-29):* no correctness regressions; serial INFO enrich accepted lite; successful failover still cools auto re-entry (intentional)
   - Residual closed by **FN**: CKQUORUM live probe + probe self-vs-`*`; hello SUBSCRIBE stays accepted residual
 
-- [x] **`[P3]`** **Batch FN — Sentinel lite SM residuals**
+- [x] **`[P3]`** **Batch FN — Sentinel lite SM residuals** (`db222f4`)
   - CKQUORUM + elect majority: `count_reachable_sentinels` (self + peers answering `PING`); dead peers do not inflate usable/N
   - Probe `runid=*` with no prior vote returns leader `"*"` / epoch 0 (Redis-honest); sticky vote still returned on probe; sole-sentinel auto path via `is_failover_leader` / live≤1 elect
   - Hello SUBSCRIBE fan-in **not** implemented (accepted residual; tick PUBLISH + peer HELLO remains primary discovery)
   - Tests: unit probe/`leader_votes_needed_for`; e2e CKQUORUM dead→NOQUORUM / live→OK; elect ignores dead peers; probe sticky vote
   - Residual: election-timeout SM (pre-attempt epoch thrash); optional parallel INFO enrich; ephemeral ports
 
-#### Open optional queue (post-FN)
-- [ ] **`[P3]`** **Batch FO — NODE 2PC durable prepare (optional)**
-  - Persist prepare votes (or honest docs-only close); optional prepare-epoch in nodes.conf; atomic COMMITPREPARE if feasible
+- [x] **`[P3]`** **Batch FO — NODE 2PC durable prepare**
+  - `nodes.conf` header `# prepare <slot> <target> <epoch> <unix_ms>`; SAVECONFIG / autosave write non-expired votes; load restores; expired/malformed skipped (fail-closed)
+  - Prepare stamps wall-clock **unix-ms** (not process `Instant`) so TTL survives restart
+  - Autosave on PREPARE / ABORTPREPARE / COMMITPREPARE when dir configured (dual-end local prepare too)
+  - `SETSLOT COMMITPREPARE <node-id>` atomic check+NODE under one write lock; dual-end dest RESP + source local use it (NODE fallback for older peers; operator NODE still bypasses)
+  - Closed FL residual (prepare not in conf) + FH residual (durable + atomic commit)
+  - Tests: state prepare round-trip / expired not restored / COMMITPREPARE; migrate unit + **42/42** e2e; `cluster_test` Config compile fix
+  - Residual: binary cluster bus 2PC; dest prepare breadth; operator NODE bypass (intentional); per-slot epochs not fully persisted in nodes.conf (file-epoch stamp + prepare fence)
+
+#### Open optional queue (post-FO)
 - [ ] **`[P3]`** **Batch FP — Expire slot header (optional)**
   - Fold `typed_expires` into per-key metadata on `KeyValue` / slot header; keep LOADING/epoch install correct
 - [ ] **`[P3]`** **Later / backlog**
@@ -837,6 +848,7 @@ Also tracked in `docs/roadmap.md`.
   - Global repl backlog write serialization (FI residual; no Valkey parity claim)
   - Sentinel suite ephemeral ports (flake risk under parallel bind)
   - Optional parallelize `enrich_replica_priorities` (serial INFO today)
+  - Cluster binary bus 2PC; dest prepare vote breadth
   - Sentinel election-timeout SM (pre-attempt campaign epoch thrash while o_down)
   - Compiler nits (dead_code: `config_kv_reply`, SkipList `len`/`is_empty`/`level`; unused_mut in search + sentinel_lite)
 
@@ -970,11 +982,12 @@ Also tracked in `docs/roadmap.md`.
 | P3 | EZ/FA post-ship: hello add_peer autosave thrash; CKQUORUM live count | **done** (FE autosave; FN live CKQUORUM) |
 | P3 | EN/EO/EU post-ship: nodes.conf omits require-full/announce flags | **done** (Batch FL) |
 | P1 | dual-end NODE RESP 2PC prepare/commit (slice 1) | **done** (Batch FB) |
-| P3 | FB post-ship: prepare not re-checked at commit; dest prepare broad; mem-only | **done FH** epoch/TTL/recheck; durable/bus residual later |
+| P3 | FB post-ship: prepare not re-checked at commit; dest prepare broad; mem-only | **done FH** epoch/TTL/recheck; **done FO** durable + COMMITPREPARE; bus residual later |
 | P3 | FC post-ship: first-replica-wins promote order | **done** (Batch FK) |
 | P3 | FK residual: INFO slave_priority + failover cooldown | **done** (Batch FM) |
 | P3 | FM post-ship: serial INFO enrich; cooldown arms on success; begin_failover no-arm | **accepted lite** (no correctness bug) |
 | P3 | FN: CKQUORUM live PING + probe `*` honesty | **done** (Batch FN; hello SUBSCRIBE residual accepted) |
+| P3 | FO: durable NODE prepare + atomic COMMITPREPARE | **done** (Batch FO) |
 | P2 | dual-end NODE 2PC slice 2 (prepare-epoch / TTL / commit re-check) | **done** (Batch FH) |
 | P2 | FI pipeline SET perf | **done** (Batch FI; ~+25% P=16) |
 | P2/P3 | FI-2 AOF-off multi-DB SELECT ordering | **done** (Batch FI-2) |

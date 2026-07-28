@@ -3,7 +3,7 @@
 ## Currently working on..
 
 - [x] Support for Redis Pub-Sub
-- **Committed through FN.** CKQUORUM live PING + probe `*` honesty. Optional FO/FP next. See root `TODO.md` → *Next work queue (post-FN)*.
+- **Committed through FO.** Durable NODE prepare votes + atomic COMMITPREPARE. Optional FP next. See root `TODO.md` → *Next work queue (post-FO)*.
 
 ## Persistence / search letter batches (recent)
 
@@ -49,7 +49,8 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Sentinel ODOWN quorum (Batch EX: MEET + IS-MASTER-DOWN-BY-ADDR votes; failover on o_down)
 - [x] Dual-end NODE preflight (Batch EY: prepare MYID+owner check; failed_preflight)
 - [x] Dual-end NODE wire 2PC slice 1 (Batch FB: SETSLOT PREPARE/ABORTPREPARE + dest-first commit; failed_prepare)
-- [x] Dual-end NODE wire 2PC slice 2 (Batch FH: prepare-epoch + TTL + CHECKPREPARE commit re-check; boot clear; failed_prepare:recheck)
+- [x] Dual-end NODE wire 2PC slice 2 (Batch FH: prepare-epoch + TTL + CHECKPREPARE commit re-check; soft clear; failed_prepare:recheck)
+- [x] NODE 2PC durable prepare (Batch FO: nodes.conf `# prepare`; wall-clock TTL; COMMITPREPARE atomic check+NODE)
 - [x] Pipeline SET perf investigation (Batch FI: AOF-off unlock + encode/argv/`+OK` cuts; ~+25% SET P=16 on M3 Pro; residual FI-2 repl backlog)
 - [x] Sentinel conf persistence (Batch EZ: FLUSHCONFIG + load sentinel.conf; autosave)
 - [x] Sentinel hello bus lite (Batch FA: HELLO CSV + PUBLISH + peer exchange)
@@ -92,7 +93,8 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] **FK** Sentinel promote ranking (priority then ROLE offset then greatest `ip:port`; 0 never; closed first-replica-wins)
 - [x] **FL** `nodes.conf` live cluster flags (require-full / allow-reads / announce / replica-priority; CONFIG SET autosave; legacy defaults)
 - [x] **FM** Sentinel residual polish (live INFO `slave_priority` refresh; auto-failover 15s cooldown; manual FAILOVER force-bypasses)
-- [ ] **Next (see `TODO.md` post-FN):** optional **FO** durable prepare · **FP** expire slot
+- [x] **FO** durable NODE prepare + COMMITPREPARE (`nodes.conf` `# prepare`; dual-end atomic commit)
+- [ ] **Next (see `TODO.md` post-FO):** optional **FP** expire slot header (`typed_expires`)
 - [x] 데드락 감지 고급 기능
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원

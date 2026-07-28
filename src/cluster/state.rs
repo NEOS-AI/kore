@@ -6,18 +6,23 @@
 //! higher per-slot epoch wins. Slots in local MIGRATING/IMPORTING are not
 //! overwritten by peer gossip (transition safety).
 //!
-//! **NODE prepare (Batch FB/FH):** `SETSLOT PREPARE` records a per-slot vote that
+//! **NODE prepare (Batch FB/FH/FO):** `SETSLOT PREPARE` records a per-slot vote that
 //! this node is ready to commit `NODE` to a target id. Dual-end reshard runs
 //! prepare on source+dest before either side applies NODE (RESP 2PC slice).
-//! Votes are stamped with the slot config epoch and a wall-clock TTL (Batch FH);
-//! commit re-checks validity before NODE. Prepares are **memory-only** (not in
-//! `nodes.conf`) and empty on boot — fail-closed after restart.
+//! Votes are stamped with the slot config epoch and a wall-clock unix-ms TTL
+//! (Batch FH); commit re-checks validity before NODE. Batch FO persists non-expired
+//! votes in `nodes.conf` as `# prepare <slot> <target> <epoch> <unix_ms>` and
+//! restores them on load (expired/malformed lines dropped — fail-closed). Soft
+//! `clear_all_prepares` still empties the map without writing until the next
+//! SAVECONFIG/autosave. `SETSLOT COMMITPREPARE` atomically check+applies NODE
+//! under one write lock (closes CHECKPREPARE→NODE race on a single node).
 //!
-//! **nodes.conf (Batch EM/EN/EO/FL):** explicit `CLUSTER SAVECONFIG` and best-effort
+//! **nodes.conf (Batch EM/EN/EO/FL/FO):** explicit `CLUSTER SAVECONFIG` and best-effort
 //! autosave after topology-mutating ops / failover claim when a dir is configured.
 //! Header also persists live cluster flags (`require-full-coverage`,
 //! `allow-reads-when-down`, `announce-ip`/`announce-port`, `replica-priority`) so
-//! CONFIG SET values survive process restart (Batch FL).
+//! CONFIG SET values survive process restart (Batch FL), plus durable prepare
+//! votes (Batch FO).
 //!
 //! **Fail quorum (Batch DW):** unreachable peers start as `pfail`. Full `fail`
 //! requires a vote quorum among known masters (`masters/2+1`). Clusters with
@@ -109,21 +114,37 @@ pub enum ManualFailoverMode {
     Takeover,
 }
 
-/// Default TTL for in-memory prepare votes (Batch FH). Expired votes fail closed.
+/// Default TTL for prepare votes (Batch FH). Expired votes fail closed.
 pub const PREPARE_VOTE_TTL: Duration = Duration::from_secs(60);
 
-/// Per-slot prepare vote for dual-end NODE 2PC (Batch FB/FH).
+/// Per-slot prepare vote for dual-end NODE 2PC (Batch FB/FH/FO).
 ///
-/// Memory-only: not written to `nodes.conf`. Boot always starts with an empty
-/// map (fail-closed after process restart).
+/// Durable across restart when written to `nodes.conf` (Batch FO). Wall-clock
+/// `prepared_at_unix_ms` so TTL survives process restart (unlike `Instant`).
+/// Boot restores non-expired votes from conf; expired/malformed lines are dropped.
 #[derive(Debug, Clone)]
 struct PrepareVote {
     /// NODE target id this vote authorizes.
     target_id: String,
     /// [`Inner::slot_config_epoch`] at prepare time (epoch fence).
     slot_epoch: u64,
-    /// When the vote was recorded (TTL via [`PREPARE_VOTE_TTL`]).
-    prepared_at: Instant,
+    /// Wall-clock ms since UNIX epoch when the vote was recorded (TTL).
+    prepared_at_unix_ms: u64,
+}
+
+/// Current wall-clock ms since UNIX epoch (prepare TTL / durability).
+fn now_unix_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Whether a prepare stamped at `prepared_at_unix_ms` is past [`PREPARE_VOTE_TTL`].
+fn prepare_vote_expired(prepared_at_unix_ms: u64) -> bool {
+    let ttl_ms = PREPARE_VOTE_TTL.as_millis() as u64;
+    now_unix_ms().saturating_sub(prepared_at_unix_ms) > ttl_ms
 }
 
 /// Result of applying one peer ownership range (or slot).
@@ -177,7 +198,8 @@ struct Inner {
     migrating: HashMap<u16, String>,
     /// slot → source node id (we are importing this slot)
     importing: HashMap<u16, String>,
-    /// slot → prepared NODE vote (Batch FB/FH dual-end prepare; epoch + TTL)
+    /// slot → prepared NODE vote (Batch FB/FH/FO dual-end prepare; epoch + TTL;
+    /// durable in nodes.conf header when SAVECONFIG/autosave runs)
     prepare_node: HashMap<u16, PrepareVote>,
     /// known nodes by id
     nodes: HashMap<String, ClusterNode>,
@@ -225,12 +247,14 @@ impl ClusterState {
         }
     }
 
-    /// Build cluster state from `CLUSTER NODES` / `SAVECONFIG` text (Batch EN/FL).
+    /// Build cluster state from `CLUSTER NODES` / `SAVECONFIG` text (Batch EN/FL/FO).
     ///
     /// Resolves **myself** via `myself` flag, else matching `ip:port`. Restores
-    /// node id, peers, slot ownership, config epoch, and live cluster flags from
-    /// header comments (Batch FL). Missing flag keys keep defaults
-    /// (require-full=true, allow-reads=false, announce none, priority 100).
+    /// node id, peers, slot ownership, config epoch, live cluster flags from
+    /// header comments (Batch FL), and non-expired prepare votes (Batch FO).
+    /// Missing flag keys keep defaults (require-full=true, allow-reads=false,
+    /// announce none, priority 100). Missing prepare lines → empty prepare map.
+    /// Expired / malformed prepare lines are skipped (fail-closed).
     /// Migrating/importing annotations in the file are ignored (start stable).
     pub fn from_nodes_conf(
         ip: impl Into<String>,
@@ -240,6 +264,7 @@ impl ClusterState {
         let ip = ip.into();
         let header_epoch = parse_nodes_conf_header_epoch(text);
         let live = parse_nodes_conf_live_flags(text);
+        let prepares = parse_nodes_conf_prepares(text);
         let lines = parse_nodes_conf_lines(text)?;
         if lines.is_empty() {
             return Err("no node lines in nodes.conf".into());
@@ -306,6 +331,10 @@ impl ClusterState {
                         }
                     }
                 }
+            }
+            // Batch FO: restore durable prepare votes (already filtered for TTL).
+            for (slot, vote) in prepares {
+                g.prepare_node.insert(slot, vote);
             }
         }
 
@@ -516,11 +545,11 @@ impl ClusterState {
         self.nodes_conf_dir.read().clone()
     }
 
-    /// Write `CLUSTER NODES` text to `{dir}/nodes.conf` (Batch EM/EO/FL).
+    /// Write `CLUSTER NODES` text to `{dir}/nodes.conf` (Batch EM/EO/FL/FO).
     ///
-    /// Header includes current config epoch (Batch EN) and live cluster flags
-    /// (Batch FL) as `# key value` comment lines so Redis-style node line
-    /// parsers remain compatible.
+    /// Header includes current config epoch (Batch EN), live cluster flags
+    /// (Batch FL), and durable prepare votes (Batch FO) as `# key value`
+    /// comment lines so Redis-style node line parsers remain compatible.
     pub fn save_nodes_conf_to(
         &self,
         dir: &str,
@@ -576,10 +605,40 @@ impl ClusterState {
         }
         writeln!(f, "# replica-priority {}", self.local_repl_priority())
             .map_err(|e| format!("write error: {}", e))?;
+        // Batch FO: durable prepare votes (non-expired only; slot order stable).
+        for line in self.format_prepare_header_lines() {
+            writeln!(f, "{}", line).map_err(|e| format!("write error: {}", e))?;
+        }
         f.write_all(body.as_bytes())
             .map_err(|e| format!("write error: {}", e))?;
         f.sync_all().map_err(|e| format!("sync error: {}", e))?;
         Ok(path)
+    }
+
+    /// `# prepare <slot> <target> <epoch> <unix_ms>` lines for SAVECONFIG (Batch FO).
+    ///
+    /// Lazy-purges expired votes. Sorted by slot for stable files.
+    fn format_prepare_header_lines(&self) -> Vec<String> {
+        // Purge expired under write lock first.
+        {
+            let mut g = self.inner.write();
+            g.prepare_node
+                .retain(|_, v| !prepare_vote_expired(v.prepared_at_unix_ms));
+        }
+        let g = self.inner.read();
+        let mut slots: Vec<u16> = g.prepare_node.keys().copied().collect();
+        slots.sort_unstable();
+        slots
+            .into_iter()
+            .filter_map(|slot| {
+                g.prepare_node.get(&slot).map(|v| {
+                    format!(
+                        "# prepare {} {} {} {}",
+                        slot, v.target_id, v.slot_epoch, v.prepared_at_unix_ms
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Best-effort persist when [`Self::set_nodes_conf_dir`] was configured (Batch EO).
@@ -1759,7 +1818,9 @@ impl ClusterState {
     ///
     /// Records that this node votes it can commit `SETSLOT NODE <node-id>` for
     /// `slot`. Does **not** change ownership. Stamps the current slot config
-    /// epoch and wall-clock time for commit re-check / TTL (Batch FH).
+    /// epoch and wall-clock unix-ms for commit re-check / TTL (Batch FH) and
+    /// durable `nodes.conf` restore (Batch FO). Best-effort autosave when a
+    /// nodes.conf dir is configured.
     ///
     /// - When `node_id` is **myself** (dest vote): accept if we already own the
     ///   slot, have IMPORTING set, the current owner is a known peer (or empty
@@ -1832,9 +1893,12 @@ impl ClusterState {
             PrepareVote {
                 target_id: node_id.to_string(),
                 slot_epoch,
-                prepared_at: Instant::now(),
+                prepared_at_unix_ms: now_unix_ms(),
             },
         );
+        drop(g);
+        // Best-effort durable prepare (Batch FO) when dir configured.
+        self.autosave_nodes_conf();
         Ok(())
     }
 
@@ -1843,8 +1907,11 @@ impl ClusterState {
         if slot >= SLOT_COUNT {
             return Err("Slot out of range".into());
         }
-        let mut g = self.inner.write();
-        g.prepare_node.remove(&slot);
+        {
+            let mut g = self.inner.write();
+            g.prepare_node.remove(&slot);
+        }
+        self.autosave_nodes_conf();
         Ok(())
     }
 
@@ -1873,10 +1940,10 @@ impl ClusterState {
             .map(|v| v.slot_epoch)
     }
 
-    /// Clear all prepare votes (Batch FH boot fail-closed / test helper).
+    /// Clear all prepare votes (Batch FH soft fail-closed / test helper).
     ///
-    /// Process boot always constructs an empty prepare map; this is for
-    /// explicit soft-reset tests and ops that want fail-closed mid-flight.
+    /// Does not touch disk until the next SAVECONFIG/autosave. Boot may still
+    /// restore durable votes from `nodes.conf` (Batch FO).
     pub fn clear_all_prepares(&self) {
         self.inner.write().prepare_node.clear();
     }
@@ -1914,7 +1981,7 @@ impl ClusterState {
                 vote.target_id, node_id, slot
             ));
         }
-        if vote.prepared_at.elapsed() > PREPARE_VOTE_TTL {
+        if prepare_vote_expired(vote.prepared_at_unix_ms) {
             drop(g);
             let mut gw = self.inner.write();
             gw.prepare_node.remove(&slot);
@@ -1929,43 +1996,79 @@ impl ClusterState {
         }
 
         // Re-assert topology readiness (same rules as set_prepare_node).
-        let my_id = g.my_id.as_str();
-        let myself = node_id == my_id;
-        let owner = g
-            .slot_owner
-            .get(slot as usize)
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        let owns = owner == my_id;
-        let already_target = !owner.is_empty() && owner == node_id;
+        prepare_topology_ready(&g, slot, node_id)
+    }
 
-        if myself {
-            if owns || already_target || g.importing.contains_key(&slot) {
-                return Ok(());
-            }
-            if owner.is_empty() || g.nodes.contains_key(owner) {
-                return Ok(());
-            }
-            return Err(format!(
-                "not ready to commit NODE as dest for slot {} (unexpected owner {})",
-                slot, owner
-            ));
+    /// CLUSTER SETSLOT <slot> COMMITPREPARE <node-id> (Batch FO atomic commit).
+    ///
+    /// Under a single write lock: re-validate prepare (epoch/TTL/topology) and
+    /// apply `NODE <node-id>` (epoch bump, clear migrate/import/prepare). Fails
+    /// closed without ownership change when prepare is missing/stale/expired.
+    /// Operator `SETSLOT NODE` still bypasses prepare (FINISH/recovery).
+    ///
+    /// Honors source NODE inject (Batch EP) and commit-recheck clear inject
+    /// (Batch FH) so dual-end tests share failure paths.
+    pub fn commit_prepare_node(&self, slot: u16, node_id: &str) -> Result<(), String> {
+        if slot >= SLOT_COUNT {
+            return Err("Slot out of range".into());
+        }
+        // Batch EP test hook: force local NODE failures (shared with set_node).
+        if self.take_source_node_inject_fail() {
+            return Err("injected source NODE failure".into());
+        }
+        // Test hook: clear prepare before atomic commit re-check (Batch FH).
+        if self.take_commit_recheck_clear_inject() {
+            let mut g = self.inner.write();
+            g.prepare_node.remove(&slot);
         }
 
-        if !owns && !already_target {
-            return Err(format!(
-                "local neither owns slot {} nor already assigned to dest (commit re-check)",
-                slot
-            ));
+        let mut g = self.inner.write();
+        // Lazy TTL purge for this slot.
+        if let Some(v) = g.prepare_node.get(&slot) {
+            if prepare_vote_expired(v.prepared_at_unix_ms) {
+                g.prepare_node.remove(&slot);
+            }
         }
-        if let Some(m) = g.migrating.get(&slot) {
-            if m != node_id {
+        let vote = match g.prepare_node.get(&slot) {
+            Some(v) => v.clone(),
+            None => {
                 return Err(format!(
-                    "MIGRATING dest is {} want {} for slot {} (commit re-check)",
-                    m, node_id, slot
+                    "no prepare vote for slot {} (cleared, expired, or never set)",
+                    slot
                 ));
             }
+        };
+        if vote.target_id != node_id {
+            return Err(format!(
+                "prepare target is {} want {} for slot {}",
+                vote.target_id, node_id, slot
+            ));
         }
+        if prepare_vote_expired(vote.prepared_at_unix_ms) {
+            g.prepare_node.remove(&slot);
+            return Err(format!("prepare vote expired for slot {}", slot));
+        }
+        let cur_epoch = g.slot_config_epoch.get(slot as usize).copied().unwrap_or(0);
+        if vote.slot_epoch != cur_epoch {
+            return Err(format!(
+                "prepare epoch stale for slot {} (vote {} current {})",
+                slot, vote.slot_epoch, cur_epoch
+            ));
+        }
+        prepare_topology_ready(&g, slot, node_id)?;
+
+        // Apply NODE under the same lock (atomic with re-check).
+        if !g.nodes.contains_key(node_id) {
+            return Err(format!("Unknown node {}", node_id));
+        }
+        g.current_epoch = g.current_epoch.saturating_add(1);
+        g.slot_owner[slot as usize] = node_id.to_string();
+        g.slot_config_epoch[slot as usize] = g.current_epoch;
+        g.migrating.remove(&slot);
+        g.importing.remove(&slot);
+        g.prepare_node.remove(&slot);
+        drop(g);
+        self.autosave_nodes_conf();
         Ok(())
     }
 
@@ -1973,7 +2076,7 @@ impl ClusterState {
     fn purge_expired_prepare(&self, slot: u16) {
         let mut g = self.inner.write();
         if let Some(v) = g.prepare_node.get(&slot) {
-            if v.prepared_at.elapsed() > PREPARE_VOTE_TTL {
+            if prepare_vote_expired(v.prepared_at_unix_ms) {
                 g.prepare_node.remove(&slot);
             }
         }
@@ -1996,9 +2099,8 @@ impl ClusterState {
     pub fn test_expire_prepare(&self, slot: u16) {
         let mut g = self.inner.write();
         if let Some(v) = g.prepare_node.get_mut(&slot) {
-            v.prepared_at = Instant::now()
-                .checked_sub(PREPARE_VOTE_TTL + Duration::from_secs(1))
-                .unwrap_or_else(Instant::now);
+            let ttl_ms = PREPARE_VOTE_TTL.as_millis() as u64;
+            v.prepared_at_unix_ms = now_unix_ms().saturating_sub(ttl_ms + 1_000);
         }
     }
 
@@ -2007,7 +2109,8 @@ impl ClusterState {
     /// Always allowed for operators (bumps epoch). Stale **gossip** ownership
     /// with a lower epoch is rejected in [`Self::apply_ownership_range`] (Batch
     /// DV fence) — not here, so `RESHARD FINISH` / manual recovery still work.
-    /// Dual-end 2PC re-checks prepare **before** calling this (Batch FH).
+    /// Dual-end 2PC re-checks prepare **before** calling this (Batch FH) or
+    /// uses [`Self::commit_prepare_node`] for atomic check+apply (Batch FO).
     pub fn set_node(&self, slot: u16, node_id: &str) -> Result<(), String> {
         // Batch EP test hook: force local NODE failures (per ClusterState instance).
         if self.take_source_node_inject_fail() {
@@ -2546,6 +2649,109 @@ fn parse_nodes_conf_live_flags(text: &str) -> NodesConfLiveFlags {
     flags
 }
 
+/// Parse Batch FO durable prepare lines: `# prepare <slot> <target> <epoch> <unix_ms>`.
+///
+/// Malformed lines and TTL-expired votes are skipped (fail-closed partial restore).
+/// Last valid line for a slot wins.
+fn parse_nodes_conf_prepares(text: &str) -> HashMap<u16, PrepareVote> {
+    let mut out = HashMap::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if !t.starts_with('#') {
+            continue;
+        }
+        let rest = t.trim_start_matches('#').trim();
+        let mut parts = rest.split_whitespace();
+        let key = match parts.next() {
+            Some("prepare") => "prepare",
+            _ => continue,
+        };
+        let _ = key;
+        let slot_s = match parts.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        let target = match parts.next() {
+            Some(s) if !s.is_empty() => s,
+            _ => continue,
+        };
+        let epoch_s = match parts.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        let ts_s = match parts.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        let slot: u16 = match slot_s.parse() {
+            Ok(s) if s < SLOT_COUNT => s,
+            _ => continue,
+        };
+        let slot_epoch: u64 = match epoch_s.parse() {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let prepared_at_unix_ms: u64 = match ts_s.parse() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if prepare_vote_expired(prepared_at_unix_ms) {
+            continue;
+        }
+        out.insert(
+            slot,
+            PrepareVote {
+                target_id: target.to_string(),
+                slot_epoch,
+                prepared_at_unix_ms,
+            },
+        );
+    }
+    out
+}
+
+/// Topology readiness shared by prepare / check / commit (Batch FB/FH/FO).
+fn prepare_topology_ready(g: &Inner, slot: u16, node_id: &str) -> Result<(), String> {
+    let my_id = g.my_id.as_str();
+    let myself = node_id == my_id;
+    let owner = g
+        .slot_owner
+        .get(slot as usize)
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let owns = owner == my_id;
+    let already_target = !owner.is_empty() && owner == node_id;
+
+    if myself {
+        if owns || already_target || g.importing.contains_key(&slot) {
+            return Ok(());
+        }
+        if owner.is_empty() || g.nodes.contains_key(owner) {
+            return Ok(());
+        }
+        return Err(format!(
+            "not ready to commit NODE as dest for slot {} (unexpected owner {})",
+            slot, owner
+        ));
+    }
+
+    if !owns && !already_target {
+        return Err(format!(
+            "local neither owns slot {} nor already assigned to dest (commit re-check)",
+            slot
+        ));
+    }
+    if let Some(m) = g.migrating.get(&slot) {
+        if m != node_id {
+            return Err(format!(
+                "MIGRATING dest is {} want {} for slot {} (commit re-check)",
+                m, node_id, slot
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn parse_nodes_conf_lines(text: &str) -> std::result::Result<Vec<ParsedNodesLine>, String> {
     let mut out = Vec::new();
     for (lineno, line) in text.lines().enumerate() {
@@ -2915,6 +3121,90 @@ mod tests {
         assert!(b.announce_port().is_none());
         assert_eq!(b.local_repl_priority(), 100);
         assert_eq!(b.my_id(), a.my_id());
+        // Pre-FO files have no prepare lines → empty prepare map.
+        assert!(!b.is_prepared(0));
+    }
+
+    /// Batch FO: prepare votes round-trip through SAVECONFIG / load.
+    #[test]
+    fn nodes_conf_prepare_votes_round_trip() {
+        let dir = std::env::temp_dir().join(format!(
+            "kore-prepare-ut-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let a = ClusterState::single_node("127.0.0.1", 7000);
+        let dest = "dd".repeat(20);
+        a.add_node(&dest, "10.0.0.2", 7001);
+        a.set_migrating(0, &dest).unwrap();
+        a.set_prepare_node(0, &dest).unwrap();
+        let stamped = a.prepared_slot_epoch(0).expect("epoch");
+        a.set_nodes_conf_dir(dir.to_str().unwrap());
+        a.autosave_nodes_conf();
+        let body = std::fs::read_to_string(dir.join("nodes.conf")).unwrap();
+        assert!(
+            body.contains(&format!("# prepare 0 {} {}", dest, stamped)),
+            "expected prepare header in nodes.conf: {}",
+            body
+        );
+
+        let b = ClusterState::load_or_single_node("127.0.0.1", 7000, dir.to_str().unwrap());
+        assert!(b.is_prepared(0), "prepare should restore across restart");
+        assert_eq!(b.prepared_node(0).as_deref(), Some(dest.as_str()));
+        assert_eq!(b.prepared_slot_epoch(0), Some(stamped));
+        // Commit re-check still ok when file epoch matches stamped slot epoch.
+        assert!(b.check_prepare_valid(0, &dest).is_ok());
+        // Atomic COMMITPREPARE applies ownership and clears prepare.
+        b.commit_prepare_node(0, &dest).unwrap();
+        assert!(!b.is_prepared(0));
+        assert_eq!(b.owner_id_of(0).as_deref(), Some(dest.as_str()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Batch FO: expired prepare lines are not restored (fail-closed).
+    #[test]
+    fn nodes_conf_expired_prepare_not_restored() {
+        let a = ClusterState::single_node("127.0.0.1", 7000);
+        let dest = "dd".repeat(20);
+        a.add_node(&dest, "10.0.0.2", 7001);
+        let ttl_ms = PREPARE_VOTE_TTL.as_millis() as u64;
+        let old_ts = now_unix_ms().saturating_sub(ttl_ms + 5_000);
+        let text = format!(
+            "# Kore cluster nodes.conf\n# epoch {}\n# prepare 0 {} 1 {}\n{}",
+            a.current_epoch(),
+            dest,
+            old_ts,
+            a.format_nodes()
+        );
+        let b = ClusterState::from_nodes_conf("127.0.0.1", 7000, &text).unwrap();
+        assert!(!b.is_prepared(0));
+        assert!(b.check_prepare_valid(0, &dest).is_err());
+    }
+
+    /// Batch FO: COMMITPREPARE fails closed without half-apply when no vote.
+    #[test]
+    fn commit_prepare_requires_valid_vote() {
+        let cs = ClusterState::single_node("127.0.0.1", 7000);
+        let dest = "dd".repeat(20);
+        cs.add_node(&dest, "10.0.0.2", 7001);
+        let err = cs.commit_prepare_node(0, &dest).unwrap_err();
+        assert!(
+            err.contains("no prepare"),
+            "expected no prepare error, got {}",
+            err
+        );
+        assert!(cs.owns_slot(0));
+        assert_ne!(cs.owner_id_of(0).as_deref(), Some(dest.as_str()));
+
+        cs.set_migrating(0, &dest).unwrap();
+        cs.set_prepare_node(0, &dest).unwrap();
+        cs.commit_prepare_node(0, &dest).unwrap();
+        assert_eq!(cs.owner_id_of(0).as_deref(), Some(dest.as_str()));
+        assert!(!cs.is_prepared(0));
     }
 
     #[test]
