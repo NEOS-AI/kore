@@ -843,7 +843,7 @@ Also tracked in `docs/roadmap.md`.
   - Tests: state prepare round-trip / expired not restored / COMMITPREPARE; migrate unit + **42/42** e2e; `cluster_test` Config compile fix
   - *Post-ship review (2026-07-29):* dual-end dest-first COMMITPREPARE + source local atomic path green; recheck inject still fail-closed; remote dest still two RPCs (CHECKPREPARE then COMMITPREPARE) — accepted lite; no correctness bug
   - Residual: binary cluster bus 2PC; dest prepare breadth; operator NODE bypass (intentional); per-slot epochs not fully persisted in nodes.conf (file-epoch stamp + prepare fence)
-- [x] **`[P3]`** **Batch FP — Expire slot header** (`9ae7fac`)
+- [x] **`[P3]`** **Batch FP — Expire slot header** (`0fa2ed6`)
   - Folded side `typed_expires` into [`KeySlot::expires_at`] on the unified `key_values` map
   - Map type: `ShardedKeyMap<KeySlot>`; `KeyspacePayload` carries slots only (no sibling expires map)
   - EXPIRE/TTL/PERSIST/active expire/volatile sample/RENAME use slot expire; RDB/AOF still export/import via `export_typed_expires_unix_ms` / `set_typed_expire_unix_ms` (wire format unchanged)
