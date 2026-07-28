@@ -3,7 +3,7 @@
 ## Currently working on..
 
 - [x] Support for Redis Pub-Sub
-- **Committed through FM.** Sentinel INFO `slave_priority` refresh + auto-failover 15s cooldown shipped. Optional FN/FO/FP next. See root `TODO.md` → *Next work queue (post-FM)*.
+- **Committed through FN.** CKQUORUM live PING + probe `*` honesty. Optional FO/FP next. See root `TODO.md` → *Next work queue (post-FN)*.
 
 ## Persistence / search letter batches (recent)
 
@@ -77,7 +77,8 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Cluster automatic reshard / multi-type MIGRATE orchestration (MVP complete: PLAN/AUTO DX, epoch gossip DU, dest-first NODE DV, fail quorum DW, EY preflight, EP dest rollback, **FB/FH RESP prepare/commit 2PC**)
 - [x] Sentinel promote-success gate (Batch FC: real promote required; in-process failover_in_progress)
 - [x] **FD** measured benchmarks vs Valkey (`docs/benchmarks.md`; single-host median of 3; no portable-win claims)
-- [x] Sentinel leader election depth (Batch FE: voted-leader / elect gate; residuals: election-timeout, hello SUBSCRIBE, CKQUORUM live)
+- [x] Sentinel leader election depth (Batch FE: voted-leader / elect gate; residual: election-timeout SM)
+- [x] Sentinel CKQUORUM live probe + probe `*` honesty (Batch FN; hello SUBSCRIBE residual accepted)
 - [x] HNSW multi-layer insert (Batch FF)
 - [x] Unified keyspace design + `KeyValue` facade (Batch FG slice A; multi-map storage)
 - [x] **FG-2** physical hashes in `ShardedKeyMap<KeyValue>` (`Cache::key_values`)
@@ -91,7 +92,7 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] **FK** Sentinel promote ranking (priority then ROLE offset then greatest `ip:port`; 0 never; closed first-replica-wins)
 - [x] **FL** `nodes.conf` live cluster flags (require-full / allow-reads / announce / replica-priority; CONFIG SET autosave; legacy defaults)
 - [x] **FM** Sentinel residual polish (live INFO `slave_priority` refresh; auto-failover 15s cooldown; manual FAILOVER force-bypasses)
-- [ ] **Next (see `TODO.md` post-FM):** optional **FN** CKQUORUM live · **FO** durable prepare · **FP** expire slot
+- [ ] **Next (see `TODO.md` post-FN):** optional **FO** durable prepare · **FP** expire slot
 - [x] 데드락 감지 고급 기능
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원
@@ -109,8 +110,9 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Sentinel multi-instance ODOWN lite (Batch EX: MEET peers + vote quorum)
 - [x] Sentinel FLUSHCONFIG / load-on-boot (Batch EZ)
 - [x] Sentinel hello bus lite (Batch FA: peer HELLO + PUBLISH on master)
-- [x] Sentinel cross-process leader election lite (Batch FE; residuals: election-timeout SM, hello SUBSCRIBE)
+- [x] Sentinel cross-process leader election lite (Batch FE; residual: election-timeout SM)
 - [x] Sentinel promote ranking (Batch FK) + INFO `slave_priority` + failover cooldown (Batch FM)
+- [x] Sentinel CKQUORUM live PING + probe `*` honesty (Batch FN; hello SUBSCRIBE residual accepted)
 - [x] Blocking `XREAD` / `XREADGROUP` (`BLOCK`)
 - [x] Multi-DB replication parity (SYNC/PSYNC all DBs + SELECT apply)
 - [x] AOF SELECT concurrency fix + atomic SELECT+cmd replication

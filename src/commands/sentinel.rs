@@ -4,7 +4,8 @@ use super::CommandHandler;
 use crate::error::Result;
 use crate::protocol::RespValue;
 use crate::sentinel::{
-    master_fields, meet_sentinel, peer_fields, try_failover, MasterInfo, SentinelState,
+    count_reachable_sentinels, master_fields, meet_sentinel, peer_fields, try_failover,
+    MasterInfo, SentinelState,
 };
 use bytes::Bytes;
 use std::sync::Arc;
@@ -242,6 +243,7 @@ impl CommandHandler {
                 }
             }
             "CKQUORUM" => {
+                // Batch FN: usable = live PING count (self + reachable peers), not table size.
                 if args.len() != 2 {
                     return Ok(RespValue::error(
                         "ERR wrong number of arguments for 'sentinel|ckquorum' command",
@@ -253,7 +255,7 @@ impl CommandHandler {
                 };
                 match sentinel.master(&name) {
                     Some(m) => {
-                        let usable = sentinel.known_sentinel_count();
+                        let usable = count_reachable_sentinels(sentinel).await;
                         if usable as u32 >= m.quorum {
                             Ok(RespValue::BulkString(Some(Bytes::from(format!(
                                 "OK {} usable Sentinels. Quorum and failover authorization are OK",
@@ -500,7 +502,7 @@ fn sentinel_help() -> RespValue {
         b"SET <name> <option> <value> -- down-after-milliseconds | quorum | auto-failover",
         b"FAILOVER <name> -- force failover to a reachable replica",
         b"FLUSHCONFIG -- write sentinel.conf under dir (also autosaved on topology changes)",
-        b"CKQUORUM <name> -- check if enough Sentinels for quorum",
+        b"CKQUORUM <name> -- check live reachable Sentinels >= quorum (PING peers)",
         b"HELP -- this help",
     ];
     RespValue::Array(

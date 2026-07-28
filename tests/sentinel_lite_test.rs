@@ -3,15 +3,16 @@
 //! Batch FE: leader election on IS-MASTER-DOWN-BY-ADDR; only elected leader auto-failovers.
 //! Batch FK: promote ranking by priority then offset (not discovery order).
 //! Batch FM: live INFO slave_priority refresh + auto failover cooldown.
+//! Batch FN: CKQUORUM / elect majority live PING; probe `*` honesty.
 
 use bytes::Bytes;
 use kore::config::Config;
 use kore::persistence::{PersistenceConfig, PersistenceManager, SaveRule};
 use kore::protocol::{RespParser, RespValue};
 use kore::{
-    parse_info_slave_priority, rank_replicas_for_promote, test_promote_inject,
-    test_set_failover_cooldown_ms, test_set_promote_inject, try_elect_leader, try_failover, Cache,
-    ReplicaInfo, Server, PROMOTE_INJECT_FORCE_FAIL, PROMOTE_INJECT_FORCE_OK,
+    count_reachable_sentinels, parse_info_slave_priority, rank_replicas_for_promote,
+    test_promote_inject, test_set_failover_cooldown_ms, test_set_promote_inject, try_elect_leader,
+    try_failover, Cache, ReplicaInfo, Server, PROMOTE_INJECT_FORCE_FAIL, PROMOTE_INJECT_FORCE_OK,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -922,7 +923,7 @@ async fn sentinel_is_master_down_returns_voted_leader() {
     sleep(Duration::from_millis(1500)).await;
     assert!(sentinel.master("mymaster").unwrap().s_down);
 
-    // Probe-only (`*`) when s_down → non-empty leader (self).
+    // Batch FN: probe-only (`*`) with no prior vote → Redis-honest leader "*".
     match send_cmd(
         &mut cli,
         &[
@@ -938,9 +939,8 @@ async fn sentinel_is_master_down_returns_voted_leader() {
     {
         RespValue::Array(a) => {
             assert_eq!(a[0], RespValue::Integer(1));
-            let leader = as_bulk(&a[1]);
-            assert!(!leader.is_empty(), "expected voted leader, got empty");
-            assert_eq!(leader, sentinel.my_id());
+            assert_eq!(as_bulk(&a[1]), "*");
+            assert_eq!(a[2], RespValue::Integer(0));
         }
         other => panic!("{:?}", other),
     }
@@ -1804,5 +1804,227 @@ async fn sentinel_failover_cooldown_after_attempt() {
     let _ = tx_t.send(true);
     hs.abort();
     ht.abort();
+    sleep(Duration::from_millis(50)).await;
+}
+
+/// Batch FN: CKQUORUM uses live PING; dead peer table entries do not inflate usable.
+#[tokio::test(flavor = "multi_thread")]
+async fn sentinel_ckquorum_live_probe_skips_dead_peers() {
+    let sentinel_port = 16990u16;
+    let live_peer_port = 16991u16;
+    // Never started — listed in peer table only.
+    let dead_peer_port = 16992u16;
+
+    let cache_s = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_s = Server::new(cache_s, make_config(sentinel_port));
+    let sentinel = Arc::clone(srv_s.sentinel());
+    let (tx_s, rx_s) = watch::channel(false);
+    let hs = tokio::spawn(async move {
+        let _ = srv_s.run_with_shutdown(rx_s).await;
+    });
+    wait_listen(sentinel_port).await;
+
+    // Live peer sentinel (no master needed for PING reachability).
+    let cache_p = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_p = Server::new(cache_p, make_config(live_peer_port));
+    let (tx_p, rx_p) = watch::channel(false);
+    let hp = tokio::spawn(async move {
+        let _ = srv_p.run_with_shutdown(rx_p).await;
+    });
+    wait_listen(live_peer_port).await;
+
+    let mut cli = TcpStream::connect(("127.0.0.1", sentinel_port)).await.unwrap();
+    assert!(is_ok(
+        &send_cmd(
+            &mut cli,
+            &[
+                "SENTINEL",
+                "MONITOR",
+                "mymaster",
+                "127.0.0.1",
+                "16999", // unused master addr; CKQUORUM only needs known master
+                "2",
+            ],
+        )
+        .await
+    ));
+
+    // Table-only dead peer: known_sentinel_count = 2 but live = 1 → NOQUORUM.
+    sentinel.add_peer("dead".repeat(10), "127.0.0.1", dead_peer_port);
+    assert_eq!(sentinel.known_sentinel_count(), 2);
+    assert_eq!(count_reachable_sentinels(&sentinel).await, 1);
+
+    match send_cmd(&mut cli, &["SENTINEL", "CKQUORUM", "mymaster"]).await {
+        RespValue::Error(e) => {
+            let msg = String::from_utf8_lossy(&e);
+            assert!(
+                msg.contains("NOQUORUM") && msg.contains("1 usable"),
+                "expected NOQUORUM with 1 usable, got {}",
+                msg
+            );
+        }
+        other => panic!("expected NOQUORUM error, got {:?}", other),
+    }
+
+    // MEET live peer → live usable 2 ≥ quorum 2 → OK.
+    assert!(is_ok(
+        &send_cmd(
+            &mut cli,
+            &["SENTINEL", "MEET", "127.0.0.1", &live_peer_port.to_string()],
+        )
+        .await
+    ));
+    // known table: self + dead + live = 3; live reachable: self + live = 2.
+    assert_eq!(sentinel.known_sentinel_count(), 3);
+    assert_eq!(count_reachable_sentinels(&sentinel).await, 2);
+
+    match send_cmd(&mut cli, &["SENTINEL", "CKQUORUM", "mymaster"]).await {
+        RespValue::BulkString(Some(b)) => {
+            let msg = String::from_utf8_lossy(&b);
+            assert!(
+                msg.starts_with("OK 2 usable"),
+                "expected OK 2 usable, got {}",
+                msg
+            );
+        }
+        other => panic!("expected OK bulk, got {:?}", other),
+    }
+
+    let _ = tx_s.send(true);
+    let _ = tx_p.send(true);
+    hs.abort();
+    hp.abort();
+    sleep(Duration::from_millis(50)).await;
+}
+
+/// Batch FN: dead peers do not inflate elect majority — sole live sentinel elects self.
+#[tokio::test(flavor = "multi_thread")]
+async fn sentinel_elect_ignores_dead_peers_for_majority() {
+    let sentinel_port = 16993u16;
+    let dead_peer_port = 16994u16; // never started
+
+    let cache_s = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_s = Server::new(cache_s, make_config(sentinel_port));
+    let sentinel = Arc::clone(srv_s.sentinel());
+    let (tx_s, rx_s) = watch::channel(false);
+    let hs = tokio::spawn(async move {
+        let _ = srv_s.run_with_shutdown(rx_s).await;
+    });
+    wait_listen(sentinel_port).await;
+
+    sentinel
+        .monitor("mymaster", "127.0.0.1", 16995, 1)
+        .unwrap();
+    // Two dead table peers would force majority 2 under table-size N=3.
+    sentinel.add_peer("dead1".repeat(8), "127.0.0.1", dead_peer_port);
+    sentinel.add_peer("dead2".repeat(8), "127.0.0.1", dead_peer_port.wrapping_add(1));
+    assert_eq!(sentinel.known_sentinel_count(), 3);
+    assert_eq!(sentinel.leader_votes_needed("mymaster"), 2);
+    assert_eq!(count_reachable_sentinels(&sentinel).await, 1);
+
+    // Live path: N=1 → elect succeeds without peer votes.
+    assert!(
+        try_elect_leader(&sentinel, "mymaster").await,
+        "sole live sentinel must elect despite dead peer table entries"
+    );
+    assert!(sentinel.is_failover_leader("mymaster"));
+    assert_eq!(sentinel.master("mymaster").unwrap().leader_runid, sentinel.my_id());
+
+    let _ = tx_s.send(true);
+    hs.abort();
+    sleep(Duration::from_millis(50)).await;
+}
+
+/// Batch FN: after casting a vote, probe `*` returns that sticky leader (not "*").
+#[tokio::test(flavor = "multi_thread")]
+async fn sentinel_probe_star_returns_sticky_vote() {
+    let master_port = 16996u16;
+    let sentinel_port = 16997u16;
+
+    let cache_m = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_m = Server::new(cache_m, make_config(master_port));
+    let (tx_m, rx_m) = watch::channel(false);
+    let hm = tokio::spawn(async move {
+        let _ = srv_m.run_with_shutdown(rx_m).await;
+    });
+    wait_listen(master_port).await;
+
+    let cache_s = Cache::new_with_sweep(8, 1024 * 1024 * 20, 500 * 1024 * 1024, false);
+    let srv_s = Server::new(cache_s, make_config(sentinel_port));
+    let sentinel = Arc::clone(srv_s.sentinel());
+    let (tx_s, rx_s) = watch::channel(false);
+    let hs = tokio::spawn(async move {
+        let _ = srv_s.run_with_shutdown(rx_s).await;
+    });
+    wait_listen(sentinel_port).await;
+
+    let mut cli = TcpStream::connect(("127.0.0.1", sentinel_port)).await.unwrap();
+    assert!(is_ok(
+        &send_cmd(
+            &mut cli,
+            &[
+                "SENTINEL",
+                "MONITOR",
+                "mymaster",
+                "127.0.0.1",
+                &master_port.to_string(),
+                "1",
+            ],
+        )
+        .await
+    ));
+    assert!(is_ok(
+        &send_cmd(
+            &mut cli,
+            &[
+                "SENTINEL",
+                "SET",
+                "mymaster",
+                "down-after-milliseconds",
+                "80",
+            ],
+        )
+        .await
+    ));
+    assert!(is_ok(
+        &send_cmd(
+            &mut cli,
+            &["SENTINEL", "SET", "mymaster", "auto-failover", "no"],
+        )
+        .await
+    ));
+
+    let _ = tx_m.send(true);
+    hm.abort();
+    sleep(Duration::from_millis(1500)).await;
+    assert!(sentinel.master("mymaster").unwrap().s_down);
+
+    // Cast sticky vote via API, then probe on the wire for Redis-honest replay.
+    let cand = "ab".repeat(20);
+    let _ = sentinel.vote_leader("mymaster", 9, &cand);
+
+    match send_cmd(
+        &mut cli,
+        &[
+            "SENTINEL",
+            "IS-MASTER-DOWN-BY-ADDR",
+            "127.0.0.1",
+            &master_port.to_string(),
+            "0",
+            "*",
+        ],
+    )
+    .await
+    {
+        RespValue::Array(a) => {
+            assert_eq!(a[0], RespValue::Integer(1));
+            assert_eq!(as_bulk(&a[1]), cand);
+            assert_eq!(a[2], RespValue::Integer(9));
+        }
+        other => panic!("{:?}", other),
+    }
+
+    let _ = tx_s.send(true);
+    hs.abort();
     sleep(Duration::from_millis(50)).await;
 }

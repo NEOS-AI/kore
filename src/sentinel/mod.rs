@@ -1,7 +1,8 @@
 //! Redis Sentinel–compatible **lite** (Batch EW) + multi-Sentinel **ODOWN** (Batch EX)
 //! + **config persistence** (Batch EZ) + **hello bus lite** (Batch FA)
 //! + **promote-success gate** (Batch FC) + **leader election** (Batch FE)
-//! + **promote ranking** (Batch FK) + **INFO priority + failover cooldown** (Batch FM).
+//! + **promote ranking** (Batch FK) + **INFO priority + failover cooldown** (Batch FM)
+//! + **CKQUORUM live probe + probe honesty** (Batch FN).
 //!
 //! - EW: subjective-down (`s_down`), MONITOR, GET-MASTER-ADDR, FAILOVER, auto-failover
 //! - EX: peer `SENTINEL MEET`, `IS-MASTER-DOWN-BY-ADDR` votes, `o_down` when votes ≥ quorum
@@ -11,16 +12,25 @@
 //! - FE: voted-leader on `IS-MASTER-DOWN-BY-ADDR` (epoch/runid); only elected leader auto-failovers
 //! - FK: promote rank = highest priority (0 never), then highest ROLE offset, then greatest `ip:port`
 //! - FM: live `INFO replication` `slave_priority` refresh; auto-failover cooldown after `try_failover`
+//! - FN: `CKQUORUM` / elect majority use **live PING** reachability (dead peers do not inflate `N`);
+//!   probe `runid=*` with no prior vote returns leader `"*"` (Redis-honest; sole-sentinel auto path
+//!   still uses [`Self::is_failover_leader`] / empty-peers elect)
 //!
 //! # Honesty vs full Redis Sentinel
 //!
-//! - **Leader election (FE):** first-seen sticky vote per epoch; higher epoch can re-vote.
-//!   Winner needs `max(quorum, floor(N/2)+1)` votes among self+peers. Manual `SENTINEL FAILOVER`
-//!   bypasses election (operator force). Not a full Raft/Sentinel state machine (no election
-//!   timeout abort, no subjective-leader lex-min runid pre-filter).
+//! - **Leader election (FE/FN):** first-seen sticky vote per epoch; higher epoch can re-vote.
+//!   Winner needs `max(quorum, floor(N/2)+1)` where **N = live reachable** sentinels (self +
+//!   peers answering `PING`; Batch FN). Manual `SENTINEL FAILOVER` bypasses election (operator
+//!   force). Not a full Raft/Sentinel state machine (no election timeout abort, no
+//!   subjective-leader lex-min runid pre-filter). While `o_down`, tick may open a new campaign
+//!   epoch every 1s until elected (FM cooldown only suppresses post-`try_failover` re-entry).
 //! - **Hello bus:** tick `PUBLISH __sentinel__:hello` + peer `SENTINEL HELLO` exchange.
-//!   No long-lived master `SUBSCRIBE` fan-in (residual).
-//! - **CKQUORUM:** peer-table size (`1 + peers`), not live reachability probes (residual).
+//!   No long-lived master `SUBSCRIBE` fan-in (accepted residual; peer HELLO is primary discovery).
+//! - **CKQUORUM (FN):** live PING of peer table; usable = `1 + reachable peers`. Dead peers no
+//!   longer inflate usable count. Sync [`Self::known_sentinel_count`] remains table size for
+//!   offline callers/tests.
+//! - **Probe honesty (FN):** `IS-MASTER-DOWN-BY-ADDR` with `runid=*` and no prior vote returns
+//!   leader `"*"` / epoch `0` (Redis-like). Existing sticky vote still returned on probe.
 //! - **Promote order (FK/FM):** mirrors cluster EA/EB — highest `priority` (0 never promote), then
 //!   highest `repl_offset` (from ROLE master slave list), then lexicographically greatest `ip:port`.
 //!   ROLE discovery defaults priority to 100; probe / `try_failover` refresh each replica via
@@ -511,7 +521,7 @@ impl SentinelState {
         false
     }
 
-    /// Local answer for `IS-MASTER-DOWN-BY-ADDR` (Batch EX + FE).
+    /// Local answer for `IS-MASTER-DOWN-BY-ADDR` (Batch EX + FE + FN).
     ///
     /// Returns `(down: 0|1, leader_runid, leader_epoch)`.
     ///
@@ -522,9 +532,11 @@ impl SentinelState {
     /// that candidate at `req_epoch` if `req_epoch` is greater than any prior
     /// vote epoch (Redis-style first-seen per epoch; higher epoch may re-vote).
     ///
-    /// When `req_runid` is `"*"` (probe only): returns the existing vote if any;
-    /// if `s_down` and no vote yet, returns **self** as leader (sole-sentinel
-    /// convenience — Redis often returns `"*"` here; we document the difference).
+    /// When `req_runid` is `"*"` (probe only): returns the existing sticky vote
+    /// if any; if `s_down` and no vote yet, returns leader `"*"` / epoch `0`
+    /// (Batch FN Redis-honest). Sole-sentinel auto-failover still works via
+    /// [`Self::is_failover_leader`] (empty peers + no vote → self) and
+    /// [`try_elect_leader`] without lying on the probe wire.
     ///
     /// When not `s_down`: `(0, "", 0)`.
     pub fn is_master_down_by_addr(
@@ -555,12 +567,11 @@ impl SentinelState {
             let (leader, epoch) = self.vote_leader(&name, req_epoch, req_runid);
             return (1, leader, epoch);
         }
-        // Probe only: existing vote, or self for lite sole-sentinel UX.
+        // Probe only: existing sticky vote, else Redis-honest "*" (Batch FN).
         if !m.leader_runid.is_empty() {
             return (1, m.leader_runid, m.leader_epoch);
         }
-        let epoch = self.current_epoch().max(1);
-        (1, self.my_id(), epoch)
+        (1, "*".into(), 0)
     }
 
     /// Cast or read sticky failover-leader vote for `name` (Batch FE).
@@ -613,12 +624,22 @@ impl SentinelState {
         m.leader_runid == self.my_id()
     }
 
-    /// Votes required to win leadership: `max(quorum, floor(N/2)+1)` (Batch FE).
-    pub fn leader_votes_needed(&self, name: &str) -> u32 {
+    /// Votes required for `voters` live sentinels: `max(quorum, floor(N/2)+1)` (Batch FE/FN).
+    ///
+    /// Prefer passing a **live** voter count from [`count_reachable_sentinels`].
+    pub fn leader_votes_needed_for(&self, name: &str, voters: u32) -> u32 {
         let quorum = self.master(name).map(|m| m.quorum).unwrap_or(1);
-        let voters = self.known_sentinel_count() as u32;
-        let majority = voters / 2 + 1;
+        let n = voters.max(1);
+        let majority = n / 2 + 1;
         quorum.max(majority).max(1)
+    }
+
+    /// Sync convenience: majority from **peer-table size** (offline / unit tests).
+    ///
+    /// Production elect path uses [`Self::leader_votes_needed_for`] with
+    /// [`count_reachable_sentinels`] so dead peers do not inflate `N` (Batch FN).
+    pub fn leader_votes_needed(&self, name: &str) -> u32 {
+        self.leader_votes_needed_for(name, self.known_sentinel_count() as u32)
     }
 
     /// Recompute o_down from local s_down + peer votes (Batch EX).
@@ -736,9 +757,9 @@ impl SentinelState {
         self.masters.read().keys().cloned().collect()
     }
 
-    /// Usable sentinels for CKQUORUM: self + known peers (table size, not live probe).
+    /// Peer-table size: `1 + peers.len()` (no network). Offline / unit-test helper.
     ///
-    /// Residual (Batch FE): does **not** PING peers; count is `1 + peers.len()`.
+    /// Wire `CKQUORUM` and leader election use [`count_reachable_sentinels`] (Batch FN).
     pub fn known_sentinel_count(&self) -> usize {
         1 + self.peers.read().len()
     }
@@ -1187,11 +1208,33 @@ async fn query_is_master_down(
     }
 }
 
-/// Campaign for failover leadership and return whether we won (Batch FE).
+/// Live usable sentinel count for CKQUORUM / elect majority (Batch FN).
 ///
-/// - Sole sentinel (no peers): vote for self and return `true`.
+/// Always counts **self** as reachable. Each peer is probed with `PING`
+/// (same IO timeout as other sentinel probes). Unreachable / timed-out peers
+/// are **not** counted so dead entries cannot inflate majority or CKQUORUM.
+pub async fn count_reachable_sentinels(sentinel: &SentinelState) -> usize {
+    let peers = sentinel.peers();
+    if peers.is_empty() {
+        return 1;
+    }
+    let mut n = 1usize; // self
+    for p in peers {
+        let addr = format!("{}:{}", p.ip, p.port);
+        match connect_and_ping(&addr).await {
+            Ok(()) => n = n.saturating_add(1),
+            Err(e) => debug!("sentinel: peer {} unreachable for live count: {}", addr, e),
+        }
+    }
+    n
+}
+
+/// Campaign for failover leadership and return whether we won (Batch FE + FN).
+///
+/// - Sole sentinel (no peers **or** no other live peers): vote for self and return `true`.
 /// - Multi-sentinel: sticky vote for self at a campaign epoch; solicit peers via
-///   `IS-MASTER-DOWN-BY-ADDR` with our runid; win if votes ≥ `leader_votes_needed`.
+///   `IS-MASTER-DOWN-BY-ADDR` with our runid; win if votes ≥
+///   `leader_votes_needed_for` with **live** voter count (Batch FN).
 /// - If we already voted for another runid this epoch, abstain (`false`).
 ///
 /// Manual `SENTINEL FAILOVER` does not call this (operator force).
@@ -1210,8 +1253,11 @@ pub async fn try_elect_leader(sentinel: &SentinelState, name: &str) -> bool {
         return false;
     }
 
-    // Sole sentinel: no cross-process race.
-    if sentinel.peers().is_empty() {
+    // Live reachability (Batch FN): dead peers must not force a higher majority.
+    let live = count_reachable_sentinels(sentinel).await;
+
+    // Sole live sentinel: no cross-process race (table may still list dead peers).
+    if live <= 1 {
         let epoch = if m.leader_epoch > 0 {
             m.leader_epoch
         } else {
@@ -1248,17 +1294,17 @@ pub async fn try_elect_leader(sentinel: &SentinelState, name: &str) -> bool {
         }
     }
 
-    let need = sentinel.leader_votes_needed(name);
+    let need = sentinel.leader_votes_needed_for(name, live as u32);
     if votes_for_me >= need {
         info!(
-            "sentinel: +elected-leader {} epoch={} votes={}/{}",
-            name, epoch, votes_for_me, need
+            "sentinel: +elected-leader {} epoch={} votes={}/{} (live={})",
+            name, epoch, votes_for_me, need, live
         );
         true
     } else {
         debug!(
-            "sentinel: not elected for {} epoch={} votes={}/{}",
-            name, epoch, votes_for_me, need
+            "sentinel: not elected for {} epoch={} votes={}/{} (live={})",
+            name, epoch, votes_for_me, need, live
         );
         false
     }
@@ -1841,11 +1887,38 @@ mod tests {
         s.set_option("m", "down-after-milliseconds", "20").unwrap();
         std::thread::sleep(Duration::from_millis(30));
         s.maybe_sdown("m");
-        // Probe-only when s_down: lite returns self as leader.
+        // Batch FN: probe-only with no prior vote → Redis-honest "*" / epoch 0.
         let (d, leader, epoch) = s.is_master_down_by_addr("10.0.0.9", 7000, 0, "*");
         assert_eq!(d, 1);
-        assert_eq!(leader, s.my_id());
-        assert!(epoch >= 1);
+        assert_eq!(leader, "*");
+        assert_eq!(epoch, 0);
+        // Sole-sentinel auto path still treats empty vote + no peers as leader.
+        assert!(s.is_failover_leader("m"));
+        // After an explicit vote, probe returns that sticky leader.
+        let cand = "aa".repeat(20);
+        let _ = s.vote_leader("m", 2, &cand);
+        let (d2, leader2, epoch2) = s.is_master_down_by_addr("10.0.0.9", 7000, 0, "*");
+        assert_eq!(d2, 1);
+        assert_eq!(leader2, cand);
+        assert_eq!(epoch2, 2);
+    }
+
+    /// Batch FN: majority helper uses voter count; table size can still inflate offline API.
+    #[test]
+    fn leader_votes_needed_for_ignores_dead_peer_inflation() {
+        let s = SentinelState::new();
+        s.monitor("m", "10.0.0.1", 6379, 1).unwrap();
+        // Two dead table peers → known_sentinel_count = 3 → majority 2.
+        s.add_peer("aa".repeat(20), "127.0.0.1", 1);
+        s.add_peer("bb".repeat(20), "127.0.0.1", 2);
+        assert_eq!(s.known_sentinel_count(), 3);
+        assert_eq!(s.leader_votes_needed("m"), 2); // offline table API
+        // Live elect path would pass voters=1 (self only) → need 1.
+        assert_eq!(s.leader_votes_needed_for("m", 1), 1);
+        // With quorum 2 and 1 live voter still need 2 (quorum wins).
+        s.set_option("m", "quorum", "2").unwrap();
+        assert_eq!(s.leader_votes_needed_for("m", 1), 2);
+        assert_eq!(s.leader_votes_needed_for("m", 3), 2);
     }
 
     /// Batch FE: sticky vote per epoch; higher epoch may re-vote.

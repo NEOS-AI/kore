@@ -154,14 +154,15 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch FA)*: Redis-style hello CSV; `SENTINEL HELLO`; tick **PUBLISH** `__sentinel__:hello` on reachable masters; peer `SENTINEL HELLO` exchange; `apply_hello` learns peers + higher-epoch **switch-master**. No long-lived master `SUBSCRIBE` fan-in (peer HELLO is primary discovery path).
   - *Done (Batch FC)*: `promote_replica` success gate — requires `FAILOVER` OK, `REPLICAOF NO ONE` OK, or post-attempt `ROLE=master`; **never** `switch_master` on PING alone. Per-master `failover_in_progress` serializes manual FAILOVER vs tick. Promote inject hooks for tests.
   - *Done (Batch FE)*: voted-leader on `IS-MASTER-DOWN-BY-ADDR` (sticky first-seen per epoch; higher epoch re-votes); auto-failover only after `try_elect_leader` (≥ `max(quorum, floor(N/2)+1)`); ODOWN probes use runid `*`; `add_peer` autosave only on real change. Manual `SENTINEL FAILOVER` still force-bypasses election.
-  - *Residual (post-FK/FL/FM)* — see Phase D cluster + backlog table / Later:
+  - *Done (Batch FN)*: `CKQUORUM` + elect majority use **live PING** (`count_reachable_sentinels`); dead peers no longer inflate usable/N; probe `runid=*` with no prior vote returns leader `"*"` / epoch 0 (Redis-honest; sole-sentinel auto path via `is_failover_leader` / live≤1 elect).
+  - *Residual (post-FN)* — see Phase D cluster + backlog table / Later:
     - **done** promote ranking (Batch FK: priority → offset → `ip:port`).
     - **done** `nodes.conf` live flags (Batch FL).
     - **done** INFO `slave_priority` refresh + auto failover cooldown (Batch FM).
-    - **P3** `CKQUORUM` / `leader_votes_needed` use peer-table size, not live reachability (dead peers inflate majority).
-    - **P3** no long-lived master `__sentinel__:hello` SUBSCRIBE fan-in (tick PUBLISH + peer HELLO only).
-    - **P3** election lite: no Redis election-timeout / cooldown — while `o_down`, tick may open a **new campaign epoch every 1s** until elected (higher-epoch re-vote can thrash under multi-sentinel).
-    - **P3** probe (`runid=*`) with no prior vote returns **self** as leader (sole-sentinel UX; Redis often returns `*`) — documented in rustdoc.
+    - **done** CKQUORUM / elect majority live probe + probe `*` honesty (Batch FN).
+    - **P3 accepted** no long-lived master `__sentinel__:hello` SUBSCRIBE fan-in (tick PUBLISH + peer HELLO only).
+    - **P3** election lite: FM arms **15s auto-failover cooldown** after `try_failover`, but while `o_down` and *before* an attempt, tick may still open a **new campaign epoch every 1s** until elected (higher-epoch re-vote can thrash under multi-sentinel). No full Redis election-timeout SM.
+    - **P3 accepted** FM post-ship: serial INFO priority enrich; success still cools auto re-entry (optional parallel enrich stays Later).
 - [x] **`[P1]`** Client durability: `WAIT` + min-replicas write gate
   - *Done*: `WAIT numreplicas timeout_ms` freezes `master_repl_offset`, probes feed GETACK, returns count of replicas with ack ≥ offset (`timeout 0` = forever). `CONFIG GET|SET min-replicas-to-write` / `min-replicas-max-lag` (aliases `min-slaves-*`); writes return `NOREPLICAS` when good replica count is below threshold. INFO exposes `min_slaves_*`.
 
@@ -346,13 +347,18 @@ Also tracked in `docs/roadmap.md`.
     - *Done (Batch FE)*: sticky voted-leader on `IS-MASTER-DOWN-BY-ADDR`; auto path elects before `try_failover`; `voted-leader` / `voted-leader-epoch` on MASTER fields. Residual: not full Redis election-timeout state machine.
   - [x] **`[P3]`** **Code review (FE post-ship nits):** election-epoch thrash; probe self-as-leader; majority uses table size
     - *Found (scheduled review after FE)*: (1) multi-sentinel o_down tick can `next_election_epoch` every second until majority; (2) probe without prior vote returns self (not `*`); (3) `leader_votes_needed` uses `known_sentinel_count` (same residual as CKQUORUM).
-    - *Done (Batch FM, partial)*: post-`try_failover` auto cooldown (15s) suppresses elect+failover re-entry thrash. Residual: probe self-vs-`*`; CKQUORUM/majority still table size.
+    - *Done (Batch FM, partial)*: post-`try_failover` auto cooldown (15s) suppresses elect+failover re-entry thrash while `last_failover_attempt` is hot.
+    - *Done (Batch FN)*: probe `*` honesty; CKQUORUM + elect majority use live PING. Residual: full election-timeout SM (epoch thrash while o_down before first try_failover).
   - [x] **`[P3]`** **Code review (FC post-ship nit):** Sentinel promote still first-replica-wins
     - *Done (Batch FK)*: `rank_replicas_for_promote` — highest priority (0 never), then highest ROLE offset, then greatest `ip:port`. Tests: priority / offset / skip-0 / all-zero.
-    - *Done (Batch FM)*: live INFO `slave_priority` refresh on probe / `try_failover`; auto-failover **15s** cooldown after attempt (manual FAILOVER force bypasses). Residual: CKQUORUM live probe; probe self-vs-`*`; full election-timeout SM.
+    - *Done (Batch FM)*: live INFO `slave_priority` refresh on probe / `try_failover`; auto-failover **15s** cooldown after attempt (manual FAILOVER force bypasses).
+    - *Done (Batch FN)*: CKQUORUM live probe + probe self-vs-`*`. Residual: full election-timeout SM.
+  - [x] **`[P3]`** **Code review (FM post-ship):** serial INFO priority refresh; cooldown always arms
+    - *Found (scheduled review after FM, 2026-07-29):* (1) `enrich_replica_priorities` issues sequential `INFO replication` per replica (N×`IO_TIMEOUT`) — acceptable for lite; parallelize only if multi-replica failover latency matters; (2) successful failover still arms 15s auto cooldown (intentional thrash guard; Redis failover-timeout ballpark lite); (3) `begin_failover` contention path returns without arming cooldown (other owner holds in-progress — intentional). No correctness bug.
+    - *Closed (Batch FN)*: CKQUORUM live + probe honesty. Residual serial INFO enrich stays **accepted lite** / Later.
   - [x] **`[P3]`** **Code review (EZ/FA post-ship):** hello-path autosave thrash (+ partial CKQUORUM)
     - *Done (Batch FE, autosave)*: `add_peer` returns changed-only and autosaves only on new/updated peer.
-    - *Residual*: `CKQUORUM` / elect majority still peer-table size (not live probe).
+    - *Done (Batch FN)*: `CKQUORUM` / elect majority use live PING (not peer-table size alone).
   - [x] **`[P3]`** **Code review (EN/EO/EU post-ship):** `nodes.conf` omits live cluster flags
     - *Done (Batch FL)*: header `# key value` comments persist require-full-coverage / allow-reads-when-down / announce-ip|port / replica-priority; load restores; CONFIG SET autosaves when dir set. Legacy files without keys keep defaults. Boot CLI overrides only non-default flags (plain restart keeps saved).
   - [x] **`[P2]`** **Code review (DM/DN post-ship):** `failed_keys` under-reports partial key moves
@@ -723,20 +729,21 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
   - *Done (Batch BT)*: `bt_eval_select_persists_connection_db` — connection remains on selected DB after EVAL
 
-### Status snapshot (2026-07-25, post-FM)
+### Status snapshot (2026-07-29, post-FN)
 
-**Committed through Batch FM.** FB–FE, **FF**, **FG**–**FG-4**, **FH**, **FI**, **FI-2**, **FK**, **FL**, **FM** (INFO `slave_priority` + failover cooldown). Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed). Only untracked `data/` expected.
+**Committed through Batch FN.** FB–FE, **FF**, **FG**–**FG-4**, **FH**, **FI**, **FI-2**, **FK**, **FL**, **FM**, **FN** (CKQUORUM live PING + probe `*` honesty). Letter queue empty; only optional **FO**/**FP** + Later/backlog remain. Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed). Git: `main` clean except untracked `data/` (runtime conf).
 
 **Verification:**
-- **FL:** cluster_migrate **42/42**; `nodes_conf_live_flags_round_trip` + legacy defaults + autosave unit green.
-- **FM:** lib sentinel unit (incl. cooldown + INFO parse); `sentinel_lite_test` **20/20** (INFO priority refresh/skip-0 + cooldown e2e).
+- **FN:** lib sentinel **16/16** unit; `sentinel_lite_test` **23/23** (CKQUORUM dead peer NOQUORUM / live OK; elect ignores dead peers; probe `*` / sticky vote).
+- Hello SUBSCRIBE fan-in remains **accepted residual** (tick PUBLISH + peer HELLO only).
 
-**What remains:** optional **FN**/**FO**/**FP** + Later/backlog.
+**What remains:** optional **FO**/**FP** + Later/backlog (no mandatory letter batch).
 
 | Area | Residual | Priority | Planned batch |
 |------|----------|----------|---------------|
 | Sentinel | live INFO `slave_priority` + failover cooldown | **done** | **FM** |
-| Sentinel | CKQUORUM / elect majority live probe; hello SUBSCRIBE; probe self-vs-`*` | P3 | **FN** optional |
+| Sentinel | CKQUORUM / elect majority live probe; probe self-vs-`*` | **done** | **FN** |
+| Sentinel | long-lived `__sentinel__:hello` SUBSCRIBE fan-in | P3 accepted | — |
 | Cluster | NODE 2PC durable-on-disk prepare / bus / atomic COMMITPREPARE | P3 | **FO** optional |
 | Keyspace | `typed_expires` side map (not slot header); search-doc eviction special | P3 | **FP** optional |
 | Sentinel | Kore **higher** priority wins vs Redis Sentinel **lower** (documented honesty) | P3 accepted | — |
@@ -747,9 +754,9 @@ Also tracked in `docs/roadmap.md`.
 | MIGRATE / UI / load | DUMP wire; reshard weight UI; Arc-swap mid-fill | P3 accepted | — |
 | Tests | Sentinel suite hard-coded ports (flake risk under parallel bind) | P3 | later |
 
-### Next work queue (post-FM)
+### Next work queue (post-FN)
 
-**Committed letter queue through FM is empty.** Optional **FN**/**FO**/**FP** next. Standing rule: land tests with each batch.
+**Committed letter queue through FN is empty.** Optional **FO**/**FP** next. Standing rule: land tests with each batch.
 
 #### Completed (FB–FG-4 + FH + FI + FI-2 + FK + FL + FM)
 
@@ -802,19 +809,24 @@ Also tracked in `docs/roadmap.md`.
   - Closed open review: *EN/EO/EU post-ship nodes.conf omits live flags*
   - *Post-ship review:* migrate **42/42**; live-flags unit + legacy defaults green; flags as `#` comments (node-line parsers stay compatible)
   - Residual: prepare votes still not in nodes.conf (FO); only live cluster flags
-- [x] **`[P3]`** **Batch FM — Sentinel residual polish (FK leftovers)**
+- [x] **`[P3]`** **Batch FM — Sentinel residual polish (FK leftovers)** (`bbebfef`)
   - Live `INFO replication` `slave_priority` refresh on master probe + before `try_failover` rank
   - `ReplicationManager::slave_priority` + CONFIG GET/SET `replica-priority` / `slave-priority`; INFO emits `slave_priority`
   - Auto-failover cooldown **15s** (`FAILOVER_COOLDOWN`) after completed/failed `try_failover`; manual `SENTINEL FAILOVER` force-bypasses
   - Keeps FC promote-success gate + FK ranking (highest priority → offset → greatest `ip:port`; 0 never)
   - Honesty: Kore **higher** priority wins (cluster EA/EB); Redis Sentinel prefers lower numbers (module rustdoc)
-  - Tests: sentinel_lite **20/20** (INFO priority 150 beats discovery-order default 100; INFO 0 skipped; cooldown arms / expires / manual bypass)
-  - Residual: CKQUORUM live probe / hello SUBSCRIBE / probe self-vs-`*` → **FN**
+  - Tests: sentinel_lite **20/20** (INFO priority 150 beats discovery-order default 100; INFO 0 skipped; cooldown arms / expires / manual bypass); lib sentinel units green
+  - *Post-ship review (2026-07-29):* no correctness regressions; serial INFO enrich accepted lite; successful failover still cools auto re-entry (intentional)
+  - Residual closed by **FN**: CKQUORUM live probe + probe self-vs-`*`; hello SUBSCRIBE stays accepted residual
 
-#### Open optional queue (post-FM)
-- [ ] **`[P3]`** **Batch FN — Sentinel lite SM residuals (optional)**
-  - CKQUORUM / elect majority live probe (not peer-table size alone)
-  - Optional long-lived `__sentinel__:hello` SUBSCRIBE fan-in; probe self-vs-`*` honesty
+- [x] **`[P3]`** **Batch FN — Sentinel lite SM residuals**
+  - CKQUORUM + elect majority: `count_reachable_sentinels` (self + peers answering `PING`); dead peers do not inflate usable/N
+  - Probe `runid=*` with no prior vote returns leader `"*"` / epoch 0 (Redis-honest); sticky vote still returned on probe; sole-sentinel auto path via `is_failover_leader` / live≤1 elect
+  - Hello SUBSCRIBE fan-in **not** implemented (accepted residual; tick PUBLISH + peer HELLO remains primary discovery)
+  - Tests: unit probe/`leader_votes_needed_for`; e2e CKQUORUM dead→NOQUORUM / live→OK; elect ignores dead peers; probe sticky vote
+  - Residual: election-timeout SM (pre-attempt epoch thrash); optional parallel INFO enrich; ephemeral ports
+
+#### Open optional queue (post-FN)
 - [ ] **`[P3]`** **Batch FO — NODE 2PC durable prepare (optional)**
   - Persist prepare votes (or honest docs-only close); optional prepare-epoch in nodes.conf; atomic COMMITPREPARE if feasible
 - [ ] **`[P3]`** **Batch FP — Expire slot header (optional)**
@@ -824,10 +836,13 @@ Also tracked in `docs/roadmap.md`.
   - HNSW durable graph; single-DB Arc-swap mid-fill
   - Global repl backlog write serialization (FI residual; no Valkey parity claim)
   - Sentinel suite ephemeral ports (flake risk under parallel bind)
+  - Optional parallelize `enrich_replica_priorities` (serial INFO today)
+  - Sentinel election-timeout SM (pre-attempt campaign epoch thrash while o_down)
+  - Compiler nits (dead_code: `config_kv_reply`, SkipList `len`/`is_empty`/`level`; unused_mut in search + sentinel_lite)
 
 ### Code review backlog
 
-**Batches CZ–FG-4 + FH + FI + FI-2 + FK + FL + FM shipped.** Optional **FN**/**FO**/**FP** next. Standing tests-for-phase P0.
+**Batches CZ–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN shipped.** Optional **FO**/**FP** next. Standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -951,13 +966,15 @@ Also tracked in `docs/roadmap.md`.
 | P2 | FA: Sentinel hello bus lite (HELLO + PUBLISH) | done (FA) |
 | P1 | EW post-ship: promote_replica PING-only still Ok → switch_master | **done** (Batch FC) |
 | P2 | EX/FA post-ship: failover leader election (cross-process); in-process gate done FC | **done** (Batch FE) |
-| P3 | FE post-ship: election epoch thrash / probe self / majority table-size | **accepted lite** (later optional) |
-| P3 | EZ/FA post-ship: hello add_peer autosave thrash; CKQUORUM live count | **partial** (FE autosave; CKQUORUM residual) |
+| P3 | FE post-ship: election epoch thrash / probe self / majority table-size | **done FN** (probe/CKQUORUM live); election-timeout SM residual |
+| P3 | EZ/FA post-ship: hello add_peer autosave thrash; CKQUORUM live count | **done** (FE autosave; FN live CKQUORUM) |
 | P3 | EN/EO/EU post-ship: nodes.conf omits require-full/announce flags | **done** (Batch FL) |
 | P1 | dual-end NODE RESP 2PC prepare/commit (slice 1) | **done** (Batch FB) |
 | P3 | FB post-ship: prepare not re-checked at commit; dest prepare broad; mem-only | **done FH** epoch/TTL/recheck; durable/bus residual later |
 | P3 | FC post-ship: first-replica-wins promote order | **done** (Batch FK) |
-| P3 | FK residual: INFO slave_priority + failover cooldown | **in progress** (Batch FM WIP) |
+| P3 | FK residual: INFO slave_priority + failover cooldown | **done** (Batch FM) |
+| P3 | FM post-ship: serial INFO enrich; cooldown arms on success; begin_failover no-arm | **accepted lite** (no correctness bug) |
+| P3 | FN: CKQUORUM live PING + probe `*` honesty | **done** (Batch FN; hello SUBSCRIBE residual accepted) |
 | P2 | dual-end NODE 2PC slice 2 (prepare-epoch / TTL / commit re-check) | **done** (Batch FH) |
 | P2 | FI pipeline SET perf | **done** (Batch FI; ~+25% P=16) |
 | P2/P3 | FI-2 AOF-off multi-DB SELECT ordering | **done** (Batch FI-2) |
@@ -1027,4 +1044,4 @@ Highest urgency checklist (phase order preserved):
 - [x] Eviction policies (`maxmemory-policy`)
   - *Follow-ups*: Streams, bitmaps/HLL, RESP3 (done elsewhere); LFU decay done in Batch AB
 
-**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB–FL** letter work is committed complete. Resume from **Next work queue (post-FL)** — finish **FM** (WIP) then optional **FN**/**FO**/**FP**.
+**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB–FN** letter work is committed complete. Resume from **Next work queue (post-FN)** — optional **FO**/**FP** (P3 only) or Later/backlog.
