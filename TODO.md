@@ -861,7 +861,7 @@ Also tracked in `docs/roadmap.md`.
   - RENAME moves whole string slot (value + expire); take/install preserves string TTL
   - Residual: `Entry.expires_at` still mirrored for string RMW transport + legacy `ShardedHashMap`; search-doc eviction special
 
-- [x] **`[P3]`** **Batch FR — Compiler nits + Sentinel ephemeral ports** (`PENDING_HASH`)
+- [x] **`[P3]`** **Batch FR — Compiler nits + Sentinel ephemeral ports** (`f574294`)
   - Deleted unused `config_kv_reply` (CONFIG GET uses `config_kvs_reply`); removed dead private SkipList/`SkipNode` APIs (`len` / `is_empty` / `level`)
   - Fixed `unused_mut` in `sentinel_lite_test`; known FR nits clean under `cargo build --lib` / sentinel test build
   - Sentinel suite: `free_port` / `free_ports` (bind `127.0.0.1:0`, hold then release) replaces hard-coded `169xx` ports — parallel-safe under `cargo test`
