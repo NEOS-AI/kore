@@ -24,6 +24,7 @@ fn empty_snap() -> DbSnapshot {
         typed_expires: Vec::new(),
         search_indices: Vec::new(),
         search_aliases: Vec::new(),
+        hnsw_graphs: Vec::new(),
     }
 }
 

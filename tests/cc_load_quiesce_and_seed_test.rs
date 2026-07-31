@@ -128,6 +128,7 @@ fn bad_alias_rdb_bytes() -> Bytes {
                 typed_expires: Vec::new(),
                 search_indices: vec![def],
                 search_aliases: vec![("blog".to_string(), "missing".to_string())],
+                hnsw_graphs: Vec::new(),
             },
         )],
     };
@@ -154,6 +155,7 @@ fn ok_replace_rdb_bytes(key: &str, val: &str) -> Bytes {
                 typed_expires: Vec::new(),
                 search_indices: Vec::new(),
                 search_aliases: Vec::new(),
+                hnsw_graphs: Vec::new(),
             },
         )],
     };

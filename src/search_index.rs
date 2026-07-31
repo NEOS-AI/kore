@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use parking_lot::RwLock;
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
+use crate::vector_search::{HnswGraphSnapshot, HNSWIndex};
 
 /// Field types supported in search indices
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -591,6 +592,10 @@ pub struct SearchIndex {
     /// Vector field indices (stored separately)
     /// Maps field name to document ID to vector
     vector_indices: HashMap<String, HashMap<Bytes, Vec<f32>>>,
+    /// Live HNSW graphs for VECTOR HNSW fields (Batch FV dual-write with
+    /// `vector_indices`). Query path still uses the flat map; graphs are for
+    /// ANN-ready structure + RDB durable restore.
+    hnsw_indices: HashMap<String, HNSWIndex>,
     /// All document IDs in this index
     documents: HashSet<Bytes>,
     /// Document field data storage (for returning in search results)
@@ -599,12 +604,27 @@ pub struct SearchIndex {
 
 impl SearchIndex {
     pub fn new(definition: IndexDefinition) -> Self {
+        let mut hnsw_indices = HashMap::new();
+        for field in &definition.fields {
+            if let FieldType::Vector {
+                algorithm: VectorAlgorithm::HNSW { m, ef_construction },
+                distance_metric,
+                ..
+            } = &field.field_type
+            {
+                hnsw_indices.insert(
+                    field.name.clone(),
+                    HNSWIndex::new(*m, *ef_construction, distance_metric.clone()),
+                );
+            }
+        }
         Self {
             definition,
             text_indices: HashMap::new(),
             numeric_indices: HashMap::new(),
             tag_indices: HashMap::new(),
             vector_indices: HashMap::new(),
+            hnsw_indices,
             documents: HashSet::new(),
             document_data: HashMap::new(),
         }
@@ -666,12 +686,26 @@ impl SearchIndex {
                         }
                     }
                     FieldType::Vector { dimensions, .. } => {
-                        if let DocumentField::Vector(vec) = field_value {
-                            if vec.len() == *dimensions {
-                                let index = self.vector_indices
-                                    .entry(field_def.name.clone())
-                                    .or_insert_with(HashMap::new);
-                                index.insert(doc_id.clone(), vec.clone());
+                        // Accept typed Vector or parse Text as FLOAT32 components
+                        // (comma/space-separated, or LE binary of dim * 4 bytes).
+                        let parsed = match field_value {
+                            DocumentField::Vector(vec) if vec.len() == *dimensions => {
+                                Some(vec.clone())
+                            }
+                            DocumentField::Text(s) => {
+                                parse_vector_field_text(s, *dimensions)
+                            }
+                            _ => None,
+                        };
+                        if let Some(vec) = parsed {
+                            let index = self
+                                .vector_indices
+                                .entry(field_def.name.clone())
+                                .or_insert_with(HashMap::new);
+                            index.insert(doc_id.clone(), vec.clone());
+                            // Dual-write HNSW graph when this field is HNSW.
+                            if let Some(hnsw) = self.hnsw_indices.get_mut(&field_def.name) {
+                                hnsw.add(doc_id.clone(), vec);
                             }
                         }
                     }
@@ -700,6 +734,10 @@ impl SearchIndex {
         for index in self.vector_indices.values_mut() {
             index.remove(doc_id);
         }
+
+        for hnsw in self.hnsw_indices.values_mut() {
+            hnsw.remove(doc_id);
+        }
     }
 
     /// Drop all indexed documents while keeping the `IndexDefinition` (schema).
@@ -711,8 +749,78 @@ impl SearchIndex {
         self.numeric_indices.clear();
         self.tag_indices.clear();
         self.vector_indices.clear();
+        for hnsw in self.hnsw_indices.values_mut() {
+            hnsw.clear();
+        }
         self.documents.clear();
         self.document_data.clear();
+    }
+
+    /// Export durable HNSW graphs for RDB (Batch FV): `(field_name, snapshot)`.
+    ///
+    /// Empty graphs (no vectors) are omitted.
+    pub fn export_hnsw_graphs(&self) -> Vec<(String, HnswGraphSnapshot)> {
+        let mut out = Vec::new();
+        for (field, hnsw) in &self.hnsw_indices {
+            if hnsw.is_empty() {
+                continue;
+            }
+            out.push((field.clone(), hnsw.snapshot_graph()));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Apply a durable HNSW graph for `field` after vectors are loaded.
+    ///
+    /// Validates neighbor/level ids against the live HNSW vector map. If the
+    /// field has no HNSW index (FLAT / missing), returns an error.
+    pub fn apply_hnsw_graph(
+        &mut self,
+        field: &str,
+        snap: &HnswGraphSnapshot,
+    ) -> Result<(), String> {
+        let hnsw = self
+            .hnsw_indices
+            .get_mut(field)
+            .ok_or_else(|| format!("no HNSW index for field '{}'", field))?;
+        // Ensure vectors for every level node exist on the HNSW side. Prefer
+        // the flat vector map as source of truth when dual-write drifted.
+        if let Some(flat) = self.vector_indices.get(field) {
+            for (id, _) in &snap.levels {
+                if !hnsw.iter_vectors().any(|(vid, _)| vid == id) {
+                    if let Some(v) = flat.get(id) {
+                        hnsw.install_vector(id.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        hnsw.apply_graph_snapshot(snap)
+    }
+
+    /// Test/injector: force next insert levels on an HNSW field (FIFO).
+    pub fn enqueue_hnsw_levels(
+        &mut self,
+        field: &str,
+        levels: impl IntoIterator<Item = usize>,
+    ) -> Result<(), String> {
+        let hnsw = self
+            .hnsw_indices
+            .get_mut(field)
+            .ok_or_else(|| format!("no HNSW index for field '{}'", field))?;
+        hnsw.enqueue_levels(levels);
+        Ok(())
+    }
+
+    /// Snapshot of one HNSW field graph (if present and non-empty).
+    pub fn hnsw_graph_snapshot(&self, field: &str) -> Option<HnswGraphSnapshot> {
+        self.hnsw_indices.get(field).and_then(|h| {
+            if h.is_empty() {
+                None
+            } else {
+                Some(h.snapshot_graph())
+            }
+        })
     }
 
     /// Get text index for a field
@@ -769,6 +877,36 @@ impl SearchIndex {
             .map(|(id, fields)| Self::document_approx_size(id, fields))
             .sum()
     }
+}
+
+/// Parse a hash/text payload into a FLOAT32 vector of `dimensions`.
+///
+/// Accepts:
+/// - little-endian binary of exactly `dimensions * 4` bytes
+/// - comma- and/or whitespace-separated decimal floats
+fn parse_vector_field_text(s: &str, dimensions: usize) -> Option<Vec<f32>> {
+    let bytes = s.as_bytes();
+    if bytes.len() == dimensions.saturating_mul(4) {
+        let mut out = Vec::with_capacity(dimensions);
+        for i in 0..dimensions {
+            let start = i * 4;
+            let arr: [u8; 4] = bytes[start..start + 4].try_into().ok()?;
+            out.push(f32::from_le_bytes(arr));
+        }
+        return Some(out);
+    }
+    let parts: Vec<&str> = s
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.len() != dimensions {
+        return None;
+    }
+    let mut out = Vec::with_capacity(dimensions);
+    for p in parts {
+        out.push(p.parse::<f32>().ok()?);
+    }
+    Some(out)
 }
 
 /// Document field value
@@ -973,6 +1111,42 @@ impl SearchIndexManager {
             .collect();
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
         pairs
+    }
+
+    /// Export all non-empty HNSW graphs: `(index_name, field_name, snapshot)`.
+    ///
+    /// Sorted by `(index_name, field_name)` for stable RDB rewrite (Batch FV).
+    pub fn export_hnsw_graphs(&self) -> Vec<(String, String, HnswGraphSnapshot)> {
+        let indices = self.indices.read();
+        let mut out = Vec::new();
+        for (name, idx) in indices.iter() {
+            let guard = idx.read();
+            for (field, snap) in guard.export_hnsw_graphs() {
+                out.push((name.clone(), field, snap));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        out
+    }
+
+    /// Apply durable HNSW graphs after vectors have been loaded (RDB restore).
+    ///
+    /// Unknown index/field names are skipped with an error string collected;
+    /// first hard apply failure returns `Err`. Empty input is a no-op.
+    pub fn apply_hnsw_graphs(
+        &self,
+        graphs: &[(String, String, HnswGraphSnapshot)],
+    ) -> Result<(), String> {
+        for (index_name, field, snap) in graphs {
+            let Some(idx) = self.get_index(index_name) else {
+                return Err(format!(
+                    "HNSW graph restore: unknown index '{}'",
+                    index_name
+                ));
+            };
+            idx.write().apply_hnsw_graph(field, snap)?;
+        }
+        Ok(())
     }
 
     /// Get index definition (resolves aliases)

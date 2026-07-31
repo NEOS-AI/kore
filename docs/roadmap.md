@@ -62,7 +62,8 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] HNSW NN-path bridge branch test + must_keep prune safety (Batch CW)
 - [x] HNSW recall@k unit gate + N=300 indicative micro (Batch CV; not large-N ANN win)
 - [x] HNSW tighter recall gate + optional larger-N median bench (Batch DK; `#[ignore]` N=5000)
-- [x] HNSW multi-layer insert (Batch FF: geometric level assignment + upper-layer SEARCH-LAYER / connect; query descent; edges/levels not AOF/RDB durable)
+- [x] HNSW multi-layer insert (Batch FF: geometric level assignment + upper-layer SEARCH-LAYER / connect; query descent)
+- [x] HNSW durable graph in RDB (Batch FV: KORDB v6 levels+edges+entry; AOF-only still rebuilds)
 
 ## Plans
 
@@ -81,6 +82,7 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Sentinel leader election depth (Batch FE: voted-leader / elect gate; election-timeout SM → FT)
 - [x] Sentinel CKQUORUM live probe + probe `*` honesty (Batch FN; hello SUBSCRIBE residual accepted)
 - [x] HNSW multi-layer insert (Batch FF)
+- [x] HNSW durable graph RDB (Batch FV)
 - [x] Unified keyspace design + `KeyValue` facade (Batch FG slice A; multi-map storage)
 - [x] **FG-2** physical hashes in `ShardedKeyMap<KeyValue>` (`Cache::key_values`)
 - [x] **FG-3** remaining typed containers (list/set/zset/geo/stream) + `KeyspacePayload` collapse; eviction samples typed from one map
@@ -99,7 +101,8 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] **FR** compiler nits + Sentinel suite ephemeral ports (Later/backlog hygiene)
 - [x] **FS** residual lib warnings (unused imports / replica-feed flag / search `_weight`)
 - [x] **FT** Sentinel election-timeout SM (campaign epoch reuse + timed re-campaign)
-- [ ] **Next (see `TODO.md` post-FT):** Later/backlog only (letter queue empty)
+- [x] **FV** HNSW durable graph in RDB (KORDB v6; snapshot/apply; AOF residual rebuild)
+- [ ] **Next (see `TODO.md` post-FV):** Later/backlog only
 - [x] 데드락 감지 고급 기능
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원

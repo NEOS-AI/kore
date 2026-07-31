@@ -125,6 +125,7 @@ fn multi_db_flush_false_merge_preserves_other_db() {
                 typed_expires: Vec::new(),
                 search_indices: Vec::new(),
                 search_aliases: Vec::new(),
+                hnsw_graphs: Vec::new(),
             },
         )],
     };

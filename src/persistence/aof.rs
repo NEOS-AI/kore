@@ -6,6 +6,11 @@
 //!   2. SET / ZADD / GEOADD / HSET / RPUSH / SADD / XADD / XGROUP …
 //!   3. `FT.ALIASADD` (aliases after data is re-indexed)
 //! with SELECT between logical databases.
+//!
+//! **HNSW honesty (Batch FV):** AOF rewrite emits `FT.CREATE` HNSW params
+//! (`M`, `EF_CONSTRUCTION`) + document HSETs only — **not** graph edges or
+//! per-node levels. AOF-only load rebuilds HNSW by re-`add` (levels re-sampled).
+//! Edge-identical multi-layer restore is RDB v6+ durable graph only.
 
 use crate::cache::Cache;
 use crate::databases::Databases;

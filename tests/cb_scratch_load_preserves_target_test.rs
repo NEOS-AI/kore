@@ -236,6 +236,7 @@ fn rdb_load_failure_preserves_preexisting() {
                 typed_expires: Vec::new(),
                 search_indices: vec![def],
                 search_aliases: vec![("blog".to_string(), "missing".to_string())],
+                hnsw_graphs: Vec::new(),
             },
         )],
     };

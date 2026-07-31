@@ -195,7 +195,7 @@ fn rdb_roundtrip_ft_schema_docs_and_alias() {
     let raw = std::fs::read(&path).unwrap();
     assert!(raw.starts_with(b"KORDB\0"));
     let version = u32::from_le_bytes(raw[6..10].try_into().unwrap());
-    assert_eq!(version, 5, "RDB must write version 5 for search section");
+    assert_eq!(version, 6, "RDB must write version 6 (search v5+; HNSW graph section)");
 
     let loaded = make_databases();
     let n = rdb::load_databases(&loaded, &path, true).unwrap();

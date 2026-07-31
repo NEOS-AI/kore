@@ -169,6 +169,7 @@ fn watch_aborts_exec_after_flush_true_load() {
                 typed_expires: Vec::new(),
                 search_indices: Vec::new(),
                 search_aliases: Vec::new(),
+                hnsw_graphs: Vec::new(),
             },
         )],
     };

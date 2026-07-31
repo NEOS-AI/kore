@@ -24,6 +24,12 @@
 //! Layout (version 5):
 //!   same as v4 plus trailing search section per DB body (indices + aliases)
 //!
+//! Layout (version 6):
+//!   same as v5 plus optional durable HNSW graph section per DB body
+//!   (index name, field name, entry_point, per-node levels, per-layer edges).
+//!   Load: vectors from docs first, then apply graph (edge-identical restore).
+//!   v5 files without this section rebuild HNSW by re-`add` (levels re-sampled).
+//!
 //! Stream section (version >= 3):
 //!   n_streams: u64
 //!   for each stream:
@@ -47,6 +53,15 @@
 //!   n_aliases: u64
 //!   for each alias: alias name, real index name
 //!
+//! HNSW graph section (version >= 6):
+//!   n_graphs: u64
+//!   for each graph:
+//!     index_name, field_name
+//!     has_entry u8, entry_point bytes (if has_entry)
+//!     n_levels: u64, for each: doc_id, level u32
+//!     n_layers: u64, for each layer:
+//!       n_nodes: u64, for each: doc_id, n_neighbors u64, neighbor ids*
+//!
 //! Strings/keys/members are length-prefixed with u32 LE + raw bytes.
 
 use crate::cache::Cache;
@@ -56,6 +71,7 @@ use crate::error::{Error, Result};
 use crate::search_index::{
     DistanceMetric, DocumentField, FieldDefinition, FieldType, IndexDefinition, VectorAlgorithm,
 };
+use crate::vector_search::HnswGraphSnapshot;
 use crate::stream_type::{
     ConsumerSnapshot, GroupSnapshot, PendingEntrySnapshot, StreamId, StreamStateSnapshot,
 };
@@ -68,11 +84,12 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAGIC: &[u8; 6] = b"KORDB\0";
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 const VERSION_V1: u32 = 1;
 const VERSION_V2: u32 = 2;
 const VERSION_V3: u32 = 3;
 const VERSION_V4: u32 = 4;
+const VERSION_V5: u32 = 5;
 const FOOTER: u8 = 0xFF;
 
 // Field type tags in the RDB search section.
@@ -359,6 +376,8 @@ pub struct DbSnapshot {
     pub search_indices: Vec<IndexDefinition>,
     /// Search aliases: (alias, real_index). RDB v5+.
     pub search_aliases: Vec<(String, String)>,
+    /// Durable HNSW graphs: (index_name, field_name, snapshot). RDB v6+.
+    pub hnsw_graphs: Vec<(String, String, HnswGraphSnapshot)>,
 }
 
 /// Multi-database snapshot (RDB v3).
@@ -419,6 +438,7 @@ impl DbSnapshot {
         let typed_expires = cache.export_typed_expires_unix_ms();
         let search_indices = cache.list_search_index_definitions();
         let search_aliases = cache.list_search_aliases();
+        let hnsw_graphs = cache.export_hnsw_graphs();
 
         Ok(Self {
             strings,
@@ -431,6 +451,7 @@ impl DbSnapshot {
             typed_expires,
             search_indices,
             search_aliases,
+            hnsw_graphs,
         })
     }
 
@@ -566,6 +587,12 @@ impl DbSnapshot {
         for (alias, index) in &self.search_aliases {
             write_bytes(w, alias.as_bytes())?;
             write_bytes(w, index.as_bytes())?;
+        }
+
+        // Version 6+: durable HNSW graphs (entry/levels/edges)
+        write_u64(w, self.hnsw_graphs.len() as u64)?;
+        for (index_name, field, snap) in &self.hnsw_graphs {
+            write_hnsw_graph(w, index_name, field, snap)?;
         }
 
         Ok(())
@@ -742,7 +769,8 @@ impl DbSnapshot {
 
         let mut search_indices = Vec::new();
         let mut search_aliases = Vec::new();
-        if version >= VERSION {
+        let mut hnsw_graphs = Vec::new();
+        if version >= VERSION_V5 {
             let n_indices = read_u64(r)? as usize;
             search_indices.reserve(n_indices);
             for _ in 0..n_indices {
@@ -783,6 +811,14 @@ impl DbSnapshot {
             }
         }
 
+        if version >= VERSION {
+            let n_graphs = read_u64(r)? as usize;
+            hnsw_graphs.reserve(n_graphs);
+            for _ in 0..n_graphs {
+                hnsw_graphs.push(read_hnsw_graph(r)?);
+            }
+        }
+
         Ok(Self {
             strings,
             zsets,
@@ -794,6 +830,7 @@ impl DbSnapshot {
             typed_expires,
             search_indices,
             search_aliases,
+            hnsw_graphs,
         })
     }
 
@@ -832,6 +869,7 @@ impl DbSnapshot {
                 typed_expires: Vec::new(),
                 search_indices: Vec::new(),
                 search_aliases: Vec::new(),
+                hnsw_graphs: Vec::new(),
             })
         }
     }
@@ -1017,8 +1055,110 @@ impl DbSnapshot {
                 })?;
         }
 
+        // 3. Apply durable HNSW graphs after schema + docs (Batch FV).
+        // Documents already re-`add`ed vectors (rebuild path); this overwrites
+        // levels/edges/entry_point to match the pre-save hierarchy when present.
+        if !self.hnsw_graphs.is_empty() {
+            cache
+                .apply_hnsw_graphs(&self.hnsw_graphs)
+                .map_err(|e| Error::ParseError(format!("RDB HNSW graph restore: {}", e)))?;
+        }
+
         Ok(loaded)
     }
+}
+
+fn write_hnsw_graph<W: Write>(
+    w: &mut W,
+    index_name: &str,
+    field: &str,
+    snap: &HnswGraphSnapshot,
+) -> Result<()> {
+    write_bytes(w, index_name.as_bytes())?;
+    write_bytes(w, field.as_bytes())?;
+    match &snap.entry_point {
+        Some(ep) => {
+            write_u8(w, 1)?;
+            write_bytes(w, ep)?;
+        }
+        None => {
+            write_u8(w, 0)?;
+        }
+    }
+    write_u64(w, snap.levels.len() as u64)?;
+    for (id, level) in &snap.levels {
+        write_bytes(w, id)?;
+        write_u32(w, *level)?;
+    }
+    write_u64(w, snap.layers.len() as u64)?;
+    for layer in &snap.layers {
+        write_u64(w, layer.len() as u64)?;
+        for (id, neighs) in layer {
+            write_bytes(w, id)?;
+            write_u64(w, neighs.len() as u64)?;
+            for n in neighs {
+                write_bytes(w, n)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_hnsw_graph<R: Read>(r: &mut R) -> Result<(String, String, HnswGraphSnapshot)> {
+    let index_name = String::from_utf8(read_bytes(r)?)
+        .map_err(|e| Error::ParseError(format!("invalid HNSW index name: {}", e)))?;
+    let field = String::from_utf8(read_bytes(r)?)
+        .map_err(|e| Error::ParseError(format!("invalid HNSW field name: {}", e)))?;
+    let has_entry = read_u8(r)?;
+    let entry_point = if has_entry != 0 {
+        Some(Bytes::from(read_bytes(r)?))
+    } else {
+        None
+    };
+    let n_levels = read_u64(r)? as usize;
+    if n_levels > 10_000_000 {
+        return Err(Error::ParseError(format!(
+            "HNSW graph too many levels entries: {}",
+            n_levels
+        )));
+    }
+    let mut levels = Vec::with_capacity(n_levels);
+    for _ in 0..n_levels {
+        let id = Bytes::from(read_bytes(r)?);
+        let level = read_u32(r)?;
+        levels.push((id, level));
+    }
+    let n_layers = read_u64(r)? as usize;
+    if n_layers > 64 {
+        return Err(Error::ParseError(format!(
+            "HNSW graph too many layers: {}",
+            n_layers
+        )));
+    }
+    let mut layers = Vec::with_capacity(n_layers);
+    for _ in 0..n_layers {
+        let n_nodes = read_u64(r)? as usize;
+        let mut adj = Vec::with_capacity(n_nodes);
+        for _ in 0..n_nodes {
+            let id = Bytes::from(read_bytes(r)?);
+            let n_neigh = read_u64(r)? as usize;
+            let mut neighs = Vec::with_capacity(n_neigh);
+            for _ in 0..n_neigh {
+                neighs.push(Bytes::from(read_bytes(r)?));
+            }
+            adj.push((id, neighs));
+        }
+        layers.push(adj);
+    }
+    Ok((
+        index_name,
+        field,
+        HnswGraphSnapshot {
+            entry_point,
+            levels,
+            layers,
+        },
+    ))
 }
 
 // Helper trait-like clone for encode path — avoid by cleaning encode() above.
@@ -1081,6 +1221,7 @@ impl MultiDbSnapshot {
             && version != VERSION_V2
             && version != VERSION_V3
             && version != VERSION_V4
+            && version != VERSION_V5
         {
             return Err(Error::ParseError(format!(
                 "unsupported RDB version {}",
@@ -1361,6 +1502,7 @@ mod tests {
             typed_expires: vec![],
             search_indices: vec![],
             search_aliases: vec![],
+            hnsw_graphs: vec![],
         };
         let multi = MultiDbSnapshot {
             databases: vec![(0, snap)],
@@ -1368,7 +1510,7 @@ mod tests {
         let bytes = multi.encode().unwrap();
         assert!(bytes.starts_with(b"KORDB\0"));
         let version = u32::from_le_bytes(bytes[6..10].try_into().unwrap());
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
 
         let decoded = MultiDbSnapshot::decode(&bytes).unwrap();
         assert_eq!(decoded.databases.len(), 1);
