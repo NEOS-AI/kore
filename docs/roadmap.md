@@ -3,7 +3,7 @@
 ## Currently working on..
 
 - [x] Support for Redis Pub-Sub
-- **Committed through FT** (Sentinel election-timeout SM). Letter queue empty (…FS→FT). Remaining work is Later/backlog only. See root `TODO.md` → *Next work queue (post-FT)*.
+- **Committed through FT** (`4f114d9`). Letter queue empty (…FS→FT). Remaining work is Later/backlog only. See root `TODO.md` → *Next work queue (post-FT)*.
 
 ## Persistence / search letter batches (recent)
 

@@ -882,7 +882,7 @@ Also tracked in `docs/roadmap.md`.
   - Verify: `cargo build --lib` **0 warnings**; lib **360/360** (+1 ignored); `bitmap_hll` / `search` / `replication` integration green
   - Residual closed by **FT**: election-timeout SM; remaining: `Entry.expires_at` RMW mirror; other Later items
 
-- [x] **`[P3]`** **Batch FT — Sentinel election-timeout SM**
+- [x] **`[P3]`** **Batch FT — Sentinel election-timeout SM** (`4f114d9`)
   - Per-master `election_started_at` + `ELECTION_TIMEOUT` (5s; test override `test_set_election_timeout_ms`)
   - `vote_leader` stamps campaign start on higher-epoch vote
   - `try_elect_leader`: reuse self-campaign epoch while timer live (no per-tick `next_election_epoch` thrash)
