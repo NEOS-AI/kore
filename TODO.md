@@ -871,7 +871,7 @@ Also tracked in `docs/roadmap.md`.
   - Out of scope → closed by **FS**: unused imports (`bitmap` Bytes, replication Cache), `entered_replica_feed` assignment, search `weight` param
   - Residual: election-timeout SM; optional parallel INFO enrich; other Later items unchanged
 
-- [x] **`[P3]`** **Batch FS — Clear residual lib warnings** (pending stamp)
+- [x] **`[P3]`** **Batch FS — Clear residual lib warnings** (`b7219ea`)
   - Removed unused `bytes::Bytes` import in `commands/bitmap.rs`
   - Moved `Cache` import into `replication` test module only (no longer top-level unused)
   - Dropped dead `entered_replica_feed` flag in `network.rs` (replica feed always `break 'conn`; pipeline flush simplified)
