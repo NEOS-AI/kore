@@ -274,10 +274,15 @@ Pass-level raw ops/s (FI):
 **Still open (later):**
 
 - Optional: skip or shrink repl backlog when no replicas ever connected and operator opts in (breaks eager PSYNC until first write after replica appears — needs clear config).
-- Fuse `fullsync_gate` + backlog into one mutex; encode with small thread-local buffer reuse.
 - Avoid dual key ownership clone (`Entry.key` + HashMap key) / thin `Entry` without duplicated key bytes.
 - Per-shard dirty counters; batch `mark_dirty` under pipeline.
 - Flamegraph / `samply` on Linux for quantitative attribution (not run this batch on macOS).
+
+#### Batch GB (2026-07-31) — Repl backlog write serialization (partial)
+
+**Shipped:** Dropped exclusive `fullsync_gate: Mutex<()>` from every `propagate_*`. Full-resync exclusion is an atomic barrier (`fullsync_in_progress` + `writers_in_publish`); the common path takes **only the backlog mutex** for lazy SELECT + append + ordered fan-out. Precomputed `SELECT` encodings for DB 0..15. FI-2 multi-DB atomicity and fullsync snapshot+register gap preserved.
+
+**Not claimed:** Valkey pipeline SET parity; no redis-benchmark re-measure this batch. **Residual:** single global backlog still serializes ordered publish (inherent with stream `selected_db`); full-resync still blocks publishers for RDB snapshot duration; further wins need async fanout / concurrent snapshot + backlog catch-up.
 
 ## Vector search (HNSW vs FLAT) — methodology
 

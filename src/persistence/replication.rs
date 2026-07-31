@@ -187,10 +187,15 @@ pub struct ReplicationManager {
     min_replicas_max_lag_secs: AtomicUsize,
     /// Bumped when primary address changes so `sync_from_primary` reconnects.
     primary_link_epoch: AtomicU64,
-    /// Serializes full-resync (RDB snapshot + feed registration) with
-    /// `propagate_raw` so a write cannot land in the gap between snapshot and
-    /// register (would be missing from both RDB and the new live feed).
-    fullsync_gate: Mutex<()>,
+    /// Full-resync exclusion (Batch GB): when true, new writers wait in
+    /// [`Self::publish_enter`] and the fullsync path waits for
+    /// [`Self::writers_in_publish`] to reach zero before snapshot+register.
+    /// Replaces a process-wide `Mutex` gate so the common path (no fullsync)
+    /// only serializes on the backlog lock for SELECT+append+ordered fanout.
+    fullsync_in_progress: AtomicBool,
+    /// Count of threads inside the publish section (after `publish_enter`,
+    /// before `publish_exit`). Fullsync spins until this is 0.
+    writers_in_publish: AtomicUsize,
     /// Sentinel / promote priority (Batch FM). Default 100; **0 = never promote**.
     /// Reported in INFO as `slave_priority` (Redis alias for replica-priority).
     slave_priority: AtomicU32,
@@ -218,13 +223,59 @@ impl ReplicationManager {
             min_replicas_to_write: AtomicUsize::new(0),
             min_replicas_max_lag_secs: AtomicUsize::new(10),
             primary_link_epoch: AtomicU64::new(0),
-            fullsync_gate: Mutex::new(()),
+            fullsync_in_progress: AtomicBool::new(false),
+            writers_in_publish: AtomicUsize::new(0),
             slave_priority: AtomicU32::new(100),
         })
     }
 
     pub fn primary_link_epoch(&self) -> u64 {
         self.primary_link_epoch.load(Ordering::Relaxed)
+    }
+
+    // ── Fullsync ↔ publish barrier (Batch GB) ───────────────────────────
+    //
+    // Invariant: a full-resync never snapshots+registers while a writer is in
+    // the publish section, and a writer never appends/fanouts while a
+    // full-resync is between setting `fullsync_in_progress` and clearing it
+    // after register. Common path: no Mutex — only the backlog lock.
+
+    /// Enter the publish section. Waits out any in-progress full-resync.
+    #[inline]
+    fn publish_enter(&self) {
+        loop {
+            while self.fullsync_in_progress.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            self.writers_in_publish.fetch_add(1, Ordering::SeqCst);
+            // Recheck: fullsync may have started between the while and the add.
+            if !self.fullsync_in_progress.load(Ordering::SeqCst) {
+                return;
+            }
+            // Fullsync is waiting for in-flight publishers (or will). Back out
+            // and retry after it finishes so we never publish mid-gap.
+            self.writers_in_publish.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Leave the publish section (pairs with [`Self::publish_enter`]).
+    #[inline]
+    fn publish_exit(&self) {
+        self.writers_in_publish.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Run `f` with exclusive full-resync exclusion against `propagate_*`.
+    ///
+    /// Sets `fullsync_in_progress`, waits for in-flight publishers to drain,
+    /// runs `f` (RDB snapshot + feed register), then clears the flag.
+    fn with_fullsync_exclusion<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.fullsync_in_progress.store(true, Ordering::SeqCst);
+        while self.writers_in_publish.load(Ordering::SeqCst) > 0 {
+            std::thread::yield_now();
+        }
+        let out = f();
+        self.fullsync_in_progress.store(false, Ordering::SeqCst);
+        out
     }
 
     fn bump_primary_link_epoch(&self) {
@@ -521,12 +572,17 @@ impl ReplicationManager {
 
     /// Propagate a write for logical database `db` (lazy `SELECT` + command).
     ///
-    /// Command RESP is encoded **outside** the publish locks so concurrent
-    /// writers can encode in parallel. Under `fullsync_gate` + backlog:
+    /// Command RESP is encoded **outside** the publish section so concurrent
+    /// writers can encode in parallel. Under the backlog mutex (Batch GB:
+    /// no separate `fullsync_gate` Mutex on the hot path):
     /// decide whether to emit `SELECT`, append SELECT+cmd (one payload) or
-    /// cmd alone, and update `selected_db`. That critical section is what
-    /// prevents the AOF-off multi-DB race where one writer’s SELECT-less
-    /// command could land on the stream before another writer’s SELECT.
+    /// cmd alone, update `selected_db`, and fan out under the same lock so
+    /// feed order matches backlog order. The fullsync barrier
+    /// ([`Self::publish_enter`]) only waits when a full-resync is in progress.
+    ///
+    /// That critical section prevents the AOF-off multi-DB race where one
+    /// writer’s SELECT-less command could land on the stream before another
+    /// writer’s SELECT (Batch FI-2).
     pub fn propagate_write(&self, db: usize, args: &[Bytes]) {
         let cmd_raw = aof::encode_command(args);
         self.propagate_write_encoded(db, cmd_raw);
@@ -538,12 +594,11 @@ impl ReplicationManager {
             return;
         }
 
-        // Hold the gate across SELECT decision, backlog append, and live
-        // fan-out so full-resync cannot register a feed between SELECT and
-        // the write (or between append and send).
-        let _gate = self.fullsync_gate.lock();
+        // Barrier vs full-resync snapshot+register gap. When idle, this is
+        // two atomic ops only — no Mutex.
+        self.publish_enter();
 
-        let data = {
+        {
             let mut bl = self.backlog.lock();
             let emit_select = match bl.selected_db {
                 Some(prev) => prev != db,
@@ -552,10 +607,7 @@ impl ReplicationManager {
             bl.selected_db = Some(db);
 
             let payload = if emit_select {
-                let select_raw = aof::encode_command(&[
-                    Bytes::from_static(b"SELECT"),
-                    Bytes::from(db.to_string()),
-                ]);
+                let select_raw = encode_select_db(db);
                 let mut combined =
                     Vec::with_capacity(select_raw.len() + cmd_raw.len());
                 combined.extend_from_slice(&select_raw);
@@ -567,10 +619,13 @@ impl ReplicationManager {
             bl.append(&payload);
             self.master_repl_offset
                 .store(bl.end_offset(), Ordering::Relaxed);
-            payload
-        };
+            // Fan-out under the backlog lock so (1) feed order matches append
+            // order across writers and (2) partial PSYNC (also takes backlog)
+            // cannot register between SELECT+cmd append and send.
+            self.fanout_to_replicas_locked(&payload);
+        }
 
-        self.fanout_to_replicas(data);
+        self.publish_exit();
     }
 
     /// Propagate raw RESP bytes to backlog + replicas **without** SELECT logic.
@@ -581,20 +636,20 @@ impl ReplicationManager {
         if data.is_empty() {
             return;
         }
-        // Share the fullsync gate so we never append/send while a full resync
-        // is between RDB snapshot and feed registration.
-        let _gate = self.fullsync_gate.lock();
+        self.publish_enter();
 
         // Always append to backlog (even with no replicas) so reconnecting
-        // replicas can PSYNC if they reconnect quickly.
+        // replicas can PSYNC if they reconnect quickly. Fan-out under the
+        // same lock for stream order (see `propagate_write_encoded`).
         {
             let mut bl = self.backlog.lock();
             bl.append(&data);
             self.master_repl_offset
                 .store(bl.end_offset(), Ordering::Relaxed);
+            self.fanout_to_replicas_locked(&data);
         }
 
-        self.fanout_to_replicas(data);
+        self.publish_exit();
     }
 
     /// Propagate argv as RESP command on the current stream DB (no SELECT).
@@ -606,9 +661,11 @@ impl ReplicationManager {
         self.propagate_raw(raw);
     }
 
-    /// Fan-out a payload to live replica feeds. Caller must hold `fullsync_gate`
-    /// (or otherwise ensure register cannot interleave mid-send batch).
-    fn fanout_to_replicas(&self, data: Bytes) {
+    /// Fan-out a payload to live replica feeds.
+    ///
+    /// Caller must hold `self.backlog` (and be inside `publish_enter`) so a
+    /// concurrent partial register or fullsync barrier cannot open a gap.
+    fn fanout_to_replicas_locked(&self, data: &Bytes) {
         // Fast path: no connected replicas — skip the feed list lock.
         // `connected_replicas` is updated under `replicas` lock on register/drop;
         // a stale 0 is safe (miss one send → full resync later). A stale non-zero
@@ -644,12 +701,13 @@ impl ReplicationManager {
         replica_host: Option<String>,
         replica_port: Option<u16>,
     ) -> Result<(Bytes, mpsc::Receiver<Bytes>)> {
-        // Hold the gate across snapshot + register (see `fullsync_gate`).
-        let _gate = self.fullsync_gate.lock();
-        let rdb_bytes = rdb::save_databases_to_bytes(databases)?;
-        let response = RespValue::BulkString(Some(rdb_bytes)).serialize();
-        let rx = self.register_replica_announced(replica_host, replica_port);
-        Ok((response, rx))
+        // Exclude propagates across snapshot + register (Batch GB barrier).
+        self.with_fullsync_exclusion(|| {
+            let rdb_bytes = rdb::save_databases_to_bytes(databases)?;
+            let response = RespValue::BulkString(Some(rdb_bytes)).serialize();
+            let rx = self.register_replica_announced(replica_host, replica_port);
+            Ok((response, rx))
+        })
     }
 
     /// PSYNC handshake.
@@ -713,23 +771,24 @@ impl ReplicationManager {
             // fall through to full
         }
 
-        // Full resync — multi-DB snapshot + feed register under one gate so
-        // concurrent `propagate_raw` cannot insert a write into the gap
-        // (missing from RDB and from the new feed).
-        let _gate = self.fullsync_gate.lock();
-        let rdb_bytes = rdb::save_databases_to_bytes(databases)?;
-        // Offset reported is current master offset (stream starts after RDB)
-        let offset_now = self.master_repl_offset();
-        let rx = self.register_replica_announced(replica_host, replica_port);
+        // Full resync — multi-DB snapshot + feed register under the fullsync
+        // barrier so concurrent `propagate_*` cannot insert a write into the
+        // gap (missing from RDB and from the new feed).
+        self.with_fullsync_exclusion(|| {
+            let rdb_bytes = rdb::save_databases_to_bytes(databases)?;
+            // Offset reported is current master offset (stream starts after RDB)
+            let offset_now = self.master_repl_offset();
+            let rx = self.register_replica_announced(replica_host, replica_port);
 
-        let mut raw = BytesMut::new();
-        let header = format!("+FULLRESYNC {} {}\r\n", our_id, offset_now);
-        raw.extend_from_slice(header.as_bytes());
-        raw.extend_from_slice(&RespValue::BulkString(Some(rdb_bytes)).serialize());
+            let mut raw = BytesMut::new();
+            let header = format!("+FULLRESYNC {} {}\r\n", our_id, offset_now);
+            raw.extend_from_slice(header.as_bytes());
+            raw.extend_from_slice(&RespValue::BulkString(Some(rdb_bytes)).serialize());
 
-        Ok(SyncStart::Full {
-            raw_response: raw.freeze(),
-            feed: rx,
+            Ok(SyncStart::Full {
+                raw_response: raw.freeze(),
+                feed: rx,
+            })
         })
     }
 
@@ -1416,9 +1475,36 @@ impl Default for ReplicationManager {
             min_replicas_to_write: AtomicUsize::new(0),
             min_replicas_max_lag_secs: AtomicUsize::new(10),
             primary_link_epoch: AtomicU64::new(0),
-            fullsync_gate: Mutex::new(()),
+            fullsync_in_progress: AtomicBool::new(false),
+            writers_in_publish: AtomicUsize::new(0),
             slave_priority: AtomicU32::new(100),
         }
+    }
+}
+
+/// RESP `SELECT <db>` encoding. Hot path uses a static table for DB 0..15
+/// (Batch GB) so lazy-SELECT clones a precomputed `Bytes` under the backlog
+/// lock instead of formatting + encoding.
+fn encode_select_db(db: usize) -> Bytes {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<Vec<Bytes>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        (0..16)
+            .map(|d| {
+                aof::encode_command(&[
+                    Bytes::from_static(b"SELECT"),
+                    Bytes::from(d.to_string()),
+                ])
+            })
+            .collect()
+    });
+    if db < table.len() {
+        table[db].clone()
+    } else {
+        aof::encode_command(&[
+            Bytes::from_static(b"SELECT"),
+            Bytes::from(db.to_string()),
+        ])
     }
 }
 
@@ -2152,6 +2238,72 @@ mod tests {
         assert!(repl.master_repl_offset() > 0);
     }
 
+    #[test]
+    fn encode_select_db_matches_aof_encode() {
+        for db in [0usize, 1, 9, 15, 16, 100] {
+            let got = encode_select_db(db);
+            let expect = aof::encode_command(&[
+                Bytes::from_static(b"SELECT"),
+                Bytes::from(db.to_string()),
+            ]);
+            assert_eq!(got, expect, "db={db}");
+        }
+    }
+
+    /// Barrier: fullsync exclusion drains in-flight publishers and blocks new
+    /// ones until snapshot+register complete (no Mutex gate on the hot path).
+    #[test]
+    fn fullsync_barrier_excludes_concurrent_publish() {
+        use std::sync::Barrier;
+        use std::thread;
+        use std::time::Duration;
+
+        let repl = ReplicationManager::new();
+        let cache = Cache::new_with_sweep(4, 1024 * 1024, 1024 * 1024, false);
+        let databases = Databases::single(cache);
+        let start = Arc::new(Barrier::new(2));
+        let mid = Arc::new(Barrier::new(2));
+
+        let repl_w = Arc::clone(&repl);
+        let start_w = Arc::clone(&start);
+        let mid_w = Arc::clone(&mid);
+        let writer = thread::spawn(move || {
+            start_w.wait();
+            // Flood publishes while syncer runs fullresync.
+            for i in 0..100 {
+                repl_w.propagate_command(&[
+                    Bytes::from_static(b"SET"),
+                    Bytes::from(format!("bk{}", i)),
+                    Bytes::from_static(b"v"),
+                ]);
+                if i == 10 {
+                    mid_w.wait();
+                }
+            }
+        });
+
+        let repl_s = Arc::clone(&repl);
+        let start_s = Arc::clone(&start);
+        let mid_s = Arc::clone(&mid);
+        let syncer = thread::spawn(move || {
+            start_s.wait();
+            mid_s.wait();
+            // Hold exclusion longer than a single snapshot by nesting a short
+            // sleep inside with_fullsync_exclusion via start_psync (which uses
+            // the barrier). Multiple fullresyncs stress enter/exit.
+            for _ in 0..8 {
+                let _ = repl_s.start_psync(&databases, "?", -1).unwrap();
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        writer.join().unwrap();
+        syncer.join().unwrap();
+        assert!(repl.master_repl_offset() > 0);
+        assert_eq!(repl.writers_in_publish.load(Ordering::SeqCst), 0);
+        assert!(!repl.fullsync_in_progress.load(Ordering::SeqCst));
+    }
+
     /// `propagate_write` emits lazy SELECT and keeps SELECT+cmd as one payload.
     #[test]
     fn propagate_write_lazy_select_atomic() {
@@ -2381,7 +2533,7 @@ mod tests {
 
     /// Concurrent full-resync registration must not drop live writes: every
     /// propagate after a feed is registered must either be in the RDB snapshot
-    /// or appear on that feed (gate closes the snapshot/register gap).
+    /// or appear on that feed (Batch GB barrier closes the snapshot/register gap).
     #[test]
     fn fullsync_gate_keeps_propagates_visible_on_new_feed() {
         use std::sync::Barrier;

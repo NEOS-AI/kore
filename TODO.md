@@ -764,7 +764,7 @@ Also tracked in `docs/roadmap.md`.
 | Keyspace | `Entry.expires_at` RMW mirror (slot-only SoT) | **done** | **FU** |
 | Keyspace | search-doc eviction special | P3 residual | later |
 | Sentinel | Kore **higher** priority wins vs Redis Sentinel **lower** (documented honesty) | P3 accepted | — |
-| Ops | Global **repl backlog** still serializes writers | P3 | later (hard) |
+| Ops | Global **repl backlog** still serializes ordered publish (SELECT+append+fanout) | P3 residual | **GB** partial; further hard |
 | Ops | Dual SELECT trackers; `propagate_raw` skips stream-DB | P3 accepted | — |
 | Keyspace | RENAME remove+insert; create ensure_type→insert TOCTOU (historical) | P3 accepted | — |
 | Search | HNSW RDB durable graph (levels/edges/entry) | **done** | **FV** |
@@ -786,14 +786,28 @@ Also tracked in `docs/roadmap.md`.
 - [ ] **`[P3]`** **Batch FZ — Search-doc eviction special** — fold search docs into unified maxmemory sampling more honestly; tests
 - [ ] **`[P3]`** **Batch FX — HNSW AOF graph** — durable graph on AOF rewrite (or document rebuild-only if deferred)
 - [ ] **`[P3]`** **Batch GA — Retire `Entry.expires_at` field** — after audit (ShardedHashMap no longer holds live keyspace strings)
-- [ ] **`[P3]`** **Batch GB — Repl backlog serialize** — reduce global writer serialization (hard; no Valkey parity claim)
+- [x] **`[P3]`** **Batch GB — Repl backlog serialize** — partial win (see Completed)
 
 #### Defer / accept (not in active queue)
 - Cluster binary bus 2PC; dest prepare breadth; remote CHECK→COMMITPREPARE two-RPC window
 - Reshard weight UI; `__sentinel__:hello` long-lived SUBSCRIBE; Sentinel priority honesty vs Redis
 - single-DB Arc-swap mid-fill
+- Further repl publish parallelization (async fanout thread / concurrent snapshot + backlog catch-up) — residual after GB
 
-#### Completed (FB–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP + FQ + FR + FS + FT + FU + FV)
+#### Completed (FB–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP + FQ + FR + FS + FT + FU + FV + GB)
+
+- [x] **`[P3]`** **Batch GB — Repl backlog write serialization** (this commit)
+  - Dropped exclusive `fullsync_gate: Mutex<()>` on every `propagate_*`
+  - **Atomic fullsync barrier**: `fullsync_in_progress` + `writers_in_publish`; `publish_enter`/`publish_exit` / `with_fullsync_exclusion` — common path is atomics only (no Mutex) when no full-resync
+  - Ordered publish CS: under **backlog** lock only — lazy SELECT decide, append SELECT+cmd (one payload), update `selected_db`, fan-out (preserves FI-2 + feed≡backlog order)
+  - Precomputed `encode_select_db` table for DB 0..15 (clone under lock, no format/encode)
+  - Full-resync (`start_full_sync*` / PSYNC full) uses barrier across RDB snapshot + feed register (same gap invariant as old gate)
+  - Tests: `encode_select_db_matches_aof_encode`, `fullsync_barrier_excludes_concurrent_publish`; existing `propagate_write_lazy_select_atomic`, `propagate_write_concurrent_multidb_feed_replay`, `fullsync_gate_keeps_propagates_visible_on_new_feed`; aof_select 8/8; replication + multidb green
+  - **No Valkey parity claim**; no redis-benchmark re-measure this batch
+  - *Residuals (honest):*
+    - Multi-DB lazy SELECT still requires **global backlog serialization** of SELECT+append+ordered fanout (inherent with single stream `selected_db`)
+    - Full-resync still exclusive-blocks publishers for entire RDB snapshot duration
+    - Not done: fuse further with lock-free backlog; async fanout worker; concurrent snapshot + backlog catch-up; optional skip backlog when never-replicated
 
 - [x] **`[P2]`** **Batch FV — HNSW durable graph in RDB** (`d2c03a4`)
   - `HnswGraphSnapshot` + `HNSWIndex::snapshot_graph` / `apply_graph_snapshot` (entry, levels, edges; neighbor lists sorted for determinism)
@@ -830,13 +844,12 @@ Also tracked in `docs/roadmap.md`.
   - Root causes ranked in `docs/benchmarks.md` → *Pipeline SET analysis*
   - Wins: AOF-off unlock encode/propagate; direct `encode_command`; skip empty replica lock; slowlog/argv/`+OK` alloc cuts; typed-only WRONGTYPE; store value move
   - Re-measure (same host/method as FD): SET c=50 P=16 median **~621k** ops/s (FD **~498k**, **+~25%**); Valkey still ~1.59M
-  - Residual **FI-2** (correctness race fixed; backlog serialize remains):
-    - Global repl backlog still serializes all writers
+  - Residual **FI-2** (correctness race fixed; backlog serialize remains) → partial address **GB**
 - [x] **`[P2/P3]`** **Batch FI-2 — AOF-off multi-DB SELECT ordering** (`f88e83d`)
   - Root cause: FI unlocked encode/propagate outside AOF mutex; `selected_db` update was not ordered with backlog append → concurrent multi-DB writers could land SELECT-less cmds before another thread’s SELECT
-  - Fix: `ReplicationManager::propagate_write` — encode cmd outside locks; under `fullsync_gate`+backlog decide lazy SELECT, append SELECT+cmd (one payload) or cmd, update `ReplBacklog.selected_db`; AOF-off skips `aof` lock; AOF-on still holds AOF across disk append + `propagate_write` (disk/stream order)
+  - Fix: `ReplicationManager::propagate_write` — encode cmd outside locks; under publish section decide lazy SELECT, append SELECT+cmd (one payload) or cmd, update `ReplBacklog.selected_db`; AOF-off skips `aof` lock; AOF-on still holds AOF across disk append + `propagate_write` (disk/stream order)
   - Tests: `aof_select_concurrency_test` 8/8; unit `propagate_write_*` + `promote_resets_stream_selected_db`; multi-DB + TCP repl green
-  - *Post-ship review:* correctness fix holds; residual global backlog serialize (P3); dual SELECT trackers (AOF vs stream) intentional; `propagate_raw` still no stream-DB update (low-level/tests only)
+  - *Post-ship review:* correctness fix holds; residual global backlog serialize partially reduced by **GB** (dropped exclusive fullsync Mutex on hot path); dual SELECT trackers (AOF vs stream) intentional; `propagate_raw` still no stream-DB update (low-level/tests only)
 
 - [x] **`[P3]`** **Batch FK — Sentinel promote ranking + lite SM polish** (`78730ca`)
   - Rank: highest priority (0 never) → highest ROLE offset → greatest `ip:port` (mirrors cluster EA/EB)
@@ -943,7 +956,7 @@ Active items promoted to **Recommended letter queue** above (FW–GB). Remaining
 
 ### Code review backlog
 
-**Batches CZ–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP + FQ + FR + FS + FT + FU + FV shipped.** Letter queue empty; Later/backlog only. Standing tests-for-phase P0.
+**Batches CZ–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP + FQ + FR + FS + FT + FU + FV + GB shipped.** Letter queue FW–GA remain; GB done. Standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -1084,6 +1097,7 @@ Active items promoted to **Recommended letter queue** above (FW–GB). Remaining
 | P2 | dual-end NODE 2PC slice 2 (prepare-epoch / TTL / commit re-check) | **done** (Batch FH) |
 | P2 | FI pipeline SET perf | **done** (Batch FI; ~+25% P=16) |
 | P2/P3 | FI-2 AOF-off multi-DB SELECT ordering | **done** (Batch FI-2) |
+| P3 | GB repl backlog write serialization | **done** partial (dropped fullsync Mutex on hot path; backlog ordered publish residual) |
 | P3 | FL nodes.conf live flags | **done** (Batch FL) |
 | P3 | FG-4 strings unified map | **done** (Batch FG-4) |
 | P3 | DP residual: no DUMP/RESTORE wire compatibility | open (recreate-only; accepted) |
