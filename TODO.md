@@ -773,7 +773,25 @@ Also tracked in `docs/roadmap.md`.
 
 ### Next work queue (post-FU + post-FV)
 
-**Batches FU + FV shipped in parallel:** FU = `Entry.expires_at` RMW dual-write cleanup (slot-only TTL); FV = HNSW durable graph in RDB (KORDB v6). Standing rule: land tests with each change. Resume from **Later / backlog** only.
+**Batches FU + FV shipped in parallel.** Standing rule: land tests with each feature (**P0 process**).
+
+#### Track A — Release hygiene
+- [x] **`[P3]`** gitignore local `/data/` (nodes.conf / sentinel scratch)
+- [ ] **`[P1]`** Review + push/PR the commit stack on `main` (operator action; not auto-pushed)
+- [x] **`[P0]`** Standing: tests land with each feature (process rule — never closed)
+
+#### Recommended letter queue (implementing)
+- [ ] **`[P2]`** **Batch FW — ANN query path on HNSW** — `FT.SEARCH` VECTOR uses dual-written HNSW graph, not only flat `HashMap` KNN; recall/smoke tests
+- [ ] **`[P2]`** **Batch FY — DUMP/RESTORE Redis wire** — Redis RDB-compatible DUMP/RESTORE for core types (keep KDF1 as Kore path or dual-detect)
+- [ ] **`[P3]`** **Batch FZ — Search-doc eviction special** — fold search docs into unified maxmemory sampling more honestly; tests
+- [ ] **`[P3]`** **Batch FX — HNSW AOF graph** — durable graph on AOF rewrite (or document rebuild-only if deferred)
+- [ ] **`[P3]`** **Batch GA — Retire `Entry.expires_at` field** — after audit (ShardedHashMap no longer holds live keyspace strings)
+- [ ] **`[P3]`** **Batch GB — Repl backlog serialize** — reduce global writer serialization (hard; no Valkey parity claim)
+
+#### Defer / accept (not in active queue)
+- Cluster binary bus 2PC; dest prepare breadth; remote CHECK→COMMITPREPARE two-RPC window
+- Reshard weight UI; `__sentinel__:hello` long-lived SUBSCRIBE; Sentinel priority honesty vs Redis
+- single-DB Arc-swap mid-fill
 
 #### Completed (FB–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP + FQ + FR + FS + FT + FU + FV)
 
@@ -914,13 +932,14 @@ Also tracked in `docs/roadmap.md`.
 
 #### Later / backlog (no letter batch)
 
-- [ ] **`[P3]`** **Later / backlog**
-  - DUMP/RESTORE Redis wire; cluster reshard weight UI; admin_http auth/TLS
-  - single-DB Arc-swap mid-fill; HNSW AOF graph (optional); ANN query path on HNSW
-  - Global repl backlog write serialization (FI residual; no Valkey parity claim)
+Active items promoted to **Recommended letter queue** above (FW–GB). Remaining / accepted:
+
+- [ ] **`[P3]`** **Later / backlog (accepted or unscheduled)**
+  - cluster reshard weight UI; admin_http auth/TLS
+  - single-DB Arc-swap mid-fill (accepted)
   - Optional parallelize `enrich_replica_priorities` / `count_reachable_sentinels` (serial probes today)
-  - Cluster binary bus 2PC; dest prepare breadth; remote CHECK→COMMITPREPARE two-RPC window
-  - search-doc eviction special; optional full drop of `Entry.expires_at` field once `ShardedHashMap` retired
+  - Cluster binary bus 2PC; dest prepare breadth; remote CHECK→COMMITPREPARE two-RPC window (accepted lite)
+  - `__sentinel__:hello` SUBSCRIBE fan-in; Sentinel priority honesty (accepted)
 
 ### Code review backlog
 
