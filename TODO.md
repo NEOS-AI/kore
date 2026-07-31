@@ -776,7 +776,7 @@ Also tracked in `docs/roadmap.md`.
 
 #### Completed (FB–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP + FV)
 
-- [x] **`[P2]`** **Batch FV — HNSW durable graph in RDB**
+- [x] **`[P2]`** **Batch FV — HNSW durable graph in RDB** (`d2c03a4`)
   - `HnswGraphSnapshot` + `HNSWIndex::snapshot_graph` / `apply_graph_snapshot` (entry, levels, edges; neighbor lists sorted for determinism)
   - SearchIndex dual-write for VECTOR HNSW fields; Text→vector parse for hash auto-index
   - KORDB **v6** HNSW graph section after search aliases; v5- loads keep rebuild-by-readd
