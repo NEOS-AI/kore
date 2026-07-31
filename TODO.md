@@ -733,12 +733,13 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
   - *Done (Batch BT)*: `bt_eval_select_persists_connection_db` — connection remains on selected DB after EVAL
 
-### Status snapshot (2026-07-29, post-FR)
+### Status snapshot (2026-07-31, post-FS)
 
-**Committed through Batch FR** (P3 hygiene from Later/backlog). Letter queue through FQ was already empty; FR continues Later/backlog only. Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed). Git: `main` ahead of origin (do not push); untracked `data/` only.
+**Committed through Batch FS** (P3 lib-warning hygiene from Later/backlog). Letter queue empty; FR+FS continue Later/backlog only. Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed). Git: `main` ahead of origin (do not push); untracked `data/` only.
 
 **Verification:**
-- **FR:** compiler nits cleared (`config_kv_reply`, SkipList dead APIs, sentinel `unused_mut`); `sentinel_lite_test` **23/23** on ephemeral ports (`--test-threads=4` / `8`); lib `sorted_set` **16/16**, lib `sentinel` **16/16**.
+- **FS:** `cargo build --lib` **0 warnings**; removed unused `bitmap`/`replication` imports; dropped dead `entered_replica_feed` flag; `_weight` on inverted index; test-only `query_engine` import cleanup. Lib tests **360/360** (+1 ignored); bitmap/search/replication integration green.
+- **FR:** compiler nits + sentinel ephemeral ports (prior).
 - **FQ:** string TTL on `KeySlot`; unified EXPIRE/TTL/PERSIST; active expire + volatile sample read slot.
 - Hello SUBSCRIBE fan-in remains **accepted residual** (tick PUBLISH + peer HELLO only).
 
@@ -750,6 +751,7 @@ Also tracked in `docs/roadmap.md`.
 | Sentinel | CKQUORUM / elect majority live probe; probe self-vs-`*` | **done** | **FN** |
 | Sentinel | suite ephemeral ports (parallel bind flake risk) | **done** | **FR** |
 | Hygiene | compiler nits (`config_kv_reply`, SkipList dead APIs, sentinel unused_mut) | **done** | **FR** |
+| Hygiene | pre-existing lib warnings (unused imports / replica feed / weight) | **done** | **FS** |
 | Sentinel | long-lived `__sentinel__:hello` SUBSCRIBE fan-in | P3 accepted | — |
 | Sentinel | election-timeout SM (pre-attempt campaign epoch thrash) | P3 | later |
 | Cluster | NODE 2PC durable prepare + atomic COMMITPREPARE | **done** | **FO** |
@@ -765,9 +767,9 @@ Also tracked in `docs/roadmap.md`.
 | Search | HNSW edges/levels not AOF/RDB durable; `max_m=1` spanning | P3 accepted / later | — |
 | MIGRATE / UI / load | DUMP wire; reshard weight UI; Arc-swap mid-fill | P3 accepted | — |
 
-### Next work queue (post-FR)
+### Next work queue (post-FS)
 
-**Committed letter queue through FQ is empty; Batch FR (Later hygiene) done.** Standing rule: land tests with each change. Resume from **Later / backlog** only.
+**Committed letter queue through FQ is empty; Batch FR+FS (Later hygiene) done.** Standing rule: land tests with each change. Resume from **Later / backlog** only.
 
 #### Completed (FB–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP)
 
@@ -866,8 +868,17 @@ Also tracked in `docs/roadmap.md`.
   - Fixed `unused_mut` in `sentinel_lite_test`; known FR nits clean under `cargo build --lib` / sentinel test build
   - Sentinel suite: `free_port` / `free_ports` (bind `127.0.0.1:0`, hold then release) replaces hard-coded `169xx` ports — parallel-safe under `cargo test`
   - Tests: `sentinel_lite_test` **23/23**; lib sorted_set **16/16**; lib sentinel **16/16**
-  - Out of scope (documented residual warnings): unused imports (`bitmap` Bytes, replication Cache), `entered_replica_feed` assignment, search `weight` param
+  - Out of scope → closed by **FS**: unused imports (`bitmap` Bytes, replication Cache), `entered_replica_feed` assignment, search `weight` param
   - Residual: election-timeout SM; optional parallel INFO enrich; other Later items unchanged
+
+- [x] **`[P3]`** **Batch FS — Clear residual lib warnings** (pending stamp)
+  - Removed unused `bytes::Bytes` import in `commands/bitmap.rs`
+  - Moved `Cache` import into `replication` test module only (no longer top-level unused)
+  - Dropped dead `entered_replica_feed` flag in `network.rs` (replica feed always `break 'conn`; pipeline flush simplified)
+  - Renamed inverted-index `weight` → `_weight` (API kept; TF-IDF scoring still future)
+  - Bonus: unused `search_index` type imports in `query_engine` tests
+  - Verify: `cargo build --lib` **0 warnings**; lib **360/360** (+1 ignored); `bitmap_hll` / `search` / `replication` integration green
+  - Residual: election-timeout SM; `Entry.expires_at` RMW mirror; other Later items unchanged
 
 
 #### Later / backlog (no letter batch)
@@ -880,11 +891,10 @@ Also tracked in `docs/roadmap.md`.
   - Cluster binary bus 2PC; dest prepare breadth; remote CHECK→COMMITPREPARE two-RPC window
   - Sentinel election-timeout SM (pre-attempt campaign epoch thrash while o_down)
   - `Entry.expires_at` RMW mirror (optional full drop once ShardedHashMap retired); search-doc eviction special
-  - Pre-existing lib warnings (unused imports / `entered_replica_feed` / search `weight`) — not FR scope
 
 ### Code review backlog
 
-**Batches CZ–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP + FQ + FR shipped.** Letter queue empty; Later/backlog only. Standing tests-for-phase P0.
+**Batches CZ–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP + FQ + FR + FS shipped.** Letter queue empty; Later/backlog only. Standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -1089,4 +1099,4 @@ Highest urgency checklist (phase order preserved):
 - [x] Eviction policies (`maxmemory-policy`)
   - *Follow-ups*: Streams, bitmaps/HLL, RESP3 (done elsewhere); LFU decay done in Batch AB
 
-**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB–FQ** letter work is committed complete; **FR** is Later/backlog hygiene. Resume from **Next work queue (post-FR)** — Later/backlog only.
+**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB–FQ** letter work is committed complete; **FR+FS** are Later/backlog hygiene. Resume from **Next work queue (post-FS)** — Later/backlog only.

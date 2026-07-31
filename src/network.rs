@@ -715,7 +715,6 @@ where
         // Parse and handle all complete commands available after this read
         // (Redis pipelining). Coalesce serialized replies into fewer channel sends.
         let mut pipeline_buf: Vec<u8> = Vec::new();
-        let mut entered_replica_feed = false;
 
         while let Some(value) = parser.parse()? {
             let response = match handler.handle(value).await {
@@ -748,7 +747,6 @@ where
                 let _ = response_tx.send(raw.to_vec()).await;
                 if let Some(mut feed_rx) = feed_rx {
                     info!("Connection entered replica feed mode");
-                    entered_replica_feed = true;
                     let repl: Option<Arc<crate::persistence::replication::ReplicationManager>> =
                         handler
                             .persistence()
@@ -826,6 +824,7 @@ where
                             }
                         }
                     }
+                    // Replica feed ends the client loop (no further pipeline flush).
                     break 'conn Ok(());
                 }
                 continue;
@@ -851,9 +850,7 @@ where
             }
         }
 
-        if entered_replica_feed {
-            // already exited via break 'conn
-        } else if !pipeline_buf.is_empty() {
+        if !pipeline_buf.is_empty() {
             if send_response_buf(&response_tx, pipeline_buf).await.is_err() {
                 break Ok(());
             }

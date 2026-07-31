@@ -9,7 +9,6 @@
 //!
 //! Replica clients may issue normal **read** commands against a readonly replica.
 
-use crate::cache::Cache;
 use crate::databases::Databases;
 use crate::error::{Error, Result};
 use crate::persistence::{aof, rdb};
@@ -2111,6 +2110,7 @@ pub fn default_replid() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::Cache;
 
     #[test]
     fn backlog_append_and_partial() {

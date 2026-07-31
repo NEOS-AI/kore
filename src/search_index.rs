@@ -439,8 +439,11 @@ impl InvertedIndex {
         }
     }
 
-    /// Add a document to the index
-    pub fn add_document(&mut self, doc_id: Bytes, text: &str, weight: f64) {
+    /// Add a document to the index.
+    ///
+    /// `_weight` is reserved for future TF-IDF / field-weight scoring; presence
+    /// is already used at the FT schema layer (`FieldType::Text { weight }`).
+    pub fn add_document(&mut self, doc_id: Bytes, text: &str, _weight: f64) {
         let tokens = Self::tokenize(text);
         for token in tokens {
             self.terms

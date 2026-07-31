@@ -432,7 +432,6 @@ impl QueryExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search_index::{IndexDefinition, FieldDefinition, FieldType};
 
     #[test]
     fn test_query_parser() {

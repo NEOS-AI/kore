@@ -4,7 +4,6 @@ use super::CommandHandler;
 use crate::cache::{BitOpKind, BitfieldOp, BitfieldOverflow};
 use crate::error::{Error, Result};
 use crate::protocol::RespValue;
-use bytes::Bytes;
 
 impl CommandHandler {
     pub(super) fn handle_setbit(&self, args: &[RespValue]) -> Result<RespValue> {
