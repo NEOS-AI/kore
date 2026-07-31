@@ -67,7 +67,7 @@ impl Cache {
             };
             let value_bytes = Bytes::from(rendered);
 
-            // Batch FU: KEEPTTL via slot expire return; Entry.expires_at stays None.
+            // Batch FU/GA: KEEPTTL via slot expire return (Entry has no expire).
             let entry = Entry::new(key.clone(), value_bytes)
                 .with_flags(flags)
                 .with_cas(next_cas);
@@ -435,8 +435,7 @@ impl Cache {
                 return Err(Error::InvalidArgument("no such key".into()));
             }
             super::KeyType::String => {
-                // Batch FQ/FU: move whole KeySlot (value + expire); rewrite Entry key.
-                // Slot expire is SoT; clear residual Entry.expires_at.
+                // Batch FQ/FU/GA: move whole KeySlot (value + expire); rewrite Entry key.
                 let slot = self
                     .key_values
                     .remove(src)
@@ -448,7 +447,6 @@ impl Cache {
                 let old_size = entry.size();
                 let mut new_entry = (*entry).clone();
                 new_entry.key = dst.clone();
-                new_entry.expires_at = None;
                 let slot_exp = slot.expires_at;
                 let new_size = new_entry.size();
                 self.key_values.insert(

@@ -1,3 +1,36 @@
+//! Maxmemory eviction: keyspace keys + search-document special case (Batch FZ).
+//!
+//! # Victim model
+//!
+//! Eviction samples two populations under **`allkeys-*`** policies:
+//!
+//! 1. **Keyspace keys** — every live entry in [`Cache::key_values`]
+//!    (string / hash / list / set / zset / geo / stream). Removing a key frees
+//!    [`MemoryCategory::Cache`] (and related typed categories) and drops any
+//!    auto-index docs for that key name.
+//! 2. **Search documents** — entries in the FT search indexes
+//!    (`SearchIndexManager`). A search victim is **not** a Redis key: eviction
+//!    removes only the index document and frees
+//!    [`MemoryCategory::Search`]. The underlying hash (or other) key is kept.
+//!
+//! Sample budget is split **proportionally** to approximate population sizes
+//! (`key_n` vs `search_doc_n`) so that when search memory dominates, search
+//! docs are actually drawn as victims and Search bytes can be reclaimed.
+//!
+//! # Volatile policies (`volatile-*`)
+//!
+//! Search documents have **no TTL** (there is no EXPIRE for FT docs). They are
+//! therefore **never** volatile victims — only keys with
+//! [`super::KeySlot::expires_at`] participate. Keeping search allkeys-only is
+//! intentional and covered by tests.
+//!
+//! # LRU / LFU scoring for search docs
+//!
+//! Search docs lack access metadata; they are scored as **cold**
+//! (`cold_instant` / LFU freq 0), same as typed keys without touch tracking.
+//! Under `allkeys-lru` they lose to recently touched strings; under
+//! `allkeys-random` they compete uniformly with sampled keys.
+
 use crate::error::{Error, Result};
 use crate::memory::MemoryCategory;
 use bytes::Bytes;
@@ -135,10 +168,16 @@ impl Cache {
     /// Evict entries according to the configured maxmemory-policy until
     /// approximately `needed` bytes are freed.
     ///
-    /// Samples **all key types** (string, hash, list, set, zset, geo, stream)
-    /// and **search index documents** under `allkeys-*` policies. Volatile
-    /// policies sample string keys with expire and typed keys that have a TTL
-    /// (Batch AE). Search docs are not volatile victims.
+    /// # What is sampled (Batch FZ)
+    ///
+    /// | Policy family | Keyspace keys | Search documents |
+    /// |---------------|---------------|------------------|
+    /// | `allkeys-*`   | all live keys | yes (proportional sample) |
+    /// | `volatile-*`  | keys with TTL only | **no** (docs have no TTL) |
+    /// | `noeviction`  | — | — (returns OOM) |
+    ///
+    /// Search-doc eviction frees [`MemoryCategory::Search`] only; the Redis
+    /// key that was indexed remains. See module rustdoc for scoring notes.
     pub(super) fn evict_memory(&self, needed: usize) -> Result<()> {
         self.evict_memory_excluding(needed, None)
     }
@@ -278,6 +317,12 @@ impl Cache {
         }
     }
 
+    /// Build a candidate pool for one eviction round.
+    ///
+    /// Under `allkeys-*`, keyspace draws and search-doc draws share the sample
+    /// budget in proportion to `key_values.len()` vs total FT document count
+    /// (Batch FZ). When search docs dominate the population, they receive most
+    /// of the slots so Search memory can be reclaimed under pressure.
     fn sample_eviction_candidates(
         &self,
         policy: EvictionPolicy,
@@ -285,20 +330,43 @@ impl Cache {
         exclude_search_doc: Option<&Bytes>,
     ) -> Vec<EvictCandidate> {
         let volatile_only = policy.volatile_only();
-        let draw = if volatile_only {
-            (sample_size * 4).max(sample_size)
+        let sample_size = sample_size.max(1);
+
+        let key_n = self.key_values.len();
+        let search_docs = if policy.allkeys() {
+            self.search_index_manager.total_document_count()
         } else {
-            sample_size
+            // Volatile policies: search docs have no TTL → never candidates.
+            0
+        };
+
+        // Proportional split of the sample budget (allkeys only).
+        // ceil(sample_size * search_docs / (key_n + search_docs)), clamped.
+        let (key_draw, search_draw) = if policy.allkeys() && search_docs > 0 {
+            let total = key_n.saturating_add(search_docs).max(1);
+            let mut s = (sample_size.saturating_mul(search_docs) + total - 1) / total;
+            s = s.max(1).min(sample_size).min(search_docs);
+            let k = if key_n == 0 {
+                0
+            } else {
+                // Keep at least one key slot when keys exist and budget allows.
+                sample_size.saturating_sub(s).max(if s < sample_size { 1 } else { 0 })
+            };
+            // Volatile oversample N/A here; allkeys uses exact budget.
+            (k.max(if key_n > 0 { 1 } else { 0 }).min(sample_size.saturating_mul(2)), s)
+        } else if volatile_only {
+            // Extra draws: many keys lack TTL under volatile-*.
+            ((sample_size * 4).max(sample_size), 0)
+        } else {
+            (sample_size, 0)
         };
 
         let mut out = Vec::with_capacity(sample_size.saturating_mul(2));
+        let decay = self.lfu_decay_time.load(Ordering::Relaxed);
 
-        // --- Unified key_values (FG-4: strings + typed) ---
-        {
-            let n = draw.max(sample_size).max(1);
-            let decay = self.lfu_decay_time.load(Ordering::Relaxed);
-
-            for (k, slot) in self.key_values.get_n_random(n) {
+        // --- Unified key_values (strings + typed) ---
+        if key_draw > 0 {
+            for (k, slot) in self.key_values.get_n_random(key_draw) {
                 // Batch FQ: key-level expire is on the slot for all types.
                 let exp = slot.expires();
                 if slot.is_expired() {
@@ -328,34 +396,54 @@ impl Cache {
                     }
                 }
             }
+        }
 
-            // Search index documents only under allkeys (no TTL) — residual
-            // special case outside the keyspace maps.
-            if policy.allkeys() {
-                let search_n = (sample_size / 3).max(2);
-                for (index_name, doc_id, size) in self
-                    .search_index_manager
-                    .sample_documents_for_eviction(search_n, exclude_search_doc)
-                {
-                    out.push(EvictCandidate {
-                        key: doc_id,
-                        key_type: KeyType::None,
-                        size,
-                        last_access: cold_instant(),
-                        lfu_freq: 0,
-                        expires_at: None,
-                        search_index: Some(index_name),
-                    });
-                }
+        // --- Search documents (allkeys only; no TTL → not volatile) ---
+        if search_draw > 0 {
+            for (index_name, doc_id, size) in self
+                .search_index_manager
+                .sample_documents_for_eviction(search_draw, exclude_search_doc)
+            {
+                out.push(EvictCandidate {
+                    key: doc_id,
+                    key_type: KeyType::None,
+                    size,
+                    last_access: cold_instant(),
+                    lfu_freq: 0,
+                    expires_at: None,
+                    search_index: Some(index_name),
+                });
             }
         }
 
-        // Cap sample for pick_victim work
-        if out.len() > sample_size.saturating_mul(2) {
+        // Cap pool for pick_victim work. Prefer keeping a mix: when search
+        // candidates exist, do not drop them all in favor of keys.
+        let cap = sample_size.saturating_mul(2).max(sample_size);
+        if out.len() > cap {
             use rand::seq::SliceRandom;
             let mut rng = rand::thread_rng();
-            out.shuffle(&mut rng);
-            out.truncate(sample_size.saturating_mul(2));
+            // Partition so truncation cannot eliminate the search half when both exist.
+            let (mut search_c, mut key_c): (Vec<_>, Vec<_>) =
+                out.into_iter().partition(|c| c.search_index.is_some());
+            search_c.shuffle(&mut rng);
+            key_c.shuffle(&mut rng);
+            let search_keep = if search_c.is_empty() {
+                0
+            } else if key_c.is_empty() {
+                cap.min(search_c.len())
+            } else {
+                // Mirror the draw ratio into the cap.
+                let s = (cap * search_draw / sample_size.max(1))
+                    .max(1)
+                    .min(search_c.len())
+                    .min(cap);
+                s
+            };
+            let key_keep = cap.saturating_sub(search_keep).min(key_c.len());
+            search_c.truncate(search_keep);
+            key_c.truncate(key_keep);
+            out = key_c;
+            out.append(&mut search_c);
         }
 
         out

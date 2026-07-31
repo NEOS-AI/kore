@@ -735,17 +735,20 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
   - *Done (Batch BT)*: `bt_eval_select_persists_connection_db` — connection remains on selected DB after EVAL
 
-### Status snapshot (2026-07-31, post-FW + post-FX)
+### Status snapshot (2026-07-31, post-FW–GB)
 
-**Committed through Batches FW + FX** (ANN query path + AOF durable graph). Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed). Git: do not push.
+**Committed through Batches FW + FX + FY + FZ + GA + GB** (full recommended letter queue after FU/FV). Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed). Git: `main` ahead of origin; do not auto-push.
 
 **Verification:**
-- **FW:** `get_hnsw_index` + query engine `knn_search` / scores prefer non-empty HNSW; FLAT exact; empty HNSW → flat fallback; craft-connectivity unit proves edge walk (not full scan).
-- **FX:** AOF rewrite emits `FT._LOADGRAPH`; load edge-identical; legacy AOF without LOADGRAPH rebuilds; blob encode/decode shared with RDB body.
-- **FV:** KORDB v6 HNSW graph section; snapshot/apply edge-identical; `tests/fv_rdb_hnsw_graph_test.rs`.
-- Hello SUBSCRIBE fan-in remains **accepted residual** (tick PUBLISH + peer HELLO only).
+- **FW:** HNSW ANN for FT.SEARCH when dual-written graph non-empty; FLAT exact; empty → flat fallback.
+- **FX:** AOF `FT._LOADGRAPH`; load edge-identical; legacy rebuild path kept.
+- **FY:** Redis DUMP/RESTORE wire for string/list/set/hash/zset; KDF1 for geo/stream; dual-detect RESTORE.
+- **FZ:** proportional search-doc sampling under `allkeys-*`; volatile excludes search docs.
+- **GA:** `Entry.expires_at` removed; slot-only TTL.
+- **GB:** atomic fullsync barrier; hot path no Mutex gate; backlog still orders SELECT+append+fanout.
+- Hello SUBSCRIBE fan-in remains **accepted residual**.
 
-**What remains:** Later/backlog letter queue (FY–GB).
+**What remains:** Track A push/PR (operator); accepted Later residuals only.
 
 | Area | Residual | Priority | Planned batch |
 |------|----------|----------|---------------|
@@ -762,7 +765,8 @@ Also tracked in `docs/roadmap.md`.
 | Keyspace | expire slot header (`typed_expires` fold) | **done** | **FP** |
 | Keyspace | string TTL on `KeySlot` (unified EXPIRE/TTL path) | **done** | **FQ** |
 | Keyspace | `Entry.expires_at` RMW mirror (slot-only SoT) | **done** | **FU** |
-| Keyspace | search-doc eviction special | P3 residual | later |
+| Keyspace | search-doc eviction special (proportional allkeys sample) | **done** | **FZ** |
+| Keyspace | Retire `Entry.expires_at` field | **done** | **GA** |
 | Sentinel | Kore **higher** priority wins vs Redis Sentinel **lower** (documented honesty) | P3 accepted | — |
 | Ops | Global **repl backlog** still serializes ordered publish (SELECT+append+fanout) | P3 residual | **GB** partial; further hard |
 | Ops | Dual SELECT trackers; `propagate_raw` skips stream-DB | P3 accepted | — |
@@ -773,30 +777,22 @@ Also tracked in `docs/roadmap.md`.
 | Search | `max_m=1` spanning residual | P3 accepted / later | — |
 | MIGRATE / UI / load | DUMP/RESTORE Redis wire (**FY**); MIGRATE recreate-only; reshard weight UI; Arc-swap mid-fill | P3 partial / accepted | **FY** cmds; MIGRATE later |
 
-### Next work queue (post-FW + post-FX)
+### Next work queue (post-FW–GB)
 
-**Batches FW + FX shipped.** Standing rule: land tests with each feature (**P0 process**).
+**Full recommended letter queue shipped (FW–GB).** Standing rule: land tests with each feature (**P0 process**).
 
 #### Track A — Release hygiene
 - [x] **`[P3]`** gitignore local `/data/` (nodes.conf / sentinel scratch)
 - [ ] **`[P1]`** Review + push/PR the commit stack on `main` (operator action; not auto-pushed)
 - [x] **`[P0]`** Standing: tests land with each feature (process rule — never closed)
 
-#### Recommended letter queue (implementing)
-- [x] **`[P2]`** **Batch FW — ANN query path on HNSW** — see Completed
-- [x] **`[P2]`** **Batch FY — DUMP/RESTORE Redis wire** — see Completed
-- [x] **`[P3]`** **Batch FX — HNSW AOF graph** — see Completed
-- [ ] **`[P3]`** **Batch FZ — Search-doc eviction special** — fold search docs into unified maxmemory sampling more honestly; tests
-- [ ] **`[P3]`** **Batch GA — Retire `Entry.expires_at` field** — after audit (ShardedHashMap no longer holds live keyspace strings)
-- [x] **`[P3]`** **Batch GB — Repl backlog serialize** — partial win (see Completed)
-
-#### Completed (Batch FY)
+#### Recommended letter queue
+- [x] **`[P2]`** **Batch FW — ANN query path on HNSW**
 - [x] **`[P2]`** **Batch FY — DUMP/RESTORE Redis wire**
-  - **Format choice:** `DUMP` emits **Redis-compatible** RDB object wire for **string / list / set / hash / zset** (classic type opcodes 0/1/2/4/5, RDB version **9**, Redis CRC64). **Geo / stream** stay Kore **KDF1**.
-  - **RESTORE dual-detect:** magic `KDF1` → existing path; else Redis RDB object decode (classic + common listpack / quicklist2 / int-encoded string forms from real Redis/Valkey DUMP).
-  - Module: `src/rdb_object.rs`; wiring in `src/cache/key_xfer.rs` + `handle_dump`/`handle_restore`.
-  - Tests: `tests/fy_dump_restore_redis_wire_test.rs` (round-trip core types, real Redis fixture hex, KDF1 still accepted); unit tests in `rdb_object`; BA suite updated.
-  - **Residuals:** stream Redis RDB listpacks not encoded/decoded on DUMP wire (KDF1 only); geo not Redis geohash zset DUMP; MIGRATE still RESP recreate (not DUMP wire); zipmap / some legacy encodings best-effort; IDLETIME/FREQ still accepted no-op.
+- [x] **`[P3]`** **Batch FX — HNSW AOF graph**
+- [x] **`[P3]`** **Batch FZ — Search-doc eviction special**
+- [x] **`[P3]`** **Batch GA — Retire `Entry.expires_at` field**
+- [x] **`[P3]`** **Batch GB — Repl backlog serialize** (partial win)
 
 #### Defer / accept (not in active queue)
 - Cluster binary bus 2PC; dest prepare breadth; remote CHECK→COMMITPREPARE two-RPC window
@@ -805,28 +801,31 @@ Also tracked in `docs/roadmap.md`.
 - Further repl publish parallelization (async fanout / concurrent snapshot + backlog catch-up) — residual after GB
 - HNSW `max_m=1` spanning residual
 
-#### Completed (FB–… + FU + FV + FW + FX + FY + GB)
+#### Completed (FB–… + FU + FV + FW + FX + FY + FZ + GA + GB)
 
 - [x] **`[P2]`** **Batch FW — ANN query path on HNSW** (`ebd88e9`)
-  - `SearchIndex::get_hnsw_index` (non-empty only); query engine `knn_search` / `get_vector_scores` prefer HNSW ANN
-  - FLAT stays exact flat map; empty/missing HNSW falls back to flat
-  - Scores via `HNSWIndex::search` (`distance_to_score` = Cosine/L2/IP aligned with `compute_similarity`)
-  - Tests: craft connectivity (flat would pick isolated closer node; HNSW edge-walk excludes it); FLAT exact; empty HNSW
+  - `SearchIndex::get_hnsw_index`; query engine prefers HNSW ANN; FLAT exact; empty → flat
+  - Tests: craft connectivity edge-walk; FLAT exact; empty HNSW fallback
 
 - [x] **`[P3]`** **Batch FX — HNSW AOF graph** (`ebd88e9`)
-  - AOF rewrite: `FT.CREATE` → keys → `FT._LOADGRAPH index field <blob>` → aliases
-  - `HnswGraphSnapshot::encode`/`decode`/`write_to`/`read_from` (shared body with RDB v6)
-  - AOF apply `FT._LOADGRAPH` → `apply_hnsw_graphs`; old AOF without it rebuilds via re-`add`
-  - Tests: unit encode/decode; `tests/fx_aof_hnsw_graph_test.rs` rewrite/load edge-identical + legacy rebuild
-  - Residual: `max_m=1` spanning; FT._LOADGRAPH not a live client command (load/rewrite only)
+  - AOF rewrite: `FT.CREATE` → keys → `FT._LOADGRAPH` → aliases; shared snapshot codec with RDB v6
+  - Tests: `tests/fx_aof_hnsw_graph_test.rs`; legacy AOF rebuild path kept
+
+- [x] **`[P2]`** **Batch FY — DUMP/RESTORE Redis wire** (`d7e59e5`)
+  - DUMP Redis-compatible for string/list/set/hash/zset; geo/stream KDF1; RESTORE dual-detect
+  - Module `src/rdb_object.rs`; tests `tests/fy_dump_restore_redis_wire_test.rs`
+  - Residual: stream/geo Redis RDB; MIGRATE still recreate; IDLETIME/FREQ no-op
+
+- [x] **`[P3]`** **Batch FZ — Search-doc eviction special**
+  - Proportional allkeys sampling; volatile excludes search docs; dominate tests green
+  - Residual: docs outside `key_values` by design; optional access-touch for true LRU among docs
+
+- [x] **`[P3]`** **Batch GA — Retire `Entry.expires_at` field**
+  - Full field removal; slot-only TTL; `string_rmw_slot_only_ttl`; typed_ttl green
 
 - [x] **`[P3]`** **Batch GB — Repl backlog write serialization** (`dfcf7aa`)
-  - Dropped exclusive `fullsync_gate: Mutex<()>` on every `propagate_*`
-  - **Atomic fullsync barrier**: `fullsync_in_progress` + `writers_in_publish`; common path is atomics only when no full-resync
-  - Ordered publish CS: under **backlog** lock only — lazy SELECT + append + fan-out (FI-2 preserved)
-  - Precomputed `encode_select_db` for DB 0..15
-  - Tests: barrier + concurrent multi-DB propagate; aof_select 8/8; replication green
-  - **No Valkey parity claim**; residual: global backlog still orders SELECT+append+fanout; fullresync blocks publishers for RDB snapshot
+  - Atomic fullsync barrier; hot path no Mutex gate; backlog still orders SELECT+append+fanout
+  - **No Valkey parity claim**; residual further parallelization deferred
 
 - [x] **`[P2]`** **Batch FV — HNSW durable graph in RDB** (`d2c03a4`)
   - `HnswGraphSnapshot` + `HNSWIndex::snapshot_graph` / `apply_graph_snapshot` (entry, levels, edges; neighbor lists sorted for determinism)
@@ -959,8 +958,8 @@ Also tracked in `docs/roadmap.md`.
   - `KeySlot::expires()` is slot-only; residual Entry expire healed on first mutate / `KeySlot::string`
   - RMW call sites (SET/INCR/APPEND/SETRANGE/SETBIT/BITFIELD/PFADD/…) use slot KEEPTTL path
   - EXPIRE/PERSIST/RENAME no longer dual-write Entry; load injects expire only on returned clones (read projection)
-  - Tests: `string_rmw_clears_entry_expire_keeps_slot`; typed_ttl / string_ops / keyspace / phase_a / active_expire / bitmap_hll green
-  - Residual: `Entry.expires_at` field retained for legacy `ShardedHashMap` + load projection; search-doc eviction special
+  - Tests: `string_rmw_clears_entry_expire_keeps_slot` (rewritten as `string_rmw_slot_only_ttl` in **GA**)
+  - Residual closed by **GA** (field removal) + **FZ** (search-doc eviction)
 
 #### Later / backlog (no letter batch)
 
@@ -975,7 +974,7 @@ Active items promoted to **Recommended letter queue** above (FW–GB). Remaining
 
 ### Code review backlog
 
-**Batches through FU + FV + FW + FX + FY + GB shipped.** Letter queue FZ + GA remain. Standing tests-for-phase P0.
+**Batches through FU + FV + FW + FX + FY + FZ + GA + GB shipped.** Recommended letter queue empty. Standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|

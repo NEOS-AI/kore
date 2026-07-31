@@ -4,13 +4,7 @@ use bytes::Bytes;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::keyspace::KeyValue;
 use super::Cache;
-
-#[inline]
-fn string_entry_has_expire(value: &KeyValue) -> bool {
-    matches!(value, KeyValue::String(e) if e.expires_at.is_some())
-}
 
 impl Cache {
     /// Set expiration on a key (milliseconds from now). Works for all key types.
@@ -18,8 +12,8 @@ impl Cache {
     ///
     /// Redis: `EXPIRE key 0` / zero ms deletes the key immediately.
     ///
-    /// Batch FQ/FU: all types store absolute expire on [`super::KeySlot::expires_at`]
-    /// only. String `Entry.expires_at` is cleared if residual (not dual-written).
+    /// Batch FQ/FU/GA: all types store absolute expire on
+    /// [`super::KeySlot::expires_at`] only (`Entry` has no expire field).
     pub fn expire(&self, key: &Bytes, ttl_ms: u64) -> Result<bool> {
         // Lazy-delete if already past expiry so we don't revive a ghost key.
         let kt = self.key_type(key);
@@ -32,24 +26,13 @@ impl Cache {
         }
         let exp = Instant::now() + Duration::from_millis(ttl_ms);
         let set = self.key_values.mutate(key, |cur, _| match cur {
-            Some(slot) => {
-                // Slot-only TTL (FU). Clear residual Entry.expires_at on strings.
-                let value = match &slot.value {
-                    super::KeyValue::String(e) if e.expires_at.is_some() => {
-                        let mut ne = (**e).clone();
-                        ne.expires_at = None;
-                        super::KeyValue::String(std::sync::Arc::new(ne))
-                    }
-                    other => other.clone(),
-                };
-                (
-                    MapAction::Set(super::KeySlot {
-                        expires_at: Some(exp),
-                        value,
-                    }),
-                    true,
-                )
-            }
+            Some(slot) => (
+                MapAction::Set(super::KeySlot {
+                    expires_at: Some(exp),
+                    value: slot.value.clone(),
+                }),
+                true,
+            ),
             None => (MapAction::Keep, false),
         });
         Ok(set)
@@ -83,27 +66,16 @@ impl Cache {
 
     /// Remove any expiration from a key. Returns true if a timeout was removed.
     ///
-    /// Batch FQ/FU: clears [`super::KeySlot::expires_at`] only. Also clears any
-    /// residual string `Entry.expires_at` so dual-write cannot reappear.
+    /// Batch FQ/FU/GA: clears [`super::KeySlot::expires_at`] only.
     pub fn persist(&self, key: &Bytes) -> bool {
         self.key_values.mutate(key, |cur, _| match cur {
-            Some(slot) if slot.expires().is_some() || string_entry_has_expire(&slot.value) => {
-                let value = match &slot.value {
-                    super::KeyValue::String(e) if e.expires_at.is_some() => {
-                        let mut ne = (**e).clone();
-                        ne.expires_at = None;
-                        super::KeyValue::String(std::sync::Arc::new(ne))
-                    }
-                    other => other.clone(),
-                };
-                (
-                    MapAction::Set(super::KeySlot {
-                        expires_at: None,
-                        value,
-                    }),
-                    true,
-                )
-            }
+            Some(slot) if slot.expires().is_some() => (
+                MapAction::Set(super::KeySlot {
+                    expires_at: None,
+                    value: slot.value.clone(),
+                }),
+                true,
+            ),
             _ => (MapAction::Keep, false),
         })
     }

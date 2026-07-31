@@ -32,11 +32,15 @@ fn test_exat_absolute_unix_timestamp() {
 
     cache.store(key.clone(), value, opts).unwrap();
 
-    let entry = cache
-        .load(&key, LoadOptions::default())
-        .unwrap()
-        .expect("key should exist");
-    let ttl = entry.ttl_millis().expect("should have TTL");
+    assert!(
+        cache
+            .load(&key, LoadOptions::default())
+            .unwrap()
+            .is_some(),
+        "key should exist"
+    );
+    // Batch GA: remaining TTL is on the slot — query via Cache::ttl.
+    let ttl = cache.ttl(&key);
     // Remaining TTL should be roughly 2000ms, not ~exat_ms (which would be decades)
     assert!(
         ttl > 500 && ttl <= 2_500,

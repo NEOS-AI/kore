@@ -3,7 +3,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Cache entry with reference counting and optional expiration
+/// Cache entry with reference counting.
+///
+/// # TTL (Batch GA)
+///
+/// Key-level expiration lives on [`crate::cache::keyspace::KeySlot::expires_at`]
+/// only. This struct no longer carries `expires_at` — use
+/// [`crate::Cache::ttl`] / slot expire for TTL queries. Load returns the bare
+/// entry; callers that need remaining TTL should call `cache.ttl(key)`.
 #[derive(Debug)]
 pub struct Entry {
     /// The key
@@ -16,8 +23,6 @@ pub struct Entry {
     last_access_micros: AtomicU64,
     /// Redis-style LFU word: high 16 bits = minute stamp, low 8 = log counter.
     lfu: AtomicU64,
-    /// Expiration time (None = no expiration)
-    pub expires_at: Option<Instant>,
     /// User-defined flags (for Memcache compatibility)
     pub flags: u32,
     /// CAS (Compare-And-Swap) value
@@ -32,20 +37,9 @@ impl Entry {
             created_at: Instant::now(),
             last_access_micros: AtomicU64::new(0),
             lfu: AtomicU64::new(crate::lfu::initial()),
-            expires_at: None,
             flags: 0,
             cas: 0,
         }
-    }
-
-    pub fn with_expiration(mut self, ttl: Duration) -> Self {
-        self.expires_at = Some(self.created_at + ttl);
-        self
-    }
-
-    pub fn with_expiration_at(mut self, expires_at: Instant) -> Self {
-        self.expires_at = Some(expires_at);
-        self
     }
 
     pub fn with_flags(mut self, flags: u32) -> Self {
@@ -56,25 +50,6 @@ impl Entry {
     pub fn with_cas(mut self, cas: u64) -> Self {
         self.cas = cas;
         self
-    }
-
-    /// Check if the entry is expired
-    pub fn is_expired(&self) -> bool {
-        self.expires_at
-            .map(|exp| Instant::now() >= exp)
-            .unwrap_or(false)
-    }
-
-    /// Get remaining TTL in milliseconds
-    pub fn ttl_millis(&self) -> Option<i64> {
-        self.expires_at.map(|exp| {
-            let now = Instant::now();
-            if now >= exp {
-                -2 // Expired
-            } else {
-                exp.duration_since(now).as_millis() as i64
-            }
-        })
     }
 
     /// Accounted heap size of this entry (includes map/allocator overhead).
@@ -147,7 +122,6 @@ impl Clone for Entry {
             created_at: self.created_at,
             last_access_micros: AtomicU64::new(self.last_access_micros.load(Ordering::Relaxed)),
             lfu: AtomicU64::new(self.lfu.load(Ordering::Relaxed)),
-            expires_at: self.expires_at,
             flags: self.flags,
             cas: self.cas,
         }
