@@ -100,7 +100,7 @@ pub use memory::{
 };
 pub use search_index::{SearchIndexManager, IndexDefinition, FieldDefinition, FieldType, DocumentField, DistanceMetric, VectorAlgorithm};
 pub use query_engine::{Query, QueryFilter, QueryExecutor};
-pub use vector_search::{VectorIndex, VectorSearchResult};
+pub use vector_search::{HnswGraphSnapshot, HNSWIndex, VectorIndex, VectorSearchResult};
 pub use scripting::{script_sha1, ScriptCache};
 pub use slowlog::{SlowLog, SlowLogEntry, DEFAULT_MAX_LEN as SLOWLOG_DEFAULT_MAX_LEN, DEFAULT_SLOWER_THAN_US};
 pub use acl_log::{AclLog, AclLogEntry, DEFAULT_MAX_LEN as ACLLOG_DEFAULT_MAX_LEN};

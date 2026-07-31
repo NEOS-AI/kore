@@ -207,10 +207,13 @@ impl PartialOrd for MaxCand {
 /// Deterministic tests can force levels via [`HNSWIndex::enqueue_levels`] or seed
 /// the level RNG with [`HNSWIndex::with_level_seed`].
 ///
-/// **Persistence honesty:** AOF/RDB store vectors + HNSW params (`M`, `ef_construction`)
-/// only — **not** graph edges or per-node levels. On load, the graph (including multi-layer
-/// structure) is rebuilt by re-`add` in restore order; levels are re-sampled and will not
-/// match the pre-save hierarchy. Do not claim edge-identical multi-layer graph durability.
+/// **Persistence (Batch FV):** RDB v6+ can persist a durable graph snapshot
+/// ([`HnswGraphSnapshot`]: `entry_point`, per-node levels, per-layer adjacency)
+/// and restore it edge-identically via [`HNSWIndex::apply_graph_snapshot`] without
+/// re-sampling levels. Neighbor lists are **canonicalized** (sorted by id) on
+/// export for deterministic equality. AOF still rewrites `FT.CREATE` + docs only
+/// — AOF-only load rebuilds the graph by re-`add` (levels re-sampled). Old RDB
+/// files without a graph section keep the rebuild-by-readd path.
 ///
 /// **Batch CS:** `remove` unlinks reverse edges and clears the layer entry; insert uses
 /// layer-0 `M_max ≈ 2M` and force-keeps at least one reverse edge so new nodes stay
@@ -714,9 +717,8 @@ impl HNSWIndex {
             .collect()
     }
 
-    /// Highest layer index where `doc_id` appears, if any (tests / diagnostics).
-    #[cfg(test)]
-    fn node_level(&self, doc_id: &Bytes) -> Option<usize> {
+    /// Highest layer index where `doc_id` appears, if any (diagnostics / snapshot).
+    pub fn node_level(&self, doc_id: &Bytes) -> Option<usize> {
         let mut max = None;
         for (i, layer) in self.layers.iter().enumerate() {
             if layer.neighbors.contains_key(doc_id) {
@@ -724,6 +726,252 @@ impl HNSWIndex {
             }
         }
         max
+    }
+
+    /// Entry point id, if the index is non-empty.
+    pub fn entry_point(&self) -> Option<&Bytes> {
+        self.entry_point.as_ref()
+    }
+
+    /// Outgoing neighbors of `doc_id` on `layer` (empty if absent).
+    pub fn layer_neighbors(&self, layer: usize, doc_id: &Bytes) -> Vec<Bytes> {
+        self.layers
+            .get(layer)
+            .map(|l| l.get_neighbors(doc_id))
+            .unwrap_or_default()
+    }
+
+    /// Number of graph layers currently allocated (at least 1 when empty base exists).
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Export durable graph structure: entry point, per-node levels, per-layer edges.
+    ///
+    /// Neighbor lists and node order are **canonicalized** (sorted by id) so two
+    /// snapshots of the same undirected structure compare equal regardless of
+    /// insert-time edge append order. Vectors are **not** included — caller must
+    /// already hold the same vectors in `self` before [`apply_graph_snapshot`].
+    pub fn snapshot_graph(&self) -> HnswGraphSnapshot {
+        let mut levels: Vec<(Bytes, u32)> = self
+            .vectors
+            .keys()
+            .filter_map(|id| {
+                self.node_level(id)
+                    .map(|lvl| (id.clone(), lvl as u32))
+            })
+            .collect();
+        levels.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let top = self.highest_nonempty_layer();
+        // Export layers 0..=top (or empty single layer when index empty).
+        let layer_count = if self.vectors.is_empty() {
+            0
+        } else {
+            top + 1
+        };
+        let mut layers = Vec::with_capacity(layer_count);
+        for li in 0..layer_count {
+            let mut adj: Vec<(Bytes, Vec<Bytes>)> = self.layers[li]
+                .neighbors
+                .iter()
+                .map(|(id, neighs)| {
+                    let mut n = neighs.clone();
+                    n.sort();
+                    n.dedup();
+                    (id.clone(), n)
+                })
+                .collect();
+            adj.sort_by(|a, b| a.0.cmp(&b.0));
+            layers.push(adj);
+        }
+
+        HnswGraphSnapshot {
+            entry_point: self.entry_point.clone(),
+            levels,
+            layers,
+        }
+    }
+
+    /// Install a graph snapshot over **existing** vectors without re-sampling levels.
+    ///
+    /// Validates that every level/edge id exists in `self.vectors` and that
+    /// layer membership is consistent with declared levels (node at level L
+    /// must appear on layers `0..=L`). Neighbor lists are installed as given
+    /// (callers that want canonical order should snapshot first or sort).
+    ///
+    /// Does **not** insert missing vectors — use [`install_vector`] first when
+    /// restoring from a side channel that carries payloads.
+    pub fn apply_graph_snapshot(&mut self, snap: &HnswGraphSnapshot) -> Result<(), String> {
+        // Empty snapshot → clear graph structure but keep vectors? Prefer:
+        // empty snap with no vectors → empty index graph; if vectors remain and
+        // snap is empty, reject (would orphan vectors from search).
+        if snap.levels.is_empty() && snap.layers.is_empty() {
+            if self.vectors.is_empty() {
+                self.layers = vec![HNSWLayer::new()];
+                self.entry_point = None;
+                return Ok(());
+            }
+            return Err(
+                "HNSW graph snapshot is empty but index still has vectors".into(),
+            );
+        }
+
+        // Validate levels cover exactly the vector set (or subset with all edge ids).
+        let mut level_map: HashMap<Bytes, usize> = HashMap::new();
+        for (id, lvl) in &snap.levels {
+            if !self.vectors.contains_key(id) {
+                return Err(format!(
+                    "HNSW snapshot level node {:?} missing from vectors",
+                    id
+                ));
+            }
+            if *lvl as usize > Self::MAX_LEVEL {
+                return Err(format!(
+                    "HNSW snapshot level {} exceeds MAX_LEVEL {}",
+                    lvl,
+                    Self::MAX_LEVEL
+                ));
+            }
+            if level_map.insert(id.clone(), *lvl as usize).is_some() {
+                return Err(format!("HNSW snapshot duplicate level for {:?}", id));
+            }
+        }
+        // Every vector must have a level entry.
+        for id in self.vectors.keys() {
+            if !level_map.contains_key(id) {
+                return Err(format!(
+                    "HNSW snapshot missing level for vector {:?}",
+                    id
+                ));
+            }
+        }
+
+        let max_level = level_map.values().copied().max().unwrap_or(0);
+        if snap.layers.len() != max_level + 1 {
+            return Err(format!(
+                "HNSW snapshot layer count {} != max_level+1 ({})",
+                snap.layers.len(),
+                max_level + 1
+            ));
+        }
+
+        // Validate adjacency and build new layers.
+        let mut new_layers: Vec<HNSWLayer> = (0..=max_level)
+            .map(|_| HNSWLayer::new())
+            .collect();
+
+        for (li, adj) in snap.layers.iter().enumerate() {
+            for (id, neighs) in adj {
+                let Some(&node_lvl) = level_map.get(id) else {
+                    return Err(format!(
+                        "HNSW snapshot layer {li} has node {:?} without level",
+                        id
+                    ));
+                };
+                if li > node_lvl {
+                    return Err(format!(
+                        "HNSW snapshot node {:?} on layer {li} > its level {node_lvl}",
+                        id
+                    ));
+                }
+                if !self.vectors.contains_key(id) {
+                    return Err(format!(
+                        "HNSW snapshot edge source {:?} missing from vectors",
+                        id
+                    ));
+                }
+                let mut cleaned = Vec::with_capacity(neighs.len());
+                for n in neighs {
+                    if n == id {
+                        continue; // drop self-loops
+                    }
+                    if !self.vectors.contains_key(n) {
+                        return Err(format!(
+                            "HNSW snapshot neighbor {:?} of {:?} missing from vectors",
+                            n, id
+                        ));
+                    }
+                    let Some(&n_lvl) = level_map.get(n) else {
+                        return Err(format!(
+                            "HNSW snapshot neighbor {:?} missing level",
+                            n
+                        ));
+                    };
+                    if li > n_lvl {
+                        return Err(format!(
+                            "HNSW snapshot neighbor {:?} on layer {li} > its level {n_lvl}",
+                            n
+                        ));
+                    }
+                    if !cleaned.iter().any(|x| x == n) {
+                        cleaned.push(n.clone());
+                    }
+                }
+                new_layers[li].neighbors.insert(id.clone(), cleaned);
+            }
+            // Ensure every node with level >= li has a layer entry (possibly empty).
+            for (id, &lvl) in &level_map {
+                if lvl >= li {
+                    new_layers[li]
+                        .neighbors
+                        .entry(id.clone())
+                        .or_insert_with(Vec::new);
+                }
+            }
+        }
+
+        if let Some(ep) = &snap.entry_point {
+            if !self.vectors.contains_key(ep) {
+                return Err(format!(
+                    "HNSW snapshot entry_point {:?} missing from vectors",
+                    ep
+                ));
+            }
+            // Entry should sit on the top layer.
+            if !new_layers[max_level].neighbors.contains_key(ep) {
+                return Err(format!(
+                    "HNSW snapshot entry_point {:?} not present on top layer {}",
+                    ep, max_level
+                ));
+            }
+        } else if !self.vectors.is_empty() {
+            return Err("HNSW snapshot missing entry_point for non-empty index".into());
+        }
+
+        self.layers = new_layers;
+        self.entry_point = snap.entry_point.clone();
+        Ok(())
+    }
+
+    /// Insert or replace a vector **without** wiring graph edges or sampling a level.
+    ///
+    /// Used when restoring vectors before [`apply_graph_snapshot`]. Removes any
+    /// prior graph presence of `doc_id` so stale edges cannot revive.
+    pub fn install_vector(&mut self, doc_id: Bytes, vector: Vec<f32>) {
+        if self.vectors.contains_key(&doc_id) {
+            // Unlink from layers only (no bridge repair — full snapshot follows).
+            for layer in &mut self.layers {
+                layer.unlink_node(&doc_id);
+            }
+        }
+        self.vectors.insert(doc_id, vector);
+        if self.entry_point.as_ref().map(|ep| !self.vectors.contains_key(ep)).unwrap_or(false) {
+            self.entry_point = None;
+        }
+    }
+
+    /// Drop all vectors and graph structure (keeps M / ef / metric).
+    pub fn clear(&mut self) {
+        self.vectors.clear();
+        self.layers = vec![HNSWLayer::new()];
+        self.entry_point = None;
+        self.level_assign_queue.clear();
+    }
+
+    /// Iterate stored vectors (doc_id, components) for persistence export.
+    pub fn iter_vectors(&self) -> impl Iterator<Item = (&Bytes, &Vec<f32>)> {
+        self.vectors.iter()
     }
 
     /// SEARCH-LAYER (Malkov & Yashunin): greedy expansion of neighbors with ef bound.
@@ -999,6 +1247,27 @@ impl HNSWIndex {
     /// Check if the index is empty
     pub fn is_empty(&self) -> bool {
         self.vectors.is_empty()
+    }
+}
+
+/// Durable HNSW graph snapshot (Batch FV): entry point, per-node levels, edges.
+///
+/// Vectors are intentionally omitted — restore loads vectors first, then applies
+/// this structure so levels are **not** re-sampled. Neighbor order is sorted on
+/// export ([`HNSWIndex::snapshot_graph`]) for deterministic equality.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HnswGraphSnapshot {
+    pub entry_point: Option<Bytes>,
+    /// `(doc_id, level)` sorted by `doc_id` on export.
+    pub levels: Vec<(Bytes, u32)>,
+    /// `layers[i]` = adjacency for layer `i`: `(node_id, sorted neighbor ids)`.
+    pub layers: Vec<Vec<(Bytes, Vec<Bytes>)>>,
+}
+
+impl HnswGraphSnapshot {
+    /// True when there is no graph data to persist.
+    pub fn is_empty(&self) -> bool {
+        self.levels.is_empty() && self.layers.is_empty() && self.entry_point.is_none()
     }
 }
 
@@ -1376,6 +1645,8 @@ mod tests {
     #[test]
     fn hnsw_remove_entry_reassigns() {
         let mut index = HNSWIndex::new(4, 32, DistanceMetric::L2);
+        // Force level 0 for all so "entry" stays entry (no geometric promote).
+        index.enqueue_levels([0, 0, 0]);
         index.add(Bytes::from("entry"), vec![0.0, 0.0]);
         index.add(Bytes::from("other"), vec![1.0, 0.0]);
         index.add(Bytes::from("third"), vec![2.0, 0.0]);
@@ -2602,5 +2873,79 @@ mod tests {
         // p and q both on layer 1.
         assert!(index.layers[1].neighbors.contains_key(&Bytes::from("p")));
         assert!(index.layers[1].neighbors.contains_key(&Bytes::from("q")));
+    }
+
+    // ── Batch FV: durable graph snapshot ──────────────────────────────────
+
+    /// Forced multi-layer graph: snapshot → fresh index with same vectors →
+    /// apply → levels, entry, and edges match (canonical neighbor order).
+    #[test]
+    fn hnsw_graph_snapshot_roundtrip_forced_levels() {
+        let mut src = HNSWIndex::new(4, 32, DistanceMetric::L2);
+        src.enqueue_levels([0, 0, 2, 1, 0]);
+        src.add(Bytes::from("a"), vec![0.0, 0.0]);
+        src.add(Bytes::from("b"), vec![1.0, 0.0]);
+        src.add(Bytes::from("c"), vec![2.0, 0.0]);
+        src.add(Bytes::from("d"), vec![3.0, 0.0]);
+        src.add(Bytes::from("e"), vec![4.0, 0.0]);
+
+        let snap = src.snapshot_graph();
+        assert_eq!(snap.entry_point, Some(Bytes::from("c")));
+        assert_eq!(snap.levels.len(), 5);
+        assert_eq!(src.node_level(&Bytes::from("c")), Some(2));
+        assert!(!snap.layers.is_empty());
+
+        // Fresh index: install vectors only (no graph), then apply snapshot.
+        let mut dst = HNSWIndex::new(4, 32, DistanceMetric::L2);
+        for (id, v) in src.iter_vectors() {
+            dst.install_vector(id.clone(), v.clone());
+        }
+        dst.apply_graph_snapshot(&snap).expect("apply");
+
+        assert_eq!(dst.snapshot_graph(), snap);
+        assert_eq!(dst.entry_point, Some(Bytes::from("c")));
+        assert_eq!(dst.node_level(&Bytes::from("c")), Some(2));
+        assert_eq!(dst.node_level(&Bytes::from("d")), Some(1));
+        assert_eq!(dst.node_level(&Bytes::from("a")), Some(0));
+
+        // Search still works after exact restore.
+        let hits = dst.search(&[0.0f32, 0.0], 1);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, Bytes::from("a"));
+    }
+
+    /// apply_graph_snapshot rejects neighbor ids not present in vectors.
+    #[test]
+    fn hnsw_graph_snapshot_rejects_missing_neighbor() {
+        let mut idx = HNSWIndex::new(4, 32, DistanceMetric::L2);
+        idx.install_vector(Bytes::from("a"), vec![0.0, 0.0]);
+        idx.install_vector(Bytes::from("b"), vec![1.0, 0.0]);
+        let bad = HnswGraphSnapshot {
+            entry_point: Some(Bytes::from("a")),
+            levels: vec![(Bytes::from("a"), 0), (Bytes::from("b"), 0)],
+            layers: vec![vec![
+                (Bytes::from("a"), vec![Bytes::from("ghost")]),
+                (Bytes::from("b"), vec![]),
+            ]],
+        };
+        let err = idx.apply_graph_snapshot(&bad).unwrap_err();
+        assert!(
+            err.contains("missing"),
+            "expected missing-neighbor error, got {err}"
+        );
+    }
+
+    /// Snapshot equality is stable under re-export (canonical neighbor sort).
+    #[test]
+    fn hnsw_graph_snapshot_canonical_reexport() {
+        let mut index = HNSWIndex::new(4, 32, DistanceMetric::L2);
+        index.enqueue_levels([1, 1, 0]);
+        index.add(Bytes::from("x"), vec![0.0, 0.0]);
+        index.add(Bytes::from("y"), vec![1.0, 0.0]);
+        index.add(Bytes::from("z"), vec![2.0, 0.0]);
+        let s1 = index.snapshot_graph();
+        index.apply_graph_snapshot(&s1).unwrap();
+        let s2 = index.snapshot_graph();
+        assert_eq!(s1, s2);
     }
 }

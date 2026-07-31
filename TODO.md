@@ -734,15 +734,15 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
   - *Done (Batch BT)*: `bt_eval_select_persists_connection_db` — connection remains on selected DB after EVAL
 
-### Status snapshot (2026-07-31, post-FT)
+### Status snapshot (2026-07-31, post-FU + post-FV)
 
-**Committed through Batch FT** (Sentinel election-timeout SM from Later/backlog). Letter queue empty again after FT. Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed). Git: `main` ahead of origin (do not push); untracked `data/` only.
+**Committed through Batches FU + FV** (parallel Later/backlog). Letter queue empty. Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed). Git: `main` ahead of origin (do not push); untracked `data/` only.
 
 **Verification:**
+- **FU:** slot-only string TTL; `mutate_string` slot expire in/out; `Entry.expires_at` cleared on write-back; unit `string_rmw_clears_entry_expire_keeps_slot`.
+- **FV:** KORDB v6 HNSW graph section; snapshot/apply edge-identical; AOF-only still rebuilds; `tests/fv_rdb_hnsw_graph_test.rs`.
 - **FT:** election-timeout SM — `ELECTION_TIMEOUT` 5s; campaign epoch reuse; re-campaign after expiry (self + stuck vote-for-other). Lib sentinel **19/19**; `sentinel_lite_test` **23/23** (parallel promote-inject flake pre-existing, passes alone).
-- **FS:** `cargo build --lib` **0 warnings**; removed unused `bitmap`/`replication` imports; dropped dead `entered_replica_feed` flag; `_weight` on inverted index; test-only `query_engine` import cleanup.
-- **FR:** compiler nits + sentinel ephemeral ports (prior).
-- **FQ:** string TTL on `KeySlot`; unified EXPIRE/TTL/PERSIST; active expire + volatile sample read slot.
+- **FS:** `cargo build --lib` **0 warnings**; residual lib warning cleanup.
 - Hello SUBSCRIBE fan-in remains **accepted residual** (tick PUBLISH + peer HELLO only).
 
 **What remains:** Later/backlog only.
@@ -767,14 +767,23 @@ Also tracked in `docs/roadmap.md`.
 | Ops | Global **repl backlog** still serializes writers | P3 | later (hard) |
 | Ops | Dual SELECT trackers; `propagate_raw` skips stream-DB | P3 accepted | — |
 | Keyspace | RENAME remove+insert; create ensure_type→insert TOCTOU (historical) | P3 accepted | — |
-| Search | HNSW edges/levels not AOF/RDB durable; `max_m=1` spanning | P3 accepted / later | — |
+| Search | HNSW RDB durable graph (levels/edges/entry) | **done** | **FV** |
+| Search | HNSW AOF-only still rebuilds by re-`add`; `max_m=1` spanning residual | P3 accepted / later | — |
 | MIGRATE / UI / load | DUMP wire; reshard weight UI; Arc-swap mid-fill | P3 accepted | — |
 
-### Next work queue (post-FU)
+### Next work queue (post-FU + post-FV)
 
-**Committed letter queue through FT was empty; Batch FU took `Entry.expires_at` RMW dual-write cleanup from Later/backlog.** Standing rule: land tests with each change. Resume from **Later / backlog** only.
+**Batches FU + FV shipped in parallel:** FU = `Entry.expires_at` RMW dual-write cleanup (slot-only TTL); FV = HNSW durable graph in RDB (KORDB v6). Standing rule: land tests with each change. Resume from **Later / backlog** only.
 
-#### Completed (FB–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP)
+#### Completed (FB–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP + FQ + FR + FS + FT + FU + FV)
+
+- [x] **`[P2]`** **Batch FV — HNSW durable graph in RDB** (`d2c03a4`)
+  - `HnswGraphSnapshot` + `HNSWIndex::snapshot_graph` / `apply_graph_snapshot` (entry, levels, edges; neighbor lists sorted for determinism)
+  - SearchIndex dual-write for VECTOR HNSW fields; Text→vector parse for hash auto-index
+  - KORDB **v6** HNSW graph section after search aliases; v5- loads keep rebuild-by-readd
+  - AOF still FT.CREATE + docs only (rebuild on AOF-only load) — honesty in `aof.rs` / `vector_search.rs`
+  - Tests: unit snapshot round-trip; `tests/fv_rdb_hnsw_graph_test.rs` RDB SAVE/load edge-identical
+  - Residual: AOF-only re-samples levels; query path still flat map; `max_m=1` spanning
 
 
 - [x] **`[P1]`** **Batch FB — Cluster dual-end NODE wire 2PC (slice 1)**
@@ -783,7 +792,7 @@ Also tracked in `docs/roadmap.md`.
   - Host M3 Pro; pipeline SET is main Kore gap; no portable-win claims
 - [x] **`[P2]`** **Batch FE — Sentinel leader election depth**
 - [x] **`[P2]`** **Batch FF — HNSW multi-layer insert**
-  - Geometric levels + upper-layer connect/search; residual: edges not durable in AOF/RDB
+  - Geometric levels + upper-layer connect/search; residual closed for RDB by **FV** (AOF still rebuilds)
 - [x] **`[P2]`** **Batch FG — Unified keyspace design + facade**
 - [x] **`[P2]`** **Batch FG-2 — Physical hashes in `key_values`**
 - [x] **`[P2]`** **Batch FG-3 — Remaining typed types + payload collapse** (`1db780e`)
@@ -907,7 +916,7 @@ Also tracked in `docs/roadmap.md`.
 
 - [ ] **`[P3]`** **Later / backlog**
   - DUMP/RESTORE Redis wire; cluster reshard weight UI; admin_http auth/TLS
-  - HNSW durable graph; single-DB Arc-swap mid-fill
+  - single-DB Arc-swap mid-fill; HNSW AOF graph (optional); ANN query path on HNSW
   - Global repl backlog write serialization (FI residual; no Valkey parity claim)
   - Optional parallelize `enrich_replica_priorities` / `count_reachable_sentinels` (serial probes today)
   - Cluster binary bus 2PC; dest prepare breadth; remote CHECK→COMMITPREPARE two-RPC window
@@ -915,7 +924,7 @@ Also tracked in `docs/roadmap.md`.
 
 ### Code review backlog
 
-**Batches CZ–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP + FQ + FR + FS + FT + FU shipped.** Letter queue empty; Later/backlog only. Standing tests-for-phase P0.
+**Batches CZ–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP + FQ + FR + FS + FT + FU + FV shipped.** Letter queue empty; Later/backlog only. Standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -957,6 +966,7 @@ Also tracked in `docs/roadmap.md`.
 | P2 | CB post-ship: expand tests (memory, multi-DB, TTL, pubsub, seed, peak) | done (CP) |
 | P2 | HNSW graph search (ef_search; self-exclude; edge-walk tests) | done (CQ) |
 | P2 | HNSW multi-layer insert (level assign + upper SEARCH-LAYER + query descent) | done (FF) |
+| P2 | HNSW durable graph in RDB (KORDB v6 levels/edges/entry; AOF rebuild residual) | done (FV) |
 | P2 | CQ post-ship: HNSW remove unlinks graph + re-add clears neighbors | done (CS local hygiene) |
 | P2 | CQ post-ship: insert M-prune preserves reachability from entry | done (CS insert-time heuristic) |
 | P2 | CQ post-ship: update-in-place rewire or document | done (CS; CT 2-chain) |

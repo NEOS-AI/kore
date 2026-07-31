@@ -67,6 +67,36 @@ impl Cache {
         self.search_index_manager.list_aliases()
     }
 
+    /// Export non-empty HNSW graphs for RDB durable restore (Batch FV).
+    pub fn export_hnsw_graphs(
+        &self,
+    ) -> Vec<(String, String, crate::vector_search::HnswGraphSnapshot)> {
+        self.search_index_manager.export_hnsw_graphs()
+    }
+
+    /// Apply durable HNSW graphs after documents/vectors are loaded (Batch FV).
+    pub fn apply_hnsw_graphs(
+        &self,
+        graphs: &[(String, String, crate::vector_search::HnswGraphSnapshot)],
+    ) -> Result<(), String> {
+        self.search_index_manager.apply_hnsw_graphs(graphs)
+    }
+
+    /// Force next HNSW insert levels (FIFO) for tests / injectors (Batch FV).
+    pub fn enqueue_hnsw_levels(
+        &self,
+        index_name: &str,
+        field: &str,
+        levels: impl IntoIterator<Item = usize>,
+    ) -> Result<(), String> {
+        let index = self
+            .search_index_manager
+            .get_index(index_name)
+            .ok_or_else(|| format!("Index '{}' not found", index_name))?;
+        let result = index.write().enqueue_hnsw_levels(field, levels);
+        result
+    }
+
     /// True when this DB has any search index or alias (rewrite even if keyspace empty).
     pub fn has_search_state(&self) -> bool {
         self.search_index_manager.has_any_state()
