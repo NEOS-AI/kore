@@ -3,7 +3,7 @@
 ## Currently working on..
 
 - [x] Support for Redis Pub-Sub
-- **Committed through FU + FV** (`06ff29f` expire dual-write; `d2c03a4` HNSW durable graph). Letter queue empty. Remaining work is Later/backlog only. See root `TODO.md` → *Next work queue (post-FU + post-FV)*.
+- **Committed through FW + FX** (ANN query path on HNSW; AOF `FT._LOADGRAPH` durable graph). See root `TODO.md` → *Next work queue (post-FW + post-FX)*.
 
 ## Persistence / search letter batches (recent)
 
@@ -63,7 +63,9 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] HNSW recall@k unit gate + N=300 indicative micro (Batch CV; not large-N ANN win)
 - [x] HNSW tighter recall gate + optional larger-N median bench (Batch DK; `#[ignore]` N=5000)
 - [x] HNSW multi-layer insert (Batch FF: geometric level assignment + upper-layer SEARCH-LAYER / connect; query descent)
-- [x] HNSW durable graph in RDB (Batch FV: KORDB v6 levels+edges+entry; AOF-only still rebuilds)
+- [x] HNSW durable graph in RDB (Batch FV: KORDB v6 levels+edges+entry)
+- [x] HNSW ANN query path (Batch FW: FT.SEARCH / query engine uses dual-written graph)
+- [x] HNSW AOF durable graph (Batch FX: `FT._LOADGRAPH` rewrite/load; legacy rebuild)
 
 ## Plans
 
@@ -83,6 +85,8 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Sentinel CKQUORUM live probe + probe `*` honesty (Batch FN; hello SUBSCRIBE residual accepted)
 - [x] HNSW multi-layer insert (Batch FF)
 - [x] HNSW durable graph RDB (Batch FV)
+- [x] HNSW ANN query path (Batch FW)
+- [x] HNSW AOF durable graph (Batch FX)
 - [x] Unified keyspace design + `KeyValue` facade (Batch FG slice A; multi-map storage)
 - [x] **FG-2** physical hashes in `ShardedKeyMap<KeyValue>` (`Cache::key_values`)
 - [x] **FG-3** remaining typed containers (list/set/zset/geo/stream) + `KeyspacePayload` collapse; eviction samples typed from one map
@@ -104,7 +108,9 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] **FT** Sentinel election-timeout SM (campaign epoch reuse + timed re-campaign)
 - [x] **FU** expire dual-write cleanup — slot-only string TTL; drop `Entry.expires_at` RMW mirror
 - [x] **FV** HNSW durable graph in RDB (KORDB v6; snapshot/apply; AOF residual rebuild)
-- [ ] **Next (see `TODO.md` post-FU+FV):** Later/backlog only (letter queue empty)
+- [x] **FW** HNSW ANN query path (query engine prefers dual-written graph; FLAT exact)
+- [x] **FX** HNSW AOF graph (`FT._LOADGRAPH`; edge-identical rewrite/load)
+- [ ] **Next (see `TODO.md` post-FW+FX):** FY–GB letter queue
 - [x] 데드락 감지 고급 기능
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원
