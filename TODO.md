@@ -218,6 +218,7 @@ Also tracked in `docs/roadmap.md`.
   - *Batch AY*: `PSETEX`; `INCRBYFLOAT`; `SUBSTR` (GETRANGE alias); `TIME`; `ZRANGESTORE` (BYSCORE/BYLEX/REV/LIMIT)
   - *Batch AZ*: `LCS` `IDX` / `MINMATCHLEN` / `WITHMATCHLEN`; `OBJECT IDLETIME|REFCOUNT|FREQ`; `BITFIELD_RO`; `GEORADIUS_RO` / `GEORADIUSBYMEMBER_RO`; `SWAPDB`
   - *Batch BA*: `DUMP` / `RESTORE` (Kore KDF1 multi-type; `REPLACE`/`ABSTTL`/`IDLETIME`/`FREQ`); `EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT` `NX|XX|GT|LT`; `COMMAND GETKEYS`; `ACL GENPASS`
+  - *Batch FY*: `DUMP` emits **Redis RDB wire** for string/list/set/hash/zset (classic opcodes + CRC64 + RDB v9); geo/stream stay **KDF1**. `RESTORE` dual-detects KDF1 vs Redis (classic + listpack/quicklist2 fixtures). Module `src/rdb_object.rs`.
   - *Batch BB*: `SLOWLOG` GET/LEN/RESET; `MEMORY STATS|DOCTOR|PURGE`; `CLIENT REPLY` ON|OFF|SKIP; `CONFIG` `slowlog-log-slower-than` / `slowlog-max-len`
   - *Batch BC*: `SORT` (list/set/zset; `ALPHA`/`ASC`/`DESC`/`LIMIT`/`STORE`; `BY nosort` only); `LOLWUT`; `READONLY`/`READWRITE` (per-connection `cluster_readonly`)
   - *Batch BD*: `ZADD` `NX|XX|GT|LT|CH|INCR`; `SCAN TYPE`; `FLUSHDB`/`FLUSHALL` `ASYNC|SYNC`; shard pub/sub in `COMMAND` catalog
@@ -317,7 +318,7 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch DO)*: `MigrateSlotError` carries partial `migrated`/`skipped`; RESHARD `failed_keys` surfaces real counts; retry = leftover source keys only (docs + e2e). Range aborts on any non-`complete` (incl. `partial_*_node`). FINISH soft-checks `keys_in_slot` → optional `warning` field (does not hard-block). Source-before-dest NODE client window documented in rustdoc (order unchanged).
   - *Done (Batch DP)*: Redis key-level `MIGRATE host port key dest-db timeout [COPY] [REPLACE] [AUTH password] [AUTH2 user pass] [KEYS k…]`. Shared `migrate_one_key_on_stream` / `migrate_keys_to` reuses snapshot + RESP recreate (no DUMP/RESTORE); ASKING probed (disabled on standalone dest); `COPY` / `REPLACE` / `BUSYKEY` / `NOKEY` / connect timeout; multi-key `KEYS`; dest `SELECT` for non-zero db; AOF/repl propagates source `DEL` (not the MIGRATE form). MIGRATEKEYS loop uses the same helper. Catalog + ACL `@write`/`@keyspace`/`@dangerous` + readonly replica gate. Tests: `tests/dp_migrate_test.rs` (+ existing MIGRATEKEYS suite green).
   - *Done (Batch DQ)*: multi-key mid-batch `IOERR` includes `migrated=` / `skipped=` counts (shared inject with MIGRATEKEYS); recreate path transfers remaining TTL for all types (string `SET PX`; hash/list/set/zset/geo/stream trailing `PEXPIRE` via `Cache::ttl`). Tests: partial inject e2e + string/hash/list TTL.
-  - *Gaps*: no interactive redis-cli weight UI. MIGRATE: no Redis DUMP/RESTORE wire compatibility (recreate-only); ASKING probe / REPLACE pre-DEL semantics documented in module rustdoc (Batch DP). Dual-end NODE has RESP prepare/commit (Batch FB); not Redis binary cluster-bus 2PC.
+  - *Gaps*: no interactive redis-cli weight UI. MIGRATE still recreate-only (not DUMP wire on the wire); ASKING probe / REPLACE pre-DEL semantics documented in module rustdoc (Batch DP). Dual-end NODE has RESP prepare/commit (Batch FB); not Redis binary cluster-bus 2PC. **DUMP/RESTORE Redis wire** for core types: **done Batch FY** (MIGRATE path unchanged).
   - *Done (Batch EY)*: dual-end NODE **preflight** before any SETSLOT NODE — local owns/already-dest; dest reachable + `CLUSTER MYID` matches dest-id; dest `CLUSTER SLOTS` owner is source or dest (or unbound). Failure → `failed_preflight` (no half-apply). Idempotent complete when both already own dest.
   - *Done (Batch FB)*: dual-end NODE **wire 2PC slice 1** — `SETSLOT PREPARE`/`ABORTPREPARE` votes on source+dest (extends EY); commit only after both prepares (dest-first NODE, DV); EP rollback on source commit fail; status `failed_prepare` without half-apply; range aborts on prepare fail. Tests: happy path, dest prepare inject, source commit→rolled_back + FINISH, range abort.
   - *Done (Batch FH)*: dual-end NODE **wire 2PC slice 2** — prepare votes stamp **slot config epoch** + wall-clock **TTL** (`PREPARE_VOTE_TTL`); `SETSLOT CHECKPREPARE` + local `check_prepare_valid` before dest NODE; source re-checks again immediately before its NODE; stale epoch / cleared / expired prepare → `failed_prepare:recheck:…` without half-apply; soft clear fail-closed. Tests: unit epoch/TTL/clear/boot; e2e recheck inject + happy path; FB suite green.
@@ -769,7 +770,7 @@ Also tracked in `docs/roadmap.md`.
 | Keyspace | RENAME remove+insert; create ensure_type→insert TOCTOU (historical) | P3 accepted | — |
 | Search | HNSW RDB durable graph (levels/edges/entry) | **done** | **FV** |
 | Search | HNSW AOF-only still rebuilds by re-`add`; `max_m=1` spanning residual | P3 accepted / later | — |
-| MIGRATE / UI / load | DUMP wire; reshard weight UI; Arc-swap mid-fill | P3 accepted | — |
+| MIGRATE / UI / load | DUMP wire for DUMP/RESTORE cmds (**FY**); MIGRATE recreate-only; reshard weight UI; Arc-swap mid-fill | P3 partial / accepted | **FY** cmds; MIGRATE later |
 
 ### Next work queue (post-FU + post-FV)
 
@@ -782,11 +783,19 @@ Also tracked in `docs/roadmap.md`.
 
 #### Recommended letter queue (implementing)
 - [ ] **`[P2]`** **Batch FW — ANN query path on HNSW** — `FT.SEARCH` VECTOR uses dual-written HNSW graph, not only flat `HashMap` KNN; recall/smoke tests
-- [ ] **`[P2]`** **Batch FY — DUMP/RESTORE Redis wire** — Redis RDB-compatible DUMP/RESTORE for core types (keep KDF1 as Kore path or dual-detect)
+- [x] **`[P2]`** **Batch FY — DUMP/RESTORE Redis wire** — see Completed below
 - [ ] **`[P3]`** **Batch FZ — Search-doc eviction special** — fold search docs into unified maxmemory sampling more honestly; tests
 - [ ] **`[P3]`** **Batch FX — HNSW AOF graph** — durable graph on AOF rewrite (or document rebuild-only if deferred)
 - [ ] **`[P3]`** **Batch GA — Retire `Entry.expires_at` field** — after audit (ShardedHashMap no longer holds live keyspace strings)
 - [x] **`[P3]`** **Batch GB — Repl backlog serialize** — partial win (see Completed)
+
+#### Completed (Batch FY)
+- [x] **`[P2]`** **Batch FY — DUMP/RESTORE Redis wire**
+  - **Format choice:** `DUMP` emits **Redis-compatible** RDB object wire for **string / list / set / hash / zset** (classic type opcodes 0/1/2/4/5, RDB version **9**, Redis CRC64). **Geo / stream** stay Kore **KDF1**.
+  - **RESTORE dual-detect:** magic `KDF1` → existing path; else Redis RDB object decode (classic + common listpack / quicklist2 / int-encoded string forms from real Redis/Valkey DUMP).
+  - Module: `src/rdb_object.rs`; wiring in `src/cache/key_xfer.rs` + `handle_dump`/`handle_restore`.
+  - Tests: `tests/fy_dump_restore_redis_wire_test.rs` (round-trip core types, real Redis fixture hex, KDF1 still accepted); unit tests in `rdb_object`; BA suite updated.
+  - **Residuals:** stream Redis RDB listpacks not encoded/decoded on DUMP wire (KDF1 only); geo not Redis geohash zset DUMP; MIGRATE still RESP recreate (not DUMP wire); zipmap / some legacy encodings best-effort; IDLETIME/FREQ still accepted no-op.
 
 #### Defer / accept (not in active queue)
 - Cluster binary bus 2PC; dest prepare breadth; remote CHECK→COMMITPREPARE two-RPC window
@@ -1044,7 +1053,7 @@ Active items promoted to **Recommended letter queue** above (FW–GB). Remaining
 | P3 | DR/DS residual: single-DB mid-payload map tear | done (DT document/accept; LOADING barrier) |
 | P3 | DR post-ship nit: after_install_db test hook in prod type | done (DS docs; keep for tests/) |
 | P3 | DQ post-ship nit: migrate TTL remaining-ms not absolute | done (DT PXAT/PEXPIREAT) |
-| P3 | DP residual: no DUMP/RESTORE wire compatibility | open (recreate-only; accepted) |
+| P3 | DP residual: no DUMP/RESTORE wire compatibility | **done FY** for DUMP/RESTORE cmds; MIGRATE still recreate-only |
 | P3 | DH post-ship nit: repaint test is string-contains only | done (DT accept; string-contract only) |
 | P2 | DU: slot ownership epoch + gossip after NODE | done (DU) |
 | P2 | DV: dest-first dual-end NODE + epoch fence | done (DV) |
@@ -1100,7 +1109,8 @@ Active items promoted to **Recommended letter queue** above (FW–GB). Remaining
 | P3 | GB repl backlog write serialization | **done** partial (dropped fullsync Mutex on hot path; backlog ordered publish residual) |
 | P3 | FL nodes.conf live flags | **done** (Batch FL) |
 | P3 | FG-4 strings unified map | **done** (Batch FG-4) |
-| P3 | DP residual: no DUMP/RESTORE wire compatibility | open (recreate-only; accepted) |
+| P2 | FY: DUMP/RESTORE Redis wire (core types; KDF1 dual-detect) | **done** (Batch FY) |
+| P3 | DP residual: no DUMP/RESTORE wire compatibility | **done FY** (cmds); MIGRATE recreate residual accepted |
 | P3 | DF post-ship: HTTP MVP gaps shared with metrics | done (DJ; shared admin_http) |
 | P3 | DK post-ship: thin r@10 headroom / cross-arch flake risk | done (DL; r@10 0.95→0.93) |
 | P3 | DK post-ship: no post-delete/update churn in recall suite | done (DL; remove+update micro) |

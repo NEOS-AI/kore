@@ -311,9 +311,16 @@ impl Cache {
     }
 }
 
-// ─── Kore DUMP/RESTORE wire format (KDF1) ───────────────────────────────────
-// Not Redis RDB — Kore-native multi-type snapshot for DUMP/RESTORE round-trips.
-// Layout: magic "KDF1" | type u8 | body…  (no embedded TTL; RESTORE supplies it)
+// ─── DUMP/RESTORE wire formats (Batch FY) ───────────────────────────────────
+//
+// **DUMP format choice:** Redis-compatible RDB object wire for core types
+// (string / list / set / hash / zset). Geo and stream use Kore-native **KDF1**.
+//
+// **RESTORE dual-detect:** magic `KDF1` → Kore path; else Redis RDB object
+// (type + encoding + rdb_version u16 LE + crc64). See `crate::rdb_object`.
+//
+// KDF1 layout (still accepted on RESTORE; used for geo/stream DUMP):
+//   magic "KDF1" | type u8 | body…  (no embedded TTL; RESTORE supplies it)
 
 const KDF_MAGIC: &[u8; 4] = b"KDF1";
 const KDF_STRING: u8 = 1;
@@ -326,7 +333,21 @@ const KDF_STREAM: u8 = 7;
 
 impl KeyPayload {
     /// Encode for DUMP (TTL is not embedded — RESTORE applies expiry).
+    ///
+    /// Core types emit Redis-compatible wire; geo/stream emit KDF1.
     pub fn encode_dump(&self) -> Vec<u8> {
+        match self {
+            KeyPayload::String { value, .. } => crate::rdb_object::encode_string_dump(value),
+            KeyPayload::List { elements, .. } => crate::rdb_object::encode_list_dump(elements),
+            KeyPayload::Set { members, .. } => crate::rdb_object::encode_set_dump(members),
+            KeyPayload::Hash { fields, .. } => crate::rdb_object::encode_hash_dump(fields),
+            KeyPayload::ZSet { members, .. } => crate::rdb_object::encode_zset_dump(members),
+            KeyPayload::Geo { .. } | KeyPayload::Stream { .. } => self.encode_kdf1(),
+        }
+    }
+
+    /// Kore-native KDF1 encoding (geo/stream DUMP; still accepted by RESTORE).
+    pub fn encode_kdf1(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(64);
         out.extend_from_slice(KDF_MAGIC);
         match self {
@@ -383,7 +404,43 @@ impl KeyPayload {
     }
 
     /// Decode DUMP payload into a KeyPayload with `pttl = -1` (caller sets TTL).
+    /// Accepts KDF1 or Redis RDB object wire.
     pub fn decode_dump(data: &[u8]) -> std::result::Result<KeyPayload, String> {
+        if data.len() >= 4 && &data[0..4] == KDF_MAGIC {
+            return Self::decode_kdf1(data);
+        }
+        Self::decode_redis_wire(data)
+    }
+
+    fn decode_redis_wire(data: &[u8]) -> std::result::Result<KeyPayload, String> {
+        use crate::rdb_object::{decode_redis_dump, RdbObject};
+        let obj = decode_redis_dump(data)?;
+        Ok(match obj {
+            RdbObject::String(value) => KeyPayload::String {
+                value,
+                flags: 0,
+                pttl: -1,
+            },
+            RdbObject::List(elements) => KeyPayload::List {
+                elements,
+                pttl: -1,
+            },
+            RdbObject::Set(members) => KeyPayload::Set {
+                members,
+                pttl: -1,
+            },
+            RdbObject::Hash(fields) => KeyPayload::Hash {
+                fields,
+                pttl: -1,
+            },
+            RdbObject::ZSet(members) => KeyPayload::ZSet {
+                members,
+                pttl: -1,
+            },
+        })
+    }
+
+    fn decode_kdf1(data: &[u8]) -> std::result::Result<KeyPayload, String> {
         if data.len() < 5 || &data[0..4] != KDF_MAGIC {
             return Err("DUMP payload version or checksum are wrong".into());
         }
@@ -503,13 +560,13 @@ impl KeyPayload {
 }
 
 impl Cache {
-    /// DUMP key — Kore KDF1 blob, or None if missing.
+    /// DUMP key — Redis wire for core types, KDF1 for geo/stream; None if missing.
     pub fn dump_serialized(&self, key: &Bytes) -> Option<Bytes> {
         let payload = self.dump_key(key)?;
         Some(Bytes::from(payload.encode_dump()))
     }
 
-    /// RESTORE key from DUMP blob. Returns Ok(true) on success.
+    /// RESTORE key from DUMP blob (Redis wire or KDF1). Returns Ok(true) on success.
     /// Err string is Redis-style message (BUSYKEY / bad payload).
     pub fn restore_serialized(
         &self,

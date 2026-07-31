@@ -107,7 +107,9 @@ fn dump_restore_string_hash_replace_ttl() {
 
     handle(&mut h, cmd(&["SET", "s", "hello"]));
     let dump = as_bulk(&handle(&mut h, cmd(&["DUMP", "s"]))).expect("dump blob");
-    assert!(dump.starts_with(b"KDF1"), "magic");
+    // Batch FY: core types emit Redis RDB wire (type 0 string), not KDF1.
+    assert_eq!(dump[0], 0, "redis string type opcode");
+    assert!(!dump.starts_with(b"KDF1"));
 
     // Restore under new key with TTL.
     let resp = handle(

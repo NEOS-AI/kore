@@ -974,7 +974,8 @@ impl CommandHandler {
         Ok(RespValue::Integer(self.cache.touch_keys(&keys) as i64))
     }
 
-    /// DUMP key — Kore KDF1 serialized value (null if missing).
+    /// DUMP key — Redis-compatible wire for string/list/set/hash/zset;
+    /// KDF1 for geo/stream (null if missing). Batch FY.
     pub(super) fn handle_dump(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.len() != 1 {
             return Ok(RespValue::error(
@@ -992,7 +993,7 @@ impl CommandHandler {
     }
 
     /// RESTORE key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME seconds] [FREQ frequency]
-    /// IDLETIME/FREQ accepted and ignored (Redis compatibility).
+    /// Dual-detect: KDF1 or Redis RDB DUMP wire. IDLETIME/FREQ accepted (best-effort no-op).
     pub(super) fn handle_restore(&self, args: &[RespValue]) -> Result<RespValue> {
         if args.len() < 3 {
             return Ok(RespValue::error(
