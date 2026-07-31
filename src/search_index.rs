@@ -1224,14 +1224,32 @@ impl SearchIndexManager {
             .collect()
     }
 
+    /// Total number of documents across all indices (for eviction sample budget).
+    ///
+    /// Used by maxmemory sampling to allocate search-doc slots proportional to
+    /// search population vs keyspace keys (Batch FZ).
+    pub fn total_document_count(&self) -> usize {
+        let indices = self.indices.read();
+        indices
+            .values()
+            .map(|idx| idx.read().size())
+            .sum()
+    }
+
     /// Sample up to `n` documents across all indices for maxmemory eviction.
     ///
-    /// Returns `(index_name, doc_id, approx_size)` triples. Used so search
-    /// category memory can be reclaimed under `allkeys-*` policies without
-    /// deleting the underlying hash key.
+    /// Returns `(index_name, doc_id, approx_size)` triples. Used so
+    /// [`crate::memory::MemoryCategory::Search`] can be reclaimed under
+    /// `allkeys-*` policies without deleting the underlying hash key.
     ///
     /// `exclude_doc` skips a document currently being re-indexed so accounting
     /// does not double-free it while holding a stale size snapshot.
+    ///
+    /// # Sampling model (Batch FZ)
+    ///
+    /// Documents are drawn uniformly from the pooled set of all index docs.
+    /// The caller chooses `n` (typically proportional to search doc count vs
+    /// keyspace size). Search docs have no TTL and are never volatile victims.
     pub fn sample_documents_for_eviction(
         &self,
         n: usize,

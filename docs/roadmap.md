@@ -102,6 +102,8 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] **FS** residual lib warnings (unused imports / replica-feed flag / search `_weight`)
 - [x] **FT** Sentinel election-timeout SM (campaign epoch reuse + timed re-campaign)
 - [x] **FU** expire dual-write cleanup — slot-only string TTL; drop `Entry.expires_at` RMW mirror
+- [x] **FZ** search-doc eviction special — proportional allkeys sample; free Search category
+- [x] **GA** retire `Entry.expires_at` — full field removal; slot-only TTL
 - [x] **FV** HNSW durable graph in RDB (KORDB v6; snapshot/apply; AOF residual rebuild)
 - [ ] **Next (see `TODO.md` post-FU+FV):** Later/backlog only (letter queue empty)
 - [x] 데드락 감지 고급 기능

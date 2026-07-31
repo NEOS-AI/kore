@@ -1,7 +1,6 @@
 //! Phase C P1: Active expire sampling (avoid full-shard retain)
 
 use bytes::Bytes;
-use kore::entry::Entry;
 use kore::hashmap::{
     ActiveExpireResult, ACTIVE_EXPIRE_CONTINUE_RATIO, ACTIVE_EXPIRE_SAMPLES_PER_PASS,
 };
@@ -14,9 +13,7 @@ fn make_cache(shards: usize) -> Arc<Cache> {
 }
 
 fn store_with_ttl(cache: &Cache, key: &str, value: &str, ttl: Duration) {
-    let entry = Entry::new(Bytes::from(key.to_string()), Bytes::from(value.to_string()))
-        .with_expiration(ttl);
-    // Use low-level map insert path via store if available
+    // Batch GA: TTL is applied via StoreOptions → KeySlot.expires_at only.
     let _ = cache.store(
         Bytes::from(key.to_string()),
         Bytes::from(value.to_string()),
@@ -25,7 +22,6 @@ fn store_with_ttl(cache: &Cache, key: &str, value: &str, ttl: Duration) {
             ..Default::default()
         },
     );
-    let _ = entry; // silence if store path used
 }
 
 #[test]

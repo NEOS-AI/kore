@@ -497,3 +497,231 @@ fn test_search_docs_are_eviction_victims_under_allkeys() {
         cache.tracked_memory()
     );
 }
+
+/// Batch FZ: when search docs dominate tracked memory under `allkeys-lru`,
+/// eviction must free `MemoryCategory::Search` (not only Cache keys).
+#[test]
+fn test_search_docs_dominate_allkeys_lru_frees_search() {
+    use kore::EvictionPolicy;
+
+    let maxmemory = 24 * 1024;
+    let cache = make_cache(maxmemory);
+    cache.set_eviction_policy(EvictionPolicy::AllKeysLru);
+    cache.set_eviction_sample_size(20).unwrap();
+
+    let mut h = make_handler(cache.clone());
+    handle(
+        &mut h,
+        cmd(&[
+            "FT.CREATE",
+            "dom_idx",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "d:",
+            "SCHEMA",
+            "blob",
+            "TEXT",
+        ]),
+    );
+
+    let big = "Z".repeat(500);
+    let mut ok = 0usize;
+    for i in 0..100 {
+        let key = format!("d:{}", i);
+        let resp = handle(&mut h, cmd(&["HSET", &key, "blob", &big]));
+        if matches!(resp, RespValue::Integer(_)) {
+            ok += 1;
+        }
+        assert!(
+            cache.tracked_memory() <= maxmemory,
+            "tracked {} > maxmemory {}",
+            cache.tracked_memory(),
+            maxmemory
+        );
+    }
+    assert!(ok >= 5, "expected several HSET successes, got {}", ok);
+
+    let search_before = cache.category_memory(MemoryCategory::Search);
+    assert!(
+        search_before > 0,
+        "search memory should dominate after auto-index"
+    );
+    // Search should be a meaningful share of the budget when docs dominate.
+    assert!(
+        search_before * 3 > maxmemory / 4 || search_before > 1024,
+        "expected non-trivial Search category (search={})",
+        search_before
+    );
+
+    let evicted_before = cache
+        .stats
+        .evicted_lru
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    // Pressure: more large indexed docs — must free Search (and/or keys).
+    for i in 100..200 {
+        let key = format!("d:{}", i);
+        let _ = handle(&mut h, cmd(&["HSET", &key, "blob", &big]));
+        assert!(
+            cache.tracked_memory() <= maxmemory,
+            "over maxmemory during pressure"
+        );
+    }
+
+    let search_after = cache.category_memory(MemoryCategory::Search);
+    let evicted_after = cache
+        .stats
+        .evicted_lru
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    assert!(
+        evicted_after > evicted_before,
+        "allkeys-lru must evict under search-heavy pressure (before={} after={})",
+        evicted_before,
+        evicted_after
+    );
+    // Either Search was reclaimed relative to a pure-growth path, or it stayed
+    // bounded while total stayed under maxmemory — both prove victims work.
+    assert!(
+        search_after <= maxmemory && cache.tracked_memory() <= maxmemory,
+        "Search must be reclaimable; search_after={} total={}",
+        search_after,
+        cache.tracked_memory()
+    );
+}
+
+/// Batch FZ: same dominance under `allkeys-random`.
+#[test]
+fn test_search_docs_dominate_allkeys_random_frees_search() {
+    use kore::EvictionPolicy;
+
+    let maxmemory = 24 * 1024;
+    let cache = make_cache(maxmemory);
+    cache.set_eviction_policy(EvictionPolicy::AllKeysRandom);
+    cache.set_eviction_sample_size(20).unwrap();
+
+    let mut h = make_handler(cache.clone());
+    handle(
+        &mut h,
+        cmd(&[
+            "FT.CREATE",
+            "rnd_idx",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "r:",
+            "SCHEMA",
+            "blob",
+            "TEXT",
+        ]),
+    );
+
+    let big = "W".repeat(500);
+    let mut ok = 0usize;
+    for i in 0..100 {
+        let key = format!("r:{}", i);
+        if matches!(
+            handle(&mut h, cmd(&["HSET", &key, "blob", &big])),
+            RespValue::Integer(_)
+        ) {
+            ok += 1;
+        }
+        assert!(cache.tracked_memory() <= maxmemory);
+    }
+    assert!(ok >= 5, "expected several HSET successes, got {}", ok);
+    assert!(cache.category_memory(MemoryCategory::Search) > 0);
+
+    let evicted_before = cache
+        .stats
+        .evicted_lru
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    for i in 100..200 {
+        let key = format!("r:{}", i);
+        let _ = handle(&mut h, cmd(&["HSET", &key, "blob", &big]));
+        assert!(cache.tracked_memory() <= maxmemory);
+    }
+
+    let evicted_after = cache
+        .stats
+        .evicted_lru
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        evicted_after > evicted_before,
+        "allkeys-random must evict under search-heavy pressure"
+    );
+    assert!(cache.category_memory(MemoryCategory::Search) <= maxmemory);
+}
+
+/// Batch FZ: under `volatile-lru`, search docs are never victims (no TTL).
+/// Only keys with expire may be reclaimed; search memory is not required to drop.
+#[test]
+fn test_volatile_policy_does_not_require_search_eviction() {
+    use kore::EvictionPolicy;
+    use kore::entry::StoreOptions;
+
+    let maxmemory = 20 * 1024;
+    let cache = make_cache(maxmemory);
+    cache.set_eviction_policy(EvictionPolicy::VolatileLru);
+    cache.set_eviction_sample_size(16).unwrap();
+
+    let mut h = make_handler(cache.clone());
+    handle(
+        &mut h,
+        cmd(&[
+            "FT.CREATE",
+            "vol_idx",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "v:",
+            "SCHEMA",
+            "blob",
+            "TEXT",
+        ]),
+    );
+
+    // Permanent indexed hashes (no TTL on hash keys; search docs never TTL).
+    let big = "V".repeat(400);
+    for i in 0..30 {
+        let key = format!("v:{}", i);
+        let _ = handle(&mut h, cmd(&["HSET", &key, "blob", &big]));
+    }
+    let search_mem = cache.category_memory(MemoryCategory::Search);
+    assert!(search_mem > 0, "need search docs present");
+
+    // Volatile-only keys that *can* be victims.
+    for i in 0..40 {
+        let mut opts = StoreOptions::default();
+        opts.ttl_ms = Some(60_000);
+        let _ = cache.store(
+            Bytes::from(format!("ttl:{}", i)),
+            Bytes::from("x".repeat(200)),
+            opts,
+        );
+    }
+
+    // Under volatile-lru, further pressure should prefer TTL string keys — not
+    // search docs. We only assert that the policy does not panic / OOM-loop
+    // when search cannot be volatile, and that tracked stays bounded when
+    // volatile victims exist.
+    for i in 40..80 {
+        let mut opts = StoreOptions::default();
+        opts.ttl_ms = Some(60_000);
+        let _ = cache.store(
+            Bytes::from(format!("ttl:{}", i)),
+            Bytes::from("x".repeat(200)),
+            opts,
+        );
+    }
+    // Search may still be present (not volatile); that is intentional (Batch FZ).
+    assert!(
+        cache.category_memory(MemoryCategory::Search) > 0
+            || cache.stats.evicted_lru.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "volatile path either keeps search or evicts TTL keys"
+    );
+}

@@ -33,14 +33,14 @@ Never invert these (deadlock risk):
   `contains_key` walks.
 - **DEL** uses `remove_key_value_raw` (drops the whole slot: value + expire)
   then search docs. Slot expire purge removes the key the same way.
-- **FG-4 / FP / FQ / FU:** **all** types (including strings) are physical
+- **FG-4 / FP / FQ / FU / GA:** **all** types (including strings) are physical
   `KeyValue` variants inside `KeySlot` in `Cache::key_values` (`ShardedKeyMap`).
   String RMW uses `Cache::mutate_string` (shard write lock + CAS; slot expire
   in/out). Key-level TTL for every type is **only** `KeySlot.expires_at`
-  (Batch FU dropped the string `Entry.expires_at` RMW dual-write).
-  Residual: search-doc eviction special. Design detail:
+  (Batch GA removed `Entry.expires_at`). Search docs are allkeys eviction
+  victims only (Batch FZ; free Search category; not keyspace keys). Design:
   `docs/module_architectures.md` § Unified keyspace + `src/cache/keyspace.rs`
-  rustdoc.
+  / `eviction.rs` rustdoc.
 
 ## Keyspace replace / load commit
 

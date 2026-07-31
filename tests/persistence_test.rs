@@ -89,11 +89,14 @@ fn test_rdb_preserves_ttl() {
 
     let cache2 = Cache::new_with_sweep(16, 1024 * 1024 * 50, 500 * 1024 * 1024, false);
     rdb::load_file(&cache2, &path, true).unwrap();
-    let e = cache2
-        .load(&Bytes::from("temp"), Default::default())
-        .unwrap()
-        .unwrap();
-    let ttl = e.ttl_millis().unwrap();
+    assert!(
+        cache2
+            .load(&Bytes::from("temp"), Default::default())
+            .unwrap()
+            .is_some()
+    );
+    // Batch GA: remaining TTL is on the slot — query via Cache::ttl.
+    let ttl = cache2.ttl(&Bytes::from("temp"));
     assert!(ttl > 50_000 && ttl <= 60_000, "ttl={}", ttl);
 
     let _ = std::fs::remove_dir_all(&dir);

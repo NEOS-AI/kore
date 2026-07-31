@@ -68,16 +68,10 @@ impl Cache {
         let max_entry_size = self.max_entry_size.load(Ordering::Relaxed);
 
         // Capacity pre-check for growth
+        // get_string_entry already filters slot-expired keys (Batch GA).
         let existing = self.get_string_entry(key);
-        let old_val_len = existing
-            .as_ref()
-            .filter(|e| !e.is_expired())
-            .map(|e| e.value.len())
-            .unwrap_or(0);
-        let old_size = existing
-            .as_ref()
-            .map(|e| e.size())
-            .unwrap_or(0);
+        let old_val_len = existing.as_ref().map(|e| e.value.len()).unwrap_or(0);
+        let old_size = existing.as_ref().map(|e| e.size()).unwrap_or(0);
         let new_len = needed_len.max(old_val_len);
         let projected = key.len() + new_len + std::mem::size_of::<Entry>();
         if projected > max_entry_size {
@@ -164,9 +158,6 @@ impl Cache {
         let Some(entry) = self.get_string_entry(key) else {
             return Ok(0);
         };
-        if entry.is_expired() {
-            return Ok(0);
-        }
         let byte_index = (offset / 8) as usize;
         let bit_index = (offset % 8) as u8;
         if byte_index >= entry.value.len() {
@@ -196,9 +187,6 @@ impl Cache {
         let Some(entry) = self.get_string_entry(key) else {
             return Ok(0);
         };
-        if entry.is_expired() {
-            return Ok(0);
-        }
         let bytes = &entry.value;
         let byte_len = bytes.len() as i64;
         if byte_len == 0 {
@@ -283,9 +271,6 @@ impl Cache {
         let Some(entry) = self.get_string_entry(key) else {
             return Ok(if bit == 0 { 0 } else { -1 });
         };
-        if entry.is_expired() {
-            return Ok(if bit == 0 { 0 } else { -1 });
-        }
         let bytes = &entry.value;
         let byte_len = bytes.len() as i64;
         if byte_len == 0 {
@@ -389,12 +374,8 @@ impl Cache {
                 }
                 KeyType::String => {
                     if let Some(e) = self.get_string_entry(k) {
-                        if e.is_expired() {
-                            sources.push(Vec::new());
-                        } else {
-                            max_len = max_len.max(e.value.len());
-                            sources.push(e.value.to_vec());
-                        }
+                        max_len = max_len.max(e.value.len());
+                        sources.push(e.value.to_vec());
                     } else {
                         sources.push(Vec::new());
                     }
@@ -537,17 +518,10 @@ impl Cache {
         let max_entry_size = self.max_entry_size.load(Ordering::Relaxed);
 
         if any_write {
+            // get_string_entry already filters slot-expired keys (Batch GA).
             let existing = self.get_string_entry(key);
-            let old_val_len = existing
-                .as_ref()
-                .filter(|e| !e.is_expired())
-                .map(|e| e.value.len())
-                .unwrap_or(0);
-            let old_size = existing
-                .as_ref()
-                .filter(|e| !e.is_expired())
-                .map(|e| e.size())
-                .unwrap_or(0);
+            let old_val_len = existing.as_ref().map(|e| e.value.len()).unwrap_or(0);
+            let old_size = existing.as_ref().map(|e| e.size()).unwrap_or(0);
             let new_len = needed_len.max(old_val_len);
             let projected = key.len() + new_len + std::mem::size_of::<Entry>();
             if projected > max_entry_size {

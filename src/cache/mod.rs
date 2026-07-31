@@ -43,10 +43,10 @@ pub use eviction::EvictionPolicy;
 /// Logical Redis keyspace is **one name → one typed value**. Cross-type ops use
 /// the [`KeyValue`] facade ([`Cache::get_key_value`]).
 ///
-/// **Physical storage (FG-4 / FP / FQ / FU):** **all** types — including strings —
-/// live in [`Self::key_values`] as [`KeySlot`] `{ expires_at, value }`. Key-level
-/// TTL for every type is **only** on the slot (`Entry.expires_at` cleared on
-/// string write-back; Batch FU). See `keyspace` module docs and
+/// **Physical storage (FG-4 / FP / FQ / FU / GA):** **all** types — including
+/// strings — live in [`Self::key_values`] as [`KeySlot`] `{ expires_at, value }`.
+/// Key-level TTL for every type is **only** on the slot (`Entry` has no expire
+/// field; Batch GA). See `keyspace` module docs and
 /// `docs/module_architectures.md`.
 pub struct Cache {
     /// Unified keyspace map: KeySlot (value + optional key-level expire).

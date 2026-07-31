@@ -183,102 +183,18 @@ impl Shard {
         entries
     }
 
-    /// Iterate over entries and remove expired ones (full shard scan).
-    /// Prefer `active_expire_sample` for background work on large datasets.
-    /// Returns (count removed, bytes freed).
+    /// Legacy full-scan expire sweep.
+    ///
+    /// Batch GA: [`crate::entry::Entry`] no longer carries TTL. Live keyspace
+    /// expire is [`crate::cache::keyspace::KeySlot::expires_at`] on
+    /// `ShardedKeyMap`. This legacy [`ShardedHashMap`] path is a no-op.
     pub fn sweep_expired(&self) -> SweepResult {
-        let mut map = self.map.write();
-        let mut removed = 0;
-        let mut size_freed = 0;
-
-        map.retain(|_, entry| {
-            if entry.is_expired() {
-                size_freed += entry.size();
-                removed += 1;
-                false
-            } else {
-                true
-            }
-        });
-
-        if size_freed > 0 {
-            self.size.fetch_sub(size_freed as u64, Ordering::Relaxed);
-        }
-
-        SweepResult {
-            count: removed,
-            bytes_freed: size_freed,
-        }
+        SweepResult::default()
     }
 
-    /// Redis-style active expire sample: examine up to `samples` random keys that
-    /// have a TTL and delete those that are expired. Holds only short write locks
-    /// (per deletion), never a full-map `retain`.
-    ///
-    /// Returns how many TTL keys were examined and how many were deleted.
-    pub fn active_expire_sample(&self, samples: usize) -> ActiveExpireResult {
-        use rand::Rng;
-        if samples == 0 {
-            return ActiveExpireResult::default();
-        }
-
-        let mut rng = rand::thread_rng();
-        let mut sampled = 0usize;
-        let mut count = 0usize;
-        let mut bytes_freed = 0usize;
-
-        // Extra attempts: many keys may lack a TTL.
-        let max_attempts = samples.saturating_mul(5).max(samples);
-
-        for _ in 0..max_attempts {
-            if sampled >= samples {
-                break;
-            }
-
-            // Snapshot a random key under read lock
-            let candidate = {
-                let map = self.map.read();
-                let len = map.len();
-                if len == 0 {
-                    break;
-                }
-                let idx = rng.gen_range(0..len);
-                map.iter().nth(idx).map(|(k, v)| (k.clone(), v.clone()))
-            };
-
-            let Some((key, entry)) = candidate else {
-                break;
-            };
-
-            // Only TTL keys count toward the sample (mirrors Redis expires dict).
-            if entry.expires_at.is_none() {
-                continue;
-            }
-            sampled += 1;
-
-            if !entry.is_expired() {
-                continue;
-            }
-
-            // Re-check under write lock to avoid deleting a renewed key.
-            let mut map = self.map.write();
-            if let Some(cur) = map.get(&key) {
-                if cur.is_expired() {
-                    let size = cur.size();
-                    map.remove(&key);
-                    self.size.fetch_sub(size as u64, Ordering::Relaxed);
-                    count += 1;
-                    bytes_freed += size;
-                }
-            }
-        }
-
-        ActiveExpireResult {
-            count,
-            bytes_freed,
-            sampled,
-            passes: 1,
-        }
+    /// Legacy active-expire sample (no-op after Batch GA; see [`sweep_expired`]).
+    pub fn active_expire_sample(&self, _samples: usize) -> ActiveExpireResult {
+        ActiveExpireResult::default()
     }
 
     /// Get all keys matching a pattern (simple glob-style pattern)

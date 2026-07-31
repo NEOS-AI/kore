@@ -121,9 +121,6 @@ impl Cache {
                 let Some(entry) = self.get_string_entry(key) else {
                     return Ok(None);
                 };
-                if entry.is_expired() {
-                    return Ok(None);
-                }
                 if !is_hll(&entry.value) {
                     return Err(Error::InvalidArgument(
                         "WRONGTYPE Key is not a valid HyperLogLog string value.".into(),
@@ -146,8 +143,9 @@ impl Cache {
     pub fn pfadd(&self, key: &Bytes, elements: &[Bytes]) -> Result<i64> {
         self.ensure_string_or_absent(key)?;
         // Existing non-HLL string is an error
+        // get_string_entry already filters slot-expired keys (Batch GA).
         if let Some(entry) = self.get_string_entry(key) {
-            if !entry.is_expired() && !entry.value.is_empty() && !is_hll(&entry.value) {
+            if !entry.value.is_empty() && !is_hll(&entry.value) {
                 return Err(Error::InvalidArgument(
                     "WRONGTYPE Key is not a valid HyperLogLog string value.".into(),
                 ));
@@ -160,11 +158,7 @@ impl Cache {
             return Err(Error::EntryTooLarge);
         }
         let old = self.get_string_entry(key);
-        let old_size = old
-            .as_ref()
-            .filter(|e| !e.is_expired())
-            .map(|e| e.size())
-            .unwrap_or(0);
+        let old_size = old.as_ref().map(|e| e.size()).unwrap_or(0);
         let net = projected.saturating_sub(old_size);
         self.ensure_capacity(net)?;
 
@@ -308,8 +302,9 @@ impl Cache {
             ));
         }
         self.ensure_string_or_absent(dest)?;
+        // get_string_entry already filters slot-expired keys (Batch GA).
         if let Some(entry) = self.get_string_entry(dest) {
-            if !entry.is_expired() && !entry.value.is_empty() && !is_hll(&entry.value) {
+            if !entry.value.is_empty() && !is_hll(&entry.value) {
                 return Err(Error::InvalidArgument(
                     "WRONGTYPE Key is not a valid HyperLogLog string value.".into(),
                 ));
@@ -336,11 +331,7 @@ impl Cache {
             return Err(Error::EntryTooLarge);
         }
         let old = self.get_string_entry(dest);
-        let old_size = old
-            .as_ref()
-            .filter(|e| !e.is_expired())
-            .map(|e| e.size())
-            .unwrap_or(0);
+        let old_size = old.as_ref().map(|e| e.size()).unwrap_or(0);
         let net = projected.saturating_sub(old_size);
         self.ensure_capacity(net)?;
 

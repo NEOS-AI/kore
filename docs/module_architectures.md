@@ -39,16 +39,16 @@ src/cache/
 Logical invariant: **one name → at most one type** (`ensure_type` / WRONGTYPE).  
 **No dual-residence:** a name lives in exactly one place (`key_values`).  
 **No side expire map:** key-level TTL is `KeySlot.expires_at` for **all** types
-(Batch FP typed; Batch FQ strings; Batch FU slot-only SoT).
+(Batch FP typed; Batch FQ strings; Batch FU/GA slot-only SoT — `Entry` has no expire).
 
 ```text
 struct KeySlot {
-    expires_at: Option<Instant>,  // all types SoT (FQ/FU)
+    expires_at: Option<Instant>,  // all types SoT (FQ/FU/GA)
     value: KeyValue,
 }
 
 enum KeyValue {
-    String(SharedEntry),  // Entry.expires_at cleared on write-back (FU)
+    String(SharedEntry),  // bare entry; no expires_at (GA)
     Hash(SharedHash),
     List(SharedList),
     Set(SharedSet),
@@ -70,8 +70,8 @@ Cache::mutate_string                             // RMW under shard lock; slot e
 | **DEL / EXISTS** | remove / `is_some` on one map |
 | **SCAN / KEYS / DBSIZE / RANDOMKEY** | iterate `key_values` only |
 | **RENAME** | take whole `KeySlot` (value + expire), insert under new name |
-| **TTL / EXPIRE** | all types: `KeySlot.expires_at` only (FQ/FU) |
-| **Memory / eviction** | per-variant size; all victims sampled from `key_values` |
+| **TTL / EXPIRE** | all types: `KeySlot.expires_at` only (FQ/FU/GA) |
+| **Memory / eviction** | per-variant size; keyspace + search docs under `allkeys-*` (FZ) |
 
 ### Migration plan
 
@@ -87,8 +87,10 @@ Cache::mutate_string                             // RMW under shard lock; slot e
 6. **FQ (done):** String key-level expire on the same slot header; EXPIRE/TTL/
    active expire/volatile sample unified.
 7. **FU (done):** Slot-only string TTL; stop dual-writing `Entry.expires_at` on
-   RMW write-back. Residual: `Entry.expires_at` field remains for legacy
-   `ShardedHashMap` + load read-projection; search-doc eviction special.
+   RMW write-back.
+8. **GA (done):** Remove `Entry.expires_at` entirely; TTL is slot-only.
+9. **FZ (done):** Search-doc eviction first-class under `allkeys-*` (proportional
+   sample; free `MemoryCategory::Search`; not volatile victims).
 
 **Load/install (`KeyspacePayload`):** `key_values: Vec<(Bytes, KeySlot)>` +
 WATCH / search / memory counters (key-level expire rides on each slot). Epoch

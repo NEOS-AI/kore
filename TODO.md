@@ -734,18 +734,18 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
   - *Done (Batch BT)*: `bt_eval_select_persists_connection_db` — connection remains on selected DB after EVAL
 
-### Status snapshot (2026-07-31, post-FU + post-FV)
+### Status snapshot (2026-07-31, post-FZ + post-GA)
 
-**Committed through Batches FU + FV** (parallel Later/backlog). Letter queue empty. Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed). Git: `main` ahead of origin (do not push); untracked `data/` only.
+**Committed through Batches FZ + GA** (search-doc eviction + retire `Entry.expires_at`). Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed). Git: worktree branch; do not push.
 
 **Verification:**
-- **FU:** slot-only string TTL; `mutate_string` slot expire in/out; `Entry.expires_at` cleared on write-back; unit `string_rmw_clears_entry_expire_keeps_slot`.
+- **FZ:** proportional search-doc sampling under `allkeys-*`; rustdoc model; volatile excludes search (no TTL); tests `test_search_docs_dominate_allkeys_{lru,random}_frees_search`, `test_volatile_policy_does_not_require_search_eviction`.
+- **GA:** `Entry.expires_at` removed; slot-only TTL; unit `string_rmw_slot_only_ttl`; typed_ttl / string_ops / keyspace / phase_a / active_expire / persistence green.
+- **FU:** slot-only string TTL (superseded field residual closed by GA).
 - **FV:** KORDB v6 HNSW graph section; snapshot/apply edge-identical; AOF-only still rebuilds; `tests/fv_rdb_hnsw_graph_test.rs`.
-- **FT:** election-timeout SM — `ELECTION_TIMEOUT` 5s; campaign epoch reuse; re-campaign after expiry (self + stuck vote-for-other). Lib sentinel **19/19**; `sentinel_lite_test` **23/23** (parallel promote-inject flake pre-existing, passes alone).
-- **FS:** `cargo build --lib` **0 warnings**; residual lib warning cleanup.
 - Hello SUBSCRIBE fan-in remains **accepted residual** (tick PUBLISH + peer HELLO only).
 
-**What remains:** Later/backlog only.
+**What remains:** Later/backlog (FW/FX/FY/GB + accepted).
 
 | Area | Residual | Priority | Planned batch |
 |------|----------|----------|---------------|
@@ -762,7 +762,8 @@ Also tracked in `docs/roadmap.md`.
 | Keyspace | expire slot header (`typed_expires` fold) | **done** | **FP** |
 | Keyspace | string TTL on `KeySlot` (unified EXPIRE/TTL path) | **done** | **FQ** |
 | Keyspace | `Entry.expires_at` RMW mirror (slot-only SoT) | **done** | **FU** |
-| Keyspace | search-doc eviction special | P3 residual | later |
+| Keyspace | search-doc eviction special (proportional allkeys sample) | **done** | **FZ** |
+| Keyspace | Retire `Entry.expires_at` field | **done** | **GA** |
 | Sentinel | Kore **higher** priority wins vs Redis Sentinel **lower** (documented honesty) | P3 accepted | — |
 | Ops | Global **repl backlog** still serializes writers | P3 | later (hard) |
 | Ops | Dual SELECT trackers; `propagate_raw` skips stream-DB | P3 accepted | — |
@@ -771,9 +772,9 @@ Also tracked in `docs/roadmap.md`.
 | Search | HNSW AOF-only still rebuilds by re-`add`; `max_m=1` spanning residual | P3 accepted / later | — |
 | MIGRATE / UI / load | DUMP wire; reshard weight UI; Arc-swap mid-fill | P3 accepted | — |
 
-### Next work queue (post-FU + post-FV)
+### Next work queue (post-FZ + post-GA)
 
-**Batches FU + FV shipped in parallel.** Standing rule: land tests with each feature (**P0 process**).
+**Batches FZ + GA shipped.** Standing rule: land tests with each feature (**P0 process**).
 
 #### Track A — Release hygiene
 - [x] **`[P3]`** gitignore local `/data/` (nodes.conf / sentinel scratch)
@@ -783,9 +784,9 @@ Also tracked in `docs/roadmap.md`.
 #### Recommended letter queue (implementing)
 - [ ] **`[P2]`** **Batch FW — ANN query path on HNSW** — `FT.SEARCH` VECTOR uses dual-written HNSW graph, not only flat `HashMap` KNN; recall/smoke tests
 - [ ] **`[P2]`** **Batch FY — DUMP/RESTORE Redis wire** — Redis RDB-compatible DUMP/RESTORE for core types (keep KDF1 as Kore path or dual-detect)
-- [ ] **`[P3]`** **Batch FZ — Search-doc eviction special** — fold search docs into unified maxmemory sampling more honestly; tests
+- [x] **`[P3]`** **Batch FZ — Search-doc eviction special** — proportional allkeys sampling; tests (see completed)
 - [ ] **`[P3]`** **Batch FX — HNSW AOF graph** — durable graph on AOF rewrite (or document rebuild-only if deferred)
-- [ ] **`[P3]`** **Batch GA — Retire `Entry.expires_at` field** — after audit (ShardedHashMap no longer holds live keyspace strings)
+- [x] **`[P3]`** **Batch GA — Retire `Entry.expires_at` field** — full removal; slot-only TTL (see completed)
 - [ ] **`[P3]`** **Batch GB — Repl backlog serialize** — reduce global writer serialization (hard; no Valkey parity claim)
 
 #### Defer / accept (not in active queue)
@@ -793,7 +794,23 @@ Also tracked in `docs/roadmap.md`.
 - Reshard weight UI; `__sentinel__:hello` long-lived SUBSCRIBE; Sentinel priority honesty vs Redis
 - single-DB Arc-swap mid-fill
 
-#### Completed (FB–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP + FQ + FR + FS + FT + FU + FV)
+#### Completed (FB–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP + FQ + FR + FS + FT + FU + FV + FZ + GA)
+
+- [x] **`[P3]`** **Batch FZ — Search-doc eviction special**
+  - Documented victim model in `src/cache/eviction.rs` module rustdoc (keyspace vs FT docs; Search-only free; cold scoring)
+  - Proportional sample budget: `search_draw ∝ search_docs / (key_n + search_docs)` under `allkeys-*`; `total_document_count()` on manager
+  - Cap truncation preserves search/key mix so search victims are not dropped wholesale
+  - **Volatile policies:** search docs have no TTL → never volatile victims (documented + test)
+  - Tests: dominate under `allkeys-lru` / `allkeys-random`; volatile honesty; existing allkeys victim test still green
+  - Residual: search docs remain outside `key_values` (by design — not Redis keys); optional future: access-touch metadata for true LRU among docs
+
+- [x] **`[P3]`** **Batch GA — Retire `Entry.expires_at` field**
+  - Removed `expires_at` / `with_expiration*` / `is_expired` / `ttl_millis` from `Entry`
+  - Slot-only TTL everywhere; load returns bare entry; callers use `Cache::ttl`
+  - Dropped residual heal/clear paths in `mutate_string` / EXPIRE / PERSIST / RENAME
+  - Legacy `ShardedHashMap` expire sweep is no-op (not used for live keyspace)
+  - Tests: `string_rmw_slot_only_ttl`; persistence / phase_a use `Cache::ttl`; typed_ttl / string_ops green
+  - Residual: none for dual TTL surface
 
 - [x] **`[P2]`** **Batch FV — HNSW durable graph in RDB** (`d2c03a4`)
   - `HnswGraphSnapshot` + `HNSWIndex::snapshot_graph` / `apply_graph_snapshot` (entry, levels, edges; neighbor lists sorted for determinism)
@@ -927,8 +944,8 @@ Also tracked in `docs/roadmap.md`.
   - `KeySlot::expires()` is slot-only; residual Entry expire healed on first mutate / `KeySlot::string`
   - RMW call sites (SET/INCR/APPEND/SETRANGE/SETBIT/BITFIELD/PFADD/…) use slot KEEPTTL path
   - EXPIRE/PERSIST/RENAME no longer dual-write Entry; load injects expire only on returned clones (read projection)
-  - Tests: `string_rmw_clears_entry_expire_keeps_slot`; typed_ttl / string_ops / keyspace / phase_a / active_expire / bitmap_hll green
-  - Residual: `Entry.expires_at` field retained for legacy `ShardedHashMap` + load projection; search-doc eviction special
+  - Tests: `string_rmw_clears_entry_expire_keeps_slot` (rewritten as `string_rmw_slot_only_ttl` in **GA**)
+  - Residual closed by **GA** (field removal) + **FZ** (search-doc eviction)
 
 #### Later / backlog (no letter batch)
 
@@ -943,7 +960,7 @@ Active items promoted to **Recommended letter queue** above (FW–GB). Remaining
 
 ### Code review backlog
 
-**Batches CZ–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP + FQ + FR + FS + FT + FU + FV shipped.** Letter queue empty; Later/backlog only. Standing tests-for-phase P0.
+**Batches CZ–FG-4 + FH…FV + FZ + GA shipped.** Remaining letter queue: FW / FX / FY / GB. Standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
