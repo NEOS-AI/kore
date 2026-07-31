@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use crate::search_index::{SearchIndex, DocumentField, DistanceMetric};
+use crate::vector_search::HNSWIndex;
 
 /// Query operators
 #[derive(Debug, Clone, PartialEq)]
@@ -256,7 +257,11 @@ impl QueryExecutor {
                 }
             }
             QueryFilter::Vector { field, vector, k, distance_metric } => {
-                if let Some(vector_index) = index.get_vector_index(field) {
+                // Batch FW: prefer dual-written HNSW ANN when the graph has data.
+                // Flat algorithm / empty HNSW fall back to exact flat-map scan.
+                if let Some(hnsw) = index.get_hnsw_index(field) {
+                    Self::knn_search_hnsw(hnsw, vector, *k)
+                } else if let Some(vector_index) = index.get_vector_index(field) {
                     Self::knn_search(vector_index, vector, *k, distance_metric)
                 } else {
                     HashSet::new()
@@ -290,7 +295,7 @@ impl QueryExecutor {
         }
     }
 
-    /// Perform K-Nearest Neighbor search
+    /// Perform exact K-Nearest Neighbor search over a flat vector map.
     fn knn_search(
         vector_index: &HashMap<Bytes, Vec<f32>>,
         query_vector: &[f32],
@@ -316,18 +321,45 @@ impl QueryExecutor {
             .collect()
     }
 
+    /// Approximate KNN via dual-written HNSW graph (Batch FW).
+    ///
+    /// Walks graph edges only — disconnected nodes are not returned even when
+    /// closer in the flat map. Scores use the same Cosine/L2/IP mapping as
+    /// [`HNSWIndex::search`] / [`Self::compute_similarity`].
+    fn knn_search_hnsw(
+        hnsw: &HNSWIndex,
+        query_vector: &[f32],
+        k: usize,
+    ) -> HashSet<Bytes> {
+        hnsw.search(query_vector, k)
+            .into_iter()
+            .map(|r| r.doc_id)
+            .collect()
+    }
+
     /// Get vector similarity scores for results
     fn get_vector_scores(
         index: &SearchIndex,
         filter: &QueryFilter,
     ) -> Option<HashMap<Bytes, f32>> {
         match filter {
-            QueryFilter::Vector { field, vector, k: _, distance_metric } => {
-                if let Some(vector_index) = index.get_vector_index(field) {
+            QueryFilter::Vector { field, vector, k, distance_metric } => {
+                // Prefer HNSW ANN scores when the dual-written graph has data
+                // (Batch FW). `k` bounds the ANN result set; flat path scores
+                // the whole map (exact) for FLAT / empty-HNSW fallback.
+                if let Some(hnsw) = index.get_hnsw_index(field) {
+                    let scores: HashMap<Bytes, f32> = hnsw
+                        .search(vector, *k)
+                        .into_iter()
+                        .map(|r| (r.doc_id, r.score))
+                        .collect();
+                    Some(scores)
+                } else if let Some(vector_index) = index.get_vector_index(field) {
                     let scores: HashMap<Bytes, f32> = vector_index
                         .iter()
                         .map(|(doc_id, doc_vector)| {
-                            let score = Self::compute_similarity(vector, doc_vector, distance_metric);
+                            let score =
+                                Self::compute_similarity(vector, doc_vector, distance_metric);
                             (doc_id.clone(), score)
                         })
                         .collect();
@@ -432,6 +464,11 @@ impl QueryExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search_index::{
+        FieldDefinition, FieldType, IndexDefinition, VectorAlgorithm,
+    };
+    use crate::vector_search::HnswGraphSnapshot;
+    use std::collections::HashMap;
 
     #[test]
     fn test_query_parser() {
@@ -471,5 +508,167 @@ mod tests {
         let vec2 = vec![3.0, 4.0];
         let dist = QueryExecutor::l2_distance(&vec1, &vec2);
         assert!((dist - 5.0).abs() < 0.001);
+    }
+
+    fn hnsw_index_def(name: &str) -> IndexDefinition {
+        IndexDefinition::new(
+            name.to_string(),
+            vec![],
+            vec![FieldDefinition {
+                name: "emb".to_string(),
+                field_type: FieldType::Vector {
+                    algorithm: VectorAlgorithm::HNSW {
+                        m: 8,
+                        ef_construction: 64,
+                    },
+                    dimensions: 2,
+                    distance_metric: DistanceMetric::L2,
+                },
+            }],
+        )
+    }
+
+    fn flat_index_def(name: &str) -> IndexDefinition {
+        IndexDefinition::new(
+            name.to_string(),
+            vec![],
+            vec![FieldDefinition {
+                name: "emb".to_string(),
+                field_type: FieldType::Vector {
+                    algorithm: VectorAlgorithm::Flat,
+                    dimensions: 2,
+                    distance_metric: DistanceMetric::L2,
+                },
+            }],
+        )
+    }
+
+    /// Batch FW: crafted connectivity where flat exact top-1 differs from HNSW
+    /// edge walk — query engine must use HNSW (not full scan).
+    #[test]
+    fn knn_uses_hnsw_not_flat_scan_when_graph_present() {
+        let mut index = SearchIndex::new(hnsw_index_def("vec"));
+
+        // Index four points; dual-write builds an HNSW graph.
+        let docs = [
+            ("entry", vec![0.0f32, 0.0]),
+            ("near", vec![1.0, 0.0]),
+            ("mid", vec![10.0, 0.0]),
+            ("far_isolated", vec![0.1, 0.0]),
+        ];
+        for (id, v) in &docs {
+            let mut fields = HashMap::new();
+            fields.insert("emb".to_string(), DocumentField::Vector(v.clone()));
+            index.index_document(Bytes::from(*id), fields);
+        }
+
+        // Rewrite graph: entry -- mid -- near; leave far_isolated disconnected.
+        // Flat KNN would rank far_isolated #1 for query [0.1, 0]; HNSW must not.
+        let snap = HnswGraphSnapshot {
+            entry_point: Some(Bytes::from("entry")),
+            levels: vec![
+                (Bytes::from("entry"), 0),
+                (Bytes::from("far_isolated"), 0),
+                (Bytes::from("mid"), 0),
+                (Bytes::from("near"), 0),
+            ],
+            layers: vec![vec![
+                (Bytes::from("entry"), vec![Bytes::from("mid")]),
+                (Bytes::from("far_isolated"), vec![]),
+                (Bytes::from("mid"), vec![Bytes::from("entry"), Bytes::from("near")]),
+                (Bytes::from("near"), vec![Bytes::from("mid")]),
+            ]],
+        };
+        index.apply_hnsw_graph("emb", &snap).expect("apply crafted graph");
+
+        // Sanity: flat map still prefers isolated closer point.
+        let flat = index.get_vector_index("emb").expect("flat map");
+        let flat_top = QueryExecutor::knn_search(flat, &[0.1f32, 0.0], 1, &DistanceMetric::L2);
+        assert!(
+            flat_top.contains(&Bytes::from("far_isolated")),
+            "flat exact path must prefer far_isolated"
+        );
+
+        // HNSW API: same craft excludes isolated.
+        let hnsw = index.get_hnsw_index("emb").expect("non-empty HNSW");
+        let hnsw_top = hnsw.search(&[0.1f32, 0.0], 1);
+        assert_eq!(hnsw_top.len(), 1);
+        assert_ne!(hnsw_top[0].doc_id, Bytes::from("far_isolated"));
+        assert_eq!(hnsw_top[0].doc_id, Bytes::from("entry"));
+
+        // Query engine VECTOR filter must follow HNSW, not flat.
+        let query = Query::new()
+            .with_filter(QueryFilter::Vector {
+                field: "emb".to_string(),
+                vector: vec![0.1, 0.0],
+                k: 1,
+                distance_metric: DistanceMetric::L2,
+            })
+            .with_limit(1);
+        let doc_data = HashMap::new();
+        let results = QueryExecutor::execute(&index, &query, &doc_data);
+        assert_eq!(results.len(), 1, "expected single KNN hit: {:?}", results);
+        assert_eq!(
+            results[0].0,
+            Bytes::from("entry"),
+            "query engine must use HNSW ANN (got {:?})",
+            results[0].0
+        );
+        // Score path: L2 similarity 1/(1+d); entry at [0,0] → d=0.1.
+        let score = results[0].1.expect("vector score");
+        let expected = 1.0 / (1.0 + 0.1);
+        assert!(
+            (score - expected).abs() < 1e-5,
+            "score {} vs expected {} (HNSW L2 distance_to_score)",
+            score,
+            expected
+        );
+    }
+
+    /// FLAT VECTOR fields never get an HNSW graph; knn stays exact flat.
+    #[test]
+    fn knn_flat_algorithm_stays_exact() {
+        let mut index = SearchIndex::new(flat_index_def("flat_vec"));
+        assert!(index.get_hnsw_index("emb").is_none());
+
+        for (id, v) in [
+            ("a", vec![0.0f32, 0.0]),
+            ("b", vec![1.0, 0.0]),
+            ("c", vec![0.05, 0.0]),
+        ] {
+            let mut fields = HashMap::new();
+            fields.insert("emb".to_string(), DocumentField::Vector(v));
+            index.index_document(Bytes::from(id), fields);
+        }
+
+        let query = Query::new()
+            .with_filter(QueryFilter::Vector {
+                field: "emb".to_string(),
+                vector: vec![0.0, 0.0],
+                k: 1,
+                distance_metric: DistanceMetric::L2,
+            })
+            .with_limit(1);
+        let results = QueryExecutor::execute(&index, &query, &HashMap::new());
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, Bytes::from("a"));
+    }
+
+    /// Empty HNSW graph falls back to flat map when present.
+    #[test]
+    fn knn_falls_back_to_flat_when_hnsw_empty() {
+        // HNSW schema but no documents → get_hnsw_index is None; no flat data either.
+        let index = SearchIndex::new(hnsw_index_def("empty"));
+        assert!(index.get_hnsw_index("emb").is_none());
+        assert!(index.get_vector_index("emb").is_none());
+
+        let query = Query::new().with_filter(QueryFilter::Vector {
+            field: "emb".to_string(),
+            vector: vec![0.0, 0.0],
+            k: 3,
+            distance_metric: DistanceMetric::L2,
+        });
+        let results = QueryExecutor::execute(&index, &query, &HashMap::new());
+        assert!(results.is_empty());
     }
 }

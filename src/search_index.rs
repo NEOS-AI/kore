@@ -593,8 +593,9 @@ pub struct SearchIndex {
     /// Maps field name to document ID to vector
     vector_indices: HashMap<String, HashMap<Bytes, Vec<f32>>>,
     /// Live HNSW graphs for VECTOR HNSW fields (Batch FV dual-write with
-    /// `vector_indices`). Query path still uses the flat map; graphs are for
-    /// ANN-ready structure + RDB durable restore.
+    /// `vector_indices`). Query path (Batch FW) prefers non-empty HNSW ANN via
+    /// [`Self::get_hnsw_index`]; flat map remains for FLAT fields and as
+    /// fallback when the graph is empty/missing. Graphs are also RDB/AOF durable.
     hnsw_indices: HashMap<String, HNSWIndex>,
     /// All document IDs in this index
     documents: HashSet<Bytes>,
@@ -838,9 +839,19 @@ impl SearchIndex {
         self.tag_indices.get(field)
     }
 
-    /// Get vector index for a field
+    /// Get vector index for a field (flat map; all VECTOR fields dual-store here).
     pub fn get_vector_index(&self, field: &str) -> Option<&HashMap<Bytes, Vec<f32>>> {
         self.vector_indices.get(field)
+    }
+
+    /// Live HNSW graph for a VECTOR HNSW field when it has data (Batch FW).
+    ///
+    /// Returns `None` for FLAT fields, missing fields, or empty graphs so callers
+    /// can fall back to [`Self::get_vector_index`] exact scan.
+    pub fn get_hnsw_index(&self, field: &str) -> Option<&HNSWIndex> {
+        self.hnsw_indices
+            .get(field)
+            .filter(|h| !h.is_empty())
     }
 
     /// Get all documents in the index

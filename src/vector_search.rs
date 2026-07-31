@@ -3,6 +3,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::io::{Read, Write};
 use crate::search_index::DistanceMetric;
 
 /// Vector search result
@@ -207,12 +208,13 @@ impl PartialOrd for MaxCand {
 /// Deterministic tests can force levels via [`HNSWIndex::enqueue_levels`] or seed
 /// the level RNG with [`HNSWIndex::with_level_seed`].
 ///
-/// **Persistence (Batch FV):** RDB v6+ can persist a durable graph snapshot
-/// ([`HnswGraphSnapshot`]: `entry_point`, per-node levels, per-layer adjacency)
-/// and restore it edge-identically via [`HNSWIndex::apply_graph_snapshot`] without
-/// re-sampling levels. Neighbor lists are **canonicalized** (sorted by id) on
-/// export for deterministic equality. AOF still rewrites `FT.CREATE` + docs only
-/// — AOF-only load rebuilds the graph by re-`add` (levels re-sampled). Old RDB
+/// **Persistence (Batch FV/FX):** RDB v6+ and AOF rewrite can persist a durable
+/// graph snapshot ([`HnswGraphSnapshot`]: `entry_point`, per-node levels,
+/// per-layer adjacency) and restore it edge-identically via
+/// [`HNSWIndex::apply_graph_snapshot`] without re-sampling levels. Neighbor lists
+/// are **canonicalized** (sorted by id) on export for deterministic equality.
+/// AOF rewrite emits `FT._LOADGRAPH` after document HSETs (Batch FX); old AOF
+/// without that command still rebuilds by re-`add` (levels re-sampled). Old RDB
 /// files without a graph section keep the rebuild-by-readd path.
 ///
 /// **Batch CS:** `remove` unlinks reverse edges and clears the layer entry; insert uses
@@ -1255,6 +1257,11 @@ impl HNSWIndex {
 /// Vectors are intentionally omitted — restore loads vectors first, then applies
 /// this structure so levels are **not** re-sampled. Neighbor order is sorted on
 /// export ([`HNSWIndex::snapshot_graph`]) for deterministic equality.
+///
+/// **Persistence:** RDB v6+ stores this in the KORDB HNSW graph section; AOF
+/// rewrite (Batch FX) emits `FT._LOADGRAPH index field <blob>` after document
+/// commands so load is edge-identical like RDB. Old AOF without `FT._LOADGRAPH`
+/// still rebuilds via re-`add` (levels re-sampled).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HnswGraphSnapshot {
     pub entry_point: Option<Bytes>,
@@ -1269,6 +1276,140 @@ impl HnswGraphSnapshot {
     pub fn is_empty(&self) -> bool {
         self.levels.is_empty() && self.layers.is_empty() && self.entry_point.is_none()
     }
+
+    /// Encode graph body as a binary blob (Batch FX / shared with RDB v6 body).
+    ///
+    /// Layout (little-endian):
+    /// - `u8` has_entry; if 1: `u32` len + entry_point bytes
+    /// - `u64` n_levels; each: `u32` id_len + id + `u32` level
+    /// - `u64` n_layers; each layer: `u64` n_nodes; each node: id + `u64` n_neigh + neigh ids
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(256);
+        self.write_to(&mut buf)
+            .expect("Vec write is infallible");
+        buf
+    }
+
+    /// Write graph body to `w` (same layout as [`Self::encode`]).
+    pub fn write_to(&self, w: &mut impl Write) -> Result<(), String> {
+        self.write_to_result(w)
+            .map_err(|e| format!("HNSW graph write: {}", e))
+    }
+
+    fn write_to_result(&self, w: &mut impl Write) -> std::io::Result<()> {
+        match &self.entry_point {
+            Some(ep) => {
+                w.write_all(&[1u8])?;
+                write_blob(w, ep)?;
+            }
+            None => {
+                w.write_all(&[0u8])?;
+            }
+        }
+        w.write_all(&(self.levels.len() as u64).to_le_bytes())?;
+        for (id, level) in &self.levels {
+            write_blob(w, id)?;
+            w.write_all(&level.to_le_bytes())?;
+        }
+        w.write_all(&(self.layers.len() as u64).to_le_bytes())?;
+        for layer in &self.layers {
+            w.write_all(&(layer.len() as u64).to_le_bytes())?;
+            for (id, neighs) in layer {
+                write_blob(w, id)?;
+                w.write_all(&(neighs.len() as u64).to_le_bytes())?;
+                for n in neighs {
+                    write_blob(w, n)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Decode graph body from a binary blob ([`Self::encode`] layout).
+    pub fn decode(data: &[u8]) -> Result<Self, String> {
+        let mut cur = std::io::Cursor::new(data);
+        Self::read_from(&mut cur)
+    }
+
+    /// Read graph body from `r` (same layout as [`Self::encode`]).
+    pub fn read_from(r: &mut impl Read) -> Result<Self, String> {
+        let mut flag = [0u8; 1];
+        r.read_exact(&mut flag)
+            .map_err(|e| format!("HNSW graph blob: entry flag: {}", e))?;
+        let entry_point = if flag[0] != 0 {
+            Some(Bytes::from(read_blob(r)?))
+        } else {
+            None
+        };
+        let n_levels = read_u64_le(r)? as usize;
+        if n_levels > 10_000_000 {
+            return Err(format!(
+                "HNSW graph blob: too many level entries: {}",
+                n_levels
+            ));
+        }
+        let mut levels = Vec::with_capacity(n_levels);
+        for _ in 0..n_levels {
+            let id = Bytes::from(read_blob(r)?);
+            let level = read_u32_le(r)?;
+            levels.push((id, level));
+        }
+        let n_layers = read_u64_le(r)? as usize;
+        if n_layers > 64 {
+            return Err(format!("HNSW graph blob: too many layers: {}", n_layers));
+        }
+        let mut layers = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            let n_nodes = read_u64_le(r)? as usize;
+            let mut adj = Vec::with_capacity(n_nodes);
+            for _ in 0..n_nodes {
+                let id = Bytes::from(read_blob(r)?);
+                let n_neigh = read_u64_le(r)? as usize;
+                let mut neighs = Vec::with_capacity(n_neigh);
+                for _ in 0..n_neigh {
+                    neighs.push(Bytes::from(read_blob(r)?));
+                }
+                adj.push((id, neighs));
+            }
+            layers.push(adj);
+        }
+        Ok(HnswGraphSnapshot {
+            entry_point,
+            levels,
+            layers,
+        })
+    }
+}
+
+fn write_blob(w: &mut impl std::io::Write, data: &[u8]) -> std::io::Result<()> {
+    w.write_all(&(data.len() as u32).to_le_bytes())?;
+    w.write_all(data)?;
+    Ok(())
+}
+
+fn read_blob(r: &mut impl Read) -> Result<Vec<u8>, String> {
+    let len = read_u32_le(r)? as usize;
+    if len > 512 * 1024 * 1024 {
+        return Err(format!("HNSW graph blob: field too large: {} bytes", len));
+    }
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)
+        .map_err(|e| format!("HNSW graph blob: read field: {}", e))?;
+    Ok(buf)
+}
+
+fn read_u32_le(r: &mut impl Read) -> Result<u32, String> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)
+        .map_err(|e| format!("HNSW graph blob: u32: {}", e))?;
+    Ok(u32::from_le_bytes(b))
+}
+
+fn read_u64_le(r: &mut impl Read) -> Result<u64, String> {
+    let mut b = [0u8; 8];
+    r.read_exact(&mut b)
+        .map_err(|e| format!("HNSW graph blob: u64: {}", e))?;
+    Ok(u64::from_le_bytes(b))
 }
 
 /// Flat (brute-force) vector index
@@ -2947,5 +3088,27 @@ mod tests {
         index.apply_graph_snapshot(&s1).unwrap();
         let s2 = index.snapshot_graph();
         assert_eq!(s1, s2);
+    }
+
+    // ── Batch FX: graph blob encode/decode ────────────────────────────────
+
+    #[test]
+    fn hnsw_graph_snapshot_encode_decode_roundtrip() {
+        let mut src = HNSWIndex::new(4, 32, DistanceMetric::L2);
+        src.enqueue_levels([0, 2, 1]);
+        src.add(Bytes::from("a"), vec![0.0, 0.0]);
+        src.add(Bytes::from("b"), vec![1.0, 0.0]);
+        src.add(Bytes::from("c"), vec![2.0, 0.0]);
+        let snap = src.snapshot_graph();
+        let blob = snap.encode();
+        let decoded = HnswGraphSnapshot::decode(&blob).expect("decode");
+        assert_eq!(decoded, snap);
+
+        // Empty snapshot.
+        let empty = HnswGraphSnapshot::default();
+        assert_eq!(
+            HnswGraphSnapshot::decode(&empty.encode()).unwrap(),
+            empty
+        );
     }
 }

@@ -1076,31 +1076,9 @@ fn write_hnsw_graph<W: Write>(
 ) -> Result<()> {
     write_bytes(w, index_name.as_bytes())?;
     write_bytes(w, field.as_bytes())?;
-    match &snap.entry_point {
-        Some(ep) => {
-            write_u8(w, 1)?;
-            write_bytes(w, ep)?;
-        }
-        None => {
-            write_u8(w, 0)?;
-        }
-    }
-    write_u64(w, snap.levels.len() as u64)?;
-    for (id, level) in &snap.levels {
-        write_bytes(w, id)?;
-        write_u32(w, *level)?;
-    }
-    write_u64(w, snap.layers.len() as u64)?;
-    for layer in &snap.layers {
-        write_u64(w, layer.len() as u64)?;
-        for (id, neighs) in layer {
-            write_bytes(w, id)?;
-            write_u64(w, neighs.len() as u64)?;
-            for n in neighs {
-                write_bytes(w, n)?;
-            }
-        }
-    }
+    // Graph body layout is shared with AOF `FT._LOADGRAPH` (Batch FX).
+    snap.write_to(w)
+        .map_err(|e| Error::ParseError(e))?;
     Ok(())
 }
 
@@ -1109,56 +1087,9 @@ fn read_hnsw_graph<R: Read>(r: &mut R) -> Result<(String, String, HnswGraphSnaps
         .map_err(|e| Error::ParseError(format!("invalid HNSW index name: {}", e)))?;
     let field = String::from_utf8(read_bytes(r)?)
         .map_err(|e| Error::ParseError(format!("invalid HNSW field name: {}", e)))?;
-    let has_entry = read_u8(r)?;
-    let entry_point = if has_entry != 0 {
-        Some(Bytes::from(read_bytes(r)?))
-    } else {
-        None
-    };
-    let n_levels = read_u64(r)? as usize;
-    if n_levels > 10_000_000 {
-        return Err(Error::ParseError(format!(
-            "HNSW graph too many levels entries: {}",
-            n_levels
-        )));
-    }
-    let mut levels = Vec::with_capacity(n_levels);
-    for _ in 0..n_levels {
-        let id = Bytes::from(read_bytes(r)?);
-        let level = read_u32(r)?;
-        levels.push((id, level));
-    }
-    let n_layers = read_u64(r)? as usize;
-    if n_layers > 64 {
-        return Err(Error::ParseError(format!(
-            "HNSW graph too many layers: {}",
-            n_layers
-        )));
-    }
-    let mut layers = Vec::with_capacity(n_layers);
-    for _ in 0..n_layers {
-        let n_nodes = read_u64(r)? as usize;
-        let mut adj = Vec::with_capacity(n_nodes);
-        for _ in 0..n_nodes {
-            let id = Bytes::from(read_bytes(r)?);
-            let n_neigh = read_u64(r)? as usize;
-            let mut neighs = Vec::with_capacity(n_neigh);
-            for _ in 0..n_neigh {
-                neighs.push(Bytes::from(read_bytes(r)?));
-            }
-            adj.push((id, neighs));
-        }
-        layers.push(adj);
-    }
-    Ok((
-        index_name,
-        field,
-        HnswGraphSnapshot {
-            entry_point,
-            levels,
-            layers,
-        },
-    ))
+    let snap = HnswGraphSnapshot::read_from(r)
+        .map_err(|e| Error::ParseError(format!("RDB HNSW graph: {}", e)))?;
+    Ok((index_name, field, snap))
 }
 
 // Helper trait-like clone for encode path — avoid by cleaning encode() above.

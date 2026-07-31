@@ -4,13 +4,15 @@
 //! Rewrite materializes the current DB as:
 //!   1. `FT.CREATE` (search schema) — before key dumps so HSET auto-index repopulates
 //!   2. SET / ZADD / GEOADD / HSET / RPUSH / SADD / XADD / XGROUP …
-//!   3. `FT.ALIASADD` (aliases after data is re-indexed)
+//!   3. `FT._LOADGRAPH` (Batch FX) — durable HNSW levels/edges after docs re-index
+//!   4. `FT.ALIASADD` (aliases after data is re-indexed)
 //! with SELECT between logical databases.
 //!
-//! **HNSW honesty (Batch FV):** AOF rewrite emits `FT.CREATE` HNSW params
-//! (`M`, `EF_CONSTRUCTION`) + document HSETs only — **not** graph edges or
-//! per-node levels. AOF-only load rebuilds HNSW by re-`add` (levels re-sampled).
-//! Edge-identical multi-layer restore is RDB v6+ durable graph only.
+//! **HNSW honesty (Batch FV/FX):** AOF rewrite emits `FT.CREATE` HNSW params
+//! (`M`, `EF_CONSTRUCTION`) + document HSETs + `FT._LOADGRAPH index field <blob>`
+//! for every non-empty dual-written HNSW field so load is edge-identical like
+//! RDB v6. Old AOF without `FT._LOADGRAPH` still rebuilds by re-`add` (levels
+//! re-sampled). `FT._LOADGRAPH` is rewrite/load-only (applied in AOF replay).
 
 use crate::cache::Cache;
 use crate::databases::Databases;
@@ -19,6 +21,7 @@ use crate::persistence::rdb::DbSnapshot;
 use crate::protocol::RespValue;
 use crate::search_index::{DistanceMetric, FieldType, IndexDefinition, VectorAlgorithm};
 use crate::stream_type::StreamId;
+use crate::vector_search::HnswGraphSnapshot;
 use bytes::Bytes;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Write};
@@ -212,10 +215,31 @@ fn encode_search_alias_commands(cache: &Cache, buf: &mut Vec<u8>) {
     }
 }
 
-/// Encode one DB: FT.CREATE → keyspace dump → FT.ALIASADD (no SELECT).
+/// Encode `FT._LOADGRAPH` for every non-empty HNSW field (Batch FX).
+///
+/// Emitted **after** key dumps so vectors are re-indexed first, then the durable
+/// graph overwrites levels/edges/entry_point (edge-identical like RDB v6).
+fn encode_search_hnsw_graph_commands(cache: &Cache, buf: &mut Vec<u8>) {
+    for (index_name, field, snap) in cache.export_hnsw_graphs() {
+        if snap.is_empty() {
+            continue;
+        }
+        let blob = snap.encode();
+        let args = vec![
+            Bytes::from_static(b"FT._LOADGRAPH"),
+            Bytes::from(index_name),
+            Bytes::from(field),
+            Bytes::from(blob),
+        ];
+        buf.extend_from_slice(&encode_command(&args));
+    }
+}
+
+/// Encode one DB: FT.CREATE → keyspace dump → FT._LOADGRAPH → FT.ALIASADD (no SELECT).
 fn encode_db_commands(cache: &Cache, snap: &DbSnapshot, buf: &mut Vec<u8>) {
     encode_search_create_commands(cache, buf);
     encode_snapshot_commands(snap, buf);
+    encode_search_hnsw_graph_commands(cache, buf);
     encode_search_alias_commands(cache, buf);
 }
 
@@ -751,6 +775,23 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
                     ));
                 }
             }
+            Ok(())
+        }
+        // Batch FX: rewrite-only durable HNSW graph. Applied during AOF load
+        // after FT.CREATE + docs so vectors exist; overwrites re-sampled levels.
+        "FT._LOADGRAPH" => {
+            if argv.len() < 4 {
+                // Truncated: skip liberally (matches other AOF apply paths).
+                return Ok(());
+            }
+            let index_name = String::from_utf8_lossy(&argv[1]).into_owned();
+            let field = String::from_utf8_lossy(&argv[2]).into_owned();
+            let snap = HnswGraphSnapshot::decode(&argv[3]).map_err(|e| {
+                Error::ParseError(format!("invalid FT._LOADGRAPH blob: {}", e))
+            })?;
+            cache
+                .apply_hnsw_graphs(&[(index_name, field, snap)])
+                .map_err(|e| Error::ParseError(format!("FT._LOADGRAPH apply: {}", e)))?;
             Ok(())
         }
         "FT.DROPINDEX" => {
