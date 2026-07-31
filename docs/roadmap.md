@@ -3,7 +3,7 @@
 ## Currently working on..
 
 - [x] Support for Redis Pub-Sub
-- **Committed through FO** (`1ad6e6f`). Post-ship review (2026-07-29): FN+FO green (sentinel 23/23, cluster migrate 42/42). Optional FP next. See root `TODO.md` → *Next work queue (post-FO)*.
+- **Committed through FT** (Sentinel election-timeout SM). Letter queue empty (…FS→FT). Remaining work is Later/backlog only. See root `TODO.md` → *Next work queue (post-FT)*.
 
 ## Persistence / search letter batches (recent)
 
@@ -78,7 +78,7 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Cluster automatic reshard / multi-type MIGRATE orchestration (MVP complete: PLAN/AUTO DX, epoch gossip DU, dest-first NODE DV, fail quorum DW, EY preflight, EP dest rollback, **FB/FH RESP prepare/commit 2PC**)
 - [x] Sentinel promote-success gate (Batch FC: real promote required; in-process failover_in_progress)
 - [x] **FD** measured benchmarks vs Valkey (`docs/benchmarks.md`; single-host median of 3; no portable-win claims)
-- [x] Sentinel leader election depth (Batch FE: voted-leader / elect gate; residual: election-timeout SM)
+- [x] Sentinel leader election depth (Batch FE: voted-leader / elect gate; election-timeout SM → FT)
 - [x] Sentinel CKQUORUM live probe + probe `*` honesty (Batch FN; hello SUBSCRIBE residual accepted)
 - [x] HNSW multi-layer insert (Batch FF)
 - [x] Unified keyspace design + `KeyValue` facade (Batch FG slice A; multi-map storage)
@@ -98,7 +98,8 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] **FQ** unify string TTL onto `KeySlot.expires_at` (EXPIRE/TTL/active expire/volatile sample)
 - [x] **FR** compiler nits + Sentinel suite ephemeral ports (Later/backlog hygiene)
 - [x] **FS** residual lib warnings (unused imports / replica-feed flag / search `_weight`)
-- [ ] **Next (see `TODO.md` post-FS):** Later/backlog only (letter queue empty)
+- [x] **FT** Sentinel election-timeout SM (campaign epoch reuse + timed re-campaign)
+- [ ] **Next (see `TODO.md` post-FT):** Later/backlog only (letter queue empty)
 - [x] 데드락 감지 고급 기능
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원
@@ -116,7 +117,7 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] Sentinel multi-instance ODOWN lite (Batch EX: MEET peers + vote quorum)
 - [x] Sentinel FLUSHCONFIG / load-on-boot (Batch EZ)
 - [x] Sentinel hello bus lite (Batch FA: peer HELLO + PUBLISH on master)
-- [x] Sentinel cross-process leader election lite (Batch FE; residual: election-timeout SM)
+- [x] Sentinel cross-process leader election lite (Batch FE + FT election-timeout SM)
 - [x] Sentinel promote ranking (Batch FK) + INFO `slave_priority` + failover cooldown (Batch FM)
 - [x] Sentinel CKQUORUM live PING + probe `*` honesty (Batch FN; hello SUBSCRIBE residual accepted)
 - [x] Blocking `XREAD` / `XREADGROUP` (`BLOCK`)

@@ -161,7 +161,7 @@ Also tracked in `docs/roadmap.md`.
     - **done** INFO `slave_priority` refresh + auto failover cooldown (Batch FM).
     - **done** CKQUORUM / elect majority live probe + probe `*` honesty (Batch FN).
     - **P3 accepted** no long-lived master `__sentinel__:hello` SUBSCRIBE fan-in (tick PUBLISH + peer HELLO only).
-    - **P3** election lite: FM arms **15s auto-failover cooldown** after `try_failover`, but while `o_down` and *before* an attempt, tick may still open a **new campaign epoch every 1s** until elected (higher-epoch re-vote can thrash under multi-sentinel). No full Redis election-timeout SM.
+    - **done** election-timeout SM (Batch FT: `ELECTION_TIMEOUT` 5s; reuse campaign epoch while live; re-campaign after expiry incl. stuck vote-for-other).
     - **P3 accepted** FM post-ship: serial INFO priority enrich; success still cools auto re-entry (optional parallel enrich stays Later).
 - [x] **`[P1]`** Client durability: `WAIT` + min-replicas write gate
   - *Done*: `WAIT numreplicas timeout_ms` freezes `master_repl_offset`, probes feed GETACK, returns count of replicas with ack ≥ offset (`timeout 0` = forever). `CONFIG GET|SET min-replicas-to-write` / `min-replicas-max-lag` (aliases `min-slaves-*`); writes return `NOREPLICAS` when good replica count is below threshold. INFO exposes `min_slaves_*`.
@@ -348,15 +348,16 @@ Also tracked in `docs/roadmap.md`.
     - *Done (Batch FO)*: durable prepare in nodes.conf; atomic COMMITPREPARE. Residual: bus 2PC; dest vote breadth; operator NODE bypass (intentional).
   - *Post-ship review (FI, 2026-07-25):* AOF-off multi-DB SELECT interleave race under concurrent writers → **fixed Batch FI-2** (`propagate_write` atomic SELECT+append).
   - [x] **`[P2]`** **Code review (EX/FA post-ship):** Sentinel failover leader election (cross-process)
-    - *Done (Batch FE)*: sticky voted-leader on `IS-MASTER-DOWN-BY-ADDR`; auto path elects before `try_failover`; `voted-leader` / `voted-leader-epoch` on MASTER fields. Residual: not full Redis election-timeout state machine.
+    - *Done (Batch FE)*: sticky voted-leader on `IS-MASTER-DOWN-BY-ADDR`; auto path elects before `try_failover`; `voted-leader` / `voted-leader-epoch` on MASTER fields. Residual election-timeout SM → **done FT** (lite; not full Raft / lex-min runid).
   - [x] **`[P3]`** **Code review (FE post-ship nits):** election-epoch thrash; probe self-as-leader; majority uses table size
     - *Found (scheduled review after FE)*: (1) multi-sentinel o_down tick can `next_election_epoch` every second until majority; (2) probe without prior vote returns self (not `*`); (3) `leader_votes_needed` uses `known_sentinel_count` (same residual as CKQUORUM).
     - *Done (Batch FM, partial)*: post-`try_failover` auto cooldown (15s) suppresses elect+failover re-entry thrash while `last_failover_attempt` is hot.
-    - *Done (Batch FN)*: probe `*` honesty; CKQUORUM + elect majority use live PING. Residual: full election-timeout SM (epoch thrash while o_down before first try_failover).
+    - *Done (Batch FN)*: probe `*` honesty; CKQUORUM + elect majority use live PING. Residual: full election-timeout SM (epoch thrash while o_down before first try_failover) → **done FT**.
   - [x] **`[P3]`** **Code review (FC post-ship nit):** Sentinel promote still first-replica-wins
     - *Done (Batch FK)*: `rank_replicas_for_promote` — highest priority (0 never), then highest ROLE offset, then greatest `ip:port`. Tests: priority / offset / skip-0 / all-zero.
     - *Done (Batch FM)*: live INFO `slave_priority` refresh on probe / `try_failover`; auto-failover **15s** cooldown after attempt (manual FAILOVER force bypasses).
-    - *Done (Batch FN)*: CKQUORUM live probe + probe self-vs-`*`. Residual: full election-timeout SM.
+    - *Done (Batch FN)*: CKQUORUM live probe + probe self-vs-`*`. Residual: full election-timeout SM → **done FT**.
+
   - [x] **`[P3]`** **Code review (FM post-ship):** serial INFO priority refresh; cooldown always arms
     - *Found (scheduled review after FM, 2026-07-29):* (1) `enrich_replica_priorities` issues sequential `INFO replication` per replica (N×`IO_TIMEOUT`) — acceptable for lite; parallelize only if multi-replica failover latency matters; (2) successful failover still arms 15s auto cooldown (intentional thrash guard; Redis failover-timeout ballpark lite); (3) `begin_failover` contention path returns without arming cooldown (other owner holds in-progress — intentional). No correctness bug.
     - *Closed (Batch FN)*: CKQUORUM live + probe honesty. Residual serial INFO enrich stays **accepted lite** / Later.
@@ -733,17 +734,18 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
   - *Done (Batch BT)*: `bt_eval_select_persists_connection_db` — connection remains on selected DB after EVAL
 
-### Status snapshot (2026-07-31, post-FS)
+### Status snapshot (2026-07-31, post-FT)
 
-**Committed through Batch FS** (P3 lib-warning hygiene from Later/backlog). Letter queue empty; FR+FS continue Later/backlog only. Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed). Git: `main` ahead of origin (do not push); untracked `data/` only.
+**Committed through Batch FT** (Sentinel election-timeout SM from Later/backlog). Letter queue empty again after FT. Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed). Git: `main` ahead of origin (do not push); untracked `data/` only.
 
 **Verification:**
-- **FS:** `cargo build --lib` **0 warnings**; removed unused `bitmap`/`replication` imports; dropped dead `entered_replica_feed` flag; `_weight` on inverted index; test-only `query_engine` import cleanup. Lib tests **360/360** (+1 ignored); bitmap/search/replication integration green.
+- **FT:** election-timeout SM — `ELECTION_TIMEOUT` 5s; campaign epoch reuse; re-campaign after expiry (self + stuck vote-for-other). Lib sentinel **19/19**; `sentinel_lite_test` **23/23** (parallel promote-inject flake pre-existing, passes alone).
+- **FS:** `cargo build --lib` **0 warnings**; removed unused `bitmap`/`replication` imports; dropped dead `entered_replica_feed` flag; `_weight` on inverted index; test-only `query_engine` import cleanup.
 - **FR:** compiler nits + sentinel ephemeral ports (prior).
 - **FQ:** string TTL on `KeySlot`; unified EXPIRE/TTL/PERSIST; active expire + volatile sample read slot.
 - Hello SUBSCRIBE fan-in remains **accepted residual** (tick PUBLISH + peer HELLO only).
 
-**What remains:** Later/backlog only (no more letter batches).
+**What remains:** Later/backlog only.
 
 | Area | Residual | Priority | Planned batch |
 |------|----------|----------|---------------|
@@ -753,7 +755,7 @@ Also tracked in `docs/roadmap.md`.
 | Hygiene | compiler nits (`config_kv_reply`, SkipList dead APIs, sentinel unused_mut) | **done** | **FR** |
 | Hygiene | pre-existing lib warnings (unused imports / replica feed / weight) | **done** | **FS** |
 | Sentinel | long-lived `__sentinel__:hello` SUBSCRIBE fan-in | P3 accepted | — |
-| Sentinel | election-timeout SM (pre-attempt campaign epoch thrash) | P3 | later |
+| Sentinel | election-timeout SM (pre-attempt campaign epoch thrash) | **done** | **FT** |
 | Cluster | NODE 2PC durable prepare + atomic COMMITPREPARE | **done** | **FO** |
 | Cluster | binary bus 2PC; dest prepare breadth; operator NODE bypass | P3 accepted / later | — |
 | Cluster | remote dest CHECKPREPARE→COMMITPREPARE two-RPC window | P3 accepted lite | — |
@@ -767,9 +769,9 @@ Also tracked in `docs/roadmap.md`.
 | Search | HNSW edges/levels not AOF/RDB durable; `max_m=1` spanning | P3 accepted / later | — |
 | MIGRATE / UI / load | DUMP wire; reshard weight UI; Arc-swap mid-fill | P3 accepted | — |
 
-### Next work queue (post-FS)
+### Next work queue (post-FT)
 
-**Committed letter queue through FQ is empty; Batch FR+FS (Later hygiene) done.** Standing rule: land tests with each change. Resume from **Later / backlog** only.
+**Committed letter queue through FS was empty; Batch FT took election-timeout SM from Later/backlog.** Standing rule: land tests with each change. Resume from **Later / backlog** only.
 
 #### Completed (FB–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP)
 
@@ -836,7 +838,7 @@ Also tracked in `docs/roadmap.md`.
   - Probe `runid=*` with no prior vote returns leader `"*"` / epoch 0 (Redis-honest); sticky vote still returned on probe; sole-sentinel auto path via `is_failover_leader` / live≤1 elect
   - Hello SUBSCRIBE fan-in **not** implemented (accepted residual; tick PUBLISH + peer HELLO remains primary discovery)
   - Tests: unit probe/`leader_votes_needed_for`; e2e CKQUORUM dead→NOQUORUM / live→OK; elect ignores dead peers; probe sticky vote
-  - Residual: election-timeout SM (pre-attempt epoch thrash); optional parallel INFO enrich; ephemeral ports → **FR**
+  - Residual: election-timeout SM → **FT**; optional parallel INFO enrich; ephemeral ports → **FR**
 
 - [x] **`[P3]`** **Batch FO — NODE 2PC durable prepare** (`1ad6e6f`)
   - `nodes.conf` header `# prepare <slot> <target> <epoch> <unix_ms>`; SAVECONFIG / autosave write non-expired votes; load restores; expired/malformed skipped (fail-closed)
@@ -869,7 +871,7 @@ Also tracked in `docs/roadmap.md`.
   - Sentinel suite: `free_port` / `free_ports` (bind `127.0.0.1:0`, hold then release) replaces hard-coded `169xx` ports — parallel-safe under `cargo test`
   - Tests: `sentinel_lite_test` **23/23**; lib sorted_set **16/16**; lib sentinel **16/16**
   - Out of scope → closed by **FS**: unused imports (`bitmap` Bytes, replication Cache), `entered_replica_feed` assignment, search `weight` param
-  - Residual: election-timeout SM; optional parallel INFO enrich; other Later items unchanged
+  - Residual: election-timeout SM → **FT**; optional parallel INFO enrich; other Later items unchanged
 
 - [x] **`[P3]`** **Batch FS — Clear residual lib warnings** (`b7219ea`)
   - Removed unused `bytes::Bytes` import in `commands/bitmap.rs`
@@ -878,7 +880,18 @@ Also tracked in `docs/roadmap.md`.
   - Renamed inverted-index `weight` → `_weight` (API kept; TF-IDF scoring still future)
   - Bonus: unused `search_index` type imports in `query_engine` tests
   - Verify: `cargo build --lib` **0 warnings**; lib **360/360** (+1 ignored); `bitmap_hll` / `search` / `replication` integration green
-  - Residual: election-timeout SM; `Entry.expires_at` RMW mirror; other Later items unchanged
+  - Residual closed by **FT**: election-timeout SM; remaining: `Entry.expires_at` RMW mirror; other Later items
+
+- [x] **`[P3]`** **Batch FT — Sentinel election-timeout SM**
+  - Per-master `election_started_at` + `ELECTION_TIMEOUT` (5s; test override `test_set_election_timeout_ms`)
+  - `vote_leader` stamps campaign start on higher-epoch vote
+  - `try_elect_leader`: reuse self-campaign epoch while timer live (no per-tick `next_election_epoch` thrash)
+  - After timeout: open higher epoch for self-campaign; clear stuck vote-for-other and re-campaign
+  - `note_ok` / `switch_master` clear campaign timer with election vote
+  - Closed FE/FN residual: pre-attempt campaign epoch thrash while `o_down`
+  - Not full Redis SM (no lex-min runid pre-filter / random election desync delay)
+  - Tests: unit stamp/expire/clear; reuse-then-bump sole campaign; re-campaign after stuck other vote; lib sentinel **19/19**
+  - Residual: optional parallel INFO enrich / live PING; hello SUBSCRIBE; other Later items unchanged
 
 
 #### Later / backlog (no letter batch)
@@ -889,12 +902,11 @@ Also tracked in `docs/roadmap.md`.
   - Global repl backlog write serialization (FI residual; no Valkey parity claim)
   - Optional parallelize `enrich_replica_priorities` / `count_reachable_sentinels` (serial probes today)
   - Cluster binary bus 2PC; dest prepare breadth; remote CHECK→COMMITPREPARE two-RPC window
-  - Sentinel election-timeout SM (pre-attempt campaign epoch thrash while o_down)
   - `Entry.expires_at` RMW mirror (optional full drop once ShardedHashMap retired); search-doc eviction special
 
 ### Code review backlog
 
-**Batches CZ–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP + FQ + FR + FS shipped.** Letter queue empty; Later/backlog only. Standing tests-for-phase P0.
+**Batches CZ–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP + FQ + FR + FS + FT shipped.** Letter queue empty; Later/backlog only. Standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -1018,7 +1030,7 @@ Also tracked in `docs/roadmap.md`.
 | P2 | FA: Sentinel hello bus lite (HELLO + PUBLISH) | done (FA) |
 | P1 | EW post-ship: promote_replica PING-only still Ok → switch_master | **done** (Batch FC) |
 | P2 | EX/FA post-ship: failover leader election (cross-process); in-process gate done FC | **done** (Batch FE) |
-| P3 | FE post-ship: election epoch thrash / probe self / majority table-size | **done FN** (probe/CKQUORUM live); election-timeout SM residual |
+| P3 | FE post-ship: election epoch thrash / probe self / majority table-size | **done FN** (probe/CKQUORUM); **done FT** (election-timeout SM) |
 | P3 | EZ/FA post-ship: hello add_peer autosave thrash; CKQUORUM live count | **done** (FE autosave; FN live CKQUORUM) |
 | P3 | EN/EO/EU post-ship: nodes.conf omits require-full/announce flags | **done** (Batch FL) |
 | P1 | dual-end NODE RESP 2PC prepare/commit (slice 1) | **done** (Batch FB) |
@@ -1029,7 +1041,8 @@ Also tracked in `docs/roadmap.md`.
 | P3 | FN: CKQUORUM live PING + probe `*` honesty | **done** (Batch FN; hello SUBSCRIBE residual accepted) |
 | P3 | FO: durable NODE prepare + atomic COMMITPREPARE | **done** (Batch FO) |
 | P3 | FO post-ship: remote CHECK→COMMITPREPARE two-RPC; dest prepare breadth; bus | **accepted lite** (local commit atomic; operator NODE intentional) |
-| P3 | FN post-ship: serial peer PING; pre-attempt election epoch thrash | **accepted lite** / later SM |
+| P3 | FN post-ship: serial peer PING; pre-attempt election epoch thrash | serial PING **accepted lite**; epoch thrash **done FT** |
+| P3 | FT: Sentinel election-timeout SM (campaign reuse + re-campaign) | **done** (Batch FT) |
 | P2 | dual-end NODE 2PC slice 2 (prepare-epoch / TTL / commit re-check) | **done** (Batch FH) |
 | P2 | FI pipeline SET perf | **done** (Batch FI; ~+25% P=16) |
 | P2/P3 | FI-2 AOF-off multi-DB SELECT ordering | **done** (Batch FI-2) |
@@ -1088,7 +1101,7 @@ Highest urgency checklist (phase order preserved):
 - [x] Load from file on startup
 - [x] Async replication
 - [x] Timed SAVE policies (`--save` / CONFIG save)
-  - *Follow-ups*: long-lived master SUBSCRIBE hello fan-in; election-timeout SM polish (FE lite shipped; promote gate FC done)
+  - *Follow-ups*: long-lived master SUBSCRIBE hello fan-in (election-timeout SM done FT; promote gate FC done)
 
 **C**
 
@@ -1099,4 +1112,4 @@ Highest urgency checklist (phase order preserved):
 - [x] Eviction policies (`maxmemory-policy`)
   - *Follow-ups*: Streams, bitmaps/HLL, RESP3 (done elsewhere); LFU decay done in Batch AB
 
-**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB–FQ** letter work is committed complete; **FR+FS** are Later/backlog hygiene. Resume from **Next work queue (post-FS)** — Later/backlog only.
+**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB–FQ** letter work is committed complete; **FR+FS** are Later/backlog hygiene; **FT** election-timeout SM from Later. Resume from **Next work queue (post-FT)** — Later/backlog only.

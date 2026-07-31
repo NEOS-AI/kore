@@ -2,7 +2,8 @@
 //! + **config persistence** (Batch EZ) + **hello bus lite** (Batch FA)
 //! + **promote-success gate** (Batch FC) + **leader election** (Batch FE)
 //! + **promote ranking** (Batch FK) + **INFO priority + failover cooldown** (Batch FM)
-//! + **CKQUORUM live probe + probe honesty** (Batch FN).
+//! + **CKQUORUM live probe + probe honesty** (Batch FN)
+//! + **election-timeout SM** (Batch FT).
 //!
 //! - EW: subjective-down (`s_down`), MONITOR, GET-MASTER-ADDR, FAILOVER, auto-failover
 //! - EX: peer `SENTINEL MEET`, `IS-MASTER-DOWN-BY-ADDR` votes, `o_down` when votes ≥ quorum
@@ -15,15 +16,19 @@
 //! - FN: `CKQUORUM` / elect majority use **live PING** reachability (dead peers do not inflate `N`);
 //!   probe `runid=*` with no prior vote returns leader `"*"` (Redis-honest; sole-sentinel auto path
 //!   still uses [`Self::is_failover_leader`] / empty-peers elect)
+//! - FT: per-master campaign timer [`ELECTION_TIMEOUT`]; reuse campaign epoch while live; after
+//!   timeout re-campaign at a higher epoch (self or after stuck vote-for-other). Stops pre-attempt
+//!   epoch thrash under multi-sentinel `o_down` without a completed `try_failover`.
 //!
 //! # Honesty vs full Redis Sentinel
 //!
-//! - **Leader election (FE/FN):** first-seen sticky vote per epoch; higher epoch can re-vote.
+//! - **Leader election (FE/FN/FT):** first-seen sticky vote per epoch; higher epoch can re-vote.
 //!   Winner needs `max(quorum, floor(N/2)+1)` where **N = live reachable** sentinels (self +
 //!   peers answering `PING`; Batch FN). Manual `SENTINEL FAILOVER` bypasses election (operator
-//!   force). Not a full Raft/Sentinel state machine (no election timeout abort, no
-//!   subjective-leader lex-min runid pre-filter). While `o_down`, tick may open a new campaign
-//!   epoch every 1s until elected (FM cooldown only suppresses post-`try_failover` re-entry).
+//!   force). Campaign epoch is **sticky for [`ELECTION_TIMEOUT`]** (Batch FT; Redis
+//!   election-timeout lite — not full Raft / no subjective-leader lex-min runid pre-filter).
+//!   After timeout without a finished failover, open a higher epoch (re-campaign). FM cooldown
+//!   still suppresses post-`try_failover` re-entry only.
 //! - **Hello bus:** tick `PUBLISH __sentinel__:hello` + peer `SENTINEL HELLO` exchange.
 //!   No long-lived master `SUBSCRIBE` fan-in (accepted residual; peer HELLO is primary discovery).
 //! - **CKQUORUM (FN):** live PING of peer table; usable = `1 + reachable peers`. Dead peers no
@@ -89,6 +94,15 @@ pub const DEFAULT_DOWN_AFTER_MS: u64 = 30_000;
 /// thrashing every tick. Manual `SENTINEL FAILOVER` bypasses this gate.
 pub const FAILOVER_COOLDOWN: Duration = Duration::from_secs(15);
 
+/// How long a failover-leader campaign epoch stays sticky before re-campaign (Batch FT).
+///
+/// Redis election-timeout is roughly `min(10s, failover-timeout/2)`. Lite uses **5s**
+/// (aligned under [`FAILOVER_COOLDOWN`] 15s). While the timer is live, [`try_elect_leader`]
+/// reuses the same campaign epoch (no per-tick `next_election_epoch` thrash). After expiry
+/// without a finished failover, open a higher epoch — including when stuck on a vote for
+/// another runid that never promoted.
+pub const ELECTION_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Redis Sentinel hello pub/sub channel (Batch FA).
 pub const HELLO_CHANNEL: &str = "__sentinel__:hello";
 
@@ -100,9 +114,17 @@ const IO_TIMEOUT: Duration = Duration::from_millis(800);
 /// Test override for [`FAILOVER_COOLDOWN`] duration (ms). `0` = use default 15s.
 static FAILOVER_COOLDOWN_MS_OVERRIDE: AtomicU64 = AtomicU64::new(0);
 
+/// Test override for [`ELECTION_TIMEOUT`] duration (ms). `0` = use default 5s. Batch FT.
+static ELECTION_TIMEOUT_MS_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+
 /// Set failover cooldown override for tests (`0` restores [`FAILOVER_COOLDOWN`]).
 pub fn test_set_failover_cooldown_ms(ms: u64) {
     FAILOVER_COOLDOWN_MS_OVERRIDE.store(ms, Ordering::SeqCst);
+}
+
+/// Set election-timeout override for tests (`0` restores [`ELECTION_TIMEOUT`]). Batch FT.
+pub fn test_set_election_timeout_ms(ms: u64) {
+    ELECTION_TIMEOUT_MS_OVERRIDE.store(ms, Ordering::SeqCst);
 }
 
 /// Effective auto-failover cooldown (Batch FM).
@@ -115,6 +137,15 @@ pub fn failover_cooldown_duration() -> Duration {
     }
 }
 
+/// Effective election-timeout duration (Batch FT).
+pub fn election_timeout_duration() -> Duration {
+    let ov = ELECTION_TIMEOUT_MS_OVERRIDE.load(Ordering::SeqCst);
+    if ov == 0 {
+        ELECTION_TIMEOUT
+    } else {
+        Duration::from_millis(ov)
+    }
+}
 /// Parsed Redis-style hello payload (Batch FA).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelloMsg {
@@ -222,10 +253,14 @@ pub struct MasterInfo {
     pub leader_runid: String,
     /// Epoch of [`Self::leader_runid`] (Batch FE). Sticky until a higher epoch arrives.
     pub leader_epoch: u64,
+    /// When the current leader vote / campaign epoch was established (Batch FT).
+    ///
+    /// Used with [`ELECTION_TIMEOUT`]: while live, reuse the same campaign epoch; after
+    /// expiry, [`try_elect_leader`] may open a higher epoch (or abandon a stuck vote-for-other).
+    pub election_started_at: Option<Instant>,
     /// When the last `try_failover` finished (success or fail). Batch FM cooldown clock.
     pub last_failover_attempt: Option<Instant>,
 }
-
 impl MasterInfo {
     pub fn flags(&self) -> String {
         let mut f = Vec::new();
@@ -374,6 +409,7 @@ impl SentinelState {
                 failover_in_progress: false,
                 leader_runid: String::new(),
                 leader_epoch: 0,
+                election_started_at: None,
                 last_failover_attempt: None,
             },
         );
@@ -493,9 +529,10 @@ impl SentinelState {
             m.s_down = false;
             m.o_down = false;
             m.down_votes = 0;
-            // Clear election vote when master is healthy again (Batch FE).
+            // Clear election vote when master is healthy again (Batch FE/FT).
             m.leader_runid.clear();
             m.leader_epoch = 0;
+            m.election_started_at = None;
             if let Some(r) = replicas {
                 m.replicas = r;
             }
@@ -598,6 +635,8 @@ impl SentinelState {
         if req_epoch > m.leader_epoch {
             m.leader_epoch = req_epoch;
             m.leader_runid = candidate.to_string();
+            // Stamp campaign start for election-timeout SM (Batch FT).
+            m.election_started_at = Some(Instant::now());
             debug!(
                 "sentinel: +vote-for-leader {} epoch={} leader={}",
                 name, req_epoch, candidate
@@ -609,6 +648,48 @@ impl SentinelState {
     /// Bump process config epoch and return the new value (election attempt).
     pub fn next_election_epoch(&self) -> u64 {
         self.current_epoch.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// True when the current leader vote's campaign timer has expired (Batch FT).
+    ///
+    /// No active vote → `false`. Missing `election_started_at` (legacy/unit vote path)
+    /// lazily stamps **now** and returns `false` so we never thrash epochs on first check.
+    pub fn election_expired(&self, name: &str) -> bool {
+        let mut g = self.masters.write();
+        let Some(m) = g.get_mut(name) else {
+            return false;
+        };
+        if m.leader_runid.is_empty() || m.leader_epoch == 0 {
+            return false;
+        }
+        match m.election_started_at {
+            Some(t) => t.elapsed() >= election_timeout_duration(),
+            None => {
+                m.election_started_at = Some(Instant::now());
+                false
+            }
+        }
+    }
+
+    /// Clear sticky leader vote + campaign timer (Batch FT re-campaign / recovery).
+    pub fn clear_election_vote(&self, name: &str) {
+        if let Some(m) = self.masters.write().get_mut(name) {
+            m.leader_runid.clear();
+            m.leader_epoch = 0;
+            m.election_started_at = None;
+        }
+    }
+
+    /// Force-age the campaign timer so the next elect sees expiry (Batch FT tests).
+    pub fn test_expire_election(&self, name: &str) {
+        if let Some(m) = self.masters.write().get_mut(name) {
+            if m.leader_epoch > 0 && !m.leader_runid.is_empty() {
+                let past = Instant::now()
+                    .checked_sub(election_timeout_duration() + Duration::from_millis(50))
+                    .unwrap_or_else(Instant::now);
+                m.election_started_at = Some(past);
+            }
+        }
     }
 
     /// True when this Sentinel holds the failover-leader vote for `name`
@@ -689,9 +770,10 @@ impl SentinelState {
             m.last_ok = Instant::now();
             m.failover_epoch = m.failover_epoch.saturating_add(1);
             m.replicas.clear();
-            // Clear election state after successful switch (Batch FE).
+            // Clear election state after successful switch (Batch FE/FT).
             m.leader_runid.clear();
             m.leader_epoch = 0;
+            m.election_started_at = None;
             // Leave failover_in_progress to the outer try_failover guard.
             self.current_epoch.fetch_add(1, Ordering::Relaxed);
         }
@@ -1229,13 +1311,17 @@ pub async fn count_reachable_sentinels(sentinel: &SentinelState) -> usize {
     n
 }
 
-/// Campaign for failover leadership and return whether we won (Batch FE + FN).
+/// Campaign for failover leadership and return whether we won (Batch FE + FN + FT).
 ///
 /// - Sole sentinel (no peers **or** no other live peers): vote for self and return `true`.
 /// - Multi-sentinel: sticky vote for self at a campaign epoch; solicit peers via
 ///   `IS-MASTER-DOWN-BY-ADDR` with our runid; win if votes ≥
 ///   `leader_votes_needed_for` with **live** voter count (Batch FN).
-/// - If we already voted for another runid this epoch, abstain (`false`).
+/// - If we already voted for another runid and the campaign timer is still live,
+///   abstain (`false`). After [`ELECTION_TIMEOUT`], clear that vote and re-campaign
+///   (Batch FT).
+/// - Self-campaign **reuses** the same epoch until [`ELECTION_TIMEOUT`] expires; only
+///   then opens a higher epoch (Batch FT — no per-tick epoch thrash while `o_down`).
 ///
 /// Manual `SENTINEL FAILOVER` does not call this (operator force).
 pub async fn try_elect_leader(sentinel: &SentinelState, name: &str) -> bool {
@@ -1244,21 +1330,40 @@ pub async fn try_elect_leader(sentinel: &SentinelState, name: &str) -> bool {
     };
     let my_id = sentinel.my_id();
 
-    // Already committed to another leader this epoch → abstain.
+    // Already committed to another leader: abstain while campaign timer lives;
+    // after election-timeout, drop the stuck vote and re-campaign (Batch FT).
     if !m.leader_runid.is_empty() && m.leader_runid != my_id {
-        debug!(
-            "sentinel: abstain failover for {} (voted-leader={} epoch={})",
+        if !sentinel.election_expired(name) {
+            debug!(
+                "sentinel: abstain failover for {} (voted-leader={} epoch={})",
+                name, m.leader_runid, m.leader_epoch
+            );
+            return false;
+        }
+        info!(
+            "sentinel: election-timeout on {} after vote for {} epoch={} — re-campaign",
             name, m.leader_runid, m.leader_epoch
         );
-        return false;
+        sentinel.clear_election_vote(name);
     }
+
+    // Refresh after possible clear.
+    let Some(m) = sentinel.master(name) else {
+        return false;
+    };
 
     // Live reachability (Batch FN): dead peers must not force a higher majority.
     let live = count_reachable_sentinels(sentinel).await;
 
     // Sole live sentinel: no cross-process race (table may still list dead peers).
     if live <= 1 {
-        let epoch = if m.leader_epoch > 0 {
+        let expired = sentinel.election_expired(name);
+        let epoch = if m.leader_epoch > 0 && m.leader_runid == my_id && !expired {
+            m.leader_epoch
+        } else if m.leader_epoch > 0 && m.leader_runid == my_id && expired {
+            // Re-stamp higher epoch after timeout (keeps process epoch monotonic).
+            sentinel.next_election_epoch().max(1)
+        } else if m.leader_epoch > 0 {
             m.leader_epoch
         } else {
             sentinel.next_election_epoch().max(1)
@@ -1267,10 +1372,17 @@ pub async fn try_elect_leader(sentinel: &SentinelState, name: &str) -> bool {
         return true;
     }
 
-    // Reuse campaign epoch if we already vote for ourselves; else open a new one.
-    let epoch = if m.leader_epoch > 0 && m.leader_runid == my_id {
+    // Multi: reuse self-campaign epoch while timer lives; else open a new one (Batch FT).
+    let expired = m.leader_runid == my_id && sentinel.election_expired(name);
+    let epoch = if m.leader_epoch > 0 && m.leader_runid == my_id && !expired {
         m.leader_epoch
     } else {
+        if expired {
+            info!(
+                "sentinel: election-timeout self-campaign {} epoch={} — open new epoch",
+                name, m.leader_epoch
+            );
+        }
         sentinel.next_election_epoch()
     };
     let _ = sentinel.vote_leader(name, epoch, &my_id);
@@ -1309,7 +1421,6 @@ pub async fn try_elect_leader(sentinel: &SentinelState, name: &str) -> bool {
         false
     }
 }
-
 /// `SENTINEL MEET <ip> <port>` — learn peer runid and announce ourselves (Batch EX).
 pub async fn meet_sentinel(
     sentinel: &SentinelState,
@@ -2073,6 +2184,74 @@ mod tests {
         assert_eq!(failover_cooldown_duration(), FAILOVER_COOLDOWN);
     }
 
+    /// Batch FT: vote stamps campaign timer; sticky within timeout; expires after.
+    #[test]
+    fn election_timeout_stamps_and_expires() {
+        let s = SentinelState::new();
+        s.monitor("m", "10.0.0.1", 6379, 1).unwrap();
+        test_set_election_timeout_ms(150);
+        let me = s.my_id();
+        let (runid, epoch) = s.vote_leader("m", 3, &me);
+        assert_eq!(runid, me);
+        assert_eq!(epoch, 3);
+        assert!(s.master("m").unwrap().election_started_at.is_some());
+        assert!(!s.election_expired("m"));
+        // Force-age past timeout.
+        s.test_expire_election("m");
+        assert!(s.election_expired("m"));
+        s.clear_election_vote("m");
+        assert!(s.master("m").unwrap().leader_runid.is_empty());
+        assert_eq!(s.master("m").unwrap().leader_epoch, 0);
+        assert!(s.master("m").unwrap().election_started_at.is_none());
+        assert!(!s.election_expired("m"));
+        test_set_election_timeout_ms(0);
+        assert_eq!(election_timeout_duration(), ELECTION_TIMEOUT);
+    }
+
+    /// Batch FT: self-campaign reuses epoch within timeout; opens higher after expiry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn election_timeout_reuses_then_bumps_self_campaign() {
+        let s = SentinelState::new();
+        s.monitor("m", "10.0.0.1", 6379, 1).unwrap();
+        // No peers → sole live path.
+        test_set_election_timeout_ms(200);
+        assert!(try_elect_leader(&s, "m").await);
+        let e1 = s.master("m").unwrap().leader_epoch;
+        assert!(e1 >= 1);
+        assert_eq!(s.master("m").unwrap().leader_runid, s.my_id());
+        // Second elect within timeout reuses same epoch.
+        assert!(try_elect_leader(&s, "m").await);
+        assert_eq!(s.master("m").unwrap().leader_epoch, e1);
+        // After timeout, open a higher epoch.
+        s.test_expire_election("m");
+        assert!(try_elect_leader(&s, "m").await);
+        let e2 = s.master("m").unwrap().leader_epoch;
+        assert!(e2 > e1, "expected re-campaign epoch > {e1}, got {e2}");
+        test_set_election_timeout_ms(0);
+    }
+
+    /// Batch FT: vote-for-other abstains until timeout, then re-campaigns for self.
+    #[tokio::test(flavor = "current_thread")]
+    async fn election_timeout_recampaign_after_stuck_other_vote() {
+        let s = SentinelState::new();
+        s.monitor("m", "10.0.0.1", 6379, 2).unwrap();
+        // Dead peer so live count is 1 (self only) — sole path after clear.
+        s.add_peer("aa".repeat(20), "127.0.0.1", 1);
+        test_set_election_timeout_ms(200);
+        let other = "bb".repeat(20);
+        let _ = s.vote_leader("m", 7, &other);
+        assert_eq!(s.master("m").unwrap().leader_runid, other);
+        // Within timeout → abstain.
+        assert!(!try_elect_leader(&s, "m").await);
+        assert_eq!(s.master("m").unwrap().leader_runid, other);
+        assert_eq!(s.master("m").unwrap().leader_epoch, 7);
+        // After timeout → clear and re-campaign for self.
+        s.test_expire_election("m");
+        assert!(try_elect_leader(&s, "m").await);
+        assert_eq!(s.master("m").unwrap().leader_runid, s.my_id());
+        assert!(s.master("m").unwrap().leader_epoch > 7);
+        test_set_election_timeout_ms(0);
+    }
     #[test]
     fn hello_parse_format_and_apply() {
         let a = SentinelState::new();
