@@ -28,6 +28,7 @@ pub mod search_index;
 pub mod query_engine;
 pub mod vector_search;
 pub mod persistence;
+pub mod rdb_object;
 pub mod admin_http;
 pub mod metrics;
 pub mod deadlock_ui;
