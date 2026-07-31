@@ -796,7 +796,7 @@ Also tracked in `docs/roadmap.md`.
 
 #### Completed (FB–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP + FQ + FR + FS + FT + FU + FV + GB)
 
-- [x] **`[P3]`** **Batch GB — Repl backlog write serialization** (this commit)
+- [x] **`[P3]`** **Batch GB — Repl backlog write serialization** (`dfcf7aa`)
   - Dropped exclusive `fullsync_gate: Mutex<()>` on every `propagate_*`
   - **Atomic fullsync barrier**: `fullsync_in_progress` + `writers_in_publish`; `publish_enter`/`publish_exit` / `with_fullsync_exclusion` — common path is atomics only (no Mutex) when no full-resync
   - Ordered publish CS: under **backlog** lock only — lazy SELECT decide, append SELECT+cmd (one payload), update `selected_db`, fan-out (preserves FI-2 + feed≡backlog order)
