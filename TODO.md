@@ -795,13 +795,13 @@ Also tracked in `docs/roadmap.md`.
 
 #### Completed (FB–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP + FQ + FR + FS + FT + FU + FV + FW + FX)
 
-- [x] **`[P2]`** **Batch FW — ANN query path on HNSW**
+- [x] **`[P2]`** **Batch FW — ANN query path on HNSW** (`ebd88e9`)
   - `SearchIndex::get_hnsw_index` (non-empty only); query engine `knn_search` / `get_vector_scores` prefer HNSW ANN
   - FLAT stays exact flat map; empty/missing HNSW falls back to flat
   - Scores via `HNSWIndex::search` (`distance_to_score` = Cosine/L2/IP aligned with `compute_similarity`)
   - Tests: craft connectivity (flat would pick isolated closer node; HNSW edge-walk excludes it); FLAT exact; empty HNSW
 
-- [x] **`[P3]`** **Batch FX — HNSW AOF graph**
+- [x] **`[P3]`** **Batch FX — HNSW AOF graph** (`ebd88e9`)
   - AOF rewrite: `FT.CREATE` → keys → `FT._LOADGRAPH index field <blob>` → aliases
   - `HnswGraphSnapshot::encode`/`decode`/`write_to`/`read_from` (shared body with RDB v6)
   - AOF apply `FT._LOADGRAPH` → `apply_hnsw_graphs`; old AOF without it rebuilds via re-`add`
