@@ -3,7 +3,7 @@
 ## Currently working on..
 
 - [x] Support for Redis Pub-Sub
-- **Committed through FW + FX** (ANN query path on HNSW; AOF `FT._LOADGRAPH` durable graph). See root `TODO.md` → *Next work queue (post-FW + post-FX)*.
+- **Committed through FW–GB** (ANN HNSW, AOF graph, Redis DUMP/RESTORE, search eviction, Entry TTL retirement, repl publish barrier). Recommended letter queue empty. See root `TODO.md` → *Next work queue (post-FW–GB)*. Operator: review + push/PR remaining.
 
 ## Persistence / search letter batches (recent)
 
