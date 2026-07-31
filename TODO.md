@@ -894,7 +894,7 @@ Also tracked in `docs/roadmap.md`.
   - Tests: unit stamp/expire/clear; reuse-then-bump sole campaign; re-campaign after stuck other vote; lib sentinel **19/19**
   - Residual: optional parallel INFO enrich / live PING; hello SUBSCRIBE; other Later items unchanged
 
-- [x] **`[P3]`** **Batch FU — Expire dual-write cleanup** (`PENDING_COMMIT`)
+- [x] **`[P3]`** **Batch FU — Expire dual-write cleanup** (`06ff29f`)
   - `KeySlot.expires_at` is the **only** key-level TTL SoT for strings in `key_values`
   - `mutate_string` passes slot expire in and takes intended new slot expire out; clears `Entry.expires_at` on write-back
   - `KeySlot::expires()` is slot-only; residual Entry expire healed on first mutate / `KeySlot::string`
