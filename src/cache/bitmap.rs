@@ -7,7 +7,7 @@ use bytes::Bytes;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use super::storage::KeyType;
+use super::storage::{slot_ttl_live, KeyType};
 use super::Cache;
 
 /// Max bit offset Redis allows (512MB string).
@@ -91,14 +91,14 @@ impl Cache {
             TooLarge,
         }
 
-        let outcome = match self.mutate_string(key, |current, next_cas| {
-            let (mut bytes, expires_at, flags, old_size) = match current {
-                Some(entry) if !entry.is_expired() => {
+        let outcome = match self.mutate_string(key, |current, slot_exp, next_cas| {
+            let (mut bytes, keep_exp, flags, old_size) = match current {
+                Some(entry) if slot_ttl_live(slot_exp) => {
                     let mut v = entry.value.to_vec();
                     if v.len() < needed_len {
                         v.resize(needed_len, 0);
                     }
-                    (v, entry.expires_at, entry.flags, entry.size())
+                    (v, slot_exp, entry.flags, entry.size())
                 }
                 Some(entry) => {
                     let v = vec![0u8; needed_len];
@@ -117,15 +117,16 @@ impl Cache {
 
             let entry_size = key.len() + bytes.len() + std::mem::size_of::<Entry>();
             if entry_size > max_entry_size {
-                return (EntryAction::Keep, Out::TooLarge);
+                return (EntryAction::Keep, None, Out::TooLarge);
             }
 
-            let mut entry = Entry::new(key.clone(), Bytes::from(bytes));
-            entry.expires_at = expires_at;
-            entry = entry.with_flags(flags).with_cas(next_cas);
+            let entry = Entry::new(key.clone(), Bytes::from(bytes))
+                .with_flags(flags)
+                .with_cas(next_cas);
             let new_size = entry.size();
             (
                 EntryAction::Set(Arc::new(entry)),
+                keep_exp,
                 Out::Ok {
                     prev,
                     old_size,
@@ -454,7 +455,7 @@ impl Cache {
         // If empty result, delete dest (Redis BITOP empty → delete)
         if result.is_empty() {
             if old_size > 0 {
-                let _ = self.mutate_string(dest, |_c, _cas| (EntryAction::Remove, ()))?;
+                let _ = self.mutate_string(dest, |_c, _exp, _cas| (EntryAction::Remove, None, ()))?;
                 self.account_replace(old_size, 0);
             }
             return Ok(0);
@@ -463,21 +464,17 @@ impl Cache {
         let net = projected.saturating_sub(old_size);
         self.ensure_capacity(net)?;
 
-        let outcome = self.mutate_string(dest, |current, next_cas| {
+        // BITOP does not preserve TTL in Redis — new slot expire is None.
+        let outcome = self.mutate_string(dest, |current, _slot_exp, next_cas| {
             let old_size = match current {
-                Some(e) if !e.is_expired() => e.size(),
                 Some(e) => e.size(),
                 None => 0,
             };
-            let expires_at = current
-                .filter(|e| !e.is_expired())
-                .and_then(|e| e.expires_at);
-            // BITOP does not preserve TTL in Redis — clears expire
-            let _ = expires_at;
             let entry = Entry::new(dest.clone(), Bytes::from(result.clone())).with_cas(next_cas);
             let new_size = entry.size();
             (
                 EntryAction::Set(Arc::new(entry)),
+                None,
                 (old_size, new_size),
             )
         })?;
@@ -585,14 +582,14 @@ impl Cache {
         let ops = ops.to_vec();
         let overflow_mode = overflow;
 
-        let outcome = match self.mutate_string(key, |current, next_cas| {
-            let (mut bytes, expires_at, flags, old_size) = match current {
-                Some(entry) if !entry.is_expired() => {
+        let outcome = match self.mutate_string(key, |current, slot_exp, next_cas| {
+            let (mut bytes, keep_exp, flags, old_size) = match current {
+                Some(entry) if slot_ttl_live(slot_exp) => {
                     let mut v = entry.value.to_vec();
                     if any_write && v.len() < needed_len {
                         v.resize(needed_len, 0);
                     }
-                    (v, entry.expires_at, entry.flags, entry.size())
+                    (v, slot_exp, entry.flags, entry.size())
                 }
                 Some(entry) => {
                     let v = if any_write {
@@ -669,6 +666,7 @@ impl Cache {
             if !wrote {
                 return (
                     EntryAction::Keep,
+                    None,
                     Out::Ok {
                         replies,
                         old_size: 0,
@@ -680,15 +678,16 @@ impl Cache {
 
             let entry_size = key.len() + bytes.len() + std::mem::size_of::<Entry>();
             if entry_size > max_entry_size {
-                return (EntryAction::Keep, Out::TooLarge);
+                return (EntryAction::Keep, None, Out::TooLarge);
             }
 
-            let mut entry = Entry::new(key.clone(), Bytes::from(bytes));
-            entry.expires_at = expires_at;
-            entry = entry.with_flags(flags).with_cas(next_cas);
+            let entry = Entry::new(key.clone(), Bytes::from(bytes))
+                .with_flags(flags)
+                .with_cas(next_cas);
             let new_size = entry.size();
             (
                 EntryAction::Set(Arc::new(entry)),
+                keep_exp,
                 Out::Ok {
                     replies,
                     old_size,

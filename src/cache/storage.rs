@@ -13,6 +13,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use super::keyspace::{KeySlot, KeyValue};
 use super::Cache;
 
+/// Whether a key with the given slot expire is still live (no expire → live).
+///
+/// Batch FU: string RMW call sites use this with the `slot_expires` argument
+/// from [`Cache::mutate_string`] instead of [`crate::entry::Entry::is_expired`].
+#[inline]
+pub(super) fn slot_ttl_live(slot_expires: Option<Instant>) -> bool {
+    match slot_expires {
+        Some(exp) => Instant::now() < exp,
+        None => true,
+    }
+}
+
 /// Drained keyspace held between multi-DB stage and install.
 ///
 /// Built by [`Cache::take_keyspace_payload`]; consumed by
@@ -118,13 +130,27 @@ impl Cache {
     /// If a non-string typed value occupies `key`, returns `Err(WrongType)`
     /// without calling `f` (no dual-residence / silent overwrite).
     ///
-    /// Batch FQ: slot expire is the key-level SoT. When presenting the current
-    /// entry to `f`, injects [`KeySlot::expires`] onto `Entry.expires_at` so
-    /// KEEPTTL / INCR / APPEND preserve TTL via the existing entry field.
-    /// [`Self::string_map_action`] lifts `Entry.expires_at` back onto the slot.
+    /// # Batch FU — slot-only TTL
+    ///
+    /// Callback signature:
+    /// ```ignore
+    /// FnOnce(
+    ///     current: Option<&SharedEntry>,   // present string (even if expired)
+    ///     slot_expires: Option<Instant>,   // key-level SoT (healed residual)
+    ///     next_cas: u64,
+    /// ) -> (EntryAction, Option<Instant>, R)
+    /// ```
+    /// For [`EntryAction::Set`], the second tuple element is the **new** slot
+    /// expire (`KEEPTTL` = previous live `slot_expires`). `Entry.expires_at` is
+    /// cleared on write-back; call sites must not use it as SoT. Use
+    /// [`slot_ttl_live`] on `slot_expires` for live-vs-expired checks.
     pub(super) fn mutate_string<F, R>(&self, key: &Bytes, f: F) -> Result<R>
     where
-        F: FnOnce(Option<&SharedEntry>, u64) -> (EntryAction, R),
+        F: FnOnce(
+            Option<&SharedEntry>,
+            Option<Instant>,
+            u64,
+        ) -> (EntryAction, Option<Instant>, R),
     {
         self.key_values.mutate(key, |current, next_cas| {
             match current {
@@ -132,34 +158,42 @@ impl Cache {
                     value: KeyValue::String(entry),
                     expires_at,
                 }) => {
-                    // Present entry with slot expire as SoT (FQ inject).
+                    // One-time heal: residual pre-FU expire only on Entry.
+                    let needs_heal = expires_at.is_none() && entry.expires_at.is_some();
                     let slot_exp = expires_at.or(entry.expires_at);
-                    let (action, r) = if entry.expires_at != slot_exp {
-                        let mut e = (**entry).clone();
-                        e.expires_at = slot_exp;
-                        let arc = Arc::new(e);
-                        f(Some(&arc), next_cas)
-                    } else {
-                        f(Some(entry), next_cas)
+                    let (action, new_exp, r) = f(Some(entry), slot_exp, next_cas);
+                    let map_action = match action {
+                        EntryAction::Keep if needs_heal => {
+                            // Persist healed slot without changing value.
+                            MapAction::Set(KeySlot::string(entry.clone()))
+                        }
+                        other => Self::string_map_action(other, new_exp),
                     };
-                    (Self::string_map_action(action), Ok(r))
+                    (map_action, Ok(r))
                 }
                 Some(_) => (MapAction::Keep, Err(Error::WrongType)),
                 None => {
-                    let (action, r) = f(None, next_cas);
-                    (Self::string_map_action(action), Ok(r))
+                    let (action, new_exp, r) = f(None, None, next_cas);
+                    (Self::string_map_action(action, new_exp), Ok(r))
                 }
             }
         })
     }
 
-    /// Lift string `EntryAction` onto a [`KeySlot`], copying expire onto the
-    /// slot header (Batch FQ).
+    /// Lift string `EntryAction` onto a [`KeySlot`] with explicit slot expire.
+    ///
+    /// Batch FU: `new_expires` is the sole SoT; any `Entry.expires_at` is
+    /// cleared inside [`KeySlot::with_expire`].
     #[inline]
-    fn string_map_action(action: EntryAction) -> MapAction<KeySlot> {
+    fn string_map_action(
+        action: EntryAction,
+        new_expires: Option<Instant>,
+    ) -> MapAction<KeySlot> {
         match action {
             EntryAction::Keep => MapAction::Keep,
-            EntryAction::Set(e) => MapAction::Set(KeySlot::string(e)),
+            EntryAction::Set(e) => {
+                MapAction::Set(KeySlot::with_expire(KeyValue::String(e), new_expires))
+            }
             EntryAction::Remove => MapAction::Remove,
         }
     }
@@ -291,13 +325,17 @@ impl Cache {
         // Build entry shell outside the shard lock when we do not need keepttl
         // (expires resolved above). CAS/NX/XX still decide under the lock.
         // Moving `value` in avoids a second clone under the write lock (Batch FI).
-        let outcome = match self.mutate_string(&key, |current, next_cas| {
+        // Batch FU: expire intent is returned separately; Entry.expires_at stays None.
+        let outcome = match self.mutate_string(&key, |current, slot_exp, next_cas| {
+            let live = slot_ttl_live(slot_exp);
+
             // NX: only set if not exists (treat expired as absent)
             if nx {
                 if let Some(existing) = current {
-                    if !existing.is_expired() {
+                    if live {
                         return (
                             EntryAction::Keep,
+                            None,
                             StoreOutcome::Exists(existing.clone()),
                         );
                     }
@@ -307,25 +345,25 @@ impl Cache {
             // XX: only set if exists and not expired
             if xx {
                 match current {
-                    Some(existing) if !existing.is_expired() => {}
-                    _ => return (EntryAction::Keep, StoreOutcome::NotExists),
+                    Some(_) if live => {}
+                    _ => return (EntryAction::Keep, None, StoreOutcome::NotExists),
                 }
             }
 
             // CAS compare-and-swap
             if let Some(expected_cas) = cas_expected {
                 match current {
-                    Some(existing) if !existing.is_expired() => {
+                    Some(existing) if live => {
                         if existing.cas != expected_cas {
-                            return (EntryAction::Keep, StoreOutcome::CasMismatch);
+                            return (EntryAction::Keep, None, StoreOutcome::CasMismatch);
                         }
                     }
-                    _ => return (EntryAction::Keep, StoreOutcome::CasMiss),
+                    _ => return (EntryAction::Keep, None, StoreOutcome::CasMiss),
                 }
             }
 
             let old_for_get = if get {
-                current.filter(|e| !e.is_expired()).cloned()
+                current.filter(|_| live).cloned()
             } else {
                 None
             };
@@ -333,22 +371,25 @@ impl Cache {
             let old_size = current.map(|e| e.size()).unwrap_or(0);
 
             // key still cloned for Entry + map slot; value is moved (single owner).
-            let mut entry = Entry::new(key.clone(), value);
-
-            if let Some(exp) = expires_at {
-                entry.expires_at = Some(exp);
-            } else if keepttl {
-                if let Some(existing) = current {
-                    entry.expires_at = existing.expires_at;
-                }
-            }
-
-            entry = entry.with_flags(flags).with_cas(next_cas);
+            // Batch FU: do not pack expire onto Entry — slot owns TTL.
+            let entry = Entry::new(key.clone(), value)
+                .with_flags(flags)
+                .with_cas(next_cas);
             let entry = Arc::new(entry);
             let new_size = entry.size();
 
+            // New slot expire: explicit EX/PX/…, else KEEPTTL from previous slot, else clear.
+            let new_slot_exp = if let Some(exp) = expires_at {
+                Some(exp)
+            } else if keepttl && live {
+                slot_exp
+            } else {
+                None
+            };
+
             (
                 EntryAction::Set(entry),
+                new_slot_exp,
                 StoreOutcome::Stored {
                     old_for_get,
                     old_size,
@@ -422,8 +463,10 @@ impl Cache {
                                 );
                             }
                             self.stats.incr(&self.stats.hits);
-                            // Ensure returned entry mirrors slot expire (API / tests).
-                            if entry.expires_at != exp {
+                            // Read projection: inject slot expire onto a returned
+                            // clone so `Entry::ttl_millis` / callers see TTL.
+                            // Stored Entry.expires_at remains cleared (Batch FU).
+                            if exp.is_some() {
                                 let mut e = (*entry).clone();
                                 e.expires_at = exp;
                                 Ok(Some(Arc::new(e)))

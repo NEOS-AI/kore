@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use super::keyspace::{KeySlot, KeyValue};
+use super::storage::slot_ttl_live;
 use super::Cache;
 
 impl Cache {
@@ -36,15 +37,15 @@ impl Cache {
             Nan,
         }
 
-        let outcome = match self.mutate_string(key, |current, next_cas| {
-            let (current_val, expires_at, flags) = match current {
-                Some(entry) if !entry.is_expired() => {
+        let outcome = match self.mutate_string(key, |current, slot_exp, next_cas| {
+            let (current_val, keep_exp, flags) = match current {
+                Some(entry) if slot_ttl_live(slot_exp) => {
                     let parsed = std::str::from_utf8(&entry.value)
                         .ok()
                         .and_then(|s| s.trim().parse::<f64>().ok());
                     match parsed {
-                        Some(v) if !v.is_nan() => (v, entry.expires_at, entry.flags),
-                        _ => return (EntryAction::Keep, Outcome::NotFloat),
+                        Some(v) if !v.is_nan() => (v, slot_exp, entry.flags),
+                        _ => return (EntryAction::Keep, None, Outcome::NotFloat),
                     }
                 }
                 _ => (0.0f64, None, 0u32),
@@ -52,7 +53,7 @@ impl Cache {
 
             let new_value = current_val + delta;
             if new_value.is_nan() {
-                return (EntryAction::Keep, Outcome::Nan);
+                return (EntryAction::Keep, None, Outcome::Nan);
             }
 
             // Redis-ish rendering: drop trailing .0 for exact integers.
@@ -66,9 +67,10 @@ impl Cache {
             };
             let value_bytes = Bytes::from(rendered);
 
-            let mut entry = Entry::new(key.clone(), value_bytes);
-            entry.expires_at = expires_at;
-            entry = entry.with_flags(flags).with_cas(next_cas);
+            // Batch FU: KEEPTTL via slot expire return; Entry.expires_at stays None.
+            let entry = Entry::new(key.clone(), value_bytes)
+                .with_flags(flags)
+                .with_cas(next_cas);
             let entry = Arc::new(entry);
 
             let new_size = entry.size();
@@ -76,6 +78,7 @@ impl Cache {
 
             (
                 EntryAction::Set(entry),
+                keep_exp,
                 Outcome::Ok {
                     value: new_value,
                     old_size,
@@ -127,15 +130,16 @@ impl Cache {
             NotInteger,
         }
 
-        let outcome = match self.mutate_string(key, |current, next_cas| {
-            let (current_val, expires_at, flags) = match current {
-                Some(entry) if !entry.is_expired() => {
+        let outcome = match self.mutate_string(key, |current, slot_exp, next_cas| {
+            let (current_val, keep_exp, flags) = match current {
+                Some(entry) if slot_ttl_live(slot_exp) => {
                     let parsed = std::str::from_utf8(&entry.value)
                         .ok()
                         .and_then(|s| s.parse::<i64>().ok());
                     match parsed {
-                        Some(v) => (v, entry.expires_at, entry.flags),
-                        None => return (EntryAction::Keep, IncrOutcome::NotInteger),
+                        // KEEPTTL: previous slot expire (Batch FU)
+                        Some(v) => (v, slot_exp, entry.flags),
+                        None => return (EntryAction::Keep, None, IncrOutcome::NotInteger),
                     }
                 }
                 // Missing or expired: start from 0 (Redis semantics)
@@ -145,10 +149,9 @@ impl Cache {
             let new_value = current_val + delta;
             let value_bytes = Bytes::from(new_value.to_string());
 
-            let mut entry = Entry::new(key.clone(), value_bytes);
-            // Preserve TTL and flags from the existing entry (Redis keeps TTL on INCR)
-            entry.expires_at = expires_at;
-            entry = entry.with_flags(flags).with_cas(next_cas);
+            let entry = Entry::new(key.clone(), value_bytes)
+                .with_flags(flags)
+                .with_cas(next_cas);
             let entry = Arc::new(entry);
 
             let new_size = entry.size();
@@ -157,6 +160,7 @@ impl Cache {
 
             (
                 EntryAction::Set(entry),
+                keep_exp,
                 IncrOutcome::Ok {
                     value: new_value,
                     old_size,
@@ -231,11 +235,11 @@ impl Cache {
         let net = projected.saturating_sub(existing_size);
         self.ensure_capacity(net)?;
 
-        let outcome = match self.mutate_string(key, |current, next_cas| {
-            let (old_val, expires_at, flags, old_size) = match current {
-                Some(entry) if !entry.is_expired() => (
+        let outcome = match self.mutate_string(key, |current, slot_exp, next_cas| {
+            let (old_val, keep_exp, flags, old_size) = match current {
+                Some(entry) if slot_ttl_live(slot_exp) => (
                     entry.value.clone(),
-                    entry.expires_at,
+                    slot_exp,
                     entry.flags,
                     entry.size(),
                 ),
@@ -255,16 +259,17 @@ impl Cache {
             let logical_sz =
                 crate::memory::logical_string_entry(key.len(), len, entry_sz);
             if logical_sz > max_entry_size {
-                return (EntryAction::Keep, AppendOutcome::TooLarge);
+                return (EntryAction::Keep, None, AppendOutcome::TooLarge);
             }
 
-            let mut entry = Entry::new(key.clone(), new_val);
-            entry.expires_at = expires_at;
-            entry = entry.with_flags(flags).with_cas(next_cas);
+            let entry = Entry::new(key.clone(), new_val)
+                .with_flags(flags)
+                .with_cas(next_cas);
             let new_size = entry.size();
 
             (
                 EntryAction::Set(Arc::new(entry)),
+                keep_exp,
                 AppendOutcome::Ok {
                     len,
                     old_size,
@@ -329,11 +334,11 @@ impl Cache {
         let net = projected.saturating_sub(existing_size);
         self.ensure_capacity(net)?;
 
-        let outcome = match self.mutate_string(key, |current, next_cas| {
-            let (old_val, expires_at, flags, old_size) = match current {
-                Some(entry) if !entry.is_expired() => (
+        let outcome = match self.mutate_string(key, |current, slot_exp, next_cas| {
+            let (old_val, keep_exp, flags, old_size) = match current {
+                Some(entry) if slot_ttl_live(slot_exp) => (
                     entry.value.clone(),
-                    entry.expires_at,
+                    slot_exp,
                     entry.flags,
                     entry.size(),
                 ),
@@ -353,16 +358,17 @@ impl Cache {
             let logical_sz =
                 crate::memory::logical_string_entry(key.len(), len, entry_sz);
             if logical_sz > max_entry_size {
-                return (EntryAction::Keep, SetRangeOutcome::TooLarge);
+                return (EntryAction::Keep, None, SetRangeOutcome::TooLarge);
             }
 
-            let mut entry = Entry::new(key.clone(), new_val);
-            entry.expires_at = expires_at;
-            entry = entry.with_flags(flags).with_cas(next_cas);
+            let entry = Entry::new(key.clone(), new_val)
+                .with_flags(flags)
+                .with_cas(next_cas);
             let new_size = entry.size();
 
             (
                 EntryAction::Set(Arc::new(entry)),
+                keep_exp,
                 SetRangeOutcome::Ok {
                     len,
                     old_size,
@@ -429,7 +435,8 @@ impl Cache {
                 return Err(Error::InvalidArgument("no such key".into()));
             }
             super::KeyType::String => {
-                // Batch FQ: move whole KeySlot (value + expire); rewrite Entry key.
+                // Batch FQ/FU: move whole KeySlot (value + expire); rewrite Entry key.
+                // Slot expire is SoT; clear residual Entry.expires_at.
                 let slot = self
                     .key_values
                     .remove(src)
@@ -441,13 +448,13 @@ impl Cache {
                 let old_size = entry.size();
                 let mut new_entry = (*entry).clone();
                 new_entry.key = dst.clone();
-                // Keep Entry expire mirror in sync with slot.
-                new_entry.expires_at = slot.expires_at.or(new_entry.expires_at);
+                new_entry.expires_at = None;
+                let slot_exp = slot.expires_at;
                 let new_size = new_entry.size();
                 self.key_values.insert(
                     dst.clone(),
                     KeySlot {
-                        expires_at: slot.expires_at.or(new_entry.expires_at),
+                        expires_at: slot_exp,
                         value: KeyValue::String(Arc::new(new_entry)),
                     },
                 );

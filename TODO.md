@@ -761,7 +761,8 @@ Also tracked in `docs/roadmap.md`.
 | Cluster | remote dest CHECKPREPARE→COMMITPREPARE two-RPC window | P3 accepted lite | — |
 | Keyspace | expire slot header (`typed_expires` fold) | **done** | **FP** |
 | Keyspace | string TTL on `KeySlot` (unified EXPIRE/TTL path) | **done** | **FQ** |
-| Keyspace | `Entry.expires_at` RMW mirror + search-doc eviction special | P3 residual | later |
+| Keyspace | `Entry.expires_at` RMW mirror (slot-only SoT) | **done** | **FU** |
+| Keyspace | search-doc eviction special | P3 residual | later |
 | Sentinel | Kore **higher** priority wins vs Redis Sentinel **lower** (documented honesty) | P3 accepted | — |
 | Ops | Global **repl backlog** still serializes writers | P3 | later (hard) |
 | Ops | Dual SELECT trackers; `propagate_raw` skips stream-DB | P3 accepted | — |
@@ -769,9 +770,9 @@ Also tracked in `docs/roadmap.md`.
 | Search | HNSW edges/levels not AOF/RDB durable; `max_m=1` spanning | P3 accepted / later | — |
 | MIGRATE / UI / load | DUMP wire; reshard weight UI; Arc-swap mid-fill | P3 accepted | — |
 
-### Next work queue (post-FT)
+### Next work queue (post-FU)
 
-**Committed letter queue through FS was empty; Batch FT took election-timeout SM from Later/backlog.** Standing rule: land tests with each change. Resume from **Later / backlog** only.
+**Committed letter queue through FT was empty; Batch FU took `Entry.expires_at` RMW dual-write cleanup from Later/backlog.** Standing rule: land tests with each change. Resume from **Later / backlog** only.
 
 #### Completed (FB–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP)
 
@@ -863,7 +864,7 @@ Also tracked in `docs/roadmap.md`.
   - SET EX/PX/EXAT/PXAT/KEEPTTL + INCR/APPEND/… lift `Entry.expires_at` onto the slot (`KeySlot::string` / `mutate_string`)
   - Active expire (string sample + typed sample) and volatile eviction read slot expire
   - RENAME moves whole string slot (value + expire); take/install preserves string TTL
-  - Residual: `Entry.expires_at` still mirrored for string RMW transport + legacy `ShardedHashMap`; search-doc eviction special
+  - Residual closed by **FU**: drop string RMW dual-write of `Entry.expires_at`; search-doc eviction special remains
 
 - [x] **`[P3]`** **Batch FR — Compiler nits + Sentinel ephemeral ports** (`f574294`)
   - Deleted unused `config_kv_reply` (CONFIG GET uses `config_kvs_reply`); removed dead private SkipList/`SkipNode` APIs (`len` / `is_empty` / `level`)
@@ -880,7 +881,7 @@ Also tracked in `docs/roadmap.md`.
   - Renamed inverted-index `weight` → `_weight` (API kept; TF-IDF scoring still future)
   - Bonus: unused `search_index` type imports in `query_engine` tests
   - Verify: `cargo build --lib` **0 warnings**; lib **360/360** (+1 ignored); `bitmap_hll` / `search` / `replication` integration green
-  - Residual closed by **FT**: election-timeout SM; remaining: `Entry.expires_at` RMW mirror; other Later items
+  - Residual closed by **FT**: election-timeout SM; remaining closed by **FU**: `Entry.expires_at` RMW mirror
 
 - [x] **`[P3]`** **Batch FT — Sentinel election-timeout SM** (`4f114d9`)
   - Per-master `election_started_at` + `ELECTION_TIMEOUT` (5s; test override `test_set_election_timeout_ms`)
@@ -893,6 +894,14 @@ Also tracked in `docs/roadmap.md`.
   - Tests: unit stamp/expire/clear; reuse-then-bump sole campaign; re-campaign after stuck other vote; lib sentinel **19/19**
   - Residual: optional parallel INFO enrich / live PING; hello SUBSCRIBE; other Later items unchanged
 
+- [x] **`[P3]`** **Batch FU — Expire dual-write cleanup** (`PENDING_COMMIT`)
+  - `KeySlot.expires_at` is the **only** key-level TTL SoT for strings in `key_values`
+  - `mutate_string` passes slot expire in and takes intended new slot expire out; clears `Entry.expires_at` on write-back
+  - `KeySlot::expires()` is slot-only; residual Entry expire healed on first mutate / `KeySlot::string`
+  - RMW call sites (SET/INCR/APPEND/SETRANGE/SETBIT/BITFIELD/PFADD/…) use slot KEEPTTL path
+  - EXPIRE/PERSIST/RENAME no longer dual-write Entry; load injects expire only on returned clones (read projection)
+  - Tests: `string_rmw_clears_entry_expire_keeps_slot`; typed_ttl / string_ops / keyspace / phase_a / active_expire / bitmap_hll green
+  - Residual: `Entry.expires_at` field retained for legacy `ShardedHashMap` + load projection; search-doc eviction special
 
 #### Later / backlog (no letter batch)
 
@@ -902,11 +911,11 @@ Also tracked in `docs/roadmap.md`.
   - Global repl backlog write serialization (FI residual; no Valkey parity claim)
   - Optional parallelize `enrich_replica_priorities` / `count_reachable_sentinels` (serial probes today)
   - Cluster binary bus 2PC; dest prepare breadth; remote CHECK→COMMITPREPARE two-RPC window
-  - `Entry.expires_at` RMW mirror (optional full drop once ShardedHashMap retired); search-doc eviction special
+  - search-doc eviction special; optional full drop of `Entry.expires_at` field once `ShardedHashMap` retired
 
 ### Code review backlog
 
-**Batches CZ–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP + FQ + FR + FS + FT shipped.** Letter queue empty; Later/backlog only. Standing tests-for-phase P0.
+**Batches CZ–FG-4 + FH + FI + FI-2 + FK + FL + FM + FN + FO + FP + FQ + FR + FS + FT + FU shipped.** Letter queue empty; Later/backlog only. Standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|

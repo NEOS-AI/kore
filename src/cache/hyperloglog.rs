@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use ahash::AHasher;
 
-use super::storage::KeyType;
+use super::storage::{slot_ttl_live, KeyType};
 use super::Cache;
 
 const HLL_P: u32 = 14;
@@ -176,11 +176,11 @@ impl Cache {
             TooLarge,
         }
 
-        let outcome = match self.mutate_string(key, |current, next_cas| {
-            let (mut bytes, expires_at, flags, old_size) = match current {
-                Some(entry) if !entry.is_expired() => {
+        let outcome = match self.mutate_string(key, |current, slot_exp, next_cas| {
+            let (mut bytes, keep_exp, flags, old_size) = match current {
+                Some(entry) if slot_ttl_live(slot_exp) => {
                     if !entry.value.is_empty() && !is_hll(&entry.value) {
-                        return (EntryAction::Keep, Out::BadType);
+                        return (EntryAction::Keep, None, Out::BadType);
                     }
                     let v = if is_hll(&entry.value) {
                         let mut v = entry.value.to_vec();
@@ -191,7 +191,7 @@ impl Cache {
                     } else {
                         empty_hll()
                     };
-                    (v, entry.expires_at, entry.flags, entry.size())
+                    (v, slot_exp, entry.flags, entry.size())
                 }
                 Some(entry) => (empty_hll(), None, 0u32, entry.size()),
                 None => (empty_hll(), None, 0u32, 0usize),
@@ -213,6 +213,7 @@ impl Cache {
                 // No structural change — keep
                 return (
                     EntryAction::Keep,
+                    None,
                     Out::Ok {
                         changed: 0,
                         old_size: 0,
@@ -223,15 +224,16 @@ impl Cache {
 
             let entry_size = key.len() + bytes.len() + std::mem::size_of::<Entry>();
             if entry_size > max_entry_size {
-                return (EntryAction::Keep, Out::TooLarge);
+                return (EntryAction::Keep, None, Out::TooLarge);
             }
 
-            let mut entry = Entry::new(key.clone(), Bytes::from(bytes));
-            entry.expires_at = expires_at;
-            entry = entry.with_flags(flags).with_cas(next_cas);
+            let entry = Entry::new(key.clone(), Bytes::from(bytes))
+                .with_flags(flags)
+                .with_cas(next_cas);
             let new_size = entry.size();
             (
                 EntryAction::Set(Arc::new(entry)),
+                keep_exp,
                 Out::Ok {
                     changed,
                     old_size,
@@ -342,14 +344,19 @@ impl Cache {
         let net = projected.saturating_sub(old_size);
         self.ensure_capacity(net)?;
 
-        let outcome = match self.mutate_string(dest, |current, next_cas| {
+        // PFMERGE overwrites dest (like SET) — clear prior expire (Redis-compatible).
+        let outcome = match self.mutate_string(dest, |current, _slot_exp, next_cas| {
             let old_size = match current {
                 Some(e) => e.size(),
                 None => 0,
             };
             let entry = Entry::new(dest.clone(), Bytes::from(merged.clone())).with_cas(next_cas);
             let new_size = entry.size();
-            (EntryAction::Set(Arc::new(entry)), (old_size, new_size))
+            (
+                EntryAction::Set(Arc::new(entry)),
+                None,
+                (old_size, new_size),
+            )
         }) {
             Ok(o) => o,
             Err(e) => return Err(e),

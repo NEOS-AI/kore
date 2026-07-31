@@ -99,7 +99,8 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] **FR** compiler nits + Sentinel suite ephemeral ports (Later/backlog hygiene)
 - [x] **FS** residual lib warnings (unused imports / replica-feed flag / search `_weight`)
 - [x] **FT** Sentinel election-timeout SM (campaign epoch reuse + timed re-campaign)
-- [ ] **Next (see `TODO.md` post-FT):** Later/backlog only (letter queue empty)
+- [x] **FU** expire dual-write cleanup — slot-only string TTL; drop `Entry.expires_at` RMW mirror
+- [ ] **Next (see `TODO.md` post-FU):** Later/backlog only (letter queue empty)
 - [x] 데드락 감지 고급 기능
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원

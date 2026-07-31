@@ -4,7 +4,13 @@ use bytes::Bytes;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::keyspace::KeyValue;
 use super::Cache;
+
+#[inline]
+fn string_entry_has_expire(value: &KeyValue) -> bool {
+    matches!(value, KeyValue::String(e) if e.expires_at.is_some())
+}
 
 impl Cache {
     /// Set expiration on a key (milliseconds from now). Works for all key types.
@@ -12,8 +18,8 @@ impl Cache {
     ///
     /// Redis: `EXPIRE key 0` / zero ms deletes the key immediately.
     ///
-    /// Batch FQ: all types store absolute expire on [`super::KeySlot::expires_at`].
-    /// Strings also mirror onto `Entry.expires_at` so RMW / load APIs stay consistent.
+    /// Batch FQ/FU: all types store absolute expire on [`super::KeySlot::expires_at`]
+    /// only. String `Entry.expires_at` is cleared if residual (not dual-written).
     pub fn expire(&self, key: &Bytes, ttl_ms: u64) -> Result<bool> {
         // Lazy-delete if already past expiry so we don't revive a ghost key.
         let kt = self.key_type(key);
@@ -27,10 +33,11 @@ impl Cache {
         let exp = Instant::now() + Duration::from_millis(ttl_ms);
         let set = self.key_values.mutate(key, |cur, _| match cur {
             Some(slot) => {
+                // Slot-only TTL (FU). Clear residual Entry.expires_at on strings.
                 let value = match &slot.value {
-                    super::KeyValue::String(e) => {
+                    super::KeyValue::String(e) if e.expires_at.is_some() => {
                         let mut ne = (**e).clone();
-                        ne.expires_at = Some(exp);
+                        ne.expires_at = None;
                         super::KeyValue::String(std::sync::Arc::new(ne))
                     }
                     other => other.clone(),
@@ -76,11 +83,11 @@ impl Cache {
 
     /// Remove any expiration from a key. Returns true if a timeout was removed.
     ///
-    /// Batch FQ: clears [`super::KeySlot::expires_at`] for every type; mirrors
-    /// clear onto string `Entry.expires_at`.
+    /// Batch FQ/FU: clears [`super::KeySlot::expires_at`] only. Also clears any
+    /// residual string `Entry.expires_at` so dual-write cannot reappear.
     pub fn persist(&self, key: &Bytes) -> bool {
         self.key_values.mutate(key, |cur, _| match cur {
-            Some(slot) if slot.expires().is_some() => {
+            Some(slot) if slot.expires().is_some() || string_entry_has_expire(&slot.value) => {
                 let value = match &slot.value {
                     super::KeyValue::String(e) if e.expires_at.is_some() => {
                         let mut ne = (**e).clone();

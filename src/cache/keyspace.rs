@@ -1,4 +1,4 @@
-//! Unified keyspace facade + physical `KeySlot` map (Batch FG / FG-2 / FG-3 / FG-4 / FP / FQ).
+//! Unified keyspace facade + physical `KeySlot` map (Batch FG / FG-2 / FG-3 / FG-4 / FP / FQ / FU).
 //!
 //! # Design target
 //!
@@ -7,12 +7,12 @@
 //!
 //! ```text
 //! struct KeySlot {
-//!     expires_at: Option<Instant>,  // key-level TTL for all types (Batch FP/FQ)
+//!     expires_at: Option<Instant>,  // key-level TTL SoT for all types (FP/FQ/FU)
 //!     value: KeyValue,
 //! }
 //!
 //! enum KeyValue {
-//!     String(SharedEntry),   // expire also mirrored on Entry for RMW transport
+//!     String(SharedEntry),   // Entry.expires_at not SoT (cleared on write-back; FU)
 //!     Hash(SharedHash),
 //!     List(SharedList),
 //!     Set(SharedSet),
@@ -23,11 +23,12 @@
 //! ```
 //!
 //! Batch **FP** folded the former side `typed_expires` map into
-//! [`KeySlot::expires_at`]. Batch **FQ** extends the same slot header to
-//! **strings** so EXPIRE/TTL/PERSIST/active expire/volatile sample share one
-//! path for every type. `Entry.expires_at` remains a write-side mirror used by
-//! string RMW (SET/INCR/…) and legacy [`crate::hashmap::ShardedHashMap`];
-//! key-level commands and lazy/active expire read the slot.
+//! [`KeySlot::expires_at`]. Batch **FQ** extended the same slot header to
+//! **strings**. Batch **FU** drops the string RMW dual-write of
+//! `Entry.expires_at`: the slot is the only key-level SoT for keys in
+//! `key_values`. `Entry.expires_at` remains on the struct for legacy
+//! [`crate::hashmap::ShardedHashMap`] and may appear on **returned** load
+//! clones (read projection), but is cleared on every string write-back.
 //!
 //! # How cross-type ops work on the unified map
 //!
@@ -39,7 +40,7 @@
 //! | **EXISTS** | `get_key_value(k).is_some()` after lazy expire |
 //! | **SCAN / KEYS / DBSIZE / RANDOMKEY** | Iterate `key_values` (single map) |
 //! | **RENAME** | Atomic take of `KeySlot` (value + expire), insert under new name |
-//! | **TTL / EXPIRE** | All types: [`KeySlot::expires_at`] (FQ) |
+//! | **TTL / EXPIRE** | All types: [`KeySlot::expires_at`] only (FQ/FU) |
 //! | **Memory / eviction** | Per-variant size estimate; eviction samples all keys from `key_values` |
 //!
 //! # Migration plan
@@ -52,8 +53,10 @@
 //!    [`KeyValue::String`]; collapse [`KeyspacePayload`] to one stream.
 //! 5. **FP (done):** Fold typed TTL into [`KeySlot::expires_at`]; remove
 //!    side `typed_expires` map.
-//! 6. **FQ (this batch):** String key-level expire on the same slot header;
+//! 6. **FQ (done):** String key-level expire on the same slot header;
 //!    unified EXPIRE/TTL/active expire/volatile sample.
+//! 7. **FU (this batch):** Slot-only string TTL; stop dual-writing
+//!    `Entry.expires_at` on RMW write-back.
 //!
 //! # Invariants preserved
 //!
@@ -78,14 +81,15 @@ use super::geo_sets::SharedGeoSet;
 use super::storage::KeyType;
 use super::Cache;
 
-/// Per-key slot in the unified keyspace map (Batch FP / FQ).
+/// Per-key slot in the unified keyspace map (Batch FP / FQ / FU).
 ///
 /// Holds the Redis-typed value plus optional absolute Instant expiry for
-/// **all** key types (strings included as of Batch FQ).
+/// **all** key types. [`Self::expires_at`] is the only key-level TTL SoT
+/// (Batch FU cleared the string `Entry.expires_at` RMW mirror).
 #[derive(Clone)]
 pub struct KeySlot {
-    /// Absolute Instant expiry (key-level TTL). Source of truth for EXPIRE/TTL
-    /// / active expire / volatile sample (Batch FP typed; Batch FQ strings).
+    /// Absolute Instant expiry (key-level TTL). Sole source of truth for
+    /// EXPIRE/TTL / active expire / volatile sample / string RMW KEEPTTL.
     pub expires_at: Option<Instant>,
     /// The Redis-typed value at this name.
     pub value: KeyValue,
@@ -101,36 +105,49 @@ impl KeySlot {
         }
     }
 
-    /// Slot for a string entry. Lifts [`crate::entry::Entry::expires_at`] onto
-    /// the slot header (Batch FQ) so key-level expire is on the slot.
+    /// Slot for a string entry.
+    ///
+    /// Batch FU: lifts any residual [`crate::entry::Entry::expires_at`] onto
+    /// the slot header (one-time heal for pre-FU / legacy writers), then
+    /// **clears** `Entry.expires_at` so the slot is the only stored SoT.
     #[inline]
     pub fn string(entry: SharedEntry) -> Self {
         let expires_at = entry.expires_at;
-        Self {
-            expires_at,
-            value: KeyValue::String(entry),
-        }
+        let value = if expires_at.is_some() {
+            let mut e = (*entry).clone();
+            e.expires_at = None;
+            KeyValue::String(std::sync::Arc::new(e))
+        } else {
+            KeyValue::String(entry)
+        };
+        Self { expires_at, value }
     }
 
     /// Slot with an explicit absolute expire (all types, including strings).
+    ///
+    /// When `value` is a string with residual `Entry.expires_at`, that field
+    /// is cleared (slot `expires_at` is authoritative).
     #[inline]
     pub fn with_expire(value: KeyValue, expires_at: Option<Instant>) -> Self {
+        let value = match value {
+            KeyValue::String(entry) if entry.expires_at.is_some() => {
+                let mut e = (*entry).clone();
+                e.expires_at = None;
+                KeyValue::String(std::sync::Arc::new(e))
+            }
+            other => other,
+        };
         Self { expires_at, value }
     }
 
     /// Effective absolute expire for this key.
     ///
-    /// Slot is the source of truth. For residual string slots written before
-    /// FQ (expire only on `Entry`), falls back to `Entry.expires_at`.
+    /// Batch FU: **slot only** (`self.expires_at`). Residual pre-FU
+    /// `Entry.expires_at` is healed on first string mutate / `KeySlot::string`
+    /// write-back, not on every read.
     #[inline]
     pub fn expires(&self) -> Option<Instant> {
-        if self.expires_at.is_some() {
-            return self.expires_at;
-        }
-        match &self.value {
-            KeyValue::String(e) => e.expires_at,
-            _ => None,
-        }
+        self.expires_at
     }
 
     /// Whether this key's TTL has elapsed (no expire → live forever).
@@ -154,10 +171,11 @@ impl KeySlot {
 
 /// Typed value for one key name in the logical Redis keyspace.
 ///
-/// **Storage (FG-4 / FP / FQ):** every type — including strings — is **physically**
-/// stored in [`Cache::key_values`] as [`KeySlot`] `{ expires_at, value: KeyValue }`.
-/// Dropping a cloned Arc does not remove the key; use [`Cache::delete`] /
-/// type-specific `remove_*`.
+/// **Storage (FG-4 / FP / FQ / FU):** every type — including strings — is
+/// **physically** stored in [`Cache::key_values`] as [`KeySlot`]
+/// `{ expires_at, value: KeyValue }`. String `Entry.expires_at` is not the
+/// key-level SoT (cleared on write-back). Dropping a cloned Arc does not remove
+/// the key; use [`Cache::delete`] / type-specific `remove_*`.
 #[derive(Clone)]
 pub enum KeyValue {
     String(SharedEntry),
@@ -787,5 +805,74 @@ mod tests {
         );
         let ttl2 = c.ttl(&b("k"));
         assert!(ttl2 > 20_000 && ttl2 <= 30_000, "ttl after EXPIRE={ttl2}");
+    }
+
+    /// Batch FU: after RMW on a TTL string key, slot has expire and
+    /// stored `Entry.expires_at` is `None` (no dual-write).
+    #[test]
+    fn string_rmw_clears_entry_expire_keeps_slot() {
+        let c = cache();
+        c.store(
+            b("n"),
+            Bytes::from_static(b"10"),
+            StoreOptions {
+                ttl_ms: Some(60_000),
+                ..store_opts()
+            },
+        )
+        .unwrap();
+
+        // After store: slot SoT, Entry.expires_at cleared.
+        match c.key_values.get(&b("n")) {
+            Some(KeySlot {
+                expires_at: Some(_),
+                value: KeyValue::String(e),
+            }) => {
+                assert!(
+                    e.expires_at.is_none(),
+                    "store must not dual-write Entry.expires_at"
+                );
+            }
+            other => panic!("expected string slot with expire, got {:?}", other.map(|s| {
+                (
+                    s.expires_at.is_some(),
+                    matches!(s.value, KeyValue::String(_)),
+                )
+            })),
+        }
+
+        // INCR RMW preserves slot TTL, still clears Entry.expires_at.
+        let v = c.incr(&b("n"), 1).unwrap();
+        assert_eq!(v, 11);
+        let ttl = c.ttl(&b("n"));
+        assert!(ttl > 50_000, "INCR KEEPTTL via slot, ttl={ttl}");
+        match c.key_values.get(&b("n")) {
+            Some(KeySlot {
+                expires_at: Some(_),
+                value: KeyValue::String(e),
+            }) => {
+                assert!(
+                    e.expires_at.is_none(),
+                    "INCR must not dual-write Entry.expires_at"
+                );
+            }
+            other => panic!("expected string slot after INCR, got {:?}", other.map(|s| {
+                s.expires_at.is_some()
+            })),
+        }
+
+        // APPEND similarly.
+        c.append(&b("n"), &Bytes::from_static(b"x")).unwrap();
+        match c.key_values.get(&b("n")) {
+            Some(KeySlot {
+                expires_at: Some(_),
+                value: KeyValue::String(e),
+            }) => {
+                assert!(e.expires_at.is_none());
+            }
+            other => panic!("expected string after APPEND, got {:?}", other.map(|s| s.expires_at)),
+        }
+        let ttl2 = c.ttl(&b("n"));
+        assert!(ttl2 > 50_000, "APPEND KEEPTTL via slot, ttl={ttl2}");
     }
 }

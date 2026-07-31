@@ -38,15 +38,16 @@ pub use eviction::EvictionPolicy;
 
 /// The main cache structure.
 ///
-/// # Keyspace layout (Batch FG / FG-2 / FG-3 / FG-4 / FP / FQ)
+/// # Keyspace layout (Batch FG / FG-2 / FG-3 / FG-4 / FP / FQ / FU)
 ///
 /// Logical Redis keyspace is **one name → one typed value**. Cross-type ops use
 /// the [`KeyValue`] facade ([`Cache::get_key_value`]).
 ///
-/// **Physical storage (FG-4 / FP / FQ):** **all** types — including strings — live in
-/// [`Self::key_values`] as [`KeySlot`] `{ expires_at, value }`. Key-level TTL for
-/// every type is on the slot (Batch FP typed; Batch FQ strings). See `keyspace`
-/// module docs and `docs/module_architectures.md`.
+/// **Physical storage (FG-4 / FP / FQ / FU):** **all** types — including strings —
+/// live in [`Self::key_values`] as [`KeySlot`] `{ expires_at, value }`. Key-level
+/// TTL for every type is **only** on the slot (`Entry.expires_at` cleared on
+/// string write-back; Batch FU). See `keyspace` module docs and
+/// `docs/module_architectures.md`.
 pub struct Cache {
     /// Unified keyspace map: KeySlot (value + optional key-level expire).
     pub(super) key_values: ShardedKeyMap<KeySlot>,

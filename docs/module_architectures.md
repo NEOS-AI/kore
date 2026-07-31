@@ -39,16 +39,16 @@ src/cache/
 Logical invariant: **one name → at most one type** (`ensure_type` / WRONGTYPE).  
 **No dual-residence:** a name lives in exactly one place (`key_values`).  
 **No side expire map:** key-level TTL is `KeySlot.expires_at` for **all** types
-(Batch FP typed; Batch FQ strings).
+(Batch FP typed; Batch FQ strings; Batch FU slot-only SoT).
 
 ```text
 struct KeySlot {
-    expires_at: Option<Instant>,  // all types (FQ)
+    expires_at: Option<Instant>,  // all types SoT (FQ/FU)
     value: KeyValue,
 }
 
 enum KeyValue {
-    String(SharedEntry),  // Entry.expires_at mirrored for RMW transport
+    String(SharedEntry),  // Entry.expires_at cleared on write-back (FU)
     Hash(SharedHash),
     List(SharedList),
     Set(SharedSet),
@@ -60,7 +60,7 @@ enum KeyValue {
 Cache::get_key_value(key) -> Option<KeyValue>   // single map (+ lazy expire)
 Cache::key_type / exists                         // via get_key_value
 Cache::delete / remove_key_value_raw             // unified remove (slot drops expire)
-Cache::mutate_string                             // RMW under shard lock (SET/INCR/…)
+Cache::mutate_string                             // RMW under shard lock; slot expire arg/return
 ```
 
 | Op | On unified map |
@@ -70,7 +70,7 @@ Cache::mutate_string                             // RMW under shard lock (SET/IN
 | **DEL / EXISTS** | remove / `is_some` on one map |
 | **SCAN / KEYS / DBSIZE / RANDOMKEY** | iterate `key_values` only |
 | **RENAME** | take whole `KeySlot` (value + expire), insert under new name |
-| **TTL / EXPIRE** | all types: `KeySlot.expires_at` (FQ) |
+| **TTL / EXPIRE** | all types: `KeySlot.expires_at` only (FQ/FU) |
 | **Memory / eviction** | per-variant size; all victims sampled from `key_values` |
 
 ### Migration plan
@@ -85,9 +85,10 @@ Cache::mutate_string                             // RMW under shard lock (SET/IN
 5. **FP (done):** Fold typed TTL into `KeySlot.expires_at`; remove side
    `typed_expires` map.
 6. **FQ (done):** String key-level expire on the same slot header; EXPIRE/TTL/
-   active expire/volatile sample unified. **Residual:** `Entry.expires_at`
-   still mirrored for string RMW transport + legacy `ShardedHashMap`; search-doc
-   eviction special.
+   active expire/volatile sample unified.
+7. **FU (done):** Slot-only string TTL; stop dual-writing `Entry.expires_at` on
+   RMW write-back. Residual: `Entry.expires_at` field remains for legacy
+   `ShardedHashMap` + load read-projection; search-doc eviction special.
 
 **Load/install (`KeyspacePayload`):** `key_values: Vec<(Bytes, KeySlot)>` +
 WATCH / search / memory counters (key-level expire rides on each slot). Epoch
