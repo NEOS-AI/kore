@@ -4,7 +4,8 @@
 //! via [`crate::admin_http`].
 
 use crate::admin_http::{
-    parse_request_line, read_request_line, write_400, write_404, write_405_get_only, write_response,
+    read_http_request, serve_connection, write_400, write_401, write_404, write_405_get_only,
+    write_response, AdminHttpOptions, AdminStream,
 };
 use crate::cache::Cache;
 use crate::databases::Databases;
@@ -274,18 +275,21 @@ pub fn snapshot_from_stats(stats: &Stats, used_memory: u64, maxmemory: u64) -> M
     }
 }
 
-/// Spawn a minimal HTTP server on `127.0.0.1:port` serving GET /metrics.
+/// Spawn a metrics HTTP(S) server on `options.bind:port` serving GET /metrics.
+///
 /// Serves until `shutdown` is true. Non-GET on `/metrics` → 405; unknown path → 404.
-/// For tests, prefer [`run_metrics_server_on_listener`] with a pre-bound `127.0.0.1:0` listener.
+/// Optional Bearer/Basic auth and TLS via [`AdminHttpOptions`] (Batch GM).
+/// For tests, prefer [`run_metrics_server_on_listener`] with a pre-bound listener.
 pub async fn run_metrics_server(
     port: u16,
     databases: Arc<Databases>,
     persistence: Option<Arc<PersistenceManager>>,
     shutdown: watch::Receiver<bool>,
+    options: AdminHttpOptions,
 ) -> anyhow::Result<()> {
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("{}:{}", options.bind, port);
     let listener = TcpListener::bind(&addr).await?;
-    run_metrics_server_on_listener(listener, databases, persistence, shutdown).await
+    run_metrics_server_on_listener(listener, databases, persistence, shutdown, options).await
 }
 
 /// Same as [`run_metrics_server`] but uses an already-bound listener
@@ -295,9 +299,20 @@ pub async fn run_metrics_server_on_listener(
     databases: Arc<Databases>,
     persistence: Option<Arc<PersistenceManager>>,
     mut shutdown: watch::Receiver<bool>,
+    options: AdminHttpOptions,
 ) -> anyhow::Result<()> {
     let bound = listener.local_addr()?;
-    info!("Prometheus metrics listening on http://{}/metrics", bound);
+    let options = Arc::new(options);
+    info!(
+        "Prometheus metrics listening on {}://{}/metrics{}",
+        options.scheme(),
+        bound,
+        if options.auth_required() {
+            " (auth required)"
+        } else {
+            ""
+        }
+    );
 
     loop {
         tokio::select! {
@@ -309,19 +324,24 @@ pub async fn run_metrics_server_on_listener(
             }
             accept = listener.accept() => {
                 match accept {
-                    Ok((mut stream, _)) => {
+                    Ok((stream, _)) => {
                         let databases = databases.clone();
                         let persistence = persistence.clone();
+                        let options = options.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_metrics_conn(
-                                &mut stream,
-                                &databases,
-                                persistence.as_deref(),
-                            )
-                            .await
-                            {
-                                warn!("metrics connection error: {}", e);
-                            }
+                            serve_connection(stream, options.clone(), move |mut s| async move {
+                                if let Err(e) = handle_metrics_conn(
+                                    &mut s,
+                                    &databases,
+                                    persistence.as_deref(),
+                                    &options,
+                                )
+                                .await
+                                {
+                                    warn!("metrics connection error: {}", e);
+                                }
+                            })
+                            .await;
                         });
                     }
                     Err(e) => {
@@ -335,22 +355,29 @@ pub async fn run_metrics_server_on_listener(
 }
 
 async fn handle_metrics_conn(
-    stream: &mut tokio::net::TcpStream,
+    stream: &mut AdminStream,
     databases: &Databases,
     persistence: Option<&PersistenceManager>,
+    options: &AdminHttpOptions,
 ) -> anyhow::Result<()> {
-    let Some(first_line) = read_request_line(stream).await? else {
+    let Some(req) = read_http_request(stream).await? else {
         return Ok(());
     };
-    let Some(req) = parse_request_line(&first_line) else {
+    if req.line.method.is_empty() || req.line.path.is_empty() {
         write_400(stream).await?;
         let _ = stream.shutdown().await;
         return Ok(());
-    };
+    }
 
-    if req.path == "/metrics" && !req.is_get() {
+    if !options.authorize(&req.headers) {
+        write_401(stream, &options.www_authenticate()).await?;
+        let _ = stream.shutdown().await;
+        return Ok(());
+    }
+
+    if req.line.path == "/metrics" && !req.line.is_get() {
         write_405_get_only(stream).await?;
-    } else if req.is_get() && req.path == "/metrics" {
+    } else if req.line.is_get() && req.line.path == "/metrics" {
         let cache = databases.db0();
         let snap = collect_snapshot(&cache, persistence);
         let body = render_prometheus(&snap);

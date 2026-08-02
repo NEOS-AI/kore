@@ -109,4 +109,6 @@ pub use scripting::{
 };
 pub use slowlog::{SlowLog, SlowLogEntry, DEFAULT_MAX_LEN as SLOWLOG_DEFAULT_MAX_LEN, DEFAULT_SLOWER_THAN_US};
 pub use acl_log::{AclLog, AclLogEntry, DEFAULT_MAX_LEN as ACLLOG_DEFAULT_MAX_LEN};
+pub use admin_http::{options_from_parts, AdminHttpOptions};
+pub use network::load_tls_acceptor;
 

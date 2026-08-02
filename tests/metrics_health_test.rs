@@ -52,6 +52,13 @@ fn make_config() -> Config {
         databases: 16,
         metrics_port: 0,
         deadlock_ui_port: 0,
+            admin_bind: "127.0.0.1".to_string(),
+            admin_http_token: String::new(),
+            admin_http_user: String::new(),
+            admin_http_password: String::new(),
+            admin_tls: false,
+            admin_tls_cert: String::new(),
+            admin_tls_key: String::new(),
         enable_deadlock_detection: false,
         deadlock_max_wait_ms: 30_000,
         deadlock_auto_resolve: false,
@@ -269,9 +276,15 @@ async fn metrics_http_endpoint_integration() {
 
     let dbs = databases.clone();
     let server = tokio::spawn(async move {
-        run_metrics_server_on_listener(listener, dbs, None, shutdown_rx)
-            .await
-            .unwrap();
+        run_metrics_server_on_listener(
+            listener,
+            dbs,
+            None,
+            shutdown_rx,
+            kore::AdminHttpOptions::default(),
+        )
+        .await
+        .unwrap();
     });
 
     let resp = metrics_http_exchange(port, "GET /metrics HTTP/1.1").await;

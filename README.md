@@ -29,7 +29,7 @@ Kore speaks the RESP protocol so common Redis clients (`redis-cli`, redis-py, re
 ### Security & ops
 - **ACL** users/categories + `ACL LOG`; boot `--aclfile`
 - **TLS** — `--tls` / cert / key; dual `--tls-port`; mTLS (`--tls-auth-clients` + `--tls-ca`); replica link (`--tls-replication`)
-- **Metrics** — Prometheus text on `--metrics-port`; `HEALTH` / richer `INFO`
+- **Metrics / admin UI** — Prometheus text + deadlock dashboard; optional Bearer/Basic auth and TLS (Batch **GM**)
 - **Slowlog**, structured JSON logs (`--log-format json`)
 
 ### Kore differentiators
@@ -103,7 +103,9 @@ With custom options:
 - `--replicaof <host> <port>`: start as replica; `--cluster-enabled` for cluster mode
 - `--tls` / `--tls-cert` / `--tls-key`: enable TLS on the client port
 - `--unixsocket <path>`: bind a Unix domain socket in addition to TCP
-- `--metrics-port <port>`: Prometheus text endpoint (0 = off); binds `127.0.0.1`
+- `--metrics-port <port>`: Prometheus text endpoint (0 = off); bind via `--admin-bind` (default `127.0.0.1`)
+- `--admin-http-token` / `--admin-http-user` + `--admin-http-password`: admin HTTP auth
+- `--admin-tls` [+ `--admin-tls-cert`/`--admin-tls-key`]: TLS for metrics + deadlock UI
 - `--enable-redlock` / `--redlock-instances` / fair-queue and deadlock UI flags: see [docs/redlock.md](docs/redlock.md)
 
 For the full flag surface run `kore --help`.

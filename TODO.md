@@ -746,7 +746,7 @@ Also tracked in `docs/roadmap.md`.
 
 **Shipped letter stream:** FW–GB baseline · GC–GH · GK · GL · **GC-rel**.
 
-**What remains:** optional depth — **GM / GN+** (and P3 residuals). Accepted P3 residuals stay out of the active queue.
+**What remains:** optional depth — **GN+** (and P3 residuals). Accepted P3 residuals stay out of the active queue.
 
 | Area | Residual | Priority | Planned batch |
 |------|----------|----------|---------------|
@@ -756,7 +756,7 @@ Also tracked in `docs/roadmap.md`.
 | Compat | stream listpack foreign DUMP fixtures; geo restore as zset | P3 residual | — |
 | Compat | Redis Functions library + real FCALL (**GI** done) | **P2** | — |
 | Compat | Lua setresp + time limits (**GJ** done) | **P2** | — |
-| Security | admin_http / metrics / deadlock UI: localhost MVP, no auth | **P2** | **GM** |
+| Security | admin HTTP auth + TLS (**GM** done) | **P2** | — |
 | Cluster | binary bus 2PC; dest prepare breadth; operator NODE bypass | P3 accepted / later | **GP** |
 | Cluster | remote CHECKPREPARE→COMMITPREPARE two-RPC window | P3 accepted lite | **GO** |
 | Cluster | per-slot config epochs not fully in nodes.conf | **P2** | **GN** |
@@ -793,9 +793,8 @@ Phases A–E P0 lists are green; prefer **P1 product/perf** over hunting accepte
 
 Ordered execution after **0.7.0**:
 
-1. **GM** — admin HTTP auth+TLS when exposing UI
-2. **GN+** — cluster/Sentinel depth as needed
-3. Optional P3 residuals only when production needs them
+1. **GN+** — cluster/Sentinel depth as needed
+2. Optional P3 residuals only when production needs them
 
 | Batch | Pri | Track | Scope |
 |-------|-----|-------|--------|
@@ -809,7 +808,7 @@ Ordered execution after **0.7.0**:
 | **GJ** | P2 | Compat | **done** — `redis.setresp`, `lua-time-limit`, SCRIPT/FUNCTION KILL |
 | **GK** | P1 | Compat | **done** — `scripts/client_smoke.sh` + CI (redis-cli + redis-py; ioredis optional) |
 | **GL** | P1 | Security | **done** — mTLS (`--tls-auth-clients`/`--tls-ca`), dual port (`--tls-port`), replica TLS (`--tls-replication`) |
-| **GM** | P2 | Security | admin_http / metrics / deadlock UI: auth + TLS |
+| **GM** | P2 | Security | **done** — Bearer/Basic auth, admin TLS, non-loopback requires auth |
 | **GN** | P2 | Cluster | Per-slot config epochs fully in `nodes.conf` |
 | **GO** | P3 | Cluster | Collapse remote CHECKPREPARE→COMMITPREPARE two-RPC window |
 | **GP** | P3 | Cluster | Binary cluster bus 2PC (large; only if Redis cluster clients demand it) |
@@ -880,7 +879,15 @@ Checklist (active):
   - `--tls-auth-clients` + `--tls-ca`: mTLS via rustls `WebPkiClientVerifier`
   - `--tls-replication`: replica→primary TLS; trust `--tls-ca` or `--tls-cert`
   - Tests: dual listener, mTLS reject anonymous / accept client cert; existing TLS suite green
-- [ ] **`[P2]`** **Batch GM — Admin HTTP auth + TLS**
+- [x] **`[P2]`** **Batch GM — Admin HTTP auth + TLS**
+  - Shared `AdminHttpOptions`: Bearer token, Basic user/password, optional TLS acceptor, bind host
+  - Header-aware request parse; `401` + `WWW-Authenticate` when credentials configured
+  - Metrics + deadlock UI accept loops: plain or TLS via `serve_connection`
+  - Flags: `--admin-bind`, `--admin-http-token`, `--admin-http-user`/`--admin-http-password`,
+    `--admin-tls` + `--admin-tls-cert`/`--admin-tls-key` (fallback to `--tls-cert`/`--tls-key`)
+  - Non-loopback bind requires auth; basic user/password must be paired
+  - Tests: `tests/gm_admin_http_auth_tls_test.rs`; existing metrics/UI exchange tests updated
+  - Residual: no mTLS for admin scrape; no rate limiting
 - [ ] **`[P2]`** **Batch GN — Per-slot epochs in nodes.conf**
 - [ ] **`[P3]`** **Batch GO — Single-RPC prepare commit window**
 - [ ] **`[P3]`** **Batch GP — Binary cluster bus 2PC**

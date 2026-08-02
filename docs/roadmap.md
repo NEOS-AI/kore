@@ -5,7 +5,7 @@
 - [x] Support for Redis Pub-Sub
 - **Committed through FW–GB** (ANN HNSW, AOF graph, Redis DUMP/RESTORE, search eviction, Entry TTL retirement, repl publish barrier). Baseline A–E green; `main` synced with origin.
 - **Release **0.7.0** (Batch GC-rel):** productization cut (GC–GH, GK, GL) + [`docs/ops.md`](ops.md). See `CHANGELOG.md`.
-- **Next:** ops polish — **GM** / **GN+**. See root `TODO.md`.
+- **Next:** optional cluster/Sentinel depth — **GN+**. See root `TODO.md`.
 
 ## Persistence / search letter batches (recent)
 

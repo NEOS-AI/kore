@@ -232,18 +232,51 @@ fn main() -> anyhow::Result<()> {
             });
         }
 
-        // Optional Prometheus metrics HTTP endpoint (127.0.0.1 only)
+        // Batch GM: shared admin HTTP options (auth + optional TLS) for metrics / UI.
+        let admin_options = {
+            let mut opts = kore::admin_http::options_from_parts(
+                &config.admin_http_token,
+                &config.admin_http_user,
+                &config.admin_http_password,
+                &config.admin_bind,
+                None,
+            );
+            if config.admin_tls {
+                let cert = if !config.admin_tls_cert.is_empty() {
+                    config.admin_tls_cert.as_str()
+                } else {
+                    config.tls_cert.as_str()
+                };
+                let key = if !config.admin_tls_key.is_empty() {
+                    config.admin_tls_key.as_str()
+                } else {
+                    config.tls_key.as_str()
+                };
+                match kore::network::load_tls_acceptor(cert, key) {
+                    Ok(acc) => opts.tls = Some(acc),
+                    Err(e) => {
+                        eprintln!("Admin TLS configuration error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            opts
+        };
+
+        // Optional Prometheus metrics HTTP(S) endpoint
         if config.metrics_port != 0 {
             let databases_m = databases.clone();
             let persistence_m = persistence.clone();
             let shutdown_rx_metrics = shutdown_rx.clone();
             let metrics_port = config.metrics_port;
+            let opts_m = admin_options.clone();
             tokio::spawn(async move {
                 if let Err(e) = kore::metrics::run_metrics_server(
                     metrics_port,
                     databases_m,
                     Some(persistence_m),
                     shutdown_rx_metrics,
+                    opts_m,
                 )
                 .await
                 {
@@ -251,8 +284,10 @@ fn main() -> anyhow::Result<()> {
                 }
             });
             info!(
-                "Metrics endpoint enabled on 127.0.0.1:{}",
-                config.metrics_port
+                "Metrics endpoint enabled on {}:{} ({})",
+                config.admin_bind,
+                config.metrics_port,
+                if config.admin_tls { "https" } else { "http" }
             );
         }
 
@@ -278,22 +313,29 @@ fn main() -> anyhow::Result<()> {
             info!("Redlock disabled");
         }
 
-        // Optional deadlock monitoring Web UI (127.0.0.1 only, no auth).
+        // Optional deadlock monitoring Web UI (auth/TLS via admin options).
         // Shares Redlock's detector when present; otherwise serves a disabled view.
         if config.deadlock_ui_port != 0 {
             let detector = redlock.as_ref().and_then(|rl| rl.deadlock_detector());
             let shutdown_rx_ui = shutdown_rx.clone();
             let ui_port = config.deadlock_ui_port;
+            let opts_ui = admin_options.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    kore::deadlock_ui::run_deadlock_ui_server(ui_port, detector, shutdown_rx_ui)
-                        .await
+                if let Err(e) = kore::deadlock_ui::run_deadlock_ui_server(
+                    ui_port,
+                    detector,
+                    shutdown_rx_ui,
+                    opts_ui,
+                )
+                .await
                 {
                     warn!("Deadlock UI server exited: {}", e);
                 }
             });
             info!(
-                "Deadlock UI enabled on http://127.0.0.1:{}/ (JSON /api/deadlock){}",
+                "Deadlock UI enabled on {}://{}:{}/ (JSON /api/deadlock){}",
+                if config.admin_tls { "https" } else { "http" },
+                config.admin_bind,
                 config.deadlock_ui_port,
                 if redlock.is_some() {
                     ""

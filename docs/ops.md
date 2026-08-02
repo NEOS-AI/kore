@@ -159,16 +159,25 @@ redis-cli HEALTH FULL
 redis-cli INFO server
 redis-cli INFO replication
 
-# Prometheus text (localhost only)
+# Prometheus text (default bind 127.0.0.1; optional auth/TLS)
 kore --metrics-port 9121
 curl -s http://127.0.0.1:9121/metrics
+
+# With Bearer auth
+kore --metrics-port 9121 --admin-http-token s3cret
+curl -s -H 'Authorization: Bearer s3cret' http://127.0.0.1:9121/metrics
 ```
 
-Deadlock UI (localhost, **no auth** — Batch GM residual):
+Deadlock UI / metrics (Batch **GM** — optional auth + TLS):
 
 ```bash
 kore --enable-redlock --deadlock-ui-port 9122
 # open http://127.0.0.1:9122/
+
+# TLS + token (cert falls back to --tls-cert/--tls-key when admin cert empty)
+kore --metrics-port 9121 --deadlock-ui-port 9122 \
+  --admin-http-token s3cret --admin-tls \
+  --tls-cert /path/cert.pem --tls-key /path/key.pem
 ```
 
 ## Auth / ACL
@@ -215,7 +224,7 @@ Runtime: `ACL SETUSER` / `GETUSER` / `LIST` / `LOG` / `SAVE` / `LOAD`.
 5. [ ] `HEALTH FULL` / metrics scrape configured
 6. [ ] Replica or Sentinel plan tested in staging
 7. [ ] Client smoke: `scripts/client_smoke.sh` or app integration tests
-8. [ ] Known gaps reviewed: Functions not in RDB/AOF, no cluster bus, admin UI unauthenticated
+8. [ ] Known gaps reviewed: Functions not in RDB/AOF, no cluster bus; admin auth/TLS if exposed
 
 ## Related docs
 

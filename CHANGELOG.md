@@ -13,10 +13,10 @@ The detailed letter-batch history lives in root [`TODO.md`](TODO.md). This file 
 - **GJ** — Lua polish: `redis.setresp(2|3)`; `CONFIG GET|SET lua-time-limit` (default 5000 ms, `0` unlimited); hard script timeout; real `SCRIPT KILL` / `FUNCTION KILL` with write tracking (UNKILLABLE).
 - **GT** — Real TF-IDF from inverted-index term frequencies + TEXT field WEIGHT; FT.SEARCH ranks by score; `WITHSCORES` / `NOCONTENT`.
 - **GU** — Adaptive HNSW search `ef` for large-k; mid-N (N=800, k=50) CI recall@k vs FLAT; `set_ef_search` / `search_with_ef`.
+- **GM** — Admin HTTP security: Bearer/Basic auth for metrics + deadlock UI; optional admin TLS; `--admin-bind` (non-loopback requires auth).
 
 ### Planned (see TODO.md)
 
-- **GM** — admin HTTP / metrics / deadlock UI auth + TLS
 - **GN+** — cluster/Sentinel depth (optional)
 
 ## [0.7.0] — 2026-08-02

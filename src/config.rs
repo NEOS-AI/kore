@@ -122,18 +122,47 @@ pub struct Config {
     #[arg(long, default_value = "16")]
     pub databases: usize,
 
-    /// Prometheus metrics HTTP port bound to 127.0.0.1 (0 = disabled).
+    /// Prometheus metrics HTTP port (0 = disabled). Bound to [`admin_bind`].
     #[arg(long, default_value = "0")]
     pub metrics_port: u16,
 
-    /// Deadlock monitoring Web UI HTTP port bound to 127.0.0.1 (0 = disabled).
-    /// Serves HTML at `/` and JSON at `/api/deadlock`. Localhost-only; no auth.
-    /// Binds HTTP only — does not by itself configure detector params (see
+    /// Deadlock monitoring Web UI port (0 = disabled). Bound to [`admin_bind`].
+    /// Serves HTML at `/` and JSON at `/api/deadlock`. Optional auth/TLS (Batch GM).
+    /// Does not by itself configure detector params (see
     /// `--enable-deadlock-detection` / `--deadlock-max-wait-ms` / etc.). When
     /// non-zero and Redlock is on, a detector is still auto-attached for a live
     /// graph (back-compat) using the deadlock-* param flags.
     #[arg(long, default_value = "0")]
     pub deadlock_ui_port: u16,
+
+    /// Bind host for metrics + deadlock UI (default `127.0.0.1`).
+    /// Non-loopback binds require admin auth (token and/or basic).
+    #[arg(long, default_value = "127.0.0.1")]
+    pub admin_bind: String,
+
+    /// Bearer token for admin HTTP (metrics + deadlock UI). Empty = no token auth.
+    #[arg(long, default_value = "")]
+    pub admin_http_token: String,
+
+    /// Basic-auth username for admin HTTP. Empty = no basic auth.
+    #[arg(long, default_value = "")]
+    pub admin_http_user: String,
+
+    /// Basic-auth password for admin HTTP (paired with `--admin-http-user`).
+    #[arg(long, default_value = "")]
+    pub admin_http_password: String,
+
+    /// Enable TLS for metrics + deadlock UI listeners (Batch GM).
+    #[arg(long, default_value = "false")]
+    pub admin_tls: bool,
+
+    /// PEM cert for admin TLS (empty falls back to `--tls-cert`).
+    #[arg(long, default_value = "")]
+    pub admin_tls_cert: String,
+
+    /// PEM key for admin TLS (empty falls back to `--tls-key`).
+    #[arg(long, default_value = "")]
+    pub admin_tls_key: String,
 
     /// Enable Redlock deadlock detection (wait-for graph) independent of the UI.
     /// Also auto-enabled when `--deadlock-ui-port` is non-zero (so the UI has a
@@ -257,6 +286,13 @@ impl Default for Config {
             databases: 16,
             metrics_port: 0,
             deadlock_ui_port: 0,
+            admin_bind: "127.0.0.1".to_string(),
+            admin_http_token: String::new(),
+            admin_http_user: String::new(),
+            admin_http_password: String::new(),
+            admin_tls: false,
+            admin_tls_cert: String::new(),
+            admin_tls_key: String::new(),
             enable_deadlock_detection: false,
             deadlock_max_wait_ms: 30_000,
             deadlock_auto_resolve: false,
@@ -454,6 +490,58 @@ impl Config {
                 "deadlock_victim_strategy must be youngest|oldest|fewest-locks, got {}",
                 self.deadlock_victim_strategy
             )));
+        }
+
+        // Batch GM: admin HTTP auth + TLS validation
+        let admin_user_set = !self.admin_http_user.is_empty();
+        let admin_pass_set = !self.admin_http_password.is_empty();
+        if admin_user_set != admin_pass_set {
+            return Err(Error::ConfigError(
+                "--admin-http-user and --admin-http-password must be set together".to_string(),
+            ));
+        }
+        let admin_auth = !self.admin_http_token.is_empty() || (admin_user_set && admin_pass_set);
+        let bind_loopback = self.admin_bind == "127.0.0.1"
+            || self.admin_bind == "localhost"
+            || self.admin_bind == "::1"
+            || self.admin_bind == "[::1]";
+        if (self.metrics_port != 0 || self.deadlock_ui_port != 0)
+            && !bind_loopback
+            && !admin_auth
+        {
+            return Err(Error::ConfigError(
+                "non-loopback --admin-bind requires --admin-http-token or basic auth".to_string(),
+            ));
+        }
+        if self.admin_tls {
+            let cert = if !self.admin_tls_cert.is_empty() {
+                self.admin_tls_cert.as_str()
+            } else {
+                self.tls_cert.as_str()
+            };
+            let key = if !self.admin_tls_key.is_empty() {
+                self.admin_tls_key.as_str()
+            } else {
+                self.tls_key.as_str()
+            };
+            if cert.is_empty() || key.is_empty() {
+                return Err(Error::ConfigError(
+                    "--admin-tls requires --admin-tls-cert/--admin-tls-key or --tls-cert/--tls-key"
+                        .to_string(),
+                ));
+            }
+            if !std::path::Path::new(cert).is_file() {
+                return Err(Error::ConfigError(format!(
+                    "admin TLS certificate file not found: {}",
+                    cert
+                )));
+            }
+            if !std::path::Path::new(key).is_file() {
+                return Err(Error::ConfigError(format!(
+                    "admin TLS private key file not found: {}",
+                    key
+                )));
+            }
         }
 
         // Validate TLS configuration

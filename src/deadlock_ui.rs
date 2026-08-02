@@ -1,11 +1,13 @@
-//! Deadlock monitoring Web UI (hand-rolled HTTP on 127.0.0.1, no extra crates).
+//! Deadlock monitoring Web UI (hand-rolled HTTP, no extra crates).
 //!
 //! Serves a self-contained HTML dashboard and a JSON API for the wait-for graph.
-//! Bind is localhost-only; no authentication (MVP — do not expose beyond loopback).
-//! Request-line parsing / 405/404 responses share [`crate::admin_http`].
+//! Default bind is localhost; Batch **GM** adds optional Bearer/Basic auth and TLS
+//! via [`AdminHttpOptions`]. Prefer auth when binding beyond loopback.
+//! Request parsing / 405/404/401 responses share [`crate::admin_http`].
 
 use crate::admin_http::{
-    parse_request_line, read_request_line, write_400, write_404, write_405_get_only, write_response,
+    read_http_request, serve_connection, write_400, write_401, write_404, write_405_get_only,
+    write_response, AdminHttpOptions, AdminStream,
 };
 use crate::deadlock::{DeadlockDetector, DeadlockStatus};
 use std::sync::Arc;
@@ -537,23 +539,24 @@ fn is_known_path(path: &str) -> bool {
     is_json_path(path) || is_html_path(path)
 }
 
-/// Spawn a minimal HTTP server on `127.0.0.1:port` for deadlock monitoring.
+/// Spawn an HTTP(S) server on `options.bind:port` for deadlock monitoring.
 ///
 /// Routes (GET only; non-GET on known paths → 405):
 /// - `GET /` and `GET /deadlock` — HTML dashboard
 /// - `GET /api/deadlock` and `GET /deadlock.json` — JSON snapshot
 ///
-/// Serves until `shutdown` becomes true. Localhost-only; no authentication.
+/// Serves until `shutdown` becomes true. Optional auth/TLS via [`AdminHttpOptions`].
 /// For tests, prefer [`run_deadlock_ui_server_on_listener`] with a pre-bound
 /// `127.0.0.1:0` listener to avoid probe-bind-then-rebind races.
 pub async fn run_deadlock_ui_server(
     port: u16,
     detector: Option<Arc<DeadlockDetector>>,
     shutdown: watch::Receiver<bool>,
+    options: AdminHttpOptions,
 ) -> anyhow::Result<()> {
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("{}:{}", options.bind, port);
     let listener = TcpListener::bind(&addr).await?;
-    run_deadlock_ui_server_on_listener(listener, detector, shutdown).await
+    run_deadlock_ui_server_on_listener(listener, detector, shutdown, options).await
 }
 
 /// Same as [`run_deadlock_ui_server`] but uses an already-bound listener
@@ -562,11 +565,19 @@ pub async fn run_deadlock_ui_server_on_listener(
     listener: TcpListener,
     detector: Option<Arc<DeadlockDetector>>,
     mut shutdown: watch::Receiver<bool>,
+    options: AdminHttpOptions,
 ) -> anyhow::Result<()> {
     let bound = listener.local_addr()?;
+    let options = Arc::new(options);
     info!(
-        "Deadlock UI listening on http://{}/ (JSON: /api/deadlock)",
-        bound
+        "Deadlock UI listening on {}://{}/ (JSON: /api/deadlock){}",
+        options.scheme(),
+        bound,
+        if options.auth_required() {
+            " (auth required)"
+        } else {
+            ""
+        }
     );
 
     loop {
@@ -579,12 +590,18 @@ pub async fn run_deadlock_ui_server_on_listener(
             }
             accept = listener.accept() => {
                 match accept {
-                    Ok((mut stream, _)) => {
+                    Ok((stream, _)) => {
                         let detector = detector.clone();
+                        let options = options.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_conn(&mut stream, detector.as_ref()).await {
-                                warn!("deadlock UI connection error: {}", e);
-                            }
+                            serve_connection(stream, options.clone(), move |mut s| async move {
+                                if let Err(e) =
+                                    handle_conn(&mut s, detector.as_ref(), &options).await
+                                {
+                                    warn!("deadlock UI connection error: {}", e);
+                                }
+                            })
+                            .await;
                         });
                     }
                     Err(e) => {
@@ -598,22 +615,29 @@ pub async fn run_deadlock_ui_server_on_listener(
 }
 
 async fn handle_conn(
-    stream: &mut tokio::net::TcpStream,
+    stream: &mut AdminStream,
     detector: Option<&Arc<DeadlockDetector>>,
+    options: &AdminHttpOptions,
 ) -> anyhow::Result<()> {
-    let Some(first_line) = read_request_line(stream).await? else {
+    let Some(req) = read_http_request(stream).await? else {
         return Ok(());
     };
-    let Some(req) = parse_request_line(&first_line) else {
+    if req.line.method.is_empty() || req.line.path.is_empty() {
         write_400(stream).await?;
         let _ = stream.shutdown().await;
         return Ok(());
-    };
+    }
 
-    let known = is_known_path(&req.path);
-    if known && !req.is_get() {
+    if !options.authorize(&req.headers) {
+        write_401(stream, &options.www_authenticate()).await?;
+        let _ = stream.shutdown().await;
+        return Ok(());
+    }
+
+    let known = is_known_path(&req.line.path);
+    if known && !req.line.is_get() {
         write_405_get_only(stream).await?;
-    } else if req.is_get() && is_json_path(&req.path) {
+    } else if req.line.is_get() && is_json_path(&req.line.path) {
         let snap = collect_snap(detector);
         let body = render_json(&snap);
         write_response(
@@ -625,7 +649,7 @@ async fn handle_conn(
             &[("Cache-Control", "no-store")],
         )
         .await?;
-    } else if req.is_get() && is_html_path(&req.path) {
+    } else if req.line.is_get() && is_html_path(&req.line.path) {
         let snap = collect_snap(detector);
         let body = render_html(&snap);
         write_response(
@@ -850,9 +874,14 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let d = det.clone();
         let server = tokio::spawn(async move {
-            run_deadlock_ui_server_on_listener(listener, Some(d), shutdown_rx)
-                .await
-                .unwrap();
+            run_deadlock_ui_server_on_listener(
+                listener,
+                Some(d),
+                shutdown_rx,
+                AdminHttpOptions::default(),
+            )
+            .await
+            .unwrap();
         });
 
         // JSON
@@ -897,9 +926,14 @@ mod tests {
         let port2 = listener2.local_addr().unwrap().port();
         let (stx2, srx2) = watch::channel(false);
         let server2 = tokio::spawn(async move {
-            run_deadlock_ui_server_on_listener(listener2, None, srx2)
-                .await
-                .unwrap();
+            run_deadlock_ui_server_on_listener(
+                listener2,
+                None,
+                srx2,
+                AdminHttpOptions::default(),
+            )
+            .await
+            .unwrap();
         });
         let resp = http_exchange(port2, "GET /deadlock.json HTTP/1.1").await;
         assert!(resp.contains("\"status\": \"disabled\""), "resp={}", resp);
