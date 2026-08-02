@@ -7,32 +7,45 @@ The detailed letter-batch history lives in root [`TODO.md`](TODO.md). This file 
 
 ## [Unreleased]
 
+### Planned (see TODO.md)
+
+- **GI / GT–GU** — Redis Functions or search scoring/ANN polish (pick one track)
+- **GJ** — Lua script time limits / `redis.setresp`
+- **GM** — admin HTTP / metrics / deadlock UI auth + TLS
+- **GN+** — cluster/Sentinel depth (optional)
+
+## [0.7.0] — 2026-08-02
+
+**Productization cut** after letter batches **GC–GH**, **GK**, **GL**. Baseline Redis/HA/cluster/search story was **0.6.0** (through **GB**); this release hardens ops, wire compat, TLS, and client smoke.
+
 ### Performance
 
-- **Batch GC** — pure-standalone masters skip replication stream encode/backlog when no replica has ever been fed; SET path drops extra type probe, static write-cmd bytes, in-place map overwrite. Indicative SET pipeline (c=50 P=16) ~**+19%** vs Batch FI on M3 Pro (~741k ops/s). See `docs/benchmarks.md`.
-- **Batch GD** — `CommandId` enum dispatch (length-first match on stack-uppercased name); ACL/cluster key-spec use stack lowercase instead of allocating `String`. SET P=16 remains in the GC band (~741k); structural hygiene for further path work.
-- **Batch GE** — replication publish: backlog mutex no longer held across replica `try_send`; ordered deferred fan-out via `fanout_order` (feed order still matches backlog). Multi-replica write path only.
-- **Batch GF** — full FD-style re-bench vs Valkey 9 post-GC/GD (Kore SET P=16 ~730k vs Valkey ~1.59M on M3 Pro; host-local only). See `docs/benchmarks.md`.
+- **GC** — pure-standalone masters skip replication stream encode/backlog when no replica has been fed; SET path cuts (type probe, static write-cmd bytes, in-place map overwrite). Indicative SET P=16 ~**+19%** vs Batch FI (~741k ops/s on M3 Pro).
+- **GD** — `CommandId` enum dispatch; stack ACL lowercase (no per-command `String` lowercasing).
+- **GE** — ordered deferred repl fan-out (`fanout_order`); backlog mutex not held across replica `try_send`.
+- **GF** — full re-bench vs Valkey 9 (host-local; SET P=16 ~730k vs Valkey ~1.59M). See `docs/benchmarks.md`.
 
 ### Compatibility
 
-- **Batch GG** — `MIGRATE` uses DUMP→RESTORE wire for string/list/set/hash/zset (Redis RDB object from FY). Absolute expire via `RESTORE ABSTTL`.
-- **Batch GH** — Geo DUMP as Redis ZSET_2 (geohash scores); stream DUMP as type-15 + Kore `KST1` body; MIGRATE uses DUMP for geo/stream. Legacy KDF1 still accepted on RESTORE.
-- **Batch GK** — client smoke script (`scripts/client_smoke.sh`) + GitHub Actions job for redis-cli and redis-py.
+- **GG** — `MIGRATE` via DUMP→RESTORE for core types; absolute expire with `RESTORE ABSTTL`.
+- **GH** — Geo DUMP as Redis ZSET_2 (geohash scores); stream type-15 + Kore `KST1` body; MIGRATE dump path for all types; legacy KDF1 still accepted.
+- **GK** — `scripts/client_smoke.sh` + CI (redis-cli + redis-py).
 
 ### Security
 
-- **Batch GL** — dual TLS listener (`--tls-port`), mTLS (`--tls-auth-clients` + `--tls-ca`), replica→primary TLS (`--tls-replication`).
+- **GL** — dual TLS listener (`--tls-port`), mTLS (`--tls-auth-clients` + `--tls-ca`), replica→primary TLS (`--tls-replication`).
 
-### Planned (see TODO.md → *Next work queue (post-GB)*)
+### Docs / release
 
-- **GH** — Redis DUMP wire for geo/stream
-- **GI / GT–GU** — Redis Functions or search scoring/ANN polish (pick one track)
-- **GM** — admin HTTP auth + TLS
+- **GC-rel** — this **0.7.0** cut; production runbook [`docs/ops.md`](docs/ops.md); changelog/README/TODO stamp.
 
-### Docs
+### Known gaps
 
-- Stamped post-GB through post-GF status; README feature matrix; this changelog; roadmap pointer to **GC+**
+- Pipelined SET still below Valkey absolute throughput on measured host
+- Redis Functions / `FCALL` stubs only (**GI**)
+- Stream foreign Redis listpack DUMP fixtures residual; geo DUMP restores as zset (Redis TYPE)
+- Admin HTTP / metrics / deadlock UI: localhost, no auth (**GM**)
+- No binary Redis cluster bus; Sentinel hello SUBSCRIBE fan-in not implemented
 
 ## [0.6.0] — 2026-07-31
 
@@ -61,7 +74,7 @@ Baseline product cut after letter batches through **GB**. Not every batch is lis
 - Proportional search-doc eviction under `allkeys-*` (**FZ**)
 
 #### Protocol, security, ops
-- RESP3 `HELLO 3`; ACL MVP + LOG; TLS server; Unix sockets
+- RESP3 `HELLO 3`; ACL MVP + LOG; TLS server (MVP); Unix sockets
 - Prometheus metrics port; `HEALTH`; JSON logging; graceful shutdown
 
 #### Kore differentiators
@@ -71,18 +84,14 @@ Baseline product cut after letter batches through **GB**. Not every batch is lis
 - Pipeline SET path cuts (**FI**, ~+25% P=16 on M3 Pro vs prior); AOF-off multi-DB SELECT ordering (**FI-2**)
 - Repl publish: drop exclusive fullsync Mutex on hot path (**GB**; ordered backlog residual remains)
 
-### Known gaps (accepted or scheduled)
+### Known gaps at 0.6.0 (many closed in 0.7.0)
 
-- Pipelined SET still below Valkey absolute throughput on measured host — **GC–GF**
-- MIGRATE still recreate-only (not DUMP wire on the wire) — **GG**
-- Redis Functions / FCALL stubs only — **GI**
-- TLS: no mTLS / dual listener / replica link TLS — **GL**
-- No binary Redis cluster bus; Sentinel hello SUBSCRIBE fan-in not implemented (tick PUBLISH + peer HELLO)
-
-### Benchmarks
-
-See [`docs/benchmarks.md`](docs/benchmarks.md) (Batch FD + FI re-measure notes). Numbers are host-local; not portable marketing claims.
+- Pipelined SET below Valkey — partially addressed in **GC–GF**
+- MIGRATE recreate-only — **GG/GH**
+- TLS mTLS / dual / replica link — **GL**
+- Redis Functions stubs — still **GI**
+- No binary Redis cluster bus; Sentinel hello SUBSCRIBE residual
 
 ## Earlier history
 
-Pre-0.6.0 work (core types, pub/sub, first persistence, Redlock MVP, etc.) is tracked as completed checklists in [`TODO.md`](TODO.md) Phases A–E and the long letter-batch series (**AA** onward). Summarize new user-visible work under `[Unreleased]` or a new version heading when cutting a release.
+Pre-0.6.0 work (core types, pub/sub, first persistence, Redlock MVP, etc.) is tracked as completed checklists in [`TODO.md`](TODO.md) Phases A–E and the long letter-batch series (**AA** onward).

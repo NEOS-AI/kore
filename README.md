@@ -1,6 +1,6 @@
 # Kore
 
-A low-latency, high-performance **Redis/Valkey-compatible** cache and data server written in Rust (version **0.6.0**).
+A low-latency, high-performance **Redis/Valkey-compatible** cache and data server written in Rust (version **0.7.0**).
 
 Kore speaks the RESP protocol so common Redis clients (`redis-cli`, redis-py, redis-rs, ioredis, …) work against it. Beyond a sharded in-memory keyspace it includes persistence, replication, cluster/Sentinel-lite, full-text/vector search, and Kore-specific locking (Redlock, fair queues, deadlock detection).
 
@@ -37,8 +37,9 @@ Kore speaks the RESP protocol so common Redis clients (`redis-cli`, redis-py, re
 - **FT search** — TEXT / NUMERIC / TAG / VECTOR; **HNSW** ANN with durable RDB/AOF graph
 
 ### Status & planning
-- Changelog: [CHANGELOG.md](CHANGELOG.md)
-- Detailed backlog: [TODO.md](TODO.md) → *Next work queue (post-GB)* (perf GC+, MIGRATE wire, TLS depth, …)
+- Changelog: [CHANGELOG.md](CHANGELOG.md) (**0.7.0** productization cut)
+- **Operations runbook:** [docs/ops.md](docs/ops.md) — deploy, persistence, replica/Sentinel/cluster, TLS, health
+- Detailed backlog: [TODO.md](TODO.md) → *Next work queue (post-GB)*
 - High-level plan: [docs/roadmap.md](docs/roadmap.md)
 - Locking / load rules for contributors: [docs/locking.md](docs/locking.md)
 
@@ -505,7 +506,7 @@ OK
 
 127.0.0.1:6379> INFO
 # Server
-kore_version:0.6.0
+kore_version:0.7.0
 
 # Stats
 ...
@@ -524,7 +525,7 @@ OK
 
 127.0.0.1:6379> INFO
 # Server
-kore_version:0.6.0
+kore_version:0.7.0
 
 # Stats
 total_commands_processed:7

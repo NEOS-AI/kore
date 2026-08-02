@@ -4,8 +4,8 @@
 
 - [x] Support for Redis Pub-Sub
 - **Committed through FW–GB** (ANN HNSW, AOF graph, Redis DUMP/RESTORE, search eviction, Entry TTL retirement, repl publish barrier). Baseline A–E green; `main` synced with origin.
-- **Next stream (post-GB):** productization / perf / compat — letter batches **GC+**. See root `TODO.md` → *Next work queue (post-GB)*.
-  - **[x] GC–GH** through geo/stream DUMP wire. **[x] GK/GL** smoke+TLS. Next: **GI** / **GT–GU** / **GM**.
+- **Release **0.7.0** (Batch GC-rel):** productization cut (GC–GH, GK, GL) + [`docs/ops.md`](ops.md). See `CHANGELOG.md`.
+- **Next:** differentiators / polish — **GI** / **GJ** / **GT–GU** / **GM**. See root `TODO.md`.
 
 ## Persistence / search letter batches (recent)
 

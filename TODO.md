@@ -727,8 +727,9 @@ Also tracked in `docs/roadmap.md`.
   - *Done*: in-tree smoke fuzz unit tests (random + structured); `fuzz/` crate with `resp_parse` + `command_dispatch` targets (`cargo +nightly fuzz run …` when cargo-fuzz installed).
 - [x] **`[P1]`** **Concurrency / loom or stress** jobs for shard RMW paths
   - *Done*: `tests/concurrency_stress_test.rs` — concurrent INCR, INCR/DECR net-zero, SET NX single winner, multi-key multi-shard, mixed RMW+reads, hash field RMW under `parking_lot`
-- [x] **`[P2]`** Align version strings in docs/`INFO` examples with `Cargo.toml` (currently 0.6.0)
-  - *Done (Batch CK)*: README `kore_version` examples updated to 0.6.0.
+- [x] **`[P2]`** Align version strings in docs/`INFO` examples with `Cargo.toml`
+  - *Done (Batch CK)*: README `kore_version` examples → 0.6.0
+  - *Done (Batch GC-rel)*: **0.7.0** cargo + README examples + ops runbook
 - [x] **`[P2]`** Consistent locking and error handling guidelines in contributor docs
   - *Done (Batch CO)*: `docs/locking.md` (lock orders, load commit, errors); linked from README.
 - [x] **`[P2]`** Keep `docs/roadmap.md` in sync with this file (or make this the single source of truth)
@@ -737,33 +738,22 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
   - *Done (Batch BT)*: `bt_eval_select_persists_connection_db` — connection remains on selected DB after EVAL
 
-### Status snapshot (2026-08-02, post-GC)
+### Status snapshot (2026-08-02, post-GC-rel / **v0.7.0**)
 
-**Shipped through Batches FW–GB + GC** (pipeline SET standalone skip). Phases **A–E** baseline is green. Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed).
+**Release cut:** **0.7.0** = productization **GC–GH + GK + GL** (ops runbook, client smoke, TLS depth, MIGRATE dump wire, SET perf). **0.6.0** remains the FW–GB baseline story in the changelog (may be untagged; cargo was already 0.6.0). Phases **A–E** green. Standing **`[P0]`** tests-with-feature remains.
 
-**Git (as of 2026-08-02):** working tree may be ahead of origin with GC commit; `main` was synced pre-GC.
+**Shipped letter stream:** FW–GB baseline · GC–GH · GK · GL · **GC-rel**.
 
-**Verification (FW–GB):**
-- **FW:** HNSW ANN for FT.SEARCH when dual-written graph non-empty; FLAT exact; empty → flat fallback.
-- **FX:** AOF `FT._LOADGRAPH`; load edge-identical; legacy rebuild path kept.
-- **FY:** Redis DUMP/RESTORE wire for string/list/set/hash/zset; KDF1 for geo/stream; dual-detect RESTORE.
-- **FZ:** proportional search-doc sampling under `allkeys-*`; volatile excludes search docs.
-- **GA:** `Entry.expires_at` removed; slot-only TTL.
-- **GB:** atomic fullsync barrier; hot path no Mutex gate; backlog still orders SELECT+append+fanout.
-
-**What remains:** productization + perf + compat depth — see **Next work queue (post-GB)** below. Accepted P3 residuals stay out of the active queue.
+**What remains:** differentiators and optional depth — **GI / GJ / GT–GU / GM / GN+**. Accepted P3 residuals stay out of the active queue.
 
 | Area | Residual | Priority | Planned batch |
 |------|----------|----------|---------------|
-| Docs / release | README under-sells features; no CHANGELOG; TODO status drift | **done** | **GC-docs** |
-| Perf | Pipeline SET gap vs Valkey (GC/GD ~0.74M P=16; Valkey FI ~1.59M) | **P1 residual** | **GE / GF** (GC+GD shipped) |
-| Ops | Global repl backlog ordered publish residual (after GB) | P3 residual | **GE** (if multi-replica write path matters) |
-| Compat | MIGRATE DUMP→RESTORE all types (**GG+GH**); stream listpack foreign fixtures residual | **P3 residual** | — |
-| Compat | DUMP geo/stream still KDF1 (not Redis RDB wire) | **P2** | **GH** |
+| Docs / release | **0.7.0** + `docs/ops.md` | **done** | **GC-rel** |
+| Perf | Pipeline SET gap vs Valkey (~0.73M vs ~1.59M GF) | P1 residual | store path later |
+| Ops | Global repl backlog ordered publish residual | P3 residual | after GE |
+| Compat | stream listpack foreign DUMP fixtures; geo restore as zset | P3 residual | — |
 | Compat | Redis Functions / FCALL stubs only | **P2** | **GI** |
 | Compat | Lua: no script time limits / `redis.setresp` full depth | **P2** | **GJ** |
-| Compat | Multi-language client smoke not in CI | **P1** | **GK** |
-| Security | TLS: no mTLS / dual listener / replica-link TLS | **P1** | **GL** |
 | Security | admin_http / metrics / deadlock UI: localhost MVP, no auth | **P2** | **GM** |
 | Cluster | binary bus 2PC; dest prepare breadth; operator NODE bypass | P3 accepted / later | **GP** |
 | Cluster | remote CHECKPREPARE→COMMITPREPARE two-RPC window | P3 accepted lite | **GO** |
@@ -791,14 +781,19 @@ Phases A–E P0 lists are green; prefer **P1 product/perf** over hunting accepte
 - [x] **`[P1]`** **Batch GC-docs** — stamp post-GB status; `CHANGELOG.md`; README feature matrix; roadmap pointer
 - [x] **`[P1]`** **Batch GC — Pipeline SET profile + hot-path cuts** (standalone stream skip; ~+19% SET P=16 vs FI on M3 Pro)
 - [x] **`[P1]`** **Batch GD — CommandId enum dispatch + ACL lower alloc**
-- [ ] **`[P1]`** **Batch GC-rel** — decide release cut (`0.6.0` tag vs `0.7.0` for FW–GB story); production runbook (deploy flags, AOF/RDB, replica+Sentinel, cluster bootstrap, health/metrics)
+- [x] **`[P1]`** **Batch GC-rel — Release cut 0.7.0 + production runbook**
+  - **Decision:** **0.7.0** = GC–GH + GK + GL productization; **0.6.0** = FW–GB baseline (changelog)
+  - `Cargo.toml` → `0.7.0`; `CHANGELOG.md` release section; README version examples
+  - Runbook: [`docs/ops.md`](docs/ops.md) (persistence, replica/Sentinel/cluster, TLS, health, checklist)
+  - Tag: `v0.7.0` on this release commit
 
 #### Recommended letter queue (start here)
 
-Ordered execution for the next ~2 weeks of work:
+Ordered execution after **0.7.0**:
 
-1. **GH** / differentiator — geo stream Redis DUMP, or **GI** / **GT–GU** (GK+GL shipped)
-2. **GM** — admin HTTP auth+TLS when exposing UI
+1. **GI** or **GT–GU** — Functions or search scoring/ANN (one differentiator)
+2. **GJ** — Lua limits / setresp
+3. **GM** — admin HTTP auth+TLS when exposing UI
 
 | Batch | Pri | Track | Scope |
 |-------|-----|-------|--------|
