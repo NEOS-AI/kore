@@ -5,7 +5,7 @@
 - [x] Support for Redis Pub-Sub
 - **Committed through FW–GB** (ANN HNSW, AOF graph, Redis DUMP/RESTORE, search eviction, Entry TTL retirement, repl publish barrier). Baseline A–E green; `main` synced with origin.
 - **Release **0.7.0** (Batch GC-rel):** productization cut (GC–GH, GK, GL) + [`docs/ops.md`](ops.md). See `CHANGELOG.md`.
-- **Next:** differentiators / polish — **GI** / **GJ** / **GT–GU** / **GM**. See root `TODO.md`.
+- **Next:** differentiators / polish — **GT–GU** / **GM** / **GN+**. See root `TODO.md`.
 
 ## Persistence / search letter batches (recent)
 
@@ -125,7 +125,8 @@ Tracked in detail in root `TODO.md`. High level:
   - [x] GK client smoke CI (redis-cli + redis-py)
   - [x] GL TLS mTLS / dual listener / replica TLS
   - [x] GI Redis Functions library (`FUNCTION LOAD` / real `FCALL`)
-  - [ ] Optional GJ Lua polish or GT/GU search scoring/ANN
+  - [x] GJ `redis.setresp` + `lua-time-limit` + SCRIPT KILL
+  - [ ] Optional GT/GU search scoring/ANN
 - [x] 데드락 감지 고급 기능
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원

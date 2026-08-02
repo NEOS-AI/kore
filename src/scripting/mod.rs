@@ -1,11 +1,17 @@
-//! Lua script cache (SCRIPT LOAD / EVALSHA) and Redis Functions library store.
+//! Lua script cache (SCRIPT LOAD / EVALSHA), Redis Functions library store,
+//! and script runtime controls (`lua-time-limit`, SCRIPT KILL).
 //!
 //! Shared server-wide so SCRIPT LOAD / FUNCTION LOAD on one connection is visible to others.
 
 use parking_lot::Mutex;
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
+
+/// Default Redis-compatible `lua-time-limit` (milliseconds). `0` = unlimited.
+pub const DEFAULT_LUA_TIME_LIMIT_MS: u64 = 5000;
 
 /// SHA1 hex digest of a Lua script body (lowercase, Redis-compatible).
 pub fn script_sha1(script: &str) -> String {
@@ -367,6 +373,132 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     rec(pattern.as_bytes(), text.as_bytes())
 }
 
+/// Per-script execution flags (shared with Lua hooks / redis.call / SCRIPT KILL).
+#[derive(Debug)]
+pub struct ScriptRunFlags {
+    id: u64,
+    started: Instant,
+    has_writes: AtomicBool,
+    kill_requested: AtomicBool,
+}
+
+impl ScriptRunFlags {
+    pub fn mark_write(&self) {
+        self.has_writes.store(true, Ordering::SeqCst);
+    }
+
+    pub fn has_writes(&self) -> bool {
+        self.has_writes.load(Ordering::SeqCst)
+    }
+
+    pub fn request_kill(&self) {
+        self.kill_requested.store(true, Ordering::SeqCst);
+    }
+
+    pub fn kill_requested(&self) -> bool {
+        self.kill_requested.load(Ordering::SeqCst)
+    }
+
+    pub fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+}
+
+/// Outcome of `SCRIPT KILL`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptKillResult {
+    Ok,
+    NotBusy,
+    Unkillable,
+}
+
+/// Server-wide script runtime: `lua-time-limit` + active script tracking for KILL.
+#[derive(Debug)]
+pub struct ScriptRuntime {
+    lua_time_limit_ms: AtomicU64,
+    next_id: AtomicU64,
+    active: Mutex<Vec<Arc<ScriptRunFlags>>>,
+}
+
+impl Default for ScriptRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ScriptRuntime {
+    pub fn new() -> Self {
+        Self {
+            lua_time_limit_ms: AtomicU64::new(DEFAULT_LUA_TIME_LIMIT_MS),
+            next_id: AtomicU64::new(1),
+            active: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn shared() -> Arc<Self> {
+        Arc::new(Self::new())
+    }
+
+    pub fn time_limit_ms(&self) -> u64 {
+        self.lua_time_limit_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn set_time_limit_ms(&self, ms: u64) {
+        self.lua_time_limit_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Register a new script execution (paired with [`end`]).
+    pub fn begin(&self) -> Arc<ScriptRunFlags> {
+        let flags = Arc::new(ScriptRunFlags {
+            id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            started: Instant::now(),
+            has_writes: AtomicBool::new(false),
+            kill_requested: AtomicBool::new(false),
+        });
+        self.active.lock().push(Arc::clone(&flags));
+        flags
+    }
+
+    /// Unregister a finished script execution.
+    pub fn end(&self, flags: &ScriptRunFlags) {
+        self.active.lock().retain(|f| f.id != flags.id);
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.active.lock().len()
+    }
+
+    /// `SCRIPT KILL` — request abort of active scripts that have not written.
+    pub fn request_kill(&self) -> ScriptKillResult {
+        let active = self.active.lock();
+        if active.is_empty() {
+            return ScriptKillResult::NotBusy;
+        }
+        if active.iter().any(|f| f.has_writes()) {
+            return ScriptKillResult::Unkillable;
+        }
+        for f in active.iter() {
+            f.request_kill();
+        }
+        ScriptKillResult::Ok
+    }
+
+    /// Check whether this run should abort (kill requested or hard time limit).
+    ///
+    /// Returns `Some(error_message)` when the script must stop.
+    pub fn should_abort(&self, flags: &ScriptRunFlags) -> Option<&'static str> {
+        if flags.kill_requested() {
+            return Some("ERR script killed by user with SCRIPT KILL.");
+        }
+        let limit = self.time_limit_ms();
+        // 0 = unlimited (Redis-compatible).
+        if limit > 0 && flags.elapsed_ms() >= limit {
+            return Some("ERR Lua script run time exceeded lua-time-limit");
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,5 +571,28 @@ mod tests {
 
         store.delete("mylib").unwrap();
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn script_runtime_kill_and_time_limit() {
+        let rt = ScriptRuntime::new();
+        assert_eq!(rt.time_limit_ms(), DEFAULT_LUA_TIME_LIMIT_MS);
+        rt.set_time_limit_ms(10);
+        assert_eq!(rt.time_limit_ms(), 10);
+
+        assert_eq!(rt.request_kill(), ScriptKillResult::NotBusy);
+
+        let flags = rt.begin();
+        assert_eq!(rt.active_count(), 1);
+        assert_eq!(rt.request_kill(), ScriptKillResult::Ok);
+        assert!(flags.kill_requested());
+        assert!(rt.should_abort(&flags).unwrap().contains("SCRIPT KILL"));
+        rt.end(&flags);
+        assert_eq!(rt.active_count(), 0);
+
+        let flags2 = rt.begin();
+        flags2.mark_write();
+        assert_eq!(rt.request_kill(), ScriptKillResult::Unkillable);
+        rt.end(&flags2);
     }
 }

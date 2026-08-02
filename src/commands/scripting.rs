@@ -6,12 +6,12 @@ use crate::error::Result;
 use crate::protocol::RespValue;
 use crate::scripting::{
     parse_function_shebang, script_sha1, strip_function_shebang, FunctionLibrary,
-    FunctionMeta,
+    FunctionMeta, ScriptKillResult, ScriptRunFlags, ScriptRuntime,
 };
 use bytes::Bytes;
-use mlua::{Lua, Value as LuaValue};
+use mlua::{HookTriggers, Lua, Value as LuaValue, VmState};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 /// Commands that may be invoked via `redis.call` / `redis.pcall` inside scripts.
@@ -166,9 +166,18 @@ impl CommandHandler {
                 Ok(RespValue::BulkString(Some(Bytes::from(payload))))
             }
             "RESTORE" => self.function_restore(&args[1..]),
-            "KILL" => Ok(RespValue::error(
-                "NOTBUSY No scripts in execution right now.",
-            )),
+            "KILL" => match self.script_runtime.request_kill() {
+                ScriptKillResult::Ok => Ok(RespValue::ok()),
+                ScriptKillResult::NotBusy => Ok(RespValue::error(
+                    "NOTBUSY No scripts in execution right now.",
+                )),
+                ScriptKillResult::Unkillable => Ok(RespValue::error(
+                    "UNKILLABLE Sorry the script already executed write \
+                     commands against the dataset. You can either wait the \
+                     script termination or kill the server in a hard way \
+                     using the SHUTDOWN NOSAVE command.",
+                )),
+            },
             "HELP" => Ok(RespValue::Array(vec![
                 RespValue::BulkString(Some(Bytes::from_static(
                     b"FUNCTION <subcommand> [<arg> ...]. Subcommands are:",
@@ -514,15 +523,41 @@ impl CommandHandler {
         argv: &[Bytes],
         readonly: bool,
     ) -> std::result::Result<RespValue, String> {
+        let run_flags = self.script_runtime.begin();
+        let result =
+            self.run_function_inner(library_code, function_name, keys, argv, readonly, &run_flags);
+        self.script_runtime.end(&run_flags);
+        result
+    }
+
+    fn run_function_inner(
+        &mut self,
+        library_code: &str,
+        function_name: &str,
+        keys: &[Bytes],
+        argv: &[Bytes],
+        readonly: bool,
+        run_flags: &Arc<ScriptRunFlags>,
+    ) -> std::result::Result<RespValue, String> {
         let lua = Lua::new();
         let handler_ptr = self as *mut CommandHandler;
         let in_call = AtomicBool::new(false);
+        let resp_ver = Arc::new(AtomicU8::new(2));
 
         // Captured callbacks: name → Function (stored via Arc/Mutex for registry).
         let registry: Arc<StdMutex<HashMap<String, mlua::Function>>> =
             Arc::new(StdMutex::new(HashMap::new()));
 
-        install_redis_table(&lua, handler_ptr, &in_call, readonly, Some(&registry))?;
+        let ctx = ScriptExecCtx {
+            handler_ptr,
+            in_call: &in_call as *const AtomicBool,
+            readonly,
+            resp_ver: Arc::clone(&resp_ver),
+            run_flags: Arc::clone(run_flags),
+            runtime: Arc::clone(&self.script_runtime),
+        };
+        install_redis_table(&lua, &ctx, Some(&registry))?;
+        install_script_hooks(&lua, &ctx)?;
 
         // Execute library body (shebang stripped — Lua rejects #!).
         let body = strip_function_shebang(library_code);
@@ -555,21 +590,23 @@ impl CommandHandler {
                 .map_err(|e| e.to_string())?;
         }
 
-        let ret: LuaValue = callback
-            .call((keys_tbl, argv_tbl))
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("NOSCRIPT")
-                    || msg.starts_with("ERR ")
-                    || msg.starts_with("WRONGTYPE")
-                {
-                    msg
-                } else {
-                    format!("ERR function_lib: {}", msg)
-                }
-            })?;
+        let ret: LuaValue = callback.call((keys_tbl, argv_tbl)).map_err(|e| {
+            let msg = e.to_string();
+            if let Some(idx) = msg.find("ERR script killed") {
+                return msg[idx..].to_string();
+            }
+            if let Some(idx) = msg.find("ERR Lua script run time") {
+                return msg[idx..].to_string();
+            }
+            if msg.contains("NOSCRIPT") || msg.starts_with("ERR ") || msg.starts_with("WRONGTYPE") {
+                msg
+            } else {
+                format!("ERR function_lib: {}", msg)
+            }
+        })?;
 
-        lua_value_to_resp(ret)
+        let ver = resp_ver.load(Ordering::Relaxed);
+        lua_value_to_resp(ret, ver)
     }
 
     /// SCRIPT LOAD | EXISTS | FLUSH | KILL
@@ -638,12 +675,18 @@ impl CommandHandler {
                 self.script_cache.flush();
                 Ok(RespValue::ok())
             }
-            "KILL" => {
-                // No long-running script tracking yet.
-                Ok(RespValue::error(
+            "KILL" => match self.script_runtime.request_kill() {
+                ScriptKillResult::Ok => Ok(RespValue::ok()),
+                ScriptKillResult::NotBusy => Ok(RespValue::error(
                     "NOTBUSY No scripts in execution right now.",
-                ))
-            }
+                )),
+                ScriptKillResult::Unkillable => Ok(RespValue::error(
+                    "UNKILLABLE Sorry the script already executed write \
+                     commands against the dataset. You can either wait the \
+                     script termination or kill the server in a hard way \
+                     using the SHUTDOWN NOSAVE command.",
+                )),
+            },
             "HELP" => Ok(RespValue::Array(vec![
                 RespValue::BulkString(Some(Bytes::from_static(
                     b"SCRIPT <subcommand> [<arg> ...]. Subcommands are:",
@@ -740,6 +783,20 @@ impl CommandHandler {
         argv: &[Bytes],
         readonly: bool,
     ) -> std::result::Result<RespValue, String> {
+        let run_flags = self.script_runtime.begin();
+        let result = self.run_lua_inner(source, keys, argv, readonly, &run_flags);
+        self.script_runtime.end(&run_flags);
+        result
+    }
+
+    fn run_lua_inner(
+        &mut self,
+        source: &str,
+        keys: &[Bytes],
+        argv: &[Bytes],
+        readonly: bool,
+        run_flags: &Arc<ScriptRunFlags>,
+    ) -> std::result::Result<RespValue, String> {
         let lua = Lua::new();
 
         // KEYS / ARGV as 1-based arrays (Redis convention).
@@ -766,7 +823,17 @@ impl CommandHandler {
         // Safety: handler is not moved; nested EVAL is denied in dispatch.
         let handler_ptr = self as *mut CommandHandler;
         let in_call = AtomicBool::new(false);
-        install_redis_table(&lua, handler_ptr, &in_call, readonly, None)?;
+        let resp_ver = Arc::new(AtomicU8::new(2));
+        let ctx = ScriptExecCtx {
+            handler_ptr,
+            in_call: &in_call as *const AtomicBool,
+            readonly,
+            resp_ver: Arc::clone(&resp_ver),
+            run_flags: Arc::clone(run_flags),
+            runtime: Arc::clone(&self.script_runtime),
+        };
+        install_redis_table(&lua, &ctx, None)?;
+        install_script_hooks(&lua, &ctx)?;
 
         let chunk = lua
             .load(source)
@@ -777,14 +844,31 @@ impl CommandHandler {
         let ret: LuaValue = chunk.call(()).map_err(|e| {
             // Strip mlua noise; keep Redis-style prefix.
             let msg = e.to_string();
-            if msg.contains("NOSCRIPT") || msg.starts_with("ERR ") || msg.starts_with("WRONGTYPE") {
+            if msg.contains("NOSCRIPT")
+                || msg.starts_with("ERR ")
+                || msg.starts_with("WRONGTYPE")
+                || msg.contains("script killed")
+                || msg.contains("lua-time-limit")
+            {
+                // Prefer clean Redis-style messages when present in the chain.
+                if let Some(idx) = msg.find("ERR script killed") {
+                    return msg[idx..].to_string();
+                }
+                if let Some(idx) = msg.find("ERR Lua script run time") {
+                    return msg[idx..].to_string();
+                }
+                if msg.starts_with("ERR ") || msg.starts_with("WRONGTYPE") || msg.contains("NOSCRIPT")
+                {
+                    return msg;
+                }
                 msg
             } else {
                 format!("ERR user_script: {}", msg)
             }
         })?;
 
-        lua_value_to_resp(ret)
+        let ver = resp_ver.load(Ordering::Relaxed);
+        lua_value_to_resp(ret, ver)
     }
 
     /// Synchronous command dispatch used by redis.call (no ACL re-check, no AOF per-op).
@@ -977,20 +1061,57 @@ fn compile_check(source: &str) -> std::result::Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Install `redis.call` / `redis.pcall` / helpers, and optionally
+/// Context shared by redis.call / setresp / time-limit hooks during one script run.
+struct ScriptExecCtx {
+    handler_ptr: *mut CommandHandler,
+    in_call: *const AtomicBool,
+    readonly: bool,
+    resp_ver: Arc<AtomicU8>,
+    run_flags: Arc<ScriptRunFlags>,
+    runtime: Arc<ScriptRuntime>,
+}
+
+// ScriptExecCtx is only used while the handler borrow is live; never Send across threads.
+unsafe impl Send for ScriptExecCtx {}
+
+/// Install instruction/line hooks that enforce `lua-time-limit` and SCRIPT KILL.
+fn install_script_hooks(lua: &Lua, ctx: &ScriptExecCtx) -> std::result::Result<(), String> {
+    let flags = Arc::clone(&ctx.run_flags);
+    let runtime = Arc::clone(&ctx.runtime);
+    lua.set_hook(
+        HookTriggers::new().every_nth_instruction(10_000),
+        move |_lua, _debug| {
+            if let Some(msg) = runtime.should_abort(&flags) {
+                return Err(mlua::Error::runtime(msg));
+            }
+            Ok(VmState::Continue)
+        },
+    );
+    Ok(())
+}
+
+/// Install `redis.call` / `redis.pcall` / `redis.setresp` / helpers, and optionally
 /// `redis.register_function` (Redis Functions libraries).
 ///
 /// When `registry` is `Some`, callbacks are stored for later FCALL.
 /// When `None` (EVAL path), `register_function` is omitted.
 fn install_redis_table(
     lua: &Lua,
-    handler_ptr: *mut CommandHandler,
-    in_call: &AtomicBool,
-    readonly: bool,
+    ctx: &ScriptExecCtx,
     registry: Option<&Arc<StdMutex<HashMap<String, mlua::Function>>>>,
 ) -> std::result::Result<(), String> {
+    let handler_ptr = ctx.handler_ptr;
+    let in_call = ctx.in_call;
+    let readonly = ctx.readonly;
+    let resp_ver_call = Arc::clone(&ctx.resp_ver);
+    let run_flags_call = Arc::clone(&ctx.run_flags);
+    let runtime_call = Arc::clone(&ctx.runtime);
+
     let call_fn = {
-        let in_call = in_call as *const AtomicBool;
+        let in_call = in_call;
+        let resp_ver = Arc::clone(&resp_ver_call);
+        let run_flags = Arc::clone(&run_flags_call);
+        let runtime = Arc::clone(&runtime_call);
         lua.create_function(move |lua_ctx, args: mlua::Variadic<LuaValue>| {
             let in_call = unsafe { &*in_call };
             if in_call.swap(true, Ordering::SeqCst) {
@@ -999,8 +1120,19 @@ fn install_redis_table(
                 ));
             }
             let result = (|| {
+                if let Some(msg) = runtime.should_abort(&run_flags) {
+                    return Err(mlua::Error::runtime(msg));
+                }
                 let h = unsafe { &mut *handler_ptr };
-                dispatch_redis_call(lua_ctx, h, args, false, readonly)
+                dispatch_redis_call(
+                    lua_ctx,
+                    h,
+                    args,
+                    false,
+                    readonly,
+                    &resp_ver,
+                    &run_flags,
+                )
             })();
             in_call.store(false, Ordering::SeqCst);
             result
@@ -1009,7 +1141,10 @@ fn install_redis_table(
     };
 
     let pcall_fn = {
-        let in_call = in_call as *const AtomicBool;
+        let in_call = in_call;
+        let resp_ver = Arc::clone(&resp_ver_call);
+        let run_flags = Arc::clone(&run_flags_call);
+        let runtime = Arc::clone(&runtime_call);
         lua.create_function(move |lua_ctx, args: mlua::Variadic<LuaValue>| {
             let in_call = unsafe { &*in_call };
             if in_call.swap(true, Ordering::SeqCst) {
@@ -1018,8 +1153,19 @@ fn install_redis_table(
                 ));
             }
             let result = (|| {
+                if let Some(msg) = runtime.should_abort(&run_flags) {
+                    return Err(mlua::Error::runtime(msg));
+                }
                 let h = unsafe { &mut *handler_ptr };
-                dispatch_redis_call(lua_ctx, h, args, true, readonly)
+                dispatch_redis_call(
+                    lua_ctx,
+                    h,
+                    args,
+                    true,
+                    readonly,
+                    &resp_ver,
+                    &run_flags,
+                )
             })();
             in_call.store(false, Ordering::SeqCst);
             result
@@ -1033,6 +1179,23 @@ fn install_redis_table(
         .map_err(|e| e.to_string())?;
     redis_tbl
         .set("pcall", pcall_fn)
+        .map_err(|e| e.to_string())?;
+
+    // redis.setresp(2|3) — switch protocol for redis.call replies and script returns.
+    let resp_ver_set = Arc::clone(&ctx.resp_ver);
+    let setresp_fn = lua
+        .create_function(move |_, ver: i64| {
+            if ver != 2 && ver != 3 {
+                return Err(mlua::Error::runtime(
+                    "ERR RESP version must be 2 or 3",
+                ));
+            }
+            resp_ver_set.store(ver as u8, Ordering::Relaxed);
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+    redis_tbl
+        .set("setresp", setresp_fn)
         .map_err(|e| e.to_string())?;
 
     let status_fn = lua
@@ -1309,6 +1472,8 @@ fn dispatch_redis_call(
     args: mlua::Variadic<LuaValue>,
     is_pcall: bool,
     readonly: bool,
+    resp_ver: &AtomicU8,
+    run_flags: &ScriptRunFlags,
 ) -> mlua::Result<LuaValue> {
     if args.is_empty() {
         let err = "ERR wrong number of arguments for 'redis.call'";
@@ -1359,7 +1524,14 @@ fn dispatch_redis_call(
         }
     }
 
-    let result = match handler.script_dispatch_sync(&cmd, &resp_args) {
+    // Use script setresp version for command replies (independent of connection HELLO).
+    let script_resp = resp_ver.load(Ordering::Relaxed).max(2);
+    let saved_proto = handler.protocol_version;
+    handler.protocol_version = script_resp;
+    let result = handler.script_dispatch_sync(&cmd, &resp_args);
+    handler.protocol_version = saved_proto;
+
+    let result = match result {
         Ok(r) => r,
         Err(e) => {
             let msg = e.to_string();
@@ -1369,6 +1541,13 @@ fn dispatch_redis_call(
             return Err(mlua::Error::runtime(msg));
         }
     };
+
+    // Track writes for SCRIPT KILL (only successful mutating commands).
+    if is_write_command(&cmd) {
+        if !matches!(result, RespValue::Error(_)) {
+            run_flags.mark_write();
+        }
+    }
 
     match &result {
         RespValue::Error(e) => {
@@ -1380,15 +1559,8 @@ fn dispatch_redis_call(
             }
         }
         other => {
-            let lv = resp_to_lua(lua, other)?;
-            if is_pcall {
-                // redis.pcall success: return value directly (Redis returns multi values
-                // with true first only for Lua pcall, not redis.pcall — redis.pcall
-                // returns the reply or {err=...}).
-                Ok(lv)
-            } else {
-                Ok(lv)
-            }
+            let lv = resp_to_lua(lua, other, script_resp)?;
+            Ok(lv)
         }
     }
 }
@@ -1421,7 +1593,10 @@ fn lua_arg_to_bulk(v: &LuaValue) -> std::result::Result<Bytes, String> {
 }
 
 /// Convert a Redis reply into a Lua value (redis.call return mapping).
-fn resp_to_lua(lua: &Lua, v: &RespValue) -> mlua::Result<LuaValue> {
+///
+/// Under RESP3 (`resp_ver >= 3`), maps become `{map=…}` tables and null uses
+/// Redis RESP3 conventions; booleans stay booleans.
+fn resp_to_lua(lua: &Lua, v: &RespValue, resp_ver: u8) -> mlua::Result<LuaValue> {
     match v {
         RespValue::SimpleString(s) => {
             // Status replies become {ok = "..."} tables (Redis Lua convention).
@@ -1438,7 +1613,7 @@ fn resp_to_lua(lua: &Lua, v: &RespValue) -> mlua::Result<LuaValue> {
         }
         RespValue::Integer(i) => Ok(LuaValue::Integer(*i)),
         RespValue::BulkString(None) | RespValue::Null | RespValue::NullArray => {
-            // Redis: nil bulk → false in Lua
+            // Redis: nil bulk / RESP3 null → false in Lua (both protocols).
             Ok(LuaValue::Boolean(false))
         }
         RespValue::BulkString(Some(b)) => {
@@ -1448,25 +1623,39 @@ fn resp_to_lua(lua: &Lua, v: &RespValue) -> mlua::Result<LuaValue> {
         RespValue::Array(arr) => {
             let t = lua.create_table()?;
             for (i, item) in arr.iter().enumerate() {
-                t.set(i + 1, resp_to_lua(lua, item)?)?;
+                t.set(i + 1, resp_to_lua(lua, item, resp_ver)?)?;
             }
             Ok(LuaValue::Table(t))
         }
         RespValue::Bool(b) => Ok(LuaValue::Boolean(*b)),
         RespValue::Map(pairs) => {
-            let t = lua.create_table()?;
-            let mut i = 1;
-            for (k, val) in pairs {
-                t.set(i, resp_to_lua(lua, k)?)?;
-                t.set(i + 1, resp_to_lua(lua, val)?)?;
-                i += 2;
+            if resp_ver >= 3 {
+                // RESP3 map → { map = { [k]=v, ... } }
+                let map_tbl = lua.create_table()?;
+                for (k, val) in pairs {
+                    let key = resp_to_lua(lua, k, resp_ver)?;
+                    let value = resp_to_lua(lua, val, resp_ver)?;
+                    map_tbl.set(key, value)?;
+                }
+                let wrap = lua.create_table()?;
+                wrap.set("map", map_tbl)?;
+                Ok(LuaValue::Table(wrap))
+            } else {
+                // RESP2-style flat array of k,v pairs for Lua.
+                let t = lua.create_table()?;
+                let mut i = 1;
+                for (k, val) in pairs {
+                    t.set(i, resp_to_lua(lua, k, resp_ver)?)?;
+                    t.set(i + 1, resp_to_lua(lua, val, resp_ver)?)?;
+                    i += 2;
+                }
+                Ok(LuaValue::Table(t))
             }
-            Ok(LuaValue::Table(t))
         }
         RespValue::Push(arr) => {
             let t = lua.create_table()?;
             for (i, item) in arr.iter().enumerate() {
-                t.set(i + 1, resp_to_lua(lua, item)?)?;
+                t.set(i + 1, resp_to_lua(lua, item, resp_ver)?)?;
             }
             Ok(LuaValue::Table(t))
         }
@@ -1474,7 +1663,7 @@ fn resp_to_lua(lua: &Lua, v: &RespValue) -> mlua::Result<LuaValue> {
             // Flatten to array of replies.
             let t = lua.create_table()?;
             for (i, item) in vals.iter().enumerate() {
-                t.set(i + 1, resp_to_lua(lua, item)?)?;
+                t.set(i + 1, resp_to_lua(lua, item, resp_ver)?)?;
             }
             Ok(LuaValue::Table(t))
         }
@@ -1482,11 +1671,32 @@ fn resp_to_lua(lua: &Lua, v: &RespValue) -> mlua::Result<LuaValue> {
 }
 
 /// Convert a Lua script return value into a RESP reply (Redis conventions).
-fn lua_value_to_resp(v: LuaValue) -> std::result::Result<RespValue, String> {
+///
+/// `resp_ver` 2: `true`→1, `false`→null bulk.
+/// `resp_ver` 3: booleans stay RESP3 Bool; `{map=…}` → Map; `{double=n}` → bulk number.
+fn lua_value_to_resp(v: LuaValue, resp_ver: u8) -> std::result::Result<RespValue, String> {
     match v {
-        LuaValue::Nil => Ok(RespValue::null()),
-        LuaValue::Boolean(false) => Ok(RespValue::null()),
-        LuaValue::Boolean(true) => Ok(RespValue::Integer(1)),
+        LuaValue::Nil => {
+            if resp_ver >= 3 {
+                Ok(RespValue::Null)
+            } else {
+                Ok(RespValue::null())
+            }
+        }
+        LuaValue::Boolean(false) => {
+            if resp_ver >= 3 {
+                Ok(RespValue::Bool(false))
+            } else {
+                Ok(RespValue::null())
+            }
+        }
+        LuaValue::Boolean(true) => {
+            if resp_ver >= 3 {
+                Ok(RespValue::Bool(true))
+            } else {
+                Ok(RespValue::Integer(1))
+            }
+        }
         LuaValue::Integer(i) => Ok(RespValue::Integer(i)),
         LuaValue::Number(n) => {
             if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
@@ -1509,6 +1719,57 @@ fn lua_value_to_resp(v: LuaValue) -> std::result::Result<RespValue, String> {
                 let s = err.to_str().map_err(|e| e.to_string())?.to_string();
                 return Ok(RespValue::error(s));
             }
+            // RESP3 map wrapper: { map = { k = v, ... } }
+            if resp_ver >= 3 {
+                if let Ok(LuaValue::Table(map_inner)) = t.get::<LuaValue>("map") {
+                    let mut pairs = Vec::new();
+                    // Prefer array-like pairs if present; else iterate map pairs.
+                    let mut i = 1i64;
+                    let mut saw_array = false;
+                    loop {
+                        let k: LuaValue = map_inner.get(i).map_err(|e| e.to_string())?;
+                        if matches!(k, LuaValue::Nil) {
+                            break;
+                        }
+                        saw_array = true;
+                        let val: LuaValue = map_inner.get(i + 1).map_err(|e| e.to_string())?;
+                        pairs.push((
+                            lua_value_to_resp(k, resp_ver)?,
+                            lua_value_to_resp(val, resp_ver)?,
+                        ));
+                        i += 2;
+                        if i > 1_000_000 {
+                            return Err("ERR Lua table too large".into());
+                        }
+                    }
+                    if !saw_array {
+                        // String-key map
+                        for pair in map_inner.pairs::<LuaValue, LuaValue>() {
+                            let (k, val) = pair.map_err(|e| e.to_string())?;
+                            pairs.push((
+                                lua_value_to_resp(k, resp_ver)?,
+                                lua_value_to_resp(val, resp_ver)?,
+                            ));
+                        }
+                    }
+                    return Ok(RespValue::Map(pairs));
+                }
+                // RESP3 double wrapper (no native Double type — bulk string).
+                if let Ok(d) = t.get::<LuaValue>("double") {
+                    match d {
+                        LuaValue::Number(n) => {
+                            return Ok(RespValue::BulkString(Some(Bytes::from(n.to_string()))));
+                        }
+                        LuaValue::Integer(i) => {
+                            return Ok(RespValue::BulkString(Some(Bytes::from(i.to_string()))));
+                        }
+                        LuaValue::Nil => {}
+                        _ => {
+                            return Err("ERR invalid double table field".into());
+                        }
+                    }
+                }
+            }
             // Array-like table: consecutive integer keys from 1.
             let mut items = Vec::new();
             let mut i = 1i64;
@@ -1517,7 +1778,7 @@ fn lua_value_to_resp(v: LuaValue) -> std::result::Result<RespValue, String> {
                 if matches!(val, LuaValue::Nil) {
                     break;
                 }
-                items.push(lua_value_to_resp(val)?);
+                items.push(lua_value_to_resp(val, resp_ver)?);
                 i += 1;
                 if i > 1_000_000 {
                     return Err("ERR Lua table too large".into());

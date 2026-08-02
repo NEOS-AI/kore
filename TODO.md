@@ -254,11 +254,12 @@ Also tracked in `docs/roadmap.md`.
   - *Done*: `--databases` (default 16); per-connection `SELECT`; key isolation; `FLUSHDB` vs `FLUSHALL`; shared pub/sub+stats; **RDB v3 multi-DB + AOF SELECT** on save/rewrite/load/startup
   - *Batch AZ*: `SWAPDB` (content swap all types + TTL via dump/restore)
 - [x] **`[P2]`** Lua scripting / functions
-  - *Done (MVP)*: `EVAL` / `EVALSHA` / `SCRIPT LOAD|EXISTS|FLUSH|KILL` via mlua Lua 5.4 (vendored); shared `ScriptCache`; `redis.call` / `redis.pcall` whitelist for core string/hash/list/set/zset/bitmap/HLL ops; KEYS/ARGV; RESP↔Lua mapping (nil bulk→false, status→`{ok=…}`); ACL `@scripting`; cluster key extract from numkeys. Residual: `redis.setresp`, full movablekeys COMMAND, nested scripts, script time limits (**GJ**).
+  - *Done (MVP)*: `EVAL` / `EVALSHA` / `SCRIPT LOAD|EXISTS|FLUSH|KILL` via mlua Lua 5.4 (vendored); shared `ScriptCache`; `redis.call` / `redis.pcall` whitelist for core string/hash/list/set/zset/bitmap/HLL ops; KEYS/ARGV; RESP↔Lua mapping (nil bulk→false, status→`{ok=…}`); ACL `@scripting`; cluster key extract from numkeys. Residual: full movablekeys COMMAND, nested scripts.
   - *Batch BG*: `EVAL_RO` / `EVALSHA_RO` (reject write `redis.call`); `CLIENT GETREDIR` / `TRACKINGINFO` (tracking off)
   - *Batch BL*: `SCRIPT HELP`; `CONFIG HELP`
   - *Batch BO*: `FUNCTION` HELP/LIST/STATS stubs; `FCALL`/`FCALL_RO` not-found; `CONFIG REWRITE` (no conf file)
   - *Batch GI*: real Redis Functions — shared `FunctionLibraryStore`; `FUNCTION LOAD`/`LIST`/`DELETE`/`FLUSH`/`DUMP`/`RESTORE`/`STATS`; `FCALL`/`FCALL_RO` with `redis.register_function` + shebang `#!lua name=`; Kore `KORF1` dump format
+  - *Batch GJ*: `redis.setresp(2|3)`; RESP3 bool/map/double mapping; `CONFIG GET|SET lua-time-limit` (default 5000, 0=unlimited); hard timeout via mlua hooks; real `SCRIPT KILL` / `FUNCTION KILL` (NOTBUSY / UNKILLABLE / write tracking)
   - *Batch BP*: `ACL LOG` GET/LEN/RESET + denial recording; `SHUTDOWN` [NOSAVE|SAVE]; connection close after `QUIT`/`SHUTDOWN`/`CLIENT KILL ID … SKIPME no`; `acllog-max-len` CONFIG
   - *Batch BQ*: `DEBUG` HELP/SLEEP/OBJECT; INFO `# Clients`/`# CPU`/`# Persistence`; `redis.call` GEO* + XADD/XLEN/XRANGE/XDEL/XTRIM/XACK + TOUCH/SCAN/RANDOMKEY
   - *Batch BR*: `CONFIG GET` port/bind/dir/dbfilename/appendonly/appendfilename/unixsocket/cluster-enabled; `MEMORY MALLOC-STATS`; `FT.TAGVALS`; `redis.call` COPY/MOVE; schema coerce TAG/NUMERIC from HSET text
@@ -745,7 +746,7 @@ Also tracked in `docs/roadmap.md`.
 
 **Shipped letter stream:** FW–GB baseline · GC–GH · GK · GL · **GC-rel**.
 
-**What remains:** differentiators and optional depth — **GJ / GT–GU / GM / GN+**. Accepted P3 residuals stay out of the active queue.
+**What remains:** differentiators and optional depth — **GT–GU / GM / GN+**. Accepted P3 residuals stay out of the active queue.
 
 | Area | Residual | Priority | Planned batch |
 |------|----------|----------|---------------|
@@ -753,8 +754,8 @@ Also tracked in `docs/roadmap.md`.
 | Perf | Pipeline SET gap vs Valkey (~0.73M vs ~1.59M GF) | P1 residual | store path later |
 | Ops | Global repl backlog ordered publish residual | P3 residual | after GE |
 | Compat | stream listpack foreign DUMP fixtures; geo restore as zset | P3 residual | — |
-| Compat | Redis Functions library + real FCALL (**GI** done) | **P2** | **GJ** polish |
-| Compat | Lua: no script time limits / `redis.setresp` full depth | **P2** | **GJ** |
+| Compat | Redis Functions library + real FCALL (**GI** done) | **P2** | — |
+| Compat | Lua setresp + time limits (**GJ** done) | **P2** | — |
 | Security | admin_http / metrics / deadlock UI: localhost MVP, no auth | **P2** | **GM** |
 | Cluster | binary bus 2PC; dest prepare breadth; operator NODE bypass | P3 accepted / later | **GP** |
 | Cluster | remote CHECKPREPARE→COMMITPREPARE two-RPC window | P3 accepted lite | **GO** |
@@ -792,7 +793,7 @@ Phases A–E P0 lists are green; prefer **P1 product/perf** over hunting accepte
 
 Ordered execution after **0.7.0**:
 
-1. **GJ** or **GT–GU** — Lua polish or search scoring/ANN
+1. **GT–GU** — search scoring / ANN polish
 2. **GM** — admin HTTP auth+TLS when exposing UI
 3. **GN+** — cluster/Sentinel depth as needed
 
@@ -805,7 +806,7 @@ Ordered execution after **0.7.0**:
 | **GG** | P1 | Compat | **done** — MIGRATE DUMP→RESTORE for core types; geo/stream recreate residual |
 | **GH** | P2 | Compat | **done** — geo ZSET_2 geohash; stream type-15+KST1; KDF1 dual-detect kept |
 | **GI** | P2 | Compat | **done** — Functions library: LOAD/LIST/DELETE/FLUSH/DUMP/RESTORE + real FCALL/FCALL_RO |
-| **GJ** | P2 | Compat | Lua polish: script time limits, `redis.setresp`, deeper `redis.call` surface |
+| **GJ** | P2 | Compat | **done** — `redis.setresp`, `lua-time-limit`, SCRIPT/FUNCTION KILL |
 | **GK** | P1 | Compat | **done** — `scripts/client_smoke.sh` + CI (redis-cli + redis-py; ioredis optional) |
 | **GL** | P1 | Security | **done** — mTLS (`--tls-auth-clients`/`--tls-ca`), dual port (`--tls-port`), replica TLS (`--tls-replication`) |
 | **GM** | P2 | Security | admin_http / metrics / deadlock UI: auth + TLS |
@@ -863,8 +864,14 @@ Checklist (active):
   - `FCALL` / `FCALL_RO` (RO requires `no-writes`; write `redis.call` denied under RO)
   - ACL `@scripting` includes `function`/`fcall`/`fcall_ro`
   - Tests: `tests/gi_function_library_test.rs`; BO stub expectations updated
-  - Residual: Redis-native dump blob (not KORF1); library code not durable in RDB/AOF yet; no script time limits (**GJ**)
-- [ ] **`[P2]`** **Batch GJ — Lua script limits + setresp polish**
+  - Residual: Redis-native dump blob (not KORF1); library code not durable in RDB/AOF yet
+- [x] **`[P2]`** **Batch GJ — Lua script limits + setresp polish**
+  - `redis.setresp(2|3)`: script-local RESP for `redis.call` replies and script returns (bool/map/double wrappers)
+  - `CONFIG GET|SET lua-time-limit` (ms; default 5000; `0` = unlimited); shared `ScriptRuntime`
+  - Hard abort via mlua instruction hooks when past limit; write tracking for KILL
+  - Real `SCRIPT KILL` / `FUNCTION KILL`: NOTBUSY / OK / UNKILLABLE
+  - Tests: `tests/gj_lua_setresp_time_limit_test.rs`
+  - Residual: Redis soft-BUSY-to-other-clients model (Kore multi-thread hard-aborts); no RESP3 double wire type
 - [x] **`[P1]`** **Batch GK — Multi-language client smoke + CI**
   - `scripts/client_smoke.sh`: redis-cli (string/hash/list/set/zset, multi-DB `-n`); optional redis-py / ioredis
   - CI: `.github/workflows/client-smoke.yml` (redis-tools + python3-redis + release build)

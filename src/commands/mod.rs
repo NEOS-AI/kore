@@ -34,7 +34,7 @@ use crate::persistence::PersistenceManager;
 use crate::protocol::RespValue;
 use crate::pubsub::ClientId;
 use crate::redlock::Redlock;
-use crate::scripting::{FunctionLibraryStore, ScriptCache};
+use crate::scripting::{FunctionLibraryStore, ScriptCache, ScriptRuntime};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -94,6 +94,8 @@ pub struct CommandHandler {
     script_cache: Arc<ScriptCache>,
     /// Shared Redis Functions library store (FUNCTION LOAD / FCALL).
     function_libs: Arc<FunctionLibraryStore>,
+    /// Shared script runtime (`lua-time-limit`, SCRIPT KILL tracking).
+    script_runtime: Arc<ScriptRuntime>,
     /// CLIENT REPLY OFF — suppress all replies until ON.
     client_reply_off: bool,
     /// CLIENT REPLY SKIP — suppress the next command's reply once.
@@ -201,6 +203,7 @@ impl CommandHandler {
             redlock: None,
             script_cache: ScriptCache::shared(),
             function_libs: FunctionLibraryStore::shared(),
+            script_runtime: ScriptRuntime::shared(),
             client_reply_off: false,
             client_reply_skip: false,
             suppress_reply: false,
@@ -280,6 +283,17 @@ impl CommandHandler {
     /// Shared Redis Functions library store.
     pub fn function_libs(&self) -> &Arc<FunctionLibraryStore> {
         &self.function_libs
+    }
+
+    /// Share script runtime (time limit / KILL) across connections (server path).
+    pub fn with_script_runtime(mut self, script_runtime: Arc<ScriptRuntime>) -> Self {
+        self.script_runtime = script_runtime;
+        self
+    }
+
+    /// Shared script runtime controls.
+    pub fn script_runtime(&self) -> &Arc<ScriptRuntime> {
+        &self.script_runtime
     }
 
     /// Redlock reference if present.
@@ -368,6 +382,10 @@ impl CommandHandler {
             (
                 "acllog-max-len".into(),
                 self.cache.acl_log.max_len().to_string(),
+            ),
+            (
+                "lua-time-limit".into(),
+                self.script_runtime.time_limit_ms().to_string(),
             ),
             ("databases".into(), self.databases.len().to_string()),
             (
@@ -512,6 +530,7 @@ fn config_param_aliases(canonical: &str) -> &'static [&'static str] {
         "slowlog-log-slower-than" => &["slowlog_log_slower_than"],
         "slowlog-max-len" => &["slowlog_max_len"],
         "acllog-max-len" => &["acllog_max_len", "acl-log-max-len"],
+        "lua-time-limit" => &["lua_time_limit"],
         "min-replicas-to-write" => &["min-slaves-to-write"],
         "min-replicas-max-lag" => &["min-slaves-max-lag"],
         "replica-priority" => &["slave-priority", "replica_priority", "slave_priority"],

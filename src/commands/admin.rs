@@ -1381,6 +1381,23 @@ impl CommandHandler {
                         self.cache.acl_log.set_max_len(n as usize);
                         Ok(RespValue::ok())
                     }
+                    "lua-time-limit" | "lua_time_limit" => {
+                        let n: i64 = match value_str.parse() {
+                            Ok(n) if n >= 0 => n,
+                            Ok(_) => {
+                                return Ok(RespValue::error(
+                                    "ERR lua-time-limit must be >= 0",
+                                ))
+                            }
+                            Err(_) => {
+                                return Ok(RespValue::error(
+                                    "ERR invalid lua-time-limit value",
+                                ))
+                            }
+                        };
+                        self.script_runtime.set_time_limit_ms(n as u64);
+                        Ok(RespValue::ok())
+                    }
                     "lfu-decay-time" | "lfu_decay_time" => {
                         let n: u64 = match value_str.parse() {
                             Ok(n) => n,
