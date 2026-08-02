@@ -128,6 +128,7 @@ Tracked in detail in root `TODO.md`. High level:
   - [x] GJ `redis.setresp` + `lua-time-limit` + SCRIPT KILL
   - [x] GT TF-IDF field-weight scoring + FT.SEARCH WITHSCORES
   - [x] GU adaptive HNSW ef + mid-N large-k recall gate
+  - [x] GM admin metrics/UI Bearer·Basic auth + TLS
 - [x] 데드락 감지 고급 기능
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원
