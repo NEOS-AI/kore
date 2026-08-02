@@ -26,7 +26,7 @@ Kore speaks the **RESP** protocol, so common clients work out of the box (`redis
   - `redis.call` / `redis.pcall` whitelist for core ops
   - `redis.setresp(2\|3)`, `CONFIG GET|SET lua-time-limit` (default 5000 ms; `0` = unlimited)
   - Hard script timeout + real `SCRIPT KILL` / `FUNCTION KILL` (write tracking → `UNKILLABLE`)
-- **Redis Functions** — `FUNCTION LOAD|LIST|DELETE|FLUSH|DUMP|RESTORE|STATS`; real `FCALL` / `FCALL_RO` via `redis.register_function` and `#!lua name=` shebang (dump format: Kore portable **KORF1**; not yet RDB/AOF-durable)
+- **Redis Functions** — `FUNCTION LOAD|LIST|DELETE|FLUSH|DUMP|RESTORE|STATS`; real `FCALL` / `FCALL_RO` via `redis.register_function` and `#!lua name=` shebang (dump format: Kore portable **KORF1**; durable in RDB v7 + AOF rewrite/load — Batch **GY**)
 - **DUMP / RESTORE / MIGRATE** — Redis RDB wire for string/list/set/hash/zset; geo as ZSET_2 geohash; stream type-15+KST1; legacy KDF1 dual-detect kept
 
 ### Persistence & HA
@@ -328,7 +328,7 @@ Client smoke (optional):
 Honest gaps vs full Redis/Valkey (see [CHANGELOG](CHANGELOG.md) and [TODO.md](TODO.md)):
 
 - Pipelined SET absolute throughput still below Valkey on measured hosts
-- Redis Functions dump is Kore **KORF1** (not Redis-native blob); libraries not yet in RDB/AOF
+- Redis Functions dump is Kore **KORF1** (not Redis-native blob); libraries durable in RDB v7 + AOF (Batch GY); Redis-native dump blob still not supported
 - No full Redis **cluster bus** (gossip/MEET stay RESP). Dual-end NODE 2PC may use **Kore peer bus lite** (`KORB` frames on cport) with RESP `COMMITPREPARE` fallback
 - Sentinel hello long-lived `SUBSCRIBE` fan-in not implemented
 - Geo DUMP restores as zset for Redis `TYPE`; foreign Redis stream listpack fixtures residual

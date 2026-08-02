@@ -2,6 +2,7 @@
 //!
 //! Format: stream of RESP arrays (Redis-compatible command log).
 //! Rewrite materializes the current DB as:
+//!   0. `FUNCTION FLUSH` + `FUNCTION LOAD REPLACE` (Batch GY — global, before DBs)
 //!   1. `FT.CREATE` (search schema) — before key dumps so HSET auto-index repopulates
 //!   2. SET / ZADD / GEOADD / HSET / RPUSH / SADD / XADD / XGROUP …
 //!   3. `FT._LOADGRAPH` (Batch FX) — durable HNSW levels/edges after docs re-index
@@ -19,6 +20,7 @@ use crate::databases::Databases;
 use crate::error::{Error, Result};
 use crate::persistence::rdb::DbSnapshot;
 use crate::protocol::RespValue;
+use crate::scripting::FunctionLibraryStore;
 use crate::search_index::{DistanceMetric, FieldType, IndexDefinition, VectorAlgorithm};
 use crate::stream_type::StreamId;
 use crate::vector_search::HnswGraphSnapshot;
@@ -243,6 +245,26 @@ fn encode_db_commands(cache: &Cache, snap: &DbSnapshot, buf: &mut Vec<u8>) {
     encode_search_alias_commands(cache, buf);
 }
 
+/// Encode global Redis Functions for AOF rewrite (Batch GY).
+///
+/// Emitted once at the start of rewrite (before any SELECT/DB body) so load
+/// restores libraries server-wide. Live AOF already appends `FUNCTION` writes.
+fn encode_function_commands(libs: &FunctionLibraryStore, buf: &mut Vec<u8>) {
+    if libs.is_empty() {
+        return;
+    }
+    buf.extend_from_slice(&encode_command(&[Bytes::from_static(b"FUNCTION"), Bytes::from_static(b"FLUSH")]));
+    for lib in libs.list() {
+        let args = vec![
+            Bytes::from_static(b"FUNCTION"),
+            Bytes::from_static(b"LOAD"),
+            Bytes::from_static(b"REPLACE"),
+            Bytes::from(lib.code),
+        ];
+        buf.extend_from_slice(&encode_command(&args));
+    }
+}
+
 /// Encode one DB snapshot as AOF rewrite commands (no SELECT).
 fn encode_snapshot_commands(snap: &DbSnapshot, buf: &mut Vec<u8>) {
     for s in &snap.strings {
@@ -423,8 +445,19 @@ fn write_aof_buffer(buf: &[u8], path: &Path) -> Result<()> {
 
 /// Rewrite AOF from current cache state (atomic replace). Single DB (no SELECT).
 pub fn rewrite(cache: &Cache, path: &Path) -> Result<()> {
+    rewrite_with_functions(cache, path, None)
+}
+
+pub fn rewrite_with_functions(
+    cache: &Cache,
+    path: &Path,
+    function_libs: Option<&FunctionLibraryStore>,
+) -> Result<()> {
     let snap = DbSnapshot::from_cache(cache)?;
     let mut buf = Vec::with_capacity(4096);
+    if let Some(libs) = function_libs {
+        encode_function_commands(libs, &mut buf);
+    }
     encode_db_commands(cache, &snap, &mut buf);
     write_aof_buffer(&buf, path)
 }
@@ -438,6 +471,14 @@ pub fn rewrite(cache: &Cache, path: &Path) -> Result<()> {
 /// install cannot produce a torn AOF (DB0-new + DB1-old). Matches RDB
 /// [`crate::persistence::rdb::MultiDbSnapshot::from_databases`].
 pub fn rewrite_databases(databases: &Databases, path: &Path) -> Result<()> {
+    rewrite_databases_with_functions(databases, path, None)
+}
+
+pub fn rewrite_databases_with_functions(
+    databases: &Databases,
+    path: &Path,
+    function_libs: Option<&FunctionLibraryStore>,
+) -> Result<()> {
     let buf = databases.with_stable_keyspace_view(|| {
         let mut non_empty: Vec<(usize, Arc<Cache>, DbSnapshot)> = Vec::new();
         for (idx, cache) in databases.iter().enumerate() {
@@ -448,6 +489,14 @@ pub fn rewrite_databases(databases: &Databases, path: &Path) -> Result<()> {
         }
 
         let mut buf = Vec::with_capacity(4096);
+        // Batch GY: Functions are global — emit before any SELECT/DB body.
+        if let Some(libs) = function_libs {
+            encode_function_commands(libs, &mut buf);
+        }
+        // Still rewrite when only functions exist (empty keyspaces).
+        if non_empty.is_empty() {
+            return Ok::<Vec<u8>, crate::error::Error>(buf);
+        }
         let multi = non_empty.len() > 1;
         for (idx, cache, snap) in &non_empty {
             // Emit SELECT for every DB when multiple are non-empty, and for any
@@ -530,6 +579,62 @@ fn parse_ft_create_definition(argv: &[Bytes]) -> Option<IndexDefinition> {
 }
 
 /// Apply a single AOF write command against one cache.
+/// Apply `FUNCTION` subcommands during AOF load (Batch GY).
+fn apply_function_command(libs: &FunctionLibraryStore, argv: &[Bytes]) -> Result<()> {
+    if argv.len() < 2 {
+        return Ok(());
+    }
+    let sub = String::from_utf8_lossy(&argv[1]).to_ascii_uppercase();
+    match sub.as_str() {
+        "FLUSH" => {
+            libs.flush();
+            Ok(())
+        }
+        "DELETE" => {
+            if argv.len() < 3 {
+                return Ok(());
+            }
+            let name = String::from_utf8_lossy(&argv[2]);
+            let _ = libs.delete(&name);
+            Ok(())
+        }
+        "LOAD" => {
+            // FUNCTION LOAD [REPLACE] <code>
+            let mut i = 2;
+            let mut replace = false;
+            if i < argv.len()
+                && String::from_utf8_lossy(&argv[i]).eq_ignore_ascii_case("REPLACE")
+            {
+                replace = true;
+                i += 1;
+            }
+            if i >= argv.len() {
+                return Ok(());
+            }
+            let code = String::from_utf8_lossy(&argv[i]);
+            libs.load_from_source(&code, replace)
+                .map_err(|e| Error::ParseError(format!("AOF FUNCTION LOAD: {}", e)))?;
+            Ok(())
+        }
+        "RESTORE" => {
+            // FUNCTION RESTORE <payload> [FLUSH|APPEND|REPLACE]
+            if argv.len() < 3 {
+                return Ok(());
+            }
+            let payload = &argv[2];
+            let mode = if argv.len() >= 4 {
+                String::from_utf8_lossy(&argv[3]).to_ascii_lowercase()
+            } else {
+                "append".to_string()
+            };
+            libs.restore_from_dump(payload, &mode)
+                .map_err(|e| Error::ParseError(format!("AOF FUNCTION RESTORE: {}", e)))?;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
     use crate::entry::StoreOptions;
     use crate::search_index::DocumentField;
@@ -777,6 +882,8 @@ pub fn apply_command_to_cache(cache: &Cache, argv: &[Bytes]) -> Result<()> {
             }
             Ok(())
         }
+        // Batch GY: FUNCTION is server-wide — handled in load_into_databases, not here.
+        "FUNCTION" => Ok(()),
         // Batch FX: rewrite-only durable HNSW graph. Applied during AOF load
         // after FT.CREATE + docs so vectors exist; overwrites re-sampled levels.
         "FT._LOADGRAPH" => {
@@ -1361,6 +1468,14 @@ pub fn load_into_cache(cache: &Arc<Cache>, path: &Path) -> Result<usize> {
 /// `databases` is left completely untouched. Multi-DB exporters take the epoch
 /// read lock; command path sees `-LOADING` during commit.
 pub fn load_into_databases(databases: &Databases, path: &Path) -> Result<usize> {
+    load_into_databases_with_functions(databases, path, None)
+}
+
+pub fn load_into_databases_with_functions(
+    databases: &Databases,
+    path: &Path,
+    function_libs: Option<&FunctionLibraryStore>,
+) -> Result<usize> {
     let scratch = databases.empty_like();
     let mut current = 0usize;
     let result = load_file_with(path, |argv| {
@@ -1382,6 +1497,13 @@ pub fn load_into_databases(databases: &Databases, path: &Path) -> Result<usize> 
                 // Live FLUSHALL during AOF replay: keys/docs only, keep schema
                 // if any had been created earlier in the file (matches runtime).
                 scratch.flush_all();
+                Ok(())
+            }
+            // Batch GY: Redis Functions are server-wide (not per-DB).
+            "FUNCTION" => {
+                if let Some(libs) = function_libs {
+                    apply_function_command(libs, &argv)?;
+                }
                 Ok(())
             }
             _ => {

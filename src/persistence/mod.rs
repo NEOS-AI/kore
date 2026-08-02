@@ -7,6 +7,7 @@ pub mod replication;
 use crate::cache::Cache;
 use crate::databases::Databases;
 use crate::error::{Error, Result};
+use crate::scripting::FunctionLibraryStore;
 use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -155,6 +156,8 @@ pub struct PersistenceManager {
     bgsave_in_progress: AtomicBool,
     aof: Mutex<AofLiveState>,
     pub replication: Arc<ReplicationManager>,
+    /// Shared Redis Functions store (Batch GY — durable in RDB/AOF).
+    function_libs: Mutex<Option<Arc<FunctionLibraryStore>>>,
 }
 
 impl PersistenceManager {
@@ -179,7 +182,22 @@ impl PersistenceManager {
                 selected_db: None,
             }),
             replication: ReplicationManager::new(),
+            function_libs: Mutex::new(None),
         }))
+    }
+
+    /// Attach the server-wide Functions store for RDB/AOF durability (Batch GY).
+    pub fn set_function_libs(&self, libs: Arc<FunctionLibraryStore>) {
+        *self.function_libs.lock() = Some(libs);
+    }
+
+    /// Shared Functions store if attached (Batch GY).
+    pub fn function_libs(&self) -> Option<Arc<FunctionLibraryStore>> {
+        self.function_libs.lock().clone()
+    }
+
+    fn function_libs_ref(&self) -> Option<Arc<FunctionLibraryStore>> {
+        self.function_libs()
     }
 
     pub fn config(&self) -> &PersistenceConfig {
@@ -242,11 +260,13 @@ impl PersistenceManager {
 
     /// Load data at startup into multi-DB keyspaces: prefer AOF if appendonly, else RDB.
     pub fn load_at_startup(&self, databases: &Arc<Databases>) -> Result<()> {
+        let libs = self.function_libs_ref();
+        let libs_ref = libs.as_deref();
         if self.config.appendonly {
             let path = self.config.aof_path();
             if path.exists() {
                 info!("Loading AOF from {}", path.display());
-                let n = aof::load_into_databases(databases, &path)?;
+                let n = aof::load_into_databases_with_functions(databases, &path, libs_ref)?;
                 info!("AOF loaded ({} commands)", n);
                 return Ok(());
             }
@@ -256,7 +276,7 @@ impl PersistenceManager {
         let path = self.config.rdb_path();
         if path.exists() {
             info!("Loading RDB from {}", path.display());
-            let n = rdb::load_databases(databases, &path, true)?;
+            let n = rdb::load_databases_with_functions(databases, &path, true, libs_ref)?;
             info!("RDB loaded ({} keys)", n);
             self.touch_last_save();
             self.dirty_changes.store(0, Ordering::Relaxed);
@@ -303,7 +323,8 @@ impl PersistenceManager {
     /// Synchronous SAVE of all non-empty logical databases.
     pub fn save(&self, databases: &Databases) -> Result<()> {
         let path = self.config.rdb_path();
-        rdb::save_databases(databases, &path)?;
+        let libs = self.function_libs_ref();
+        rdb::save_databases_with_functions(databases, &path, libs.as_deref())?;
         self.touch_last_save();
         self.dirty_changes.store(0, Ordering::Relaxed);
         info!("RDB saved to {}", path.display());
@@ -313,7 +334,8 @@ impl PersistenceManager {
     /// Synchronous SAVE of a single cache (DB 0 snapshot with streams). Tests / embeds.
     pub fn save_cache(&self, cache: &Cache) -> Result<()> {
         let path = self.config.rdb_path();
-        rdb::save_file(cache, &path)?;
+        let libs = self.function_libs_ref();
+        rdb::save_file_with_functions(cache, &path, libs.as_deref())?;
         self.touch_last_save();
         self.dirty_changes.store(0, Ordering::Relaxed);
         info!("RDB saved to {}", path.display());
@@ -332,7 +354,8 @@ impl PersistenceManager {
         let mgr = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
             let path = mgr.config.rdb_path();
-            match rdb::save_databases(&databases, &path) {
+            let libs = mgr.function_libs_ref();
+            match rdb::save_databases_with_functions(&databases, &path, libs.as_deref()) {
                 Ok(()) => {
                     mgr.touch_last_save();
                     mgr.dirty_changes.store(0, Ordering::Relaxed);
@@ -357,7 +380,8 @@ impl PersistenceManager {
         let mgr = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
             let path = mgr.config.rdb_path();
-            match rdb::save_file(&cache, &path) {
+            let libs = mgr.function_libs_ref();
+            match rdb::save_file_with_functions(&cache, &path, libs.as_deref()) {
                 Ok(()) => {
                     mgr.touch_last_save();
                     mgr.dirty_changes.store(0, Ordering::Relaxed);
@@ -453,7 +477,8 @@ impl PersistenceManager {
     /// Rewrite AOF from all non-empty databases.
     pub fn rewrite_aof(&self, databases: &Databases) -> Result<()> {
         let path = self.config.aof_path();
-        aof::rewrite_databases(databases, &path)?;
+        let libs = self.function_libs_ref();
+        aof::rewrite_databases_with_functions(databases, &path, libs.as_deref())?;
         // Re-open writer at end of new file; force SELECT on next write.
         // Same mutex as on_write_command — no lock-order deadlock with concurrent writers.
         let mut state = self.aof.lock();
@@ -468,7 +493,8 @@ impl PersistenceManager {
     /// Rewrite AOF from a single cache (tests / embeds).
     pub fn rewrite_aof_cache(&self, cache: &Cache) -> Result<()> {
         let path = self.config.aof_path();
-        aof::rewrite(cache, &path)?;
+        let libs = self.function_libs_ref();
+        aof::rewrite_with_functions(cache, &path, libs.as_deref())?;
         let mut state = self.aof.lock();
         if self.config.appendonly {
             state.writer = Some(AofWriter::open(&path)?);

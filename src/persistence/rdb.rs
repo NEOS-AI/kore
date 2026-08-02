@@ -30,6 +30,13 @@
 //!   Load: vectors from docs first, then apply graph (edge-identical restore).
 //!   v5 files without this section rebuild HNSW by re-`add` (levels re-sampled).
 //!
+//! Layout (version 7):
+//!   same as v6 multi-DB body, then a **global** Functions section (server-wide,
+//!   not per-DB) before the footer:
+//!     functions_len: u32 LE (0 = none)
+//!     if len > 0: Kore `KORF1` dump blob (FUNCTION DUMP format)
+//!   Load installs into [`crate::scripting::FunctionLibraryStore`] when provided.
+//!
 //! Stream section (version >= 3):
 //!   n_streams: u64
 //!   for each stream:
@@ -84,12 +91,13 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAGIC: &[u8; 6] = b"KORDB\0";
-const VERSION: u32 = 6;
+const VERSION: u32 = 7;
 const VERSION_V1: u32 = 1;
 const VERSION_V2: u32 = 2;
 const VERSION_V3: u32 = 3;
 const VERSION_V4: u32 = 4;
 const VERSION_V5: u32 = 5;
+const VERSION_V6: u32 = 6;
 const FOOTER: u8 = 0xFF;
 
 // Field type tags in the RDB search section.
@@ -380,10 +388,12 @@ pub struct DbSnapshot {
     pub hnsw_graphs: Vec<(String, String, HnswGraphSnapshot)>,
 }
 
-/// Multi-database snapshot (RDB v3).
+/// Multi-database snapshot (RDB v3+; Functions global section in v7 — Batch GY).
 pub struct MultiDbSnapshot {
     /// (db_index, snapshot) for each non-empty DB.
     pub databases: Vec<(u32, DbSnapshot)>,
+    /// Global Redis Functions payload (Kore `KORF1`); empty when none (Batch GY).
+    pub functions_dump: Vec<u8>,
 }
 
 impl DbSnapshot {
@@ -811,7 +821,8 @@ impl DbSnapshot {
             }
         }
 
-        if version >= VERSION {
+        // HNSW graphs: present in v6+ (and v7 keeps the same per-DB body).
+        if version >= VERSION_V6 {
             let n_graphs = read_u64(r)? as usize;
             hnsw_graphs.reserve(n_graphs);
             for _ in 0..n_graphs {
@@ -847,6 +858,8 @@ impl DbSnapshot {
             write_u32(&mut buf, 0)?;
             self.encode_body(&mut buf)?;
         }
+        // Batch GY: empty global Functions section (v7 layout).
+        write_u32(&mut buf, 0)?;
         buf.push(FOOTER);
         Ok(buf)
     }
@@ -1101,6 +1114,14 @@ impl MultiDbSnapshot {
     /// produce a torn multi-DB snapshot (DB0 new + DB1 old). See
     /// [`Databases::with_stable_keyspace_view`].
     pub fn from_databases(databases: &Databases) -> Result<Self> {
+        Self::from_databases_with_functions(databases, None)
+    }
+
+    /// Like [`from_databases`], optionally attaching a Functions dump (Batch GY).
+    pub fn from_databases_with_functions(
+        databases: &Databases,
+        function_libs: Option<&crate::scripting::FunctionLibraryStore>,
+    ) -> Result<Self> {
         databases.with_stable_keyspace_view(|| {
             let mut out = Vec::new();
             for (idx, cache) in databases.iter().enumerate() {
@@ -1109,19 +1130,44 @@ impl MultiDbSnapshot {
                     out.push((idx as u32, snap));
                 }
             }
-            Ok(Self { databases: out })
+            let functions_dump = function_libs
+                .filter(|s| !s.is_empty())
+                .map(|s| s.dump())
+                .unwrap_or_default();
+            Ok(Self {
+                databases: out,
+                functions_dump,
+            })
         })
     }
 
     pub fn from_cache(cache: &Cache) -> Result<Self> {
+        Self::from_cache_with_functions(cache, None)
+    }
+
+    pub fn from_cache_with_functions(
+        cache: &Cache,
+        function_libs: Option<&crate::scripting::FunctionLibraryStore>,
+    ) -> Result<Self> {
         let snap = DbSnapshot::from_cache(cache)?;
-        if snap.is_empty() {
+        let functions_dump = function_libs
+            .filter(|s| !s.is_empty())
+            .map(|s| s.dump())
+            .unwrap_or_default();
+        if snap.is_empty() && functions_dump.is_empty() {
             Ok(Self {
                 databases: Vec::new(),
+                functions_dump,
+            })
+        } else if snap.is_empty() {
+            Ok(Self {
+                databases: Vec::new(),
+                functions_dump,
             })
         } else {
             Ok(Self {
                 databases: vec![(0, snap)],
+                functions_dump,
             })
         }
     }
@@ -1134,6 +1180,12 @@ impl MultiDbSnapshot {
         for (idx, snap) in &self.databases {
             write_u32(&mut buf, *idx)?;
             snap.encode_body(&mut buf)?;
+        }
+        // Batch GY: global Functions section (KORF1 blob; len 0 when empty).
+        let flen = self.functions_dump.len() as u32;
+        write_u32(&mut buf, flen)?;
+        if flen > 0 {
+            buf.extend_from_slice(&self.functions_dump);
         }
         buf.push(FOOTER);
         Ok(buf)
@@ -1153,6 +1205,7 @@ impl MultiDbSnapshot {
             && version != VERSION_V3
             && version != VERSION_V4
             && version != VERSION_V5
+            && version != VERSION_V6
         {
             return Err(Error::ParseError(format!(
                 "unsupported RDB version {}",
@@ -1179,13 +1232,42 @@ impl MultiDbSnapshot {
             }
         };
 
+        // Batch GY: v7+ global Functions section before footer.
+        let functions_dump = if version >= VERSION {
+            let flen = read_u32(&mut cur)? as usize;
+            if flen == 0 {
+                Vec::new()
+            } else {
+                let mut blob = vec![0u8; flen];
+                cur.read_exact(&mut blob)?;
+                blob
+            }
+        } else {
+            Vec::new()
+        };
+
         let mut footer = [0u8; 1];
         cur.read_exact(&mut footer)?;
         if footer[0] != FOOTER {
             return Err(Error::ParseError("invalid RDB footer".into()));
         }
 
-        Ok(Self { databases })
+        Ok(Self {
+            databases,
+            functions_dump,
+        })
+    }
+
+    /// Install Functions dump into `libs` when non-empty (Batch GY).
+    pub fn apply_functions(
+        &self,
+        libs: &crate::scripting::FunctionLibraryStore,
+    ) -> Result<()> {
+        if self.functions_dump.is_empty() {
+            return Ok(());
+        }
+        libs.restore_from_dump(&self.functions_dump, "flush")
+            .map_err(|e| Error::ParseError(format!("RDB functions: {}", e)))
     }
 
     /// Load into multi-DB keyspaces in place. Returns total keys loaded.
@@ -1226,13 +1308,29 @@ impl MultiDbSnapshot {
 /// Save cache snapshot to an RDB file (atomic via temp + rename).
 /// Single-cache path: written as multi-DB v3 with DB 0 only (includes streams).
 pub fn save_file(cache: &Cache, path: &Path) -> Result<()> {
-    let snap = MultiDbSnapshot::from_cache(cache)?;
+    save_file_with_functions(cache, path, None)
+}
+
+pub fn save_file_with_functions(
+    cache: &Cache,
+    path: &Path,
+    function_libs: Option<&crate::scripting::FunctionLibraryStore>,
+) -> Result<()> {
+    let snap = MultiDbSnapshot::from_cache_with_functions(cache, function_libs)?;
     write_snapshot_file(&snap, path)
 }
 
 /// Save all non-empty logical databases to an RDB file.
 pub fn save_databases(databases: &Databases, path: &Path) -> Result<()> {
-    let snap = MultiDbSnapshot::from_databases(databases)?;
+    save_databases_with_functions(databases, path, None)
+}
+
+pub fn save_databases_with_functions(
+    databases: &Databases,
+    path: &Path,
+    function_libs: Option<&crate::scripting::FunctionLibraryStore>,
+) -> Result<()> {
+    let snap = MultiDbSnapshot::from_databases_with_functions(databases, function_libs)?;
     write_snapshot_file(&snap, path)
 }
 
@@ -1257,13 +1355,27 @@ fn write_snapshot_file(snap: &MultiDbSnapshot, path: &Path) -> Result<()> {
 
 /// Encode snapshot to bytes (for SYNC / full resync). Includes streams.
 pub fn save_to_bytes(cache: &Cache) -> Result<Bytes> {
-    let snap = MultiDbSnapshot::from_cache(cache)?;
+    save_to_bytes_with_functions(cache, None)
+}
+
+pub fn save_to_bytes_with_functions(
+    cache: &Cache,
+    function_libs: Option<&crate::scripting::FunctionLibraryStore>,
+) -> Result<Bytes> {
+    let snap = MultiDbSnapshot::from_cache_with_functions(cache, function_libs)?;
     Ok(Bytes::from(snap.encode()?))
 }
 
 /// Encode multi-DB snapshot to bytes.
 pub fn save_databases_to_bytes(databases: &Databases) -> Result<Bytes> {
-    let snap = MultiDbSnapshot::from_databases(databases)?;
+    save_databases_to_bytes_with_functions(databases, None)
+}
+
+pub fn save_databases_to_bytes_with_functions(
+    databases: &Databases,
+    function_libs: Option<&crate::scripting::FunctionLibraryStore>,
+) -> Result<Bytes> {
+    let snap = MultiDbSnapshot::from_databases_with_functions(databases, function_libs)?;
     Ok(Bytes::from(snap.encode()?))
 }
 
@@ -1275,8 +1387,17 @@ pub fn load_file(cache: &Cache, path: &Path, flush: bool) -> Result<usize> {
 
 /// Load RDB file into multi-DB keyspaces.
 pub fn load_databases(databases: &Databases, path: &Path, flush: bool) -> Result<usize> {
+    load_databases_with_functions(databases, path, flush, None)
+}
+
+pub fn load_databases_with_functions(
+    databases: &Databases,
+    path: &Path,
+    flush: bool,
+    function_libs: Option<&crate::scripting::FunctionLibraryStore>,
+) -> Result<usize> {
     let data = fs::read(path)?;
-    load_databases_bytes(databases, &data, flush)
+    load_databases_bytes_with_functions(databases, &data, flush, function_libs)
 }
 
 /// Load RDB bytes into cache (DB 0 / first DB only).
@@ -1353,6 +1474,15 @@ pub fn load_bytes(cache: &Cache, data: &[u8], flush: bool) -> Result<usize> {
 ///   snapshot, then merged (existing FT names kept only when schema/target
 ///   equal; clash otherwise fails — see [`DbSnapshot::load_into`]).
 pub fn load_databases_bytes(databases: &Databases, data: &[u8], flush: bool) -> Result<usize> {
+    load_databases_bytes_with_functions(databases, data, flush, None)
+}
+
+pub fn load_databases_bytes_with_functions(
+    databases: &Databases,
+    data: &[u8],
+    flush: bool,
+    function_libs: Option<&crate::scripting::FunctionLibraryStore>,
+) -> Result<usize> {
     let snap = MultiDbSnapshot::decode(data)?;
     let scratch = databases.empty_like();
     if !flush {
@@ -1373,6 +1503,19 @@ pub fn load_databases_bytes(databases: &Databases, data: &[u8], flush: bool) -> 
                 }
                 databases.replace_keyspaces_from(&scratch);
             });
+            // Batch GY: install Functions after keyspace commit (server-wide).
+            if let Some(libs) = function_libs {
+                if snap.functions_dump.is_empty() {
+                    if flush {
+                        // Full snapshot with no functions → clear store.
+                        libs.flush();
+                    }
+                } else {
+                    let mode = if flush { "flush" } else { "replace" };
+                    libs.restore_from_dump(&snap.functions_dump, mode)
+                        .map_err(|e| Error::ParseError(format!("RDB functions: {}", e)))?;
+                }
+            }
             Ok(n)
         }
         Err(e) => Err(e),
@@ -1437,11 +1580,12 @@ mod tests {
         };
         let multi = MultiDbSnapshot {
             databases: vec![(0, snap)],
+            functions_dump: Vec::new(),
         };
         let bytes = multi.encode().unwrap();
         assert!(bytes.starts_with(b"KORDB\0"));
         let version = u32::from_le_bytes(bytes[6..10].try_into().unwrap());
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
 
         let decoded = MultiDbSnapshot::decode(&bytes).unwrap();
         assert_eq!(decoded.databases.len(), 1);

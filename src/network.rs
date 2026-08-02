@@ -188,6 +188,19 @@ impl Server {
         };
         // Batch EZ: load dir/sentinel.conf when present.
         let sentinel = SentinelState::load_or_new(&config.dir);
+        // Batch GY: reuse PersistenceManager's Functions store when already
+        // attached (main load_at_startup), otherwise create and register one.
+        let function_libs = if let Some(ref p) = persistence {
+            if let Some(libs) = p.function_libs() {
+                libs
+            } else {
+                let libs = FunctionLibraryStore::shared();
+                p.set_function_libs(Arc::clone(&libs));
+                libs
+            }
+        } else {
+            FunctionLibraryStore::shared()
+        };
         Self {
             databases,
             config,
@@ -197,10 +210,23 @@ impl Server {
             cluster,
             sentinel,
             script_cache: ScriptCache::shared(),
-            function_libs: FunctionLibraryStore::shared(),
+            function_libs,
             script_runtime: ScriptRuntime::shared(),
             shutdown_nosave: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Override the shared Functions store (Batch GY — same Arc as load_at_startup).
+    pub fn with_function_libs(mut self, libs: Arc<FunctionLibraryStore>) -> Self {
+        if let Some(ref p) = self.persistence {
+            p.set_function_libs(Arc::clone(&libs));
+        }
+        self.function_libs = libs;
+        self
+    }
+
+    pub fn function_libs(&self) -> &Arc<FunctionLibraryStore> {
+        &self.function_libs
     }
 
     /// Single-keyspace server (tests / embeds). Prefer `with_databases` in production.

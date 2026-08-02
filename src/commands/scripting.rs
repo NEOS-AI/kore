@@ -5,8 +5,8 @@ use super::{is_write_command, CommandHandler};
 use crate::error::Result;
 use crate::protocol::RespValue;
 use crate::scripting::{
-    parse_function_shebang, script_sha1, strip_function_shebang, FunctionLibrary,
-    FunctionMeta, ScriptKillResult, ScriptRunFlags, ScriptRuntime,
+    script_sha1, strip_function_shebang, FunctionMeta, ScriptKillResult, ScriptRunFlags,
+    ScriptRuntime,
 };
 use bytes::Bytes;
 use mlua::{HookTriggers, Lua, Value as LuaValue, VmState};
@@ -371,21 +371,11 @@ impl CommandHandler {
         if mode != "flush" && mode != "append" && mode != "replace" {
             return Ok(RespValue::error("ERR syntax error"));
         }
-        let pairs = match crate::scripting::FunctionLibraryStore::parse_dump(&payload) {
-            Ok(p) => p,
-            Err(e) => return Ok(RespValue::error(e)),
-        };
-        if mode == "flush" {
-            self.function_libs.flush();
+        // Batch GY: shared restore path also used by RDB/AOF load.
+        match self.function_libs.restore_from_dump(&payload, &mode) {
+            Ok(()) => Ok(RespValue::ok()),
+            Err(e) => Ok(RespValue::error(e)),
         }
-        for (_name, code) in pairs {
-            let replace = mode == "replace" || mode == "flush";
-            if let Err(e) = self.load_function_library(&code, replace) {
-                // APPEND: fail on conflict (load without replace).
-                return Ok(RespValue::error(e));
-            }
-        }
-        Ok(RespValue::ok())
     }
 
     /// Parse shebang, run library to capture `redis.register_function`, store.
@@ -394,21 +384,7 @@ impl CommandHandler {
         code: &str,
         replace: bool,
     ) -> std::result::Result<String, String> {
-        let shebang = parse_function_shebang(code)?;
-        let metas = discover_registered_functions(code)?;
-        if metas.is_empty() {
-            return Err(
-                "ERR No functions registered. Use redis.register_function.".into(),
-            );
-        }
-        let lib = FunctionLibrary {
-            name: shebang.name.clone(),
-            engine: shebang.engine,
-            code: code.to_string(),
-            functions: metas,
-        };
-        self.function_libs.load(lib, replace)?;
-        Ok(shebang.name)
+        self.function_libs.load_from_source(code, replace)
     }
 
     /// FCALL function numkeys [key ...] [arg ...]
@@ -1380,85 +1356,6 @@ fn install_register_function_dual(
         .set("register_function", register_fn)
         .map_err(|e| e.to_string())?;
     Ok(())
-}
-
-/// Run library source at LOAD time to collect registered function metadata.
-fn discover_registered_functions(
-    code: &str,
-) -> std::result::Result<Vec<FunctionMeta>, String> {
-    let lua = Lua::new();
-    let registry: Arc<StdMutex<HashMap<String, mlua::Function>>> =
-        Arc::new(StdMutex::new(HashMap::new()));
-    let meta_out: Arc<StdMutex<Vec<FunctionMeta>>> =
-        Arc::new(StdMutex::new(Vec::new()));
-
-    // Minimal redis table: register_function + stubs for call/pcall/status/error.
-    let redis_tbl = lua.create_table().map_err(|e| e.to_string())?;
-    install_register_function_dual(
-        &lua,
-        &redis_tbl,
-        Arc::clone(&registry),
-        Arc::clone(&meta_out),
-    )?;
-
-    // Stubs so libraries that touch redis.call at load time fail clearly.
-    let deny = lua
-        .create_function(|_, ()| -> mlua::Result<()> {
-            Err(mlua::Error::runtime(
-                "ERR redis.call is not allowed while loading a function library",
-            ))
-        })
-        .map_err(|e| e.to_string())?;
-    // Use variadic deny for call/pcall
-    let deny_call = lua
-        .create_function(|_, _args: mlua::Variadic<LuaValue>| -> mlua::Result<LuaValue> {
-            Err(mlua::Error::runtime(
-                "ERR redis.call is not allowed while loading a function library",
-            ))
-        })
-        .map_err(|e| e.to_string())?;
-    redis_tbl
-        .set("call", deny_call.clone())
-        .map_err(|e| e.to_string())?;
-    redis_tbl
-        .set("pcall", deny_call)
-        .map_err(|e| e.to_string())?;
-    let _ = deny;
-    let status_fn = lua
-        .create_function(|lua_ctx, msg: String| {
-            let t = lua_ctx.create_table()?;
-            t.set("ok", msg)?;
-            Ok(t)
-        })
-        .map_err(|e| e.to_string())?;
-    let error_fn = lua
-        .create_function(|lua_ctx, msg: String| {
-            let t = lua_ctx.create_table()?;
-            t.set("err", msg)?;
-            Ok(t)
-        })
-        .map_err(|e| e.to_string())?;
-    redis_tbl
-        .set("status_reply", status_fn)
-        .map_err(|e| e.to_string())?;
-    redis_tbl
-        .set("error_reply", error_fn)
-        .map_err(|e| e.to_string())?;
-    lua.globals()
-        .set("redis", redis_tbl)
-        .map_err(|e| e.to_string())?;
-
-    let body = strip_function_shebang(code);
-    lua.load(body)
-        .set_name("function_library_load")
-        .exec()
-        .map_err(|e| format!("ERR Error compiling script: {}", e))?;
-
-    let metas = meta_out
-        .lock()
-        .map_err(|e| format!("meta lock: {}", e))?
-        .clone();
-    Ok(metas)
 }
 
 fn bytes_to_lua_string(_lua: &Lua, b: &Bytes) -> std::result::Result<String, String> {

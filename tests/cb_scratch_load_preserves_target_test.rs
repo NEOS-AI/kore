@@ -231,6 +231,7 @@ fn rdb_load_failure_preserves_preexisting() {
         }],
     );
     let snap = MultiDbSnapshot {
+        functions_dump: Vec::new(),
         databases: vec![(
             0,
             DbSnapshot {

@@ -794,10 +794,11 @@ Phases A–E P0 lists are green; prefer **P1 product/perf** over hunting accepte
 Ordered execution after **0.7.0**:
 
 1. **0.8.0** release cut (or optional GX+ residual if profile shows more)
-2. Optional product residuals: Functions RDB/AOF, BM25, full Redis bus
+2. Optional product residuals: BM25, full Redis cluster bus
 
 | Batch | Pri | Track | Scope |
 |-------|-----|-------|--------|
+| **GY** | P2 | Compat | **done** — Functions RDB v7 + AOF rewrite/load (`KORF1`) |
 | **GX** | P1 | Perf | **done** — direct conn I/O (no write-task/mpsc); no per-write timeout; SET P=16 ~1.0M |
 | **GW** | P1 | Perf | **done** — MemoryTracker running total; ACL unrestricted fast path; store size reuse; SET P=16 ~860k |
 | **GV** | P1 | Perf | **done** — SET under-maxmemory skip pre-read; plain SET fast path; SET P=16 ~807k |
@@ -823,6 +824,13 @@ Ordered execution after **0.7.0**:
 
 Checklist (active):
 
+- [x] **`[P2]`** **Batch GY — Redis Functions RDB/AOF durability**
+  - KORDB **v7**: global Functions section (u32 len + `KORF1` blob) before footer; v1–v6 still load
+  - AOF rewrite: `FUNCTION FLUSH` + `FUNCTION LOAD REPLACE <code>` before DB bodies; functions-only rewrite supported
+  - AOF load / RDB load install into shared `FunctionLibraryStore` (main creates store before `load_at_startup`)
+  - `FunctionLibraryStore::load_from_source` / `restore_from_dump` shared with FUNCTION LOAD/RESTORE
+  - Tests: `tests/gy_functions_persistence_test.rs` (RDB round-trip, AOF rewrite/load, empty v7)
+  - Residual: fullresync RDB path does not yet thread Functions store (replica still needs LOAD or later wire); Redis-native dump blob still not supported
 - [x] **`[P1]`** **Batch GX — Connection I/O for pipeline SET**
   - Direct write on the connection/reader task: drop per-connection write task + response mpsc hop
   - No per-write `timeout()` timer (TCP backpressure only; pub/sub lag still disconnects)
@@ -884,7 +892,7 @@ Checklist (active):
   - `FCALL` / `FCALL_RO` (RO requires `no-writes`; write `redis.call` denied under RO)
   - ACL `@scripting` includes `function`/`fcall`/`fcall_ro`
   - Tests: `tests/gi_function_library_test.rs`; BO stub expectations updated
-  - Residual: Redis-native dump blob (not KORF1); library code not durable in RDB/AOF yet
+  - Residual: Redis-native dump blob (not KORF1); RDB/AOF durability → **GY**
 - [x] **`[P2]`** **Batch GJ — Lua script limits + setresp polish**
   - `redis.setresp(2|3)`: script-local RESP for `redis.call` replies and script returns (bool/map/double wrappers)
   - `CONFIG GET|SET lua-time-limit` (ms; default 5000; `0` = unlimited); shared `ScriptRuntime`

@@ -23,10 +23,11 @@ The detailed letter-batch history lives in root [`TODO.md`](TODO.md). This file 
 - **GV** — Pipeline SET: skip replace-size shard read / ensure_capacity when under maxmemory headroom; 2-arg SET fast path. Indicative SET P=16 ~**0.81M** ops/s (was ~0.73M GF band).
 - **GW** — Pipeline SET residual: `MemoryTracker` running total (1 atomic vs 9); open-ACL unrestricted fast path; reuse precomputed entry size; `ensure_capacity` single check. Indicative SET P=16 ~**0.86M** ops/s (was ~0.81M GV).
 - **GX** — Connection I/O: direct write on the reader task (no per-conn write-task/mpsc hop); skip per-write timeout timer; static `+OK` append; pub/sub multiplex only when subscribed. Indicative SET P=16 ~**1.0M** ops/s (was ~0.86M GW).
+- **GY** — Redis Functions durability: KORDB **v7** global `KORF1` section; AOF rewrite emits `FUNCTION FLUSH` + `FUNCTION LOAD REPLACE`; load restores into shared `FunctionLibraryStore`. Live AOF already appended `FUNCTION` writes.
 
 ### Planned (see TODO.md)
 
-- Optional further SET residual; 0.8.0 release cut; Functions RDB/AOF; BM25
+- Optional further SET residual; 0.8.0 release cut; BM25; full Redis cluster bus
 
 ## [0.7.0] — 2026-08-02
 

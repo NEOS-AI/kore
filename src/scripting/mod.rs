@@ -2,12 +2,17 @@
 //! and script runtime controls (`lua-time-limit`, SCRIPT KILL).
 //!
 //! Shared server-wide so SCRIPT LOAD / FUNCTION LOAD on one connection is visible to others.
+//!
+//! **Batch GY:** libraries are durable in RDB (KORDB v7 KORF1 section) and AOF
+//! rewrite (`FUNCTION FLUSH` + `FUNCTION LOAD REPLACE`); live AOF append already
+//! recorded `FUNCTION` via the write-command path.
 
+use mlua::{Lua, Value as LuaValue};
 use parking_lot::Mutex;
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
 /// Default Redis-compatible `lua-time-limit` (milliseconds). `0` = unlimited.
@@ -310,6 +315,257 @@ impl FunctionLibraryStore {
     pub fn parse_dump(payload: &[u8]) -> Result<Vec<(String, String)>, String> {
         parse_dump_payload(payload)
     }
+
+    /// Parse shebang, discover `redis.register_function` entries, insert library.
+    ///
+    /// Used by `FUNCTION LOAD`, AOF replay, and RDB v7 restore (Batch GY).
+    pub fn load_from_source(&self, code: &str, replace: bool) -> Result<String, String> {
+        let shebang = parse_function_shebang(code)?;
+        let metas = discover_registered_functions(code)?;
+        if metas.is_empty() {
+            return Err(
+                "ERR No functions registered. Use redis.register_function.".into(),
+            );
+        }
+        let lib = FunctionLibrary {
+            name: shebang.name.clone(),
+            engine: shebang.engine,
+            code: code.to_string(),
+            functions: metas,
+        };
+        self.load(lib, replace)?;
+        Ok(shebang.name)
+    }
+
+    /// Restore libraries from a KORF1 dump blob.
+    ///
+    /// - `flush`: clear store first, then load each with replace
+    /// - `replace`: load each with replace (keep unrelated libs)
+    /// - `append`: load without replace (fail on name conflict)
+    pub fn restore_from_dump(&self, payload: &[u8], mode: &str) -> Result<(), String> {
+        let mode = mode.to_ascii_lowercase();
+        if mode != "flush" && mode != "append" && mode != "replace" {
+            return Err("ERR syntax error".into());
+        }
+        let pairs = parse_dump_payload(payload)?;
+        if mode == "flush" {
+            self.flush();
+        }
+        let replace = mode == "replace" || mode == "flush";
+        for (_name, code) in pairs {
+            self.load_from_source(&code, replace)?;
+        }
+        Ok(())
+    }
+}
+
+/// Run library source at LOAD time to collect registered function metadata.
+fn discover_registered_functions(code: &str) -> Result<Vec<FunctionMeta>, String> {
+    let lua = Lua::new();
+    let registry: Arc<StdMutex<HashMap<String, mlua::Function>>> =
+        Arc::new(StdMutex::new(HashMap::new()));
+    let meta_out: Arc<StdMutex<Vec<FunctionMeta>>> =
+        Arc::new(StdMutex::new(Vec::new()));
+
+    let redis_tbl = lua.create_table().map_err(|e| e.to_string())?;
+    install_register_function_dual(
+        &lua,
+        &redis_tbl,
+        Arc::clone(&registry),
+        Arc::clone(&meta_out),
+    )?;
+
+    let deny_call = lua
+        .create_function(|_, _args: mlua::Variadic<LuaValue>| -> mlua::Result<LuaValue> {
+            Err(mlua::Error::runtime(
+                "ERR redis.call is not allowed while loading a function library",
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    redis_tbl
+        .set("call", deny_call.clone())
+        .map_err(|e| e.to_string())?;
+    redis_tbl
+        .set("pcall", deny_call)
+        .map_err(|e| e.to_string())?;
+    let status_fn = lua
+        .create_function(|lua_ctx, msg: String| {
+            let t = lua_ctx.create_table()?;
+            t.set("ok", msg)?;
+            Ok(t)
+        })
+        .map_err(|e| e.to_string())?;
+    let error_fn = lua
+        .create_function(|lua_ctx, msg: String| {
+            let t = lua_ctx.create_table()?;
+            t.set("err", msg)?;
+            Ok(t)
+        })
+        .map_err(|e| e.to_string())?;
+    redis_tbl
+        .set("status_reply", status_fn)
+        .map_err(|e| e.to_string())?;
+    redis_tbl
+        .set("error_reply", error_fn)
+        .map_err(|e| e.to_string())?;
+    lua.globals()
+        .set("redis", redis_tbl)
+        .map_err(|e| e.to_string())?;
+
+    let body = strip_function_shebang(code);
+    lua.load(body)
+        .set_name("function_library_load")
+        .exec()
+        .map_err(|e| format!("ERR Error compiling script: {}", e))?;
+
+    let metas = meta_out
+        .lock()
+        .map_err(|e| format!("meta lock: {}", e))?
+        .clone();
+    Ok(metas)
+}
+
+/// Two-arg / table `redis.register_function` for LOAD-time discovery.
+fn install_register_function_dual(
+    lua: &Lua,
+    redis_tbl: &mlua::Table,
+    registry: Arc<StdMutex<HashMap<String, mlua::Function>>>,
+    meta_out: Arc<StdMutex<Vec<FunctionMeta>>>,
+) -> Result<(), String> {
+    let register_fn = lua
+        .create_function(move |lua_ctx, args: mlua::Variadic<LuaValue>| {
+            if args.is_empty() {
+                return Err(mlua::Error::runtime(
+                    "ERR wrong number of arguments to redis.register_function",
+                ));
+            }
+            if args.len() >= 2 {
+                if let (LuaValue::String(name_s), LuaValue::Function(cb)) =
+                    (&args[0], &args[1])
+                {
+                    let name = name_s
+                        .to_str()
+                        .map_err(mlua::Error::external)?
+                        .to_string();
+                    if name.is_empty() {
+                        return Err(mlua::Error::runtime(
+                            "ERR Function name cannot be empty",
+                        ));
+                    }
+                    {
+                        let mut map = registry.lock().map_err(|e| {
+                            mlua::Error::runtime(format!("registry lock: {}", e))
+                        })?;
+                        if map.contains_key(&name) {
+                            return Err(mlua::Error::runtime(format!(
+                                "ERR Function {} already registered",
+                                name
+                            )));
+                        }
+                        map.insert(name.clone(), cb.clone());
+                    }
+                    let mut metas = meta_out.lock().map_err(|e| {
+                        mlua::Error::runtime(format!("meta lock: {}", e))
+                    })?;
+                    metas.push(FunctionMeta {
+                        name,
+                        description: String::new(),
+                        flags: vec![],
+                    });
+                    return Ok(());
+                }
+            }
+            let arg = args.into_iter().next().unwrap();
+            match arg {
+                LuaValue::Table(t) => {
+                    let name: String = t
+                        .get::<LuaValue>("function_name")
+                        .ok()
+                        .and_then(|v| match v {
+                            LuaValue::String(s) => {
+                                s.to_str().ok().map(|x| x.to_string())
+                            }
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            mlua::Error::runtime(
+                                "ERR register_function: missing function_name",
+                            )
+                        })?;
+                    let callback: mlua::Function = t
+                        .get::<LuaValue>("callback")
+                        .ok()
+                        .and_then(|v| match v {
+                            LuaValue::Function(f) => Some(f),
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            mlua::Error::runtime(
+                                "ERR register_function: missing callback",
+                            )
+                        })?;
+                    let description = t
+                        .get::<LuaValue>("description")
+                        .ok()
+                        .and_then(|v| match v {
+                            LuaValue::String(s) => {
+                                s.to_str().ok().map(|x| x.to_string())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    let mut flags = Vec::new();
+                    if let Ok(LuaValue::Table(ft)) = t.get::<LuaValue>("flags") {
+                        let mut i = 1i64;
+                        loop {
+                            match ft.get::<LuaValue>(i) {
+                                Ok(LuaValue::String(s)) => {
+                                    if let Ok(ss) = s.to_str() {
+                                        flags.push(ss.to_string());
+                                    }
+                                    i += 1;
+                                }
+                                Ok(LuaValue::Nil) | Err(_) => break,
+                                Ok(_) => i += 1,
+                            }
+                            if i > 64 {
+                                break;
+                            }
+                        }
+                    }
+                    {
+                        let mut map = registry.lock().map_err(|e| {
+                            mlua::Error::runtime(format!("registry lock: {}", e))
+                        })?;
+                        if map.contains_key(&name) {
+                            return Err(mlua::Error::runtime(format!(
+                                "ERR Function {} already registered",
+                                name
+                            )));
+                        }
+                        map.insert(name.clone(), callback);
+                    }
+                    let mut metas = meta_out.lock().map_err(|e| {
+                        mlua::Error::runtime(format!("meta lock: {}", e))
+                    })?;
+                    metas.push(FunctionMeta {
+                        name,
+                        description,
+                        flags,
+                    });
+                    let _ = lua_ctx;
+                    Ok(())
+                }
+                _ => Err(mlua::Error::runtime(
+                    "ERR redis.register_function expects (name, callback) or a table",
+                )),
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    redis_tbl
+        .set("register_function", register_fn)
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn write_len_str(out: &mut Vec<u8>, s: &str) {

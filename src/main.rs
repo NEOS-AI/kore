@@ -135,6 +135,9 @@ fn main() -> anyhow::Result<()> {
         };
         let persistence = PersistenceManager::new(pconfig)?;
         persistence.ensure_dir()?;
+        // Batch GY: create Functions store before load so RDB/AOF can restore libraries.
+        let function_libs = kore::FunctionLibraryStore::shared();
+        persistence.set_function_libs(function_libs.clone());
         info!(
             "Persistence dir={} rdb={} aof={} save={}",
             persistence.config().dir.display(),
@@ -348,6 +351,7 @@ fn main() -> anyhow::Result<()> {
         // Create and run server until shutdown signal
         let config = Arc::new(config);
         let server = Server::with_databases_and_persistence(databases, config, persistence)
+            .with_function_libs(function_libs)
             .with_redlock(redlock);
 
         // Pass the Sender so SHUTDOWN can exit the accept loop (signals still use clones).
