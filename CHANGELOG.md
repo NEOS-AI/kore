@@ -7,10 +7,14 @@ The detailed letter-batch history lives in root [`TODO.md`](TODO.md). This file 
 
 ## [Unreleased]
 
+### Added
+
+- **GI** — Redis Functions library beyond stubs: shared `FunctionLibraryStore`; `FUNCTION LOAD`/`LIST`/`DELETE`/`FLUSH`/`DUMP`/`RESTORE`/`STATS`; real `FCALL`/`FCALL_RO` via `redis.register_function` and `#!lua name=` shebang. Dump format is Kore-portable `KORF1` (not Redis binary blob). Not yet durable in RDB/AOF.
+
 ### Planned (see TODO.md)
 
-- **GI / GT–GU** — Redis Functions or search scoring/ANN polish (pick one track)
 - **GJ** — Lua script time limits / `redis.setresp`
+- **GT–GU** — search scoring / ANN polish
 - **GM** — admin HTTP / metrics / deadlock UI auth + TLS
 - **GN+** — cluster/Sentinel depth (optional)
 
@@ -42,7 +46,7 @@ The detailed letter-batch history lives in root [`TODO.md`](TODO.md). This file 
 ### Known gaps
 
 - Pipelined SET still below Valkey absolute throughput on measured host
-- Redis Functions / `FCALL` stubs only (**GI**)
+- Redis Functions dump is Kore `KORF1` (not Redis-native blob); libraries not yet in RDB/AOF
 - Stream foreign Redis listpack DUMP fixtures residual; geo DUMP restores as zset (Redis TYPE)
 - Admin HTTP / metrics / deadlock UI: localhost, no auth (**GM**)
 - No binary Redis cluster bus; Sentinel hello SUBSCRIBE fan-in not implemented

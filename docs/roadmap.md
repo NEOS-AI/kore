@@ -124,7 +124,8 @@ Tracked in detail in root `TODO.md`. High level:
   - [x] GH geo/stream Redis-framed DUMP; MIGRATE dump path for all types
   - [x] GK client smoke CI (redis-cli + redis-py)
   - [x] GL TLS mTLS / dual listener / replica TLS
-  - [ ] Optional GI Functions or GT/GU search polish
+  - [x] GI Redis Functions library (`FUNCTION LOAD` / real `FCALL`)
+  - [ ] Optional GJ Lua polish or GT/GU search scoring/ANN
 - [x] 데드락 감지 고급 기능
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원

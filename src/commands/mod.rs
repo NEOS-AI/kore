@@ -34,7 +34,7 @@ use crate::persistence::PersistenceManager;
 use crate::protocol::RespValue;
 use crate::pubsub::ClientId;
 use crate::redlock::Redlock;
-use crate::scripting::ScriptCache;
+use crate::scripting::{FunctionLibraryStore, ScriptCache};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -92,6 +92,8 @@ pub struct CommandHandler {
     redlock: Option<Arc<Redlock>>,
     /// Shared SCRIPT LOAD / EVALSHA cache (server-wide).
     script_cache: Arc<ScriptCache>,
+    /// Shared Redis Functions library store (FUNCTION LOAD / FCALL).
+    function_libs: Arc<FunctionLibraryStore>,
     /// CLIENT REPLY OFF — suppress all replies until ON.
     client_reply_off: bool,
     /// CLIENT REPLY SKIP — suppress the next command's reply once.
@@ -198,6 +200,7 @@ impl CommandHandler {
             protocol_version: 2,
             redlock: None,
             script_cache: ScriptCache::shared(),
+            function_libs: FunctionLibraryStore::shared(),
             client_reply_off: false,
             client_reply_skip: false,
             suppress_reply: false,
@@ -266,6 +269,17 @@ impl CommandHandler {
     /// Shared Lua script cache.
     pub fn script_cache(&self) -> &Arc<ScriptCache> {
         &self.script_cache
+    }
+
+    /// Share a Redis Functions library store across connections (server path).
+    pub fn with_function_libs(mut self, function_libs: Arc<FunctionLibraryStore>) -> Self {
+        self.function_libs = function_libs;
+        self
+    }
+
+    /// Shared Redis Functions library store.
+    pub fn function_libs(&self) -> &Arc<FunctionLibraryStore> {
+        &self.function_libs
     }
 
     /// Redlock reference if present.
@@ -1096,7 +1110,7 @@ impl CommandHandler {
             CommandId::Sunsubscribe => self.handle_sunsubscribe(&args[1..]).await,
             CommandId::Spublish => self.handle_spublish(&args[1..]).await,
 
-            // Lua scripting / Redis Functions (FUNCTION is a stub; use EVAL for scripts)
+            // Lua scripting / Redis Functions
             CommandId::Eval => self.handle_eval(&args[1..]),
             CommandId::EvalRo => self.handle_eval_ro(&args[1..]),
             CommandId::Evalsha => self.handle_evalsha(&args[1..]),

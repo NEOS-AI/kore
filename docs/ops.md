@@ -215,7 +215,7 @@ Runtime: `ACL SETUSER` / `GETUSER` / `LIST` / `LOG` / `SAVE` / `LOAD`.
 5. [ ] `HEALTH FULL` / metrics scrape configured
 6. [ ] Replica or Sentinel plan tested in staging
 7. [ ] Client smoke: `scripts/client_smoke.sh` or app integration tests
-8. [ ] Known gaps reviewed: Functions stubs, no cluster bus, admin UI unauthenticated
+8. [ ] Known gaps reviewed: Functions not in RDB/AOF, no cluster bus, admin UI unauthenticated
 
 ## Related docs
 

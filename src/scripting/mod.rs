@@ -1,6 +1,6 @@
-//! Lua script cache (SCRIPT LOAD / EVALSHA) and SHA1 helpers.
+//! Lua script cache (SCRIPT LOAD / EVALSHA) and Redis Functions library store.
 //!
-//! Shared server-wide so SCRIPT LOAD on one connection is visible to others.
+//! Shared server-wide so SCRIPT LOAD / FUNCTION LOAD on one connection is visible to others.
 
 use parking_lot::Mutex;
 use sha1::{Digest, Sha1};
@@ -72,6 +72,301 @@ impl ScriptCache {
     }
 }
 
+/// Metadata for one registered Redis Function inside a library.
+#[derive(Debug, Clone)]
+pub struct FunctionMeta {
+    pub name: String,
+    pub description: String,
+    /// Redis function flags (e.g. `"no-writes"`).
+    pub flags: Vec<String>,
+}
+
+/// One loaded Redis Functions library (Lua engine).
+#[derive(Debug, Clone)]
+pub struct FunctionLibrary {
+    pub name: String,
+    pub engine: String,
+    pub code: String,
+    pub functions: Vec<FunctionMeta>,
+}
+
+/// Parsed shebang from a library source (`#!lua name=mylib`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShebangInfo {
+    pub engine: String,
+    pub name: String,
+}
+
+/// Parse the first line of a Redis Functions library.
+///
+/// Expected form: `#!lua name=<libname>` (optional extra tokens ignored).
+pub fn parse_function_shebang(code: &str) -> Result<ShebangInfo, String> {
+    let first = code.lines().next().unwrap_or("").trim();
+    if !first.starts_with("#!") {
+        return Err(
+            "ERR Library payload must begin with a #! shebang line (e.g. #!lua name=mylib)"
+                .into(),
+        );
+    }
+    let rest = first[2..].trim();
+    let mut parts = rest.split_whitespace();
+    let engine = parts
+        .next()
+        .ok_or_else(|| "ERR Missing engine name in shebang".to_string())?
+        .to_string();
+    if !engine.eq_ignore_ascii_case("lua") {
+        return Err(format!(
+            "ERR Engine '{}' is not supported (only LUA)",
+            engine
+        ));
+    }
+    let mut name: Option<String> = None;
+    for tok in parts {
+        if let Some(v) = tok.strip_prefix("name=") {
+            if v.is_empty() {
+                return Err("ERR Library name in shebang cannot be empty".into());
+            }
+            name = Some(v.to_string());
+        }
+    }
+    let name = name.ok_or_else(|| {
+        "ERR Library shebang must include name=<library-name>".to_string()
+    })?;
+    Ok(ShebangInfo {
+        engine: "LUA".to_string(),
+        name,
+    })
+}
+
+/// Strip the leading `#!…` shebang line so Lua can execute the library body.
+///
+/// Redis keeps the shebang in stored source for DUMP/LIST WITHCODE, but Lua
+/// does not treat `#!` as a comment.
+pub fn strip_function_shebang(code: &str) -> &str {
+    let trimmed = code.strip_prefix('\u{feff}').unwrap_or(code);
+    if let Some(rest) = trimmed.strip_prefix("#!") {
+        if let Some(nl) = rest.find('\n') {
+            return rest[nl + 1..].trim_start_matches('\r');
+        }
+        // Shebang-only payload.
+        return "";
+    }
+    code
+}
+
+/// Shared in-memory Redis Functions library store (FUNCTION LOAD / FCALL).
+#[derive(Debug, Default)]
+pub struct FunctionLibraryStore {
+    inner: Mutex<FunctionStoreInner>,
+}
+
+#[derive(Debug, Default)]
+struct FunctionStoreInner {
+    /// library_name → library
+    libraries: HashMap<String, FunctionLibrary>,
+    /// function_name → library_name
+    functions: HashMap<String, String>,
+}
+
+impl FunctionLibraryStore {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(FunctionStoreInner::default()),
+        }
+    }
+
+    pub fn shared() -> Arc<Self> {
+        Arc::new(Self::new())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().libraries.is_empty()
+    }
+
+    pub fn library_count(&self) -> usize {
+        self.inner.lock().libraries.len()
+    }
+
+    /// Look up which library owns `function_name` and return a clone of that library.
+    pub fn find_function(&self, function_name: &str) -> Option<FunctionLibrary> {
+        let g = self.inner.lock();
+        let lib_name = g.functions.get(function_name)?;
+        g.libraries.get(lib_name).cloned()
+    }
+
+    /// Metadata for a single function (name, flags, description).
+    pub fn function_meta(&self, function_name: &str) -> Option<FunctionMeta> {
+        let g = self.inner.lock();
+        let lib_name = g.functions.get(function_name)?;
+        let lib = g.libraries.get(lib_name)?;
+        lib.functions
+            .iter()
+            .find(|f| f.name == function_name)
+            .cloned()
+    }
+
+    /// Insert or replace a library. On conflict without `replace`, returns an error string.
+    pub fn load(
+        &self,
+        library: FunctionLibrary,
+        replace: bool,
+    ) -> Result<(), String> {
+        let mut g = self.inner.lock();
+        if g.libraries.contains_key(&library.name) {
+            if !replace {
+                return Err(format!(
+                    "ERR Library '{}' already exists",
+                    library.name
+                ));
+            }
+            // Drop old library's function index entries first.
+            if let Some(old) = g.libraries.remove(&library.name) {
+                for f in &old.functions {
+                    g.functions.remove(&f.name);
+                }
+            }
+        }
+        // Function name uniqueness across libraries.
+        for f in &library.functions {
+            if let Some(owner) = g.functions.get(&f.name) {
+                if owner != &library.name {
+                    return Err(format!(
+                        "ERR Function {} already exists in library '{}'",
+                        f.name, owner
+                    ));
+                }
+            }
+        }
+        for f in &library.functions {
+            g.functions
+                .insert(f.name.clone(), library.name.clone());
+        }
+        g.libraries.insert(library.name.clone(), library);
+        Ok(())
+    }
+
+    pub fn delete(&self, library_name: &str) -> Result<(), String> {
+        let mut g = self.inner.lock();
+        let lib = g
+            .libraries
+            .remove(library_name)
+            .ok_or_else(|| format!("ERR Library not found '{}'", library_name))?;
+        for f in &lib.functions {
+            g.functions.remove(&f.name);
+        }
+        Ok(())
+    }
+
+    pub fn flush(&self) {
+        let mut g = self.inner.lock();
+        g.libraries.clear();
+        g.functions.clear();
+    }
+
+    /// Snapshot libraries (sorted by name) for LIST / DUMP.
+    pub fn list(&self) -> Vec<FunctionLibrary> {
+        let g = self.inner.lock();
+        let mut libs: Vec<_> = g.libraries.values().cloned().collect();
+        libs.sort_by(|a, b| a.name.cmp(&b.name));
+        libs
+    }
+
+    /// Filter by exact library name (Redis LIBRARYNAME is a pattern; we support exact / `*`).
+    pub fn list_filtered(&self, libraryname: Option<&str>) -> Vec<FunctionLibrary> {
+        let all = self.list();
+        match libraryname {
+            None => all,
+            Some("*") => all,
+            Some(pat) if pat.contains('*') || pat.contains('?') => {
+                // Simple glob: * matches any substring, ? one char.
+                all.into_iter()
+                    .filter(|l| glob_match(pat, &l.name))
+                    .collect()
+            }
+            Some(name) => all.into_iter().filter(|l| l.name == name).collect(),
+        }
+    }
+
+    /// Serialize all libraries into a portable bulk payload (Kore `KORF1` format).
+    pub fn dump(&self) -> Vec<u8> {
+        let libs = self.list();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"KORF1");
+        out.extend_from_slice(&(libs.len() as u32).to_be_bytes());
+        for lib in libs {
+            write_len_str(&mut out, &lib.name);
+            write_len_str(&mut out, &lib.code);
+        }
+        out
+    }
+
+    /// Parse dump payload into (name, code) pairs (no store mutation).
+    pub fn parse_dump(payload: &[u8]) -> Result<Vec<(String, String)>, String> {
+        parse_dump_payload(payload)
+    }
+}
+
+fn write_len_str(out: &mut Vec<u8>, s: &str) {
+    let b = s.as_bytes();
+    out.extend_from_slice(&(b.len() as u32).to_be_bytes());
+    out.extend_from_slice(b);
+}
+
+fn read_len_str(payload: &[u8], off: &mut usize) -> Result<String, String> {
+    if *off + 4 > payload.len() {
+        return Err("ERR Bad payload format".into());
+    }
+    let len = u32::from_be_bytes(payload[*off..*off + 4].try_into().unwrap()) as usize;
+    *off += 4;
+    if *off + len > payload.len() {
+        return Err("ERR Bad payload format".into());
+    }
+    let s = String::from_utf8_lossy(&payload[*off..*off + len]).into_owned();
+    *off += len;
+    Ok(s)
+}
+
+fn parse_dump_payload(payload: &[u8]) -> Result<Vec<(String, String)>, String> {
+    if payload.len() < 5 + 4 || &payload[..5] != b"KORF1" {
+        return Err("ERR Bad payload format or version".into());
+    }
+    let mut off = 5;
+    let count = u32::from_be_bytes(payload[off..off + 4].try_into().unwrap()) as usize;
+    off += 4;
+    let mut libs = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = read_len_str(payload, &mut off)?;
+        let code = read_len_str(payload, &mut off)?;
+        libs.push((name, code));
+    }
+    if off != payload.len() {
+        return Err("ERR Bad payload format (trailing data)".into());
+    }
+    Ok(libs)
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    // Minimal glob: * and ?
+    fn rec(p: &[u8], t: &[u8]) -> bool {
+        match (p.first(), t.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) => {
+                // Match zero or more
+                for i in 0..=t.len() {
+                    if rec(&p[1..], &t[i..]) {
+                        return true;
+                    }
+                }
+                false
+            }
+            (Some(b'?'), Some(_)) => rec(&p[1..], &t[1..]),
+            (Some(a), Some(b)) if a == b => rec(&p[1..], &t[1..]),
+            _ => false,
+        }
+    }
+    rec(pattern.as_bytes(), text.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +391,53 @@ mod tests {
         c.flush();
         assert!(c.is_empty());
         assert_eq!(c.exists(&[sha]), vec![0]);
+    }
+
+    #[test]
+    fn shebang_parse() {
+        let s = parse_function_shebang("#!lua name=mylib\nreturn 1").unwrap();
+        assert_eq!(s.name, "mylib");
+        assert_eq!(s.engine, "LUA");
+        assert!(parse_function_shebang("return 1").is_err());
+        assert!(parse_function_shebang("#!js name=x\n").is_err());
+    }
+
+    #[test]
+    fn function_store_load_delete_dump_restore_parse() {
+        let store = FunctionLibraryStore::new();
+        let lib = FunctionLibrary {
+            name: "mylib".into(),
+            engine: "LUA".into(),
+            code: "#!lua name=mylib\n".into(),
+            functions: vec![FunctionMeta {
+                name: "f1".into(),
+                description: String::new(),
+                flags: vec![],
+            }],
+        };
+        store.load(lib, false).unwrap();
+        assert!(store.find_function("f1").is_some());
+        assert!(store.load(
+            FunctionLibrary {
+                name: "other".into(),
+                engine: "LUA".into(),
+                code: String::new(),
+                functions: vec![FunctionMeta {
+                    name: "f1".into(),
+                    description: String::new(),
+                    flags: vec![],
+                }],
+            },
+            false
+        )
+        .is_err());
+
+        let dump = store.dump();
+        let pairs = FunctionLibraryStore::parse_dump(&dump).unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].0, "mylib");
+
+        store.delete("mylib").unwrap();
+        assert!(store.is_empty());
     }
 }

@@ -1,12 +1,18 @@
-//! EVAL / EVALSHA / EVAL_RO / EVALSHA_RO / SCRIPT — Redis Lua scripting (mlua Lua 5.4).
+//! EVAL / EVALSHA / EVAL_RO / EVALSHA_RO / SCRIPT / FUNCTION / FCALL — Lua scripting
+//! and Redis Functions (mlua Lua 5.4).
 
 use super::{is_write_command, CommandHandler};
 use crate::error::Result;
 use crate::protocol::RespValue;
-use crate::scripting::script_sha1;
+use crate::scripting::{
+    parse_function_shebang, script_sha1, strip_function_shebang, FunctionLibrary,
+    FunctionMeta,
+};
 use bytes::Bytes;
 use mlua::{Lua, Value as LuaValue};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 /// Commands that may be invoked via `redis.call` / `redis.pcall` inside scripts.
 /// Blocking / multi / admin / nested-script commands are excluded.
@@ -111,10 +117,7 @@ impl CommandHandler {
     }
 
     /// FUNCTION HELP | LIST | LOAD | DELETE | FLUSH | DUMP | RESTORE | STATS | KILL
-    ///
-    /// Redis Functions library is not implemented yet. LIST is empty; mutating
-    /// subcommands return clear errors so clients can detect the stub.
-    pub(super) fn handle_function(&self, args: &[RespValue]) -> Result<RespValue> {
+    pub(super) fn handle_function(&mut self, args: &[RespValue]) -> Result<RespValue> {
         if args.is_empty() {
             return Ok(RespValue::error(
                 "ERR wrong number of arguments for 'function' command",
@@ -125,37 +128,74 @@ impl CommandHandler {
             None => return Ok(RespValue::error("ERR syntax error")),
         };
         match sub.as_str() {
-            "LIST" => {
-                // Optional WITHCODE / LIBRARYNAME ignored; always empty.
-                Ok(RespValue::Array(vec![]))
-            }
+            "LIST" => self.function_list(&args[1..]),
             "STATS" => {
-                // Minimal empty stats map (RESP2 flat array).
+                // Minimal stats map (RESP2 flat field/value array).
+                let engines = RespValue::Array(vec![
+                    RespValue::BulkString(Some(Bytes::from_static(b"LUA"))),
+                    RespValue::Array(vec![
+                        RespValue::BulkString(Some(Bytes::from_static(b"libraries_count"))),
+                        RespValue::Integer(self.function_libs.library_count() as i64),
+                        RespValue::BulkString(Some(Bytes::from_static(b"functions_count"))),
+                        RespValue::Integer(
+                            self.function_libs
+                                .list()
+                                .iter()
+                                .map(|l| l.functions.len() as i64)
+                                .sum(),
+                        ),
+                    ]),
+                ]);
                 Ok(RespValue::Array(vec![
                     RespValue::BulkString(Some(Bytes::from_static(b"running_script"))),
                     RespValue::null(),
                     RespValue::BulkString(Some(Bytes::from_static(b"engines"))),
-                    RespValue::Array(vec![]),
+                    engines,
                 ]))
             }
-            "LOAD" | "DELETE" | "FLUSH" | "DUMP" | "RESTORE" | "KILL" => {
-                Ok(RespValue::error(format!(
-                    "ERR FUNCTION {} is not supported yet (use EVAL/EVALSHA for scripts)",
-                    sub
-                )))
+            "LOAD" => self.function_load(&args[1..]),
+            "DELETE" => self.function_delete(&args[1..]),
+            "FLUSH" => self.function_flush(&args[1..]),
+            "DUMP" => {
+                if args.len() != 1 {
+                    return Ok(RespValue::error(
+                        "ERR wrong number of arguments for 'function|dump'",
+                    ));
+                }
+                let payload = self.function_libs.dump();
+                Ok(RespValue::BulkString(Some(Bytes::from(payload))))
             }
+            "RESTORE" => self.function_restore(&args[1..]),
+            "KILL" => Ok(RespValue::error(
+                "NOTBUSY No scripts in execution right now.",
+            )),
             "HELP" => Ok(RespValue::Array(vec![
                 RespValue::BulkString(Some(Bytes::from_static(
                     b"FUNCTION <subcommand> [<arg> ...]. Subcommands are:",
                 ))),
                 RespValue::BulkString(Some(Bytes::from_static(
-                    b"LIST [LIBRARYNAME name] [WITHCODE] -- list loaded libraries (empty)",
+                    b"LIST [LIBRARYNAME name] [WITHCODE] -- list loaded libraries",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"LOAD [REPLACE] <library-code> -- load a Lua library (#!lua name=...)",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"DELETE <library-name> -- delete a library",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"FLUSH [ASYNC|SYNC] -- delete all libraries",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"DUMP -- serialize all libraries",
+                ))),
+                RespValue::BulkString(Some(Bytes::from_static(
+                    b"RESTORE <payload> [FLUSH|APPEND|REPLACE] -- restore libraries",
                 ))),
                 RespValue::BulkString(Some(Bytes::from_static(
                     b"STATS -- function runtime stats",
                 ))),
                 RespValue::BulkString(Some(Bytes::from_static(
-                    b"LOAD / DELETE / FLUSH / DUMP / RESTORE / KILL -- not supported yet",
+                    b"KILL -- kill the currently executing function (NOTBUSY if none)",
                 ))),
                 RespValue::BulkString(Some(Bytes::from_static(
                     b"HELP -- print this help",
@@ -168,17 +208,216 @@ impl CommandHandler {
         }
     }
 
-    /// FCALL function numkeys [key ...] [arg ...] — not supported (no libraries).
-    pub(super) fn handle_fcall(&self, args: &[RespValue]) -> Result<RespValue> {
-        self.fcall_stub(args, "fcall")
+    fn function_list(&self, args: &[RespValue]) -> Result<RespValue> {
+        let mut libraryname: Option<String> = None;
+        let mut withcode = false;
+        let mut i = 0;
+        while i < args.len() {
+            let tok = match args[i].as_bulk_string() {
+                Some(b) => String::from_utf8_lossy(b).to_ascii_uppercase(),
+                None => return Ok(RespValue::error("ERR syntax error")),
+            };
+            match tok.as_str() {
+                "WITHCODE" => {
+                    withcode = true;
+                    i += 1;
+                }
+                "LIBRARYNAME" => {
+                    if i + 1 >= args.len() {
+                        return Ok(RespValue::error("ERR syntax error"));
+                    }
+                    libraryname = match args[i + 1].as_bulk_string() {
+                        Some(b) => Some(String::from_utf8_lossy(b).into_owned()),
+                        None => return Ok(RespValue::error("ERR syntax error")),
+                    };
+                    i += 2;
+                }
+                _ => {
+                    return Ok(RespValue::error("ERR syntax error"));
+                }
+            }
+        }
+        let libs = self
+            .function_libs
+            .list_filtered(libraryname.as_deref());
+        let mut out = Vec::with_capacity(libs.len());
+        for lib in libs {
+            let mut entry = vec![
+                RespValue::BulkString(Some(Bytes::from_static(b"library_name"))),
+                RespValue::BulkString(Some(Bytes::from(lib.name.clone()))),
+                RespValue::BulkString(Some(Bytes::from_static(b"engine"))),
+                RespValue::BulkString(Some(Bytes::from(lib.engine.clone()))),
+                RespValue::BulkString(Some(Bytes::from_static(b"functions"))),
+            ];
+            let mut fns = Vec::with_capacity(lib.functions.len());
+            for f in &lib.functions {
+                let flags: Vec<RespValue> = f
+                    .flags
+                    .iter()
+                    .map(|fl| RespValue::BulkString(Some(Bytes::from(fl.clone()))))
+                    .collect();
+                fns.push(RespValue::Array(vec![
+                    RespValue::BulkString(Some(Bytes::from_static(b"name"))),
+                    RespValue::BulkString(Some(Bytes::from(f.name.clone()))),
+                    RespValue::BulkString(Some(Bytes::from_static(b"description"))),
+                    RespValue::BulkString(Some(Bytes::from(f.description.clone()))),
+                    RespValue::BulkString(Some(Bytes::from_static(b"flags"))),
+                    RespValue::Array(flags),
+                ]));
+            }
+            entry.push(RespValue::Array(fns));
+            if withcode {
+                entry.push(RespValue::BulkString(Some(Bytes::from_static(
+                    b"library_code",
+                ))));
+                entry.push(RespValue::BulkString(Some(Bytes::from(lib.code.clone()))));
+            }
+            out.push(RespValue::Array(entry));
+        }
+        Ok(RespValue::Array(out))
     }
 
-    /// FCALL_RO — read-only FCALL stub.
-    pub(super) fn handle_fcall_ro(&self, args: &[RespValue]) -> Result<RespValue> {
-        self.fcall_stub(args, "fcall_ro")
+    fn function_load(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'function|load'",
+            ));
+        }
+        let mut replace = false;
+        let mut idx = 0;
+        if let Some(b) = args[0].as_bulk_string() {
+            if String::from_utf8_lossy(b).eq_ignore_ascii_case("REPLACE") {
+                replace = true;
+                idx = 1;
+            }
+        }
+        if idx >= args.len() || args.len() - idx != 1 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'function|load'",
+            ));
+        }
+        let code = match args[idx].as_bulk_string() {
+            Some(b) => String::from_utf8_lossy(b).into_owned(),
+            None => return Ok(RespValue::error("ERR invalid library code")),
+        };
+        match self.load_function_library(&code, replace) {
+            Ok(name) => Ok(RespValue::BulkString(Some(Bytes::from(name)))),
+            Err(e) => Ok(RespValue::error(e)),
+        }
     }
 
-    fn fcall_stub(&self, args: &[RespValue], cmd: &str) -> Result<RespValue> {
+    fn function_delete(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() != 1 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'function|delete'",
+            ));
+        }
+        let name = match args[0].as_bulk_string() {
+            Some(b) => String::from_utf8_lossy(b).into_owned(),
+            None => return Ok(RespValue::error("ERR invalid library name")),
+        };
+        match self.function_libs.delete(&name) {
+            Ok(()) => Ok(RespValue::ok()),
+            Err(e) => Ok(RespValue::error(e)),
+        }
+    }
+
+    fn function_flush(&self, args: &[RespValue]) -> Result<RespValue> {
+        if args.len() > 1 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'function|flush'",
+            ));
+        }
+        if args.len() == 1 {
+            let mode = match args[0].as_bulk_string() {
+                Some(s) => String::from_utf8_lossy(s).to_uppercase(),
+                None => return Ok(RespValue::error("ERR syntax error")),
+            };
+            if mode != "ASYNC" && mode != "SYNC" {
+                return Ok(RespValue::error("ERR syntax error"));
+            }
+        }
+        self.function_libs.flush();
+        Ok(RespValue::ok())
+    }
+
+    fn function_restore(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        if args.is_empty() || args.len() > 2 {
+            return Ok(RespValue::error(
+                "ERR wrong number of arguments for 'function|restore'",
+            ));
+        }
+        let payload = match args[0].as_bulk_string() {
+            Some(b) => b.to_vec(),
+            None => return Ok(RespValue::error("ERR invalid payload")),
+        };
+        let mode = if args.len() == 2 {
+            match args[1].as_bulk_string() {
+                Some(s) => String::from_utf8_lossy(s).to_ascii_lowercase(),
+                None => return Ok(RespValue::error("ERR syntax error")),
+            }
+        } else {
+            "append".to_string()
+        };
+        if mode != "flush" && mode != "append" && mode != "replace" {
+            return Ok(RespValue::error("ERR syntax error"));
+        }
+        let pairs = match crate::scripting::FunctionLibraryStore::parse_dump(&payload) {
+            Ok(p) => p,
+            Err(e) => return Ok(RespValue::error(e)),
+        };
+        if mode == "flush" {
+            self.function_libs.flush();
+        }
+        for (_name, code) in pairs {
+            let replace = mode == "replace" || mode == "flush";
+            if let Err(e) = self.load_function_library(&code, replace) {
+                // APPEND: fail on conflict (load without replace).
+                return Ok(RespValue::error(e));
+            }
+        }
+        Ok(RespValue::ok())
+    }
+
+    /// Parse shebang, run library to capture `redis.register_function`, store.
+    fn load_function_library(
+        &mut self,
+        code: &str,
+        replace: bool,
+    ) -> std::result::Result<String, String> {
+        let shebang = parse_function_shebang(code)?;
+        let metas = discover_registered_functions(code)?;
+        if metas.is_empty() {
+            return Err(
+                "ERR No functions registered. Use redis.register_function.".into(),
+            );
+        }
+        let lib = FunctionLibrary {
+            name: shebang.name.clone(),
+            engine: shebang.engine,
+            code: code.to_string(),
+            functions: metas,
+        };
+        self.function_libs.load(lib, replace)?;
+        Ok(shebang.name)
+    }
+
+    /// FCALL function numkeys [key ...] [arg ...]
+    pub(super) fn handle_fcall(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        self.fcall_exec(args, false, "fcall")
+    }
+
+    /// FCALL_RO — read-only FCALL (requires `no-writes` flag; write redis.call denied).
+    pub(super) fn handle_fcall_ro(&mut self, args: &[RespValue]) -> Result<RespValue> {
+        self.fcall_exec(args, true, "fcall_ro")
+    }
+
+    fn fcall_exec(
+        &mut self,
+        args: &[RespValue],
+        readonly: bool,
+        cmd: &str,
+    ) -> Result<RespValue> {
         if args.len() < 2 {
             return Ok(RespValue::error(format!(
                 "ERR wrong number of arguments for '{}' command",
@@ -189,19 +428,148 @@ impl CommandHandler {
             Some(b) => String::from_utf8_lossy(b).into_owned(),
             None => return Ok(RespValue::error("ERR Function not found")),
         };
-        // Validate numkeys shape so clients get arity-style errors when obvious.
-        match self.parse_integer(&args[1]) {
-            Ok(n) if n >= 0 => {}
-            _ => {
+        let lib = match self.function_libs.find_function(&name) {
+            Some(l) => l,
+            None => {
+                return Ok(RespValue::error(format!(
+                    "ERR Function not found",
+                )));
+            }
+        };
+        let meta = lib
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .cloned()
+            .unwrap_or(FunctionMeta {
+                name: name.clone(),
+                description: String::new(),
+                flags: vec![],
+            });
+        if readonly {
+            let no_writes = meta
+                .flags
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case("no-writes"));
+            if !no_writes {
+                return Ok(RespValue::error(
+                    "ERR Can not execute a function with the specified flags using fcall_ro",
+                ));
+            }
+        }
+
+        // Parse numkeys / KEYS / ARGV like EVAL.
+        let numkeys = match self.parse_integer(&args[1]) {
+            Ok(n) if n >= 0 => n as usize,
+            Ok(_) => {
+                return Ok(RespValue::error(
+                    "ERR Number of keys can't be negative",
+                ));
+            }
+            Err(_) => {
                 return Ok(RespValue::error(
                     "ERR value is not an integer or out of range",
                 ));
             }
+        };
+        let rest = &args[2..];
+        if rest.len() < numkeys {
+            return Ok(RespValue::error(
+                "ERR Number of keys can't be greater than number of args",
+            ));
         }
-        Ok(RespValue::error(format!(
-            "ERR Function '{}' not found",
-            name
-        )))
+        let mut keys = Vec::with_capacity(numkeys);
+        for k in &rest[..numkeys] {
+            match k.as_bulk_string() {
+                Some(b) => keys.push(b.clone()),
+                None => return Ok(RespValue::error("ERR invalid key")),
+            }
+        }
+        let mut argv = Vec::with_capacity(rest.len() - numkeys);
+        for a in &rest[numkeys..] {
+            match a.as_bulk_string() {
+                Some(b) => argv.push(b.clone()),
+                None => {
+                    if let Some(i) = a.as_integer() {
+                        argv.push(Bytes::from(i.to_string()));
+                    } else {
+                        return Ok(RespValue::error("ERR invalid argument"));
+                    }
+                }
+            }
+        }
+
+        match self.run_function(&lib.code, &name, &keys, &argv, readonly) {
+            Ok(v) => Ok(v),
+            Err(e) => Ok(RespValue::error(e)),
+        }
+    }
+
+    /// Re-exec library code, then invoke the named registered function(keys, args).
+    fn run_function(
+        &mut self,
+        library_code: &str,
+        function_name: &str,
+        keys: &[Bytes],
+        argv: &[Bytes],
+        readonly: bool,
+    ) -> std::result::Result<RespValue, String> {
+        let lua = Lua::new();
+        let handler_ptr = self as *mut CommandHandler;
+        let in_call = AtomicBool::new(false);
+
+        // Captured callbacks: name → Function (stored via Arc/Mutex for registry).
+        let registry: Arc<StdMutex<HashMap<String, mlua::Function>>> =
+            Arc::new(StdMutex::new(HashMap::new()));
+
+        install_redis_table(&lua, handler_ptr, &in_call, readonly, Some(&registry))?;
+
+        // Execute library body (shebang stripped — Lua rejects #!).
+        let body = strip_function_shebang(library_code);
+        lua.load(body)
+            .set_name("function_library")
+            .exec()
+            .map_err(|e| format!("ERR Error running script: {}", e))?;
+
+        let callback = {
+            let map = registry
+                .lock()
+                .map_err(|_| "ERR function registry lock poisoned".to_string())?;
+            map.get(function_name)
+                .cloned()
+                .ok_or_else(|| "ERR Function not found".to_string())?
+        };
+
+        // Build keys / args tables (1-based). Redis Functions use keys/args params,
+        // not global KEYS/ARGV — but we still set globals for library convenience.
+        let keys_tbl = lua.create_table().map_err(|e| e.to_string())?;
+        for (i, k) in keys.iter().enumerate() {
+            keys_tbl
+                .set(i + 1, bytes_to_lua_string(&lua, k)?)
+                .map_err(|e| e.to_string())?;
+        }
+        let argv_tbl = lua.create_table().map_err(|e| e.to_string())?;
+        for (i, a) in argv.iter().enumerate() {
+            argv_tbl
+                .set(i + 1, bytes_to_lua_string(&lua, a)?)
+                .map_err(|e| e.to_string())?;
+        }
+
+        let ret: LuaValue = callback
+            .call((keys_tbl, argv_tbl))
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("NOSCRIPT")
+                    || msg.starts_with("ERR ")
+                    || msg.starts_with("WRONGTYPE")
+                {
+                    msg
+                } else {
+                    format!("ERR function_lib: {}", msg)
+                }
+            })?;
+
+        lua_value_to_resp(ret)
     }
 
     /// SCRIPT LOAD | EXISTS | FLUSH | KILL
@@ -398,76 +766,7 @@ impl CommandHandler {
         // Safety: handler is not moved; nested EVAL is denied in dispatch.
         let handler_ptr = self as *mut CommandHandler;
         let in_call = AtomicBool::new(false);
-
-        let call_fn = {
-            let in_call = &in_call as *const AtomicBool;
-            lua.create_function(move |lua_ctx, args: mlua::Variadic<LuaValue>| {
-                let in_call = unsafe { &*in_call };
-                if in_call.swap(true, Ordering::SeqCst) {
-                    return Err(mlua::Error::runtime(
-                        "ERR redis.call re-entry is not allowed",
-                    ));
-                }
-                let result = (|| {
-                    let h = unsafe { &mut *handler_ptr };
-                    dispatch_redis_call(lua_ctx, h, args, false, readonly)
-                })();
-                in_call.store(false, Ordering::SeqCst);
-                result
-            })
-            .map_err(|e| e.to_string())?
-        };
-
-        let pcall_fn = {
-            let in_call = &in_call as *const AtomicBool;
-            lua.create_function(move |lua_ctx, args: mlua::Variadic<LuaValue>| {
-                let in_call = unsafe { &*in_call };
-                if in_call.swap(true, Ordering::SeqCst) {
-                    return Err(mlua::Error::runtime(
-                        "ERR redis.call re-entry is not allowed",
-                    ));
-                }
-                let result = (|| {
-                    let h = unsafe { &mut *handler_ptr };
-                    dispatch_redis_call(lua_ctx, h, args, true, readonly)
-                })();
-                in_call.store(false, Ordering::SeqCst);
-                result
-            })
-            .map_err(|e| e.to_string())?
-        };
-
-        let redis_tbl = lua.create_table().map_err(|e| e.to_string())?;
-        redis_tbl
-            .set("call", call_fn)
-            .map_err(|e| e.to_string())?;
-        redis_tbl
-            .set("pcall", pcall_fn)
-            .map_err(|e| e.to_string())?;
-        // redis.status_reply / redis.error_reply helpers (optional Redis API).
-        let status_fn = lua
-            .create_function(|lua_ctx, msg: String| {
-                let t = lua_ctx.create_table()?;
-                t.set("ok", msg)?;
-                Ok(t)
-            })
-            .map_err(|e| e.to_string())?;
-        let error_fn = lua
-            .create_function(|lua_ctx, msg: String| {
-                let t = lua_ctx.create_table()?;
-                t.set("err", msg)?;
-                Ok(t)
-            })
-            .map_err(|e| e.to_string())?;
-        redis_tbl
-            .set("status_reply", status_fn)
-            .map_err(|e| e.to_string())?;
-        redis_tbl
-            .set("error_reply", error_fn)
-            .map_err(|e| e.to_string())?;
-        lua.globals()
-            .set("redis", redis_tbl)
-            .map_err(|e| e.to_string())?;
+        install_redis_table(&lua, handler_ptr, &in_call, readonly, None)?;
 
         let chunk = lua
             .load(source)
@@ -676,6 +975,327 @@ fn compile_check(source: &str) -> std::result::Result<(), String> {
         .into_function()
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// Install `redis.call` / `redis.pcall` / helpers, and optionally
+/// `redis.register_function` (Redis Functions libraries).
+///
+/// When `registry` is `Some`, callbacks are stored for later FCALL.
+/// When `None` (EVAL path), `register_function` is omitted.
+fn install_redis_table(
+    lua: &Lua,
+    handler_ptr: *mut CommandHandler,
+    in_call: &AtomicBool,
+    readonly: bool,
+    registry: Option<&Arc<StdMutex<HashMap<String, mlua::Function>>>>,
+) -> std::result::Result<(), String> {
+    let call_fn = {
+        let in_call = in_call as *const AtomicBool;
+        lua.create_function(move |lua_ctx, args: mlua::Variadic<LuaValue>| {
+            let in_call = unsafe { &*in_call };
+            if in_call.swap(true, Ordering::SeqCst) {
+                return Err(mlua::Error::runtime(
+                    "ERR redis.call re-entry is not allowed",
+                ));
+            }
+            let result = (|| {
+                let h = unsafe { &mut *handler_ptr };
+                dispatch_redis_call(lua_ctx, h, args, false, readonly)
+            })();
+            in_call.store(false, Ordering::SeqCst);
+            result
+        })
+        .map_err(|e| e.to_string())?
+    };
+
+    let pcall_fn = {
+        let in_call = in_call as *const AtomicBool;
+        lua.create_function(move |lua_ctx, args: mlua::Variadic<LuaValue>| {
+            let in_call = unsafe { &*in_call };
+            if in_call.swap(true, Ordering::SeqCst) {
+                return Err(mlua::Error::runtime(
+                    "ERR redis.call re-entry is not allowed",
+                ));
+            }
+            let result = (|| {
+                let h = unsafe { &mut *handler_ptr };
+                dispatch_redis_call(lua_ctx, h, args, true, readonly)
+            })();
+            in_call.store(false, Ordering::SeqCst);
+            result
+        })
+        .map_err(|e| e.to_string())?
+    };
+
+    let redis_tbl = lua.create_table().map_err(|e| e.to_string())?;
+    redis_tbl
+        .set("call", call_fn)
+        .map_err(|e| e.to_string())?;
+    redis_tbl
+        .set("pcall", pcall_fn)
+        .map_err(|e| e.to_string())?;
+
+    let status_fn = lua
+        .create_function(|lua_ctx, msg: String| {
+            let t = lua_ctx.create_table()?;
+            t.set("ok", msg)?;
+            Ok(t)
+        })
+        .map_err(|e| e.to_string())?;
+    let error_fn = lua
+        .create_function(|lua_ctx, msg: String| {
+            let t = lua_ctx.create_table()?;
+            t.set("err", msg)?;
+            Ok(t)
+        })
+        .map_err(|e| e.to_string())?;
+    redis_tbl
+        .set("status_reply", status_fn)
+        .map_err(|e| e.to_string())?;
+    redis_tbl
+        .set("error_reply", error_fn)
+        .map_err(|e| e.to_string())?;
+
+    if let Some(reg) = registry {
+        let meta_out: Arc<StdMutex<Vec<FunctionMeta>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        install_register_function_dual(
+            lua,
+            &redis_tbl,
+            Arc::clone(reg),
+            meta_out,
+        )?;
+    }
+
+    lua.globals()
+        .set("redis", redis_tbl)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Two-arg `redis.register_function(name, callback)` via Variadic wrapper installed
+/// at discovery/load time.
+fn install_register_function_dual(
+    lua: &Lua,
+    redis_tbl: &mlua::Table,
+    registry: Arc<StdMutex<HashMap<String, mlua::Function>>>,
+    meta_out: Arc<StdMutex<Vec<FunctionMeta>>>,
+) -> std::result::Result<(), String> {
+    let register_fn = lua
+        .create_function(move |lua_ctx, args: mlua::Variadic<LuaValue>| {
+            if args.is_empty() {
+                return Err(mlua::Error::runtime(
+                    "ERR wrong number of arguments to redis.register_function",
+                ));
+            }
+            // Two-arg form: name, callback
+            if args.len() >= 2 {
+                if let (LuaValue::String(name_s), LuaValue::Function(cb)) =
+                    (&args[0], &args[1])
+                {
+                    let name = name_s
+                        .to_str()
+                        .map_err(mlua::Error::external)?
+                        .to_string();
+                    if name.is_empty() {
+                        return Err(mlua::Error::runtime(
+                            "ERR Function name cannot be empty",
+                        ));
+                    }
+                    {
+                        let mut map = registry.lock().map_err(|e| {
+                            mlua::Error::runtime(format!("registry lock: {}", e))
+                        })?;
+                        if map.contains_key(&name) {
+                            return Err(mlua::Error::runtime(format!(
+                                "ERR Function {} already registered",
+                                name
+                            )));
+                        }
+                        map.insert(name.clone(), cb.clone());
+                    }
+                    let mut metas = meta_out.lock().map_err(|e| {
+                        mlua::Error::runtime(format!("meta lock: {}", e))
+                    })?;
+                    metas.push(FunctionMeta {
+                        name,
+                        description: String::new(),
+                        flags: vec![],
+                    });
+                    return Ok(());
+                }
+            }
+            // Table form
+            let arg = args.into_iter().next().unwrap();
+            match arg {
+                LuaValue::Table(t) => {
+                    let name: String = t
+                        .get::<LuaValue>("function_name")
+                        .ok()
+                        .and_then(|v| match v {
+                            LuaValue::String(s) => {
+                                s.to_str().ok().map(|x| x.to_string())
+                            }
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            mlua::Error::runtime(
+                                "ERR register_function: missing function_name",
+                            )
+                        })?;
+                    let callback: mlua::Function = t
+                        .get::<LuaValue>("callback")
+                        .ok()
+                        .and_then(|v| match v {
+                            LuaValue::Function(f) => Some(f),
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            mlua::Error::runtime(
+                                "ERR register_function: missing callback",
+                            )
+                        })?;
+                    let description = t
+                        .get::<LuaValue>("description")
+                        .ok()
+                        .and_then(|v| match v {
+                            LuaValue::String(s) => {
+                                s.to_str().ok().map(|x| x.to_string())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    let mut flags = Vec::new();
+                    if let Ok(LuaValue::Table(ft)) = t.get::<LuaValue>("flags") {
+                        let mut i = 1i64;
+                        loop {
+                            match ft.get::<LuaValue>(i) {
+                                Ok(LuaValue::String(s)) => {
+                                    if let Ok(ss) = s.to_str() {
+                                        flags.push(ss.to_string());
+                                    }
+                                    i += 1;
+                                }
+                                Ok(LuaValue::Nil) | Err(_) => break,
+                                Ok(_) => i += 1,
+                            }
+                            if i > 64 {
+                                break;
+                            }
+                        }
+                    }
+                    {
+                        let mut map = registry.lock().map_err(|e| {
+                            mlua::Error::runtime(format!("registry lock: {}", e))
+                        })?;
+                        if map.contains_key(&name) {
+                            return Err(mlua::Error::runtime(format!(
+                                "ERR Function {} already registered",
+                                name
+                            )));
+                        }
+                        map.insert(name.clone(), callback);
+                    }
+                    let mut metas = meta_out.lock().map_err(|e| {
+                        mlua::Error::runtime(format!("meta lock: {}", e))
+                    })?;
+                    metas.push(FunctionMeta {
+                        name,
+                        description,
+                        flags,
+                    });
+                    let _ = lua_ctx;
+                    Ok(())
+                }
+                _ => Err(mlua::Error::runtime(
+                    "ERR redis.register_function expects (name, callback) or a table",
+                )),
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    redis_tbl
+        .set("register_function", register_fn)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Run library source at LOAD time to collect registered function metadata.
+fn discover_registered_functions(
+    code: &str,
+) -> std::result::Result<Vec<FunctionMeta>, String> {
+    let lua = Lua::new();
+    let registry: Arc<StdMutex<HashMap<String, mlua::Function>>> =
+        Arc::new(StdMutex::new(HashMap::new()));
+    let meta_out: Arc<StdMutex<Vec<FunctionMeta>>> =
+        Arc::new(StdMutex::new(Vec::new()));
+
+    // Minimal redis table: register_function + stubs for call/pcall/status/error.
+    let redis_tbl = lua.create_table().map_err(|e| e.to_string())?;
+    install_register_function_dual(
+        &lua,
+        &redis_tbl,
+        Arc::clone(&registry),
+        Arc::clone(&meta_out),
+    )?;
+
+    // Stubs so libraries that touch redis.call at load time fail clearly.
+    let deny = lua
+        .create_function(|_, ()| -> mlua::Result<()> {
+            Err(mlua::Error::runtime(
+                "ERR redis.call is not allowed while loading a function library",
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    // Use variadic deny for call/pcall
+    let deny_call = lua
+        .create_function(|_, _args: mlua::Variadic<LuaValue>| -> mlua::Result<LuaValue> {
+            Err(mlua::Error::runtime(
+                "ERR redis.call is not allowed while loading a function library",
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    redis_tbl
+        .set("call", deny_call.clone())
+        .map_err(|e| e.to_string())?;
+    redis_tbl
+        .set("pcall", deny_call)
+        .map_err(|e| e.to_string())?;
+    let _ = deny;
+    let status_fn = lua
+        .create_function(|lua_ctx, msg: String| {
+            let t = lua_ctx.create_table()?;
+            t.set("ok", msg)?;
+            Ok(t)
+        })
+        .map_err(|e| e.to_string())?;
+    let error_fn = lua
+        .create_function(|lua_ctx, msg: String| {
+            let t = lua_ctx.create_table()?;
+            t.set("err", msg)?;
+            Ok(t)
+        })
+        .map_err(|e| e.to_string())?;
+    redis_tbl
+        .set("status_reply", status_fn)
+        .map_err(|e| e.to_string())?;
+    redis_tbl
+        .set("error_reply", error_fn)
+        .map_err(|e| e.to_string())?;
+    lua.globals()
+        .set("redis", redis_tbl)
+        .map_err(|e| e.to_string())?;
+
+    let body = strip_function_shebang(code);
+    lua.load(body)
+        .set_name("function_library_load")
+        .exec()
+        .map_err(|e| format!("ERR Error compiling script: {}", e))?;
+
+    let metas = meta_out
+        .lock()
+        .map_err(|e| format!("meta lock: {}", e))?
+        .clone();
+    Ok(metas)
 }
 
 fn bytes_to_lua_string(_lua: &Lua, b: &Bytes) -> std::result::Result<String, String> {

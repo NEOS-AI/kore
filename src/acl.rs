@@ -807,7 +807,16 @@ pub fn category_commands(cat: &str) -> Result<Vec<String>, String> {
             "georadius_ro", "georadiusbymember", "georadiusbymember_ro",
         ],
         "transaction" => &["multi", "exec", "discard", "watch", "unwatch"],
-        "scripting" => &["eval", "eval_ro", "evalsha", "evalsha_ro", "script"],
+        "scripting" => &[
+            "eval",
+            "eval_ro",
+            "evalsha",
+            "evalsha_ro",
+            "script",
+            "function",
+            "fcall",
+            "fcall_ro",
+        ],
         // RediSearch-style FT.* category (also listed under @read / @write).
         "search" => &[
             "ft.create",

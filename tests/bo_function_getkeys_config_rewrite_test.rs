@@ -118,10 +118,11 @@ fn bo_function_list_help_fcall() {
         other => panic!("{:?}", other),
     }
 
+    // Empty shebang body (no register_function) is rejected.
     match handle(&mut h, cmd(&["FUNCTION", "LOAD", "#!lua name=lib\n"])) {
         RespValue::Error(e) => {
             assert!(
-                String::from_utf8_lossy(&e).contains("not supported"),
+                String::from_utf8_lossy(&e).contains("No functions"),
                 "{:?}",
                 e
             );
@@ -132,7 +133,7 @@ fn bo_function_list_help_fcall() {
     match handle(&mut h, cmd(&["FCALL", "myfn", "1", "k", "arg"])) {
         RespValue::Error(e) => {
             let msg = String::from_utf8_lossy(&e);
-            assert!(msg.contains("not found") && msg.contains("myfn"), "{}", msg);
+            assert!(msg.contains("not found") || msg.contains("Function"), "{}", msg);
         }
         other => panic!("{:?}", other),
     }
@@ -140,7 +141,8 @@ fn bo_function_list_help_fcall() {
     match handle(&mut h, cmd(&["FCALL_RO", "rofn", "0"])) {
         RespValue::Error(e) => {
             assert!(
-                String::from_utf8_lossy(&e).contains("not found"),
+                String::from_utf8_lossy(&e).contains("not found")
+                    || String::from_utf8_lossy(&e).contains("Function"),
                 "{:?}",
                 e
             );

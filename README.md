@@ -16,7 +16,7 @@ Kore speaks the RESP protocol so common Redis clients (`redis-cli`, redis-py, re
 ### Data types & commands
 - **Strings, hashes, lists, sets, sorted sets, streams** (incl. consumer groups / blocking ops)
 - **Bitmaps / HyperLogLog**, **geospatial**, transactions (`MULTI`/`EXEC`/`WATCH`)
-- **Lua** — `EVAL` / `EVALSHA` / `SCRIPT *` (Functions library still stub — see roadmap)
+- **Lua** — `EVAL` / `EVALSHA` / `SCRIPT *` plus Redis Functions (`FUNCTION LOAD` / `FCALL`; see Batch **GI**)
 - **DUMP / RESTORE** — Redis RDB wire for string/list/set/hash/zset; geo as ZSET_2 geohash; stream type-15+KST1; legacy KDF1 still accepted
 
 ### Persistence & HA

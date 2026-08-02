@@ -265,7 +265,7 @@ const COMMAND_SPECS: &[CmdSpec] = &[
     CmdSpec { name: "evalsha", arity: -3, flags: &["noscript", "movablekeys"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "evalsha_ro", arity: -3, flags: &["readonly", "noscript", "movablekeys"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "script", arity: -2, flags: &["noscript"], first_key: 0, last_key: 0, step: 0 },
-    // Redis Functions (stub: LIST empty; LOAD/FCALL not implemented yet)
+    // Redis Functions (FUNCTION LOAD / FCALL via shared FunctionLibraryStore)
     CmdSpec { name: "function", arity: -2, flags: &["noscript", "stale"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "fcall", arity: -3, flags: &["noscript", "movablekeys", "write"], first_key: 0, last_key: 0, step: 0 },
     CmdSpec { name: "fcall_ro", arity: -3, flags: &["readonly", "noscript", "movablekeys"], first_key: 0, last_key: 0, step: 0 },

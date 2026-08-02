@@ -254,10 +254,11 @@ Also tracked in `docs/roadmap.md`.
   - *Done*: `--databases` (default 16); per-connection `SELECT`; key isolation; `FLUSHDB` vs `FLUSHALL`; shared pub/sub+stats; **RDB v3 multi-DB + AOF SELECT** on save/rewrite/load/startup
   - *Batch AZ*: `SWAPDB` (content swap all types + TTL via dump/restore)
 - [x] **`[P2]`** Lua scripting / functions
-  - *Done (MVP)*: `EVAL` / `EVALSHA` / `SCRIPT LOAD|EXISTS|FLUSH|KILL` via mlua Lua 5.4 (vendored); shared `ScriptCache`; `redis.call` / `redis.pcall` whitelist for core string/hash/list/set/zset/bitmap/HLL ops; KEYS/ARGV; RESP↔Lua mapping (nil bulk→false, status→`{ok=…}`); ACL `@scripting`; cluster key extract from numkeys. Not yet: FUNCTIONS library, `redis.setresp`, full movablekeys COMMAND, nested scripts, script time limits.
+  - *Done (MVP)*: `EVAL` / `EVALSHA` / `SCRIPT LOAD|EXISTS|FLUSH|KILL` via mlua Lua 5.4 (vendored); shared `ScriptCache`; `redis.call` / `redis.pcall` whitelist for core string/hash/list/set/zset/bitmap/HLL ops; KEYS/ARGV; RESP↔Lua mapping (nil bulk→false, status→`{ok=…}`); ACL `@scripting`; cluster key extract from numkeys. Residual: `redis.setresp`, full movablekeys COMMAND, nested scripts, script time limits (**GJ**).
   - *Batch BG*: `EVAL_RO` / `EVALSHA_RO` (reject write `redis.call`); `CLIENT GETREDIR` / `TRACKINGINFO` (tracking off)
   - *Batch BL*: `SCRIPT HELP`; `CONFIG HELP`
-  - *Batch BO*: `FUNCTION` HELP/LIST/STATS (empty); `FCALL`/`FCALL_RO` not-found; `CONFIG REWRITE` (no conf file)
+  - *Batch BO*: `FUNCTION` HELP/LIST/STATS stubs; `FCALL`/`FCALL_RO` not-found; `CONFIG REWRITE` (no conf file)
+  - *Batch GI*: real Redis Functions — shared `FunctionLibraryStore`; `FUNCTION LOAD`/`LIST`/`DELETE`/`FLUSH`/`DUMP`/`RESTORE`/`STATS`; `FCALL`/`FCALL_RO` with `redis.register_function` + shebang `#!lua name=`; Kore `KORF1` dump format
   - *Batch BP*: `ACL LOG` GET/LEN/RESET + denial recording; `SHUTDOWN` [NOSAVE|SAVE]; connection close after `QUIT`/`SHUTDOWN`/`CLIENT KILL ID … SKIPME no`; `acllog-max-len` CONFIG
   - *Batch BQ*: `DEBUG` HELP/SLEEP/OBJECT; INFO `# Clients`/`# CPU`/`# Persistence`; `redis.call` GEO* + XADD/XLEN/XRANGE/XDEL/XTRIM/XACK + TOUCH/SCAN/RANDOMKEY
   - *Batch BR*: `CONFIG GET` port/bind/dir/dbfilename/appendonly/appendfilename/unixsocket/cluster-enabled; `MEMORY MALLOC-STATS`; `FT.TAGVALS`; `redis.call` COPY/MOVE; schema coerce TAG/NUMERIC from HSET text
@@ -744,7 +745,7 @@ Also tracked in `docs/roadmap.md`.
 
 **Shipped letter stream:** FW–GB baseline · GC–GH · GK · GL · **GC-rel**.
 
-**What remains:** differentiators and optional depth — **GI / GJ / GT–GU / GM / GN+**. Accepted P3 residuals stay out of the active queue.
+**What remains:** differentiators and optional depth — **GJ / GT–GU / GM / GN+**. Accepted P3 residuals stay out of the active queue.
 
 | Area | Residual | Priority | Planned batch |
 |------|----------|----------|---------------|
@@ -752,7 +753,7 @@ Also tracked in `docs/roadmap.md`.
 | Perf | Pipeline SET gap vs Valkey (~0.73M vs ~1.59M GF) | P1 residual | store path later |
 | Ops | Global repl backlog ordered publish residual | P3 residual | after GE |
 | Compat | stream listpack foreign DUMP fixtures; geo restore as zset | P3 residual | — |
-| Compat | Redis Functions / FCALL stubs only | **P2** | **GI** |
+| Compat | Redis Functions library + real FCALL (**GI** done) | **P2** | **GJ** polish |
 | Compat | Lua: no script time limits / `redis.setresp` full depth | **P2** | **GJ** |
 | Security | admin_http / metrics / deadlock UI: localhost MVP, no auth | **P2** | **GM** |
 | Cluster | binary bus 2PC; dest prepare breadth; operator NODE bypass | P3 accepted / later | **GP** |
@@ -791,9 +792,9 @@ Phases A–E P0 lists are green; prefer **P1 product/perf** over hunting accepte
 
 Ordered execution after **0.7.0**:
 
-1. **GI** or **GT–GU** — Functions or search scoring/ANN (one differentiator)
-2. **GJ** — Lua limits / setresp
-3. **GM** — admin HTTP auth+TLS when exposing UI
+1. **GJ** or **GT–GU** — Lua polish or search scoring/ANN
+2. **GM** — admin HTTP auth+TLS when exposing UI
+3. **GN+** — cluster/Sentinel depth as needed
 
 | Batch | Pri | Track | Scope |
 |-------|-----|-------|--------|
@@ -803,7 +804,7 @@ Ordered execution after **0.7.0**:
 | **GF** | P1 | Perf | **done** — full re-bench vs Valkey 9; SET P=16 ~730k vs Valkey ~1.59M |
 | **GG** | P1 | Compat | **done** — MIGRATE DUMP→RESTORE for core types; geo/stream recreate residual |
 | **GH** | P2 | Compat | **done** — geo ZSET_2 geohash; stream type-15+KST1; KDF1 dual-detect kept |
-| **GI** | P2 | Compat | Redis Functions library (`FUNCTION LOAD` / real `FCALL` beyond stubs) |
+| **GI** | P2 | Compat | **done** — Functions library: LOAD/LIST/DELETE/FLUSH/DUMP/RESTORE + real FCALL/FCALL_RO |
 | **GJ** | P2 | Compat | Lua polish: script time limits, `redis.setresp`, deeper `redis.call` surface |
 | **GK** | P1 | Compat | **done** — `scripts/client_smoke.sh` + CI (redis-cli + redis-py; ioredis optional) |
 | **GL** | P1 | Security | **done** — mTLS (`--tls-auth-clients`/`--tls-ca`), dual port (`--tls-port`), replica TLS (`--tls-replication`) |
@@ -855,7 +856,14 @@ Checklist (active):
   - MIGRATE uses DUMP→RESTORE for geo/stream (all types)
   - Residual: foreign Redis listpack stream DUMP fixtures; GEO* after geo DUMP restore is zset (Redis TYPE)
   - Tests: rdb_object geo/stream; fy dump wire; migrate geo/stream e2e
-- [ ] **`[P2]`** **Batch GI — Redis Functions library**
+- [x] **`[P2]`** **Batch GI — Redis Functions library**
+  - `FunctionLibraryStore` (shared server-wide) + shebang `#!lua name=` parse / strip for Lua exec
+  - `FUNCTION LOAD [REPLACE]`, `LIST` [`LIBRARYNAME`/`WITHCODE`], `DELETE`, `FLUSH`, `DUMP`/`RESTORE` (Kore `KORF1`), `STATS`, `HELP`, `KILL`→NOTBUSY
+  - `redis.register_function(name, cb)` and table form (`function_name`/`callback`/`flags`/`description`)
+  - `FCALL` / `FCALL_RO` (RO requires `no-writes`; write `redis.call` denied under RO)
+  - ACL `@scripting` includes `function`/`fcall`/`fcall_ro`
+  - Tests: `tests/gi_function_library_test.rs`; BO stub expectations updated
+  - Residual: Redis-native dump blob (not KORF1); library code not durable in RDB/AOF yet; no script time limits (**GJ**)
 - [ ] **`[P2]`** **Batch GJ — Lua script limits + setresp polish**
 - [x] **`[P1]`** **Batch GK — Multi-language client smoke + CI**
   - `scripts/client_smoke.sh`: redis-cli (string/hash/list/set/zset, multi-DB `-n`); optional redis-py / ioredis

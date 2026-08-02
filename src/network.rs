@@ -8,7 +8,7 @@ use crate::persistence::PersistenceManager;
 use crate::sentinel::SentinelState;
 use crate::protocol::{RespParser, RespValue};
 use crate::redlock::Redlock;
-use crate::scripting::ScriptCache;
+use crate::scripting::{FunctionLibraryStore, ScriptCache};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig as RustlsServerConfig;
 use std::fs::File;
@@ -38,6 +38,8 @@ pub struct Server {
     sentinel: Arc<SentinelState>,
     /// Shared SCRIPT LOAD / EVALSHA cache for all connections.
     script_cache: Arc<ScriptCache>,
+    /// Shared Redis Functions library store for all connections.
+    function_libs: Arc<FunctionLibraryStore>,
     /// When true, skip SAVE on process shutdown (SHUTDOWN NOSAVE).
     shutdown_nosave: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -195,6 +197,7 @@ impl Server {
             cluster,
             sentinel,
             script_cache: ScriptCache::shared(),
+            function_libs: FunctionLibraryStore::shared(),
             shutdown_nosave: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -617,6 +620,7 @@ impl Server {
         let sentinel = Arc::clone(&self.sentinel);
         let redlock = self.redlock.clone();
         let script_cache = self.script_cache.clone();
+        let function_libs = self.function_libs.clone();
 
         tokio::spawn(async move {
             let _permit = permit;
@@ -633,6 +637,7 @@ impl Server {
                             sentinel,
                             redlock,
                             script_cache,
+                            function_libs,
                             shutdown_tx,
                             shutdown_nosave,
                         )
@@ -651,6 +656,7 @@ impl Server {
                     sentinel,
                     redlock,
                     script_cache,
+                    function_libs,
                     shutdown_tx,
                     shutdown_nosave,
                 )
@@ -724,6 +730,7 @@ async fn handle_connection<S>(
     sentinel: Arc<SentinelState>,
     redlock: Option<Arc<Redlock>>,
     script_cache: Arc<ScriptCache>,
+    function_libs: Arc<FunctionLibraryStore>,
     shutdown_tx: Option<Arc<watch::Sender<bool>>>,
     shutdown_nosave: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()>
@@ -744,7 +751,8 @@ where
             .with_cluster(cluster)
             .with_sentinel(Some(sentinel))
             .with_redlock(redlock)
-            .with_script_cache(script_cache);
+            .with_script_cache(script_cache)
+            .with_function_libs(function_libs);
     if let Some(tx) = shutdown_tx {
         // watch::Sender is Clone; Arc unwraps to a clone for the handler field.
         handler = handler.with_shutdown((*tx).clone(), shutdown_nosave);
