@@ -3,7 +3,9 @@
 ## Currently working on..
 
 - [x] Support for Redis Pub-Sub
-- **Committed through FW–GB** (ANN HNSW, AOF graph, Redis DUMP/RESTORE, search eviction, Entry TTL retirement, repl publish barrier). Recommended letter queue empty. See root `TODO.md` → *Next work queue (post-FW–GB)*. Operator: review + push/PR remaining.
+- **Committed through FW–GB** (ANN HNSW, AOF graph, Redis DUMP/RESTORE, search eviction, Entry TTL retirement, repl publish barrier). Baseline A–E green; `main` synced with origin.
+- **Next stream (post-GB):** productization / perf / compat — letter batches **GC+**. See root `TODO.md` → *Next work queue (post-GB)*.
+  - **[x] GC** pipeline SET standalone skip (~+19% SET P=16 vs FI). Next: **GD–GF** further SET path → **GG/GK** MIGRATE wire + client smoke → **GL** TLS → one differentiator (**GI** / **GT–GU**).
 
 ## Persistence / search letter batches (recent)
 
@@ -112,7 +114,12 @@ Tracked in detail in root `TODO.md`. High level:
 - [x] **FV** HNSW durable graph in RDB (KORDB v6; snapshot/apply; AOF residual rebuild)
 - [x] **FW** HNSW ANN query path (query engine prefers dual-written graph; FLAT exact)
 - [x] **FX** HNSW AOF graph (`FT._LOADGRAPH`; edge-identical rewrite/load)
-- [ ] **Next (see `TODO.md` post-FW+FX):** FY–GB letter queue
+- [x] **FY–GB letter queue** (DUMP/RESTORE, search eviction, Entry TTL retire, repl barrier)
+- [ ] **Next (see `TODO.md` post-GB):** GC+ productization / perf / compat
+  - [x] GC pipeline SET standalone skip + hot-path cuts
+  - [ ] GD–GF further SET path + re-bench
+  - [ ] GG MIGRATE via DUMP/RESTORE; GK client smoke CI
+  - [ ] GL TLS depth; optional GI Functions or GT/GU search polish
 - [x] 데드락 감지 고급 기능
     - [x] 크로스 프로세스 감지 (Batch DC–DE snapshot merge MVP; no transport)
     - [x] 비동기(async) 지원

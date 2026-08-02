@@ -577,7 +577,13 @@ impl<V: Clone> ShardedKeyMap<V> {
         match action {
             MapAction::Keep => {}
             MapAction::Set(v) => {
-                map.insert(key.clone(), v);
+                // Batch GC: overwrite in place avoids cloning the map key on
+                // the common redis-benchmark / replace path.
+                if let Some(slot) = map.get_mut(key) {
+                    *slot = v;
+                } else {
+                    map.insert(key.clone(), v);
+                }
             }
             MapAction::Remove => {
                 map.remove(key);

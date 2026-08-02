@@ -284,6 +284,39 @@ Pass-level raw ops/s (FI):
 
 **Not claimed:** Valkey pipeline SET parity; no redis-benchmark re-measure this batch. **Residual:** single global backlog still serializes ordered publish (inherent with stream `selected_db`); full-resync still blocks publishers for RDB snapshot duration; further wins need async fanout / concurrent snapshot + backlog catch-up.
 
+#### Batch GC (2026-08-02) — Pipeline SET hot path (standalone skip + store cuts)
+
+**Root cause reaffirmed:** under redis-benchmark (AOF off, no replicas), every SET still rebuilt argv, RESP-encoded, and took the global backlog mutex even though nothing would ever PSYNC those bytes.
+
+**Shipped:**
+
+1. **Standalone stream skip** — `ReplicationManager::needs_stream_publish()` is false until a live replica is connected **or** any stream byte has been appended (`stream_history`). Cold masters skip RESP encode + backlog lock entirely; first replica always FULLRESYNCs; after any append, history stays armed so PSYNC partial still covers disconnect windows. `arm_stream_history()` for tests/tooling.
+2. **`maybe_persist_write` early path** — AOF-off + `!needs_stream_publish` → `mark_dirty()` only (no argv `Vec` / Bytes clones).
+3. **`on_write_command`** — same skip on AOF-off; AOF-on still appends disk, stream only if needed.
+4. **SET / MSET** — drop pre-`store` `ensure_string_or_absent` (WRONGTYPE under shard write lock only); SET options match case-insensitively without allocating a `String`.
+5. **Static write-cmd `Bytes`** — `SET`/`DEL`/… use `Bytes::from_static` when building argv.
+6. **`ShardedKeyMap::mutate` Set** — overwrite in place via `get_mut` (no map-key clone on replace).
+
+**Re-measure (same host class as FI; not identical run conditions — date 2026-08-02):**
+
+| Field | Value |
+|-------|--------|
+| Date | 2026-08-02 |
+| Host | Apple M3 Pro (same machine family as FD/FI) |
+| Kore | **0.6.0** release post-GC; `--host 127.0.0.1 --port 6380 --save "" --dir /tmp/kore-bench-gc` |
+| Client | Homebrew `redis-benchmark`; warm-up discarded; **3** passes P=16; **median** ops/s |
+| Valkey | **not re-run this batch** (compare to FI table: SET P=16 ~1.59M) |
+
+| Workload | Kore FI | Kore GC | Δ vs FI | Notes |
+|----------|---------|---------|---------|-------|
+| SET c=50 P=16 | **621,118** | **740,741** | **~+19%** | passes 751880 / 735294 / 740741 |
+| GET c=50 P=16 | **1,851,852** | **~1,515,152** | noise / load | passes ~1.49–1.54M (host variance) |
+| SET c=50 P=1 | **202,020** | **197,239** | ~flat | single pass after P=16 suite |
+
+**Interpretation:** Removing pure-standalone repl work closes a large share of the multi-threaded SET tax. Residual vs Valkey pipeline SET remains (~1.9× on this host vs FI’s Valkey number) — still command/store path + Tokio multi-worker contention, not backlog mutex. Further: **GD** dispatch, dual key/`Entry` clone, **GE** multi-replica publish.
+
+**Correctness notes:** PSYNC after a replica has been fed is unchanged. Never-replicated masters no longer grow `master_repl_offset` until a replica connects (or history is armed). Tests that asserted offset without a feed now call `arm_stream_history()`.
+
 ## Vector search (HNSW vs FLAT) — methodology
 
 Generic `redis-benchmark` does not cover RediSearch vectors. For Kore-internal

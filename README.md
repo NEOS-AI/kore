@@ -1,26 +1,54 @@
 # Kore
 
-A low-latency, high-performance caching database written in Rust.
+A low-latency, high-performance **Redis/Valkey-compatible** cache and data server written in Rust (version **0.6.0**).
+
+Kore speaks the RESP protocol so common Redis clients (`redis-cli`, redis-py, redis-rs, ioredis, …) work against it. Beyond a sharded in-memory keyspace it includes persistence, replication, cluster/Sentinel-lite, full-text/vector search, and Kore-specific locking (Redlock, fair queues, deadlock detection).
 
 ## Features
 
-- **Low Latency**: Built with Rust and optimized data structures for minimal latency
-- **High Performance**: Sharded hashmap architecture (default 4096 shards) for high concurrency
-- **RESP Protocol**: Compatible with Redis/Valkey protocol
-- **Memory Management**: Configurable max memory with approximated LRU eviction (Redis-style)
-- **Expiration**: Per-entry TTL support with background sweeping
-- **Thread-Safe**: Lock-free operations where possible, with fine-grained locking
-- **Statistics**: Built-in metrics for hits, misses, evictions, and more
+### Core engine
+- **Sharded keyspace** — default 4096 shards; unified map for all Redis types (`KeyValue` / `KeySlot`)
+- **RESP2 + RESP3** — `HELLO 2|3`; maps/bools/push where applicable
+- **Memory & eviction** — `maxmemory` + Redis-style policies (`allkeys-lru/lfu`, `volatile-*`, `noeviction`); active expire sampling
+- **Multi-DB** — `SELECT` / `SWAPDB` / `MOVE` / `COPY` (`--databases`, default 16)
+- **Pipelines & Unix sockets** — reply coalescing; optional `--unixsocket`
+
+### Data types & commands
+- **Strings, hashes, lists, sets, sorted sets, streams** (incl. consumer groups / blocking ops)
+- **Bitmaps / HyperLogLog**, **geospatial**, transactions (`MULTI`/`EXEC`/`WATCH`)
+- **Lua** — `EVAL` / `EVALSHA` / `SCRIPT *` (Functions library still stub — see roadmap)
+- **DUMP / RESTORE** — Redis RDB wire for string/list/set/hash/zset; Kore KDF1 for geo/stream
+
+### Persistence & HA
+- **RDB** (Kore `KORDB`, incl. search/HNSW graph) — `SAVE` / `BGSAVE` / timed `--save`
+- **AOF** — append + `BGREWRITEAOF`; load prefers AOF when `--appendonly`
+- **Replication** — `REPLICAOF`, `SYNC`/`PSYNC`, backlog, `WAIT`, min-replicas write gate
+- **Failover** — coordinated `FAILOVER TO`; **Sentinel-lite** (MONITOR, ODOWN quorum, hello bus lite)
+- **Cluster** — hash slots, MOVED/ASK, gossip, reshard/`MIGRATE`, NODE prepare/commit 2PC (RESP; not binary bus)
+
+### Security & ops
+- **ACL** users/categories + `ACL LOG`; boot `--aclfile`
+- **TLS** server (`--tls` / cert / key); mTLS / dual listener still TODO
+- **Metrics** — Prometheus text on `--metrics-port`; `HEALTH` / richer `INFO`
+- **Slowlog**, structured JSON logs (`--log-format json`)
+
+### Kore differentiators
+- **Redlock** multi-instance locks, **fair FIFO** queueing, **deadlock detection** (+ optional web UI)
+- **FT search** — TEXT / NUMERIC / TAG / VECTOR; **HNSW** ANN with durable RDB/AOF graph
+
+### Status & planning
+- Changelog: [CHANGELOG.md](CHANGELOG.md)
+- Detailed backlog: [TODO.md](TODO.md) → *Next work queue (post-GB)* (perf GC+, MIGRATE wire, TLS depth, …)
+- High-level plan: [docs/roadmap.md](docs/roadmap.md)
+- Locking / load rules for contributors: [docs/locking.md](docs/locking.md)
 
 ## Architecture
 
-Kore implements the same core concepts as pogocache but leverages Rust's safety guarantees:
-
 - **Sharded Hashmap**: Default 4096 shards to minimize lock contention
-- **Reference Counting**: Arc-based entry management for thread-safe sharing
-- **Approximated LRU Eviction**: Redis-style eviction that samples N random entries (default 5) and evicts the least recently used one
-- **Background Sweeping**: Automatic cleanup of expired entries
-- **Atomic Operations**: Lock-free statistics and counters
+- **Unified keyspace**: strings and typed containers share one map; slot-level TTL
+- **Approximated LRU/LFU eviction**: Redis-style sampling (default 5 candidates)
+- **Background sweeping**: active expire sampling + optional full `SWEEP`
+- **Atomic stats**: hits, misses, evictions, and more via lock-free counters
 
 ## Building
 
@@ -32,7 +60,7 @@ CI (GitHub Actions) runs `cargo build --all-targets` and `cargo test --all-targe
 
 ## Benchmarks
 
-See [docs/benchmarks.md](docs/benchmarks.md) for a reproducible methodology comparing Kore to Redis/Valkey with `redis-benchmark` (persistence disabled).
+See [docs/benchmarks.md](docs/benchmarks.md) for a reproducible methodology comparing Kore to Redis/Valkey with `redis-benchmark` (persistence disabled). Pipelined SET improved again in Batch GC (~+19% vs FI on M3 Pro via standalone stream skip); residual gap vs Valkey absolute throughput remains.
 
 ## Running
 
@@ -69,6 +97,15 @@ With custom options:
 - `--auth <PASSWORD>`: Authentication password (default: none)
 - `-v, --verbosity <LEVEL>`: Verbosity level 0–3 (default: **1 = WARN**). Mapping: `0` → ERROR, `1` → WARN, `2` → INFO, `3` → DEBUG
 - `--log-format <text|json>`: Log output format — human-readable `text` (default) or structured JSON lines (`json`) for log aggregators. **Boot-only** (not changeable via `CONFIG SET`). JSON includes `target` fields for aggregator indexing; text keeps targets off for quieter consoles. Optional `RUST_LOG` / `EnvFilter` overrides the verbosity floor when set (e.g. `RUST_LOG=kore=debug`)
+- `--databases <N>`: Number of logical databases (default: 16)
+- `--dir` / `--dbfilename` / `--appendonly` / `--appendfilename` / `--save`: persistence paths and policies
+- `--replicaof <host> <port>`: start as replica; `--cluster-enabled` for cluster mode
+- `--tls` / `--tls-cert` / `--tls-key`: enable TLS on the client port
+- `--unixsocket <path>`: bind a Unix domain socket in addition to TCP
+- `--metrics-port <port>`: Prometheus text endpoint (0 = off); binds `127.0.0.1`
+- `--enable-redlock` / `--redlock-instances` / fair-queue and deadlock UI flags: see [docs/redlock.md](docs/redlock.md)
+
+For the full flag surface run `kore --help`.
 
 ## Supported Commands
 

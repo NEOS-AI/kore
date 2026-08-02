@@ -483,7 +483,10 @@ async fn failover_to_catchup_timeout_when_target_lags() {
     .expect("connect timeout")
     .expect("connect");
 
-    // Bump master_repl_offset above 0 (no replica applying)
+    // Bump master_repl_offset above 0 (no live replica applying).
+    // Batch GC: pure standalone skips the stream — arm history so FAILOVER
+    // catch-up still sees a non-zero frozen offset.
+    master_mgr.replication.arm_stream_history();
     assert_eq!(
         send_cmd(&mut cli, &["SET", "k", "v"]).await,
         RespValue::ok()
@@ -739,6 +742,8 @@ async fn failover_to_force_skips_catchup_and_promotes() {
     .expect("connect timeout")
     .expect("connect");
 
+    // Batch GC: arm stream so SET advances master_repl_offset without a feed.
+    master_mgr.replication.arm_stream_history();
     assert_eq!(
         send_cmd(&mut cli, &["SET", "only_on_master", "x"]).await,
         RespValue::ok()

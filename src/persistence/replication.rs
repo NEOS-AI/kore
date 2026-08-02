@@ -199,6 +199,14 @@ pub struct ReplicationManager {
     /// Sentinel / promote priority (Batch FM). Default 100; **0 = never promote**.
     /// Reported in INFO as `slave_priority` (Redis alias for replica-priority).
     slave_priority: AtomicU32,
+    /// Batch GC: true after any byte has been appended to the repl stream (or
+    /// forced for tests). While false **and** `connected_replicas == 0`,
+    /// [`Self::needs_stream_publish`] is false so standalone masters skip
+    /// RESP encode + backlog mutex on every write. After the first append
+    /// (typically once a replica has been fed), the flag stays set so PSYNC
+    /// partial can still cover disconnect windows. Cleared with the backlog
+    /// on promote / clear.
+    stream_history: AtomicBool,
 }
 
 impl ReplicationManager {
@@ -226,11 +234,44 @@ impl ReplicationManager {
             fullsync_in_progress: AtomicBool::new(false),
             writers_in_publish: AtomicUsize::new(0),
             slave_priority: AtomicU32::new(100),
+            stream_history: AtomicBool::new(false),
         })
     }
 
     pub fn primary_link_epoch(&self) -> u64 {
         self.primary_link_epoch.load(Ordering::Relaxed)
+    }
+
+    /// Whether writes must be encoded into the replication stream.
+    ///
+    /// **Batch GC:** pure standalone masters (no live replicas and no prior
+    /// stream bytes) return false so the SET hot path can skip RESP encode +
+    /// backlog lock entirely. Once any replica is connected, or any payload
+    /// has been appended (including after the last replica disconnects),
+    /// returns true so PSYNC partial resync remains correct.
+    #[inline]
+    pub fn needs_stream_publish(&self) -> bool {
+        self.connected_replicas.load(Ordering::Relaxed) > 0
+            || self.stream_history.load(Ordering::Relaxed)
+    }
+
+    /// Arm stream recording even with zero connected replicas.
+    ///
+    /// Production code does not need this — registering a replica (or any
+    /// prior append) is enough. Exposed for integration tests that seed the
+    /// backlog offline or assert `master_repl_offset` without a live feed.
+    pub fn arm_stream_history(&self) {
+        self.stream_history.store(true, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn note_stream_append(&self) {
+        self.stream_history.store(true, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn clear_stream_history(&self) {
+        self.stream_history.store(false, Ordering::Relaxed);
     }
 
     // ── Fullsync ↔ publish barrier (Batch GB) ───────────────────────────
@@ -583,7 +624,15 @@ impl ReplicationManager {
     /// That critical section prevents the AOF-off multi-DB race where one
     /// writer’s SELECT-less command could land on the stream before another
     /// writer’s SELECT (Batch FI-2).
+    ///
+    /// **Batch GC:** when [`Self::needs_stream_publish`] is false (no live
+    /// replicas and no prior stream history), this is a no-op — no encode and
+    /// no backlog lock. First replica always FULLRESYNCs; after any append,
+    /// history stays armed for PSYNC.
     pub fn propagate_write(&self, db: usize, args: &[Bytes]) {
+        if !self.needs_stream_publish() {
+            return;
+        }
         let cmd_raw = aof::encode_command(args);
         self.propagate_write_encoded(db, cmd_raw);
     }
@@ -591,6 +640,12 @@ impl ReplicationManager {
     /// Like [`propagate_write`] but with a pre-encoded command payload.
     pub fn propagate_write_encoded(&self, db: usize, cmd_raw: Bytes) {
         if cmd_raw.is_empty() {
+            return;
+        }
+        // Encoded path is always intentional publish (caller may have already
+        // paid for encode). Still skip pure-standalone when history is cold so
+        // accidental callers do not arm the stream without need.
+        if !self.needs_stream_publish() {
             return;
         }
 
@@ -617,6 +672,7 @@ impl ReplicationManager {
                 cmd_raw
             };
             bl.append(&payload);
+            self.note_stream_append();
             self.master_repl_offset
                 .store(bl.end_offset(), Ordering::Relaxed);
             // Fan-out under the backlog lock so (1) feed order matches append
@@ -632,6 +688,10 @@ impl ReplicationManager {
     ///
     /// Prefer [`propagate_write`] for ordinary multi-DB writes. This entry point
     /// is for pre-ordered payloads and tests; it does not update stream DB.
+    ///
+    /// Unlike [`propagate_write`], raw payloads always append when non-empty
+    /// (callers explicitly want stream bytes — tests / low-level). That arms
+    /// [`Self::needs_stream_publish`] for subsequent writes.
     pub fn propagate_raw(&self, data: Bytes) {
         if data.is_empty() {
             return;
@@ -644,6 +704,7 @@ impl ReplicationManager {
         {
             let mut bl = self.backlog.lock();
             bl.append(&data);
+            self.note_stream_append();
             self.master_repl_offset
                 .store(bl.end_offset(), Ordering::Relaxed);
             self.fanout_to_replicas_locked(&data);
@@ -1307,6 +1368,7 @@ impl ReplicationManager {
         {
             let mut bl = self.backlog.lock();
             bl.clear();
+            self.clear_stream_history();
             self.master_repl_offset.store(0, Ordering::Relaxed);
             *self.master_replid2.lock() = old_id;
             self.second_repl_offset
@@ -1478,6 +1540,7 @@ impl Default for ReplicationManager {
             fullsync_in_progress: AtomicBool::new(false),
             writers_in_publish: AtomicUsize::new(0),
             slave_priority: AtomicU32::new(100),
+            stream_history: AtomicBool::new(false),
         }
     }
 }
@@ -2304,6 +2367,42 @@ mod tests {
         assert!(!repl.fullsync_in_progress.load(Ordering::SeqCst));
     }
 
+    /// Batch GC: pure standalone skips encode/backlog until history is armed
+    /// or a replica connects.
+    #[test]
+    fn standalone_cold_skips_stream_until_armed_or_replica() {
+        let repl = ReplicationManager::new();
+        assert!(!repl.needs_stream_publish());
+        repl.propagate_write(
+            0,
+            &[
+                Bytes::from_static(b"SET"),
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"1"),
+            ],
+        );
+        assert_eq!(repl.master_repl_offset(), 0);
+        assert_eq!(repl.backlog.lock().len(), 0);
+        assert!(!repl.needs_stream_publish());
+
+        repl.arm_stream_history();
+        assert!(repl.needs_stream_publish());
+        repl.propagate_write(
+            0,
+            &[
+                Bytes::from_static(b"SET"),
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"1"),
+            ],
+        );
+        assert!(repl.master_repl_offset() > 0);
+        assert!(repl.backlog.lock().len() > 0);
+
+        // After history is live, dropping all replicas still publishes (PSYNC window).
+        // (No replica registered here; history alone keeps needs_stream_publish.)
+        assert!(repl.needs_stream_publish());
+    }
+
     /// `propagate_write` emits lazy SELECT and keeps SELECT+cmd as one payload.
     #[test]
     fn propagate_write_lazy_select_atomic() {
@@ -2466,6 +2565,8 @@ mod tests {
     #[test]
     fn promote_resets_stream_selected_db() {
         let repl = ReplicationManager::new();
+        // Batch GC: cold standalone skips stream; arm so we can seed selected_db.
+        repl.arm_stream_history();
         repl.propagate_write(
             2,
             &[

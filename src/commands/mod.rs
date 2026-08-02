@@ -607,9 +607,16 @@ impl CommandHandler {
             if p.replication.is_replica() {
                 return;
             }
+            // Batch GC: pure standalone + AOF off — only mark dirty (save policies).
+            // Skip argv Vec / Bytes clones / RESP encode / backlog mutex.
+            if !p.appendonly() && !p.replication.needs_stream_publish() {
+                p.mark_dirty();
+                return;
+            }
             // Avoid `cmd.to_string()` heap alloc on every write (Batch FI).
+            // Static slices for common write names (Batch GC).
             let mut argv = Vec::with_capacity(args.len() + 1);
-            argv.push(Bytes::copy_from_slice(cmd.as_bytes()));
+            argv.push(static_write_cmd_bytes(cmd));
             for a in args {
                 if let Some(b) = a.as_bulk_string() {
                     argv.push(b.clone());
@@ -1507,6 +1514,41 @@ fn ascii_uppercase_cmd<'a>(cmd: &[u8], buf: &'a mut [u8; 64]) -> std::borrow::Co
         std::borrow::Cow::Borrowed(s)
     } else {
         std::borrow::Cow::Owned(String::from_utf8_lossy(cmd).to_uppercase())
+    }
+}
+
+/// Static `Bytes` for common write command names (Batch GC).
+///
+/// Avoids `Bytes::copy_from_slice` on the SET/DEL/… hot path when building AOF/repl argv.
+fn static_write_cmd_bytes(cmd: &str) -> Bytes {
+    match cmd {
+        "SET" => Bytes::from_static(b"SET"),
+        "DEL" => Bytes::from_static(b"DEL"),
+        "MSET" => Bytes::from_static(b"MSET"),
+        "INCR" => Bytes::from_static(b"INCR"),
+        "DECR" => Bytes::from_static(b"DECR"),
+        "INCRBY" => Bytes::from_static(b"INCRBY"),
+        "DECRBY" => Bytes::from_static(b"DECRBY"),
+        "LPUSH" => Bytes::from_static(b"LPUSH"),
+        "RPUSH" => Bytes::from_static(b"RPUSH"),
+        "LPOP" => Bytes::from_static(b"LPOP"),
+        "RPOP" => Bytes::from_static(b"RPOP"),
+        "HSET" => Bytes::from_static(b"HSET"),
+        "HDEL" => Bytes::from_static(b"HDEL"),
+        "SADD" => Bytes::from_static(b"SADD"),
+        "SREM" => Bytes::from_static(b"SREM"),
+        "ZADD" => Bytes::from_static(b"ZADD"),
+        "ZREM" => Bytes::from_static(b"ZREM"),
+        "EXPIRE" => Bytes::from_static(b"EXPIRE"),
+        "PEXPIRE" => Bytes::from_static(b"PEXPIRE"),
+        "GETDEL" => Bytes::from_static(b"GETDEL"),
+        "SETNX" => Bytes::from_static(b"SETNX"),
+        "APPEND" => Bytes::from_static(b"APPEND"),
+        "XADD" => Bytes::from_static(b"XADD"),
+        "UNLINK" => Bytes::from_static(b"UNLINK"),
+        "FLUSHDB" => Bytes::from_static(b"FLUSHDB"),
+        "FLUSHALL" => Bytes::from_static(b"FLUSHALL"),
+        _ => Bytes::copy_from_slice(cmd.as_bytes()),
     }
 }
 

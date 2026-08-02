@@ -503,6 +503,11 @@ impl PersistenceManager {
 
         // ── Fast path: no AOF file — stream SELECT owned by replication ──
         if !self.config.appendonly {
+            // Batch GC: pure standalone (no live replicas, no stream history)
+            // skips encode + backlog entirely. mark_dirty already ran above.
+            if !self.replication.needs_stream_publish() {
+                return;
+            }
             // No aof.lock: selected_db for the repl stream is tracked inside
             // propagate_write under the same critical section as backlog append.
             self.replication.propagate_write(selected_db, args);
@@ -540,7 +545,10 @@ impl PersistenceManager {
         state.selected_db = Some(selected_db);
         // Replication owns stream SELECT under its own lock; holding aof here
         // keeps AOF disk order aligned with stream order across writers.
-        self.replication.propagate_write(selected_db, args);
+        // Batch GC: skip stream when standalone-cold (AOF still recorded above).
+        if self.replication.needs_stream_publish() {
+            self.replication.propagate_write(selected_db, args);
+        }
     }
 
     pub fn rdb_path(&self) -> PathBuf {

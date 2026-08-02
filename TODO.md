@@ -732,74 +732,144 @@ Also tracked in `docs/roadmap.md`.
   - *Done (Batch CO)*: `docs/locking.md` (lock orders, load commit, errors); linked from README.
 - [x] **`[P2]`** Keep `docs/roadmap.md` in sync with this file (or make this the single source of truth)
   - *Done (Batch CO)*: roadmap section for recent persistence/search letter batches pointing at `TODO.md`.
+  - *Done (Batch GC-docs)*: post-GB pointer to **GC+** queue; README feature matrix; root `CHANGELOG.md`.
 - [x] **`[P2]`** **Code review (BS nit):** assert post-`EVAL` connection DB after Lua `SELECT` (Redis-compatible side effect)
   - *Done (Batch BT)*: `bt_eval_select_persists_connection_db` — connection remains on selected DB after EVAL
 
-### Status snapshot (2026-07-31, post-FW–GB)
+### Status snapshot (2026-08-02, post-GC)
 
-**Committed through Batches FW + FX + FY + FZ + GA + GB** (full recommended letter queue after FU/FV). Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed). Git: `main` ahead of origin; do not auto-push.
+**Shipped through Batches FW–GB + GC** (pipeline SET standalone skip). Phases **A–E** baseline is green. Standing Engineering **`[P0]`** “tests land with the feature” remains open (process rule — never closed).
 
-**Verification:**
+**Git (as of 2026-08-02):** working tree may be ahead of origin with GC commit; `main` was synced pre-GC.
+
+**Verification (FW–GB):**
 - **FW:** HNSW ANN for FT.SEARCH when dual-written graph non-empty; FLAT exact; empty → flat fallback.
 - **FX:** AOF `FT._LOADGRAPH`; load edge-identical; legacy rebuild path kept.
 - **FY:** Redis DUMP/RESTORE wire for string/list/set/hash/zset; KDF1 for geo/stream; dual-detect RESTORE.
 - **FZ:** proportional search-doc sampling under `allkeys-*`; volatile excludes search docs.
 - **GA:** `Entry.expires_at` removed; slot-only TTL.
 - **GB:** atomic fullsync barrier; hot path no Mutex gate; backlog still orders SELECT+append+fanout.
-- Hello SUBSCRIBE fan-in remains **accepted residual**.
 
-**What remains:** Track A push/PR (operator); accepted Later residuals only.
+**What remains:** productization + perf + compat depth — see **Next work queue (post-GB)** below. Accepted P3 residuals stay out of the active queue.
 
 | Area | Residual | Priority | Planned batch |
 |------|----------|----------|---------------|
-| Sentinel | live INFO `slave_priority` + failover cooldown | **done** | **FM** |
-| Sentinel | CKQUORUM / elect majority live probe; probe self-vs-`*` | **done** | **FN** |
-| Sentinel | suite ephemeral ports (parallel bind flake risk) | **done** | **FR** |
-| Hygiene | compiler nits (`config_kv_reply`, SkipList dead APIs, sentinel unused_mut) | **done** | **FR** |
-| Hygiene | pre-existing lib warnings (unused imports / replica feed / weight) | **done** | **FS** |
+| Docs / release | README under-sells features; no CHANGELOG; TODO status drift | **done** | **GC-docs** |
+| Perf | Pipeline SET gap vs Valkey (GC ~0.74M P=16; Valkey FI ~1.59M) | **P1 residual** | **GD / GF** (GC shipped) |
+| Ops | Global repl backlog ordered publish residual (after GB) | P3 residual | **GE** (if multi-replica write path matters) |
+| Compat | MIGRATE still recreate-only (DUMP/RESTORE cmds exist) | **P1** | **GG** |
+| Compat | DUMP geo/stream still KDF1 (not Redis RDB wire) | **P2** | **GH** |
+| Compat | Redis Functions / FCALL stubs only | **P2** | **GI** |
+| Compat | Lua: no script time limits / `redis.setresp` full depth | **P2** | **GJ** |
+| Compat | Multi-language client smoke not in CI | **P1** | **GK** |
+| Security | TLS: no mTLS / dual listener / replica-link TLS | **P1** | **GL** |
+| Security | admin_http / metrics / deadlock UI: localhost MVP, no auth | **P2** | **GM** |
+| Cluster | binary bus 2PC; dest prepare breadth; operator NODE bypass | P3 accepted / later | **GP** |
+| Cluster | remote CHECKPREPARE→COMMITPREPARE two-RPC window | P3 accepted lite | **GO** |
+| Cluster | per-slot config epochs not fully in nodes.conf | **P2** | **GN** |
 | Sentinel | long-lived `__sentinel__:hello` SUBSCRIBE fan-in | P3 accepted | — |
-| Sentinel | election-timeout SM (pre-attempt campaign epoch thrash) | **done** | **FT** |
-| Cluster | NODE 2PC durable prepare + atomic COMMITPREPARE | **done** | **FO** |
-| Cluster | binary bus 2PC; dest prepare breadth; operator NODE bypass | P3 accepted / later | — |
-| Cluster | remote dest CHECKPREPARE→COMMITPREPARE two-RPC window | P3 accepted lite | — |
-| Keyspace | expire slot header (`typed_expires` fold) | **done** | **FP** |
-| Keyspace | string TTL on `KeySlot` (unified EXPIRE/TTL path) | **done** | **FQ** |
-| Keyspace | `Entry.expires_at` RMW mirror (slot-only SoT) | **done** | **FU** |
-| Keyspace | search-doc eviction special (proportional allkeys sample) | **done** | **FZ** |
-| Keyspace | Retire `Entry.expires_at` field | **done** | **GA** |
-| Sentinel | Kore **higher** priority wins vs Redis Sentinel **lower** (documented honesty) | P3 accepted | — |
-| Ops | Global **repl backlog** still serializes ordered publish (SELECT+append+fanout) | P3 residual | **GB** partial; further hard |
-| Ops | Dual SELECT trackers; `propagate_raw` skips stream-DB | P3 accepted | — |
-| Keyspace | RENAME remove+insert; create ensure_type→insert TOCTOU (historical) | P3 accepted | — |
-| Search | HNSW RDB durable graph (levels/edges/entry) | **done** | **FV** |
-| Search | HNSW ANN query path (FT.SEARCH / query engine) | **done** | **FW** |
-| Search | HNSW AOF durable graph (`FT._LOADGRAPH`) | **done** | **FX** |
-| Search | `max_m=1` spanning residual | P3 accepted / later | — |
-| MIGRATE / UI / load | DUMP/RESTORE Redis wire (**FY**); MIGRATE recreate-only; reshard weight UI; Arc-swap mid-fill | P3 partial / accepted | **FY** cmds; MIGRATE later |
+| Sentinel | Kore **higher** priority wins vs Redis lower (documented) | P3 accepted | — |
+| Sentinel | serial INFO enrich / peer PING | P3 accepted lite | **GQ** optional |
+| Search | HNSW `max_m=1` spanning residual | P3 accepted / later | **GR** |
+| Search | search-doc access-touch for true LRU among docs | **P3** | **GS** |
+| Search | inverted-index `_weight` unused (TF-IDF future) | **P2** | **GT** |
+| Search | larger-N ANN recall/throughput (DK `#[ignore]` N=5000) | **P2** | **GU** |
+| Keyspace / load | single-DB Arc-swap mid-fill; RENAME remove+insert TOCTOU | P3 accepted | — |
+| UI | cluster reshard weight UI | P3 accepted | — |
 
-### Next work queue (post-FW–GB)
+### Next work queue (post-GB)
 
-**Full recommended letter queue shipped (FW–GB).** Standing rule: land tests with each feature (**P0 process**).
+**Letter queue FW–GB is complete.** Next stream is **productization / perf / compat** (batches **GC+**). Standing rule: land tests with each feature (**P0 process**).
 
-#### Track A — Release hygiene
+Phases A–E P0 lists are green; prefer **P1 product/perf** over hunting accepted P3s.
+
+#### Track A — Release / docs hygiene
 - [x] **`[P3]`** gitignore local `/data/` (nodes.conf / sentinel scratch)
-- [ ] **`[P1]`** Review + push/PR the commit stack on `main` (operator action; not auto-pushed)
-- [x] **`[P0]`** Standing: tests land with each feature (process rule — never closed)
+- [x] **`[P1]`** Review + push/PR the commit stack on `main` — **closed 2026-08-02** (`main` == `origin/main`)
+- [x] **`[P0]`** Standing: tests land with each feature (process rule — never closed as a checklist item; always applies)
+- [x] **`[P1]`** **Batch GC-docs** — stamp post-GB status; `CHANGELOG.md`; README feature matrix; roadmap pointer
+- [x] **`[P1]`** **Batch GC — Pipeline SET profile + hot-path cuts** (standalone stream skip; ~+19% SET P=16 vs FI on M3 Pro)
+- [ ] **`[P1]`** **Batch GC-rel** — decide release cut (`0.6.0` tag vs `0.7.0` for FW–GB story); production runbook (deploy flags, AOF/RDB, replica+Sentinel, cluster bootstrap, health/metrics)
 
-#### Recommended letter queue
+#### Recommended letter queue (start here)
+
+Ordered execution for the next ~2 weeks of work:
+
+1. **GD–GF** — further SET path / re-bench (GC shipped)
+2. **GG + GK** — MIGRATE over DUMP/RESTORE + client-compat CI smoke
+3. **GL** — TLS depth if selling production drop-in
+4. **One differentiator** — either **GI** (Functions) or **GT/GU** (search polish), not both in parallel
+
+| Batch | Pri | Track | Scope |
+|-------|-----|-------|--------|
+| **GC** | P1 | Perf | **done** — standalone stream skip + store/argv cuts; SET P=16 ~741k vs FI ~621k |
+| **GD** | P1 | Perf | Zero-copy / enum or perfect-hash command dispatch (FI optional follow-up) |
+| **GE** | P2 | Perf/ops | Further repl publish parallelization (async fanout / concurrent snapshot + backlog) — only if multi-replica write path matters |
+| **GF** | P1 | Perf | Re-run FD bench suite post-GC/GD; optional Redis (non-Valkey) column; optional CI microbench smoke |
+| **GG** | P1 | Compat | **MIGRATE via DUMP/RESTORE** (FY wire for core types; path still recreate-only) |
+| **GH** | P2 | Compat | DUMP Redis wire for **geo/stream** (still KDF1) |
+| **GI** | P2 | Compat | Redis Functions library (`FUNCTION LOAD` / real `FCALL` beyond stubs) |
+| **GJ** | P2 | Compat | Lua polish: script time limits, `redis.setresp`, deeper `redis.call` surface |
+| **GK** | P1 | Compat | Client-compat suite (redis-py / redis-rs / ioredis smoke) + CI job |
+| **GL** | P1 | Security | TLS: mTLS, dual listener (plain+TLS), optional replica-link TLS |
+| **GM** | P2 | Security | admin_http / metrics / deadlock UI: auth + TLS |
+| **GN** | P2 | Cluster | Per-slot config epochs fully in `nodes.conf` |
+| **GO** | P3 | Cluster | Collapse remote CHECKPREPARE→COMMITPREPARE two-RPC window |
+| **GP** | P3 | Cluster | Binary cluster bus 2PC (large; only if Redis cluster clients demand it) |
+| **GQ** | P3 | Sentinel | Optional parallel `enrich_replica_priorities` / peer PING |
+| **GR** | P3 | Search | HNSW `max_m=1` spanning residual |
+| **GS** | P3 | Search | Search-doc access-touch for true LRU among docs (FZ residual) |
+| **GT** | P2 | Search | Use inverted-index weight for real TF-IDF scoring |
+| **GU** | P2 | Search | Larger-N ANN recall/throughput vs FLAT |
+
+Checklist (active):
+
+- [x] **`[P1]`** **Batch GC — Pipeline SET profile + hot-path cuts**
+  - Standalone `needs_stream_publish` skip (encode + backlog); `arm_stream_history` for tests
+  - `maybe_persist` / `on_write_command` early path; static write-cmd Bytes; SET option parse without String; drop pre-store type probe; map overwrite without key clone
+  - Tests: `standalone_cold_skips_stream_until_armed_or_replica`; `standalone_set_skips_repl_stream`; repl/failover arm stream where offset required
+  - Bench: SET c=50 P=16 median **~740k** ops/s (FI **~621k**, **~+19%**); residual vs Valkey still large — see `docs/benchmarks.md` Batch GC
+- [ ] **`[P1]`** **Batch GD — Command dispatch / alloc reduction**
+- [ ] **`[P2]`** **Batch GE — Repl publish further parallelization** (optional)
+- [ ] **`[P1]`** **Batch GF — Re-bench vs Valkey (+ optional Redis column / CI smoke)**
+- [ ] **`[P1]`** **Batch GG — MIGRATE over DUMP/RESTORE**
+- [ ] **`[P2]`** **Batch GH — DUMP Redis wire for geo/stream**
+- [ ] **`[P2]`** **Batch GI — Redis Functions library**
+- [ ] **`[P2]`** **Batch GJ — Lua script limits + setresp polish**
+- [ ] **`[P1]`** **Batch GK — Multi-language client smoke + CI**
+- [ ] **`[P1]`** **Batch GL — TLS mTLS / dual listener / replica TLS**
+- [ ] **`[P2]`** **Batch GM — Admin HTTP auth + TLS**
+- [ ] **`[P2]`** **Batch GN — Per-slot epochs in nodes.conf**
+- [ ] **`[P3]`** **Batch GO — Single-RPC prepare commit window**
+- [ ] **`[P3]`** **Batch GP — Binary cluster bus 2PC**
+- [ ] **`[P3]`** **Batch GQ — Parallel Sentinel probes**
+- [ ] **`[P3]`** **Batch GR — HNSW max_m=1 spanning**
+- [ ] **`[P3]`** **Batch GS — Search-doc access-touch LRU**
+- [ ] **`[P2]`** **Batch GT — TF-IDF weight scoring**
+- [ ] **`[P2]`** **Batch GU — Larger-N ANN bench / recall**
+
+#### Defer / accept (not in active queue)
+
+Do **not** schedule these as sprint work unless a production need appears:
+
+- Cluster binary bus 2PC; dest prepare breadth; operator NODE bypass (intentional recovery)
+- Remote CHECK→COMMITPREPARE two-RPC window (accepted lite)
+- Reshard weight UI
+- `__sentinel__:hello` long-lived SUBSCRIBE fan-in
+- Sentinel priority honesty vs Redis (documented)
+- single-DB Arc-swap mid-fill (LOADING barrier accepted)
+- Deadlock UI browser-driven repaint tests
+- Dual SELECT trackers; `propagate_raw` skips stream-DB
+- RENAME remove+insert; create ensure_type→insert TOCTOU (historical)
+
+#### Prior letter queue (closed FW–GB)
+
 - [x] **`[P2]`** **Batch FW — ANN query path on HNSW**
 - [x] **`[P2]`** **Batch FY — DUMP/RESTORE Redis wire**
 - [x] **`[P3]`** **Batch FX — HNSW AOF graph**
 - [x] **`[P3]`** **Batch FZ — Search-doc eviction special**
 - [x] **`[P3]`** **Batch GA — Retire `Entry.expires_at` field**
 - [x] **`[P3]`** **Batch GB — Repl backlog serialize** (partial win)
-
-#### Defer / accept (not in active queue)
-- Cluster binary bus 2PC; dest prepare breadth; remote CHECK→COMMITPREPARE two-RPC window
-- Reshard weight UI; `__sentinel__:hello` long-lived SUBSCRIBE; Sentinel priority honesty vs Redis
-- single-DB Arc-swap mid-fill
-- Further repl publish parallelization (async fanout / concurrent snapshot + backlog catch-up) — residual after GB
-- HNSW `max_m=1` spanning residual
 
 #### Completed (FB–… + FU + FV + FW + FX + FY + FZ + GA + GB)
 
@@ -963,18 +1033,19 @@ Also tracked in `docs/roadmap.md`.
 
 #### Later / backlog (no letter batch)
 
-Active items promoted to **Recommended letter queue** above (FW–GB). Remaining / accepted:
+Active product work is the **post-GB GC+** letter queue above. Remaining / accepted only:
 
 - [ ] **`[P3]`** **Later / backlog (accepted or unscheduled)**
-  - cluster reshard weight UI; admin_http auth/TLS
+  - cluster reshard weight UI
   - single-DB Arc-swap mid-fill (accepted)
-  - Optional parallelize `enrich_replica_priorities` / `count_reachable_sentinels` (serial probes today)
-  - Cluster binary bus 2PC; dest prepare breadth; remote CHECK→COMMITPREPARE two-RPC window (accepted lite)
+  - Optional parallelize `enrich_replica_priorities` / `count_reachable_sentinels` → **GQ** if scheduled
+  - Cluster binary bus 2PC; dest prepare breadth; remote CHECK→COMMITPREPARE two-RPC window (accepted lite) → **GP / GO** if scheduled
   - `__sentinel__:hello` SUBSCRIBE fan-in; Sentinel priority honesty (accepted)
+  - admin_http auth/TLS → promoted to **GM** when scheduled
 
 ### Code review backlog
 
-**Batches through FU + FV + FW + FX + FY + FZ + GA + GB shipped.** Recommended letter queue empty. Standing tests-for-phase P0.
+**Batches through FU + FV + FW + FX + FY + FZ + GA + GB shipped.** Active queue is **post-GB GC+** (perf / compat / security). Standing tests-for-phase P0.
 
 | Pri | Item | Status |
 |-----|------|--------|
@@ -1185,4 +1256,4 @@ Highest urgency checklist (phase order preserved):
 - [x] Eviction policies (`maxmemory-policy`)
   - *Follow-ups*: Streams, bitmaps/HLL, RESP3 (done elsewhere); LFU decay done in Batch AB
 
-**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB–FQ** letter work is committed complete; **FR+FS** are Later/backlog hygiene; **FT** election-timeout SM from Later. Resume from **Next work queue (post-FT)** — Later/backlog only.
+**Historical note:** The original “finish this P0 list first” rule applied while A–C were incomplete. As of **Batch FA**, that list is green; **FB–FQ** letter work is committed complete; **FR+FS** hygiene; **FT–GB** closed the post-FU product letter stream. Resume from **Next work queue (post-GB)** — productization / perf / compat (**GC+**), not baseline P0s.

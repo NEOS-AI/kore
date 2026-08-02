@@ -26,58 +26,61 @@ impl CommandHandler {
             None => return Ok(RespValue::error("ERR invalid value")),
         };
 
-        // Type safety: refuse to overwrite zset/geo keys as strings
-        if let Err(Error::WrongType) = self.cache.ensure_string_or_absent(&key) {
-            return Ok(RespValue::error(Error::WrongType.to_resp_string()));
-        }
+        // Batch GC: WRONGTYPE is enforced inside `store` / `mutate_string` under
+        // the shard write lock — no separate ensure_string_or_absent probe
+        // (that was an extra shard read lock per SET).
 
         let mut opts = StoreOptions::default();
         let mut i = 2;
 
         while i < args.len() {
+            // Batch GC: match option tokens case-insensitively without allocating a String.
             let opt = match args[i].as_bulk_string() {
-                Some(o) => String::from_utf8_lossy(o).to_uppercase(),
+                Some(o) => o,
                 None => return Ok(RespValue::error("ERR invalid option")),
             };
 
-            match opt.as_str() {
-                "NX" => opts.nx = true,
-                "XX" => opts.xx = true,
-                "GET" => opts.get = true,
-                "KEEPTTL" => opts.keepttl = true,
-                "EX" => {
-                    if i + 1 >= args.len() {
-                        return Ok(RespValue::error("ERR syntax error"));
-                    }
-                    let seconds = self.parse_integer(&args[i + 1])?;
-                    opts.ttl_ms = Some((seconds * 1000) as u64);
-                    i += 1;
+            if opt.eq_ignore_ascii_case(b"NX") {
+                opts.nx = true;
+            } else if opt.eq_ignore_ascii_case(b"XX") {
+                opts.xx = true;
+            } else if opt.eq_ignore_ascii_case(b"GET") {
+                opts.get = true;
+            } else if opt.eq_ignore_ascii_case(b"KEEPTTL") {
+                opts.keepttl = true;
+            } else if opt.eq_ignore_ascii_case(b"EX") {
+                if i + 1 >= args.len() {
+                    return Ok(RespValue::error("ERR syntax error"));
                 }
-                "PX" => {
-                    if i + 1 >= args.len() {
-                        return Ok(RespValue::error("ERR syntax error"));
-                    }
-                    let ms = self.parse_integer(&args[i + 1])?;
-                    opts.ttl_ms = Some(ms as u64);
-                    i += 1;
+                let seconds = self.parse_integer(&args[i + 1])?;
+                opts.ttl_ms = Some((seconds * 1000) as u64);
+                i += 1;
+            } else if opt.eq_ignore_ascii_case(b"PX") {
+                if i + 1 >= args.len() {
+                    return Ok(RespValue::error("ERR syntax error"));
                 }
-                "EXAT" => {
-                    if i + 1 >= args.len() {
-                        return Ok(RespValue::error("ERR syntax error"));
-                    }
-                    let timestamp = self.parse_integer(&args[i + 1])?;
-                    opts.exat_ms = Some((timestamp * 1000) as u64);
-                    i += 1;
+                let ms = self.parse_integer(&args[i + 1])?;
+                opts.ttl_ms = Some(ms as u64);
+                i += 1;
+            } else if opt.eq_ignore_ascii_case(b"EXAT") {
+                if i + 1 >= args.len() {
+                    return Ok(RespValue::error("ERR syntax error"));
                 }
-                "PXAT" => {
-                    if i + 1 >= args.len() {
-                        return Ok(RespValue::error("ERR syntax error"));
-                    }
-                    let timestamp = self.parse_integer(&args[i + 1])?;
-                    opts.exat_ms = Some(timestamp as u64);
-                    i += 1;
+                let timestamp = self.parse_integer(&args[i + 1])?;
+                opts.exat_ms = Some((timestamp * 1000) as u64);
+                i += 1;
+            } else if opt.eq_ignore_ascii_case(b"PXAT") {
+                if i + 1 >= args.len() {
+                    return Ok(RespValue::error("ERR syntax error"));
                 }
-                _ => return Ok(RespValue::error(format!("ERR unknown option '{}'", opt))),
+                let timestamp = self.parse_integer(&args[i + 1])?;
+                opts.exat_ms = Some(timestamp as u64);
+                i += 1;
+            } else {
+                return Ok(RespValue::error(format!(
+                    "ERR unknown option '{}'",
+                    String::from_utf8_lossy(opt)
+                )));
             }
 
             i += 1;
@@ -208,10 +211,7 @@ impl CommandHandler {
                 None => return Ok(RespValue::error("ERR invalid value")),
             };
 
-            if let Err(Error::WrongType) = self.cache.ensure_string_or_absent(&key) {
-                return Ok(RespValue::error(Error::WrongType.to_resp_string()));
-            }
-
+            // Batch GC: type check inside store (same as SET).
             self.cache.store(key, value, StoreOptions::default())?;
         }
 

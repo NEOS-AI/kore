@@ -429,10 +429,41 @@ fn master_offset_advances_on_client_writes() {
     let cache = Cache::new_with_sweep(8, 1024 * 1024 * 10, 500 * 1024 * 1024, false);
     let mut h = CommandHandler::with_persistence(cache, make_config(&dir), Some(mgr.clone()));
 
+    // Batch GC: pure standalone skips the repl stream; arm history so this
+    // test still exercises offset advancement when publish is required.
+    mgr.replication.arm_stream_history();
+
     let before = mgr.replication.master_repl_offset();
     handle(&mut h, cmd(&["SET", "x", "1"]));
     let after = mgr.replication.master_repl_offset();
     assert!(after > before, "offset should advance: {} -> {}", before, after);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Batch GC: with no replicas and no prior stream history, client SET must not
+/// encode into the repl backlog (pipeline SET hot path). Key is still stored.
+#[test]
+fn standalone_set_skips_repl_stream() {
+    let dir = unique_dir("standalone-skip");
+    let mgr = make_persistence(&dir);
+    let cache = Cache::new_with_sweep(8, 1024 * 1024 * 10, 500 * 1024 * 1024, false);
+    let cache2 = Arc::clone(&cache);
+    let mut h = CommandHandler::with_persistence(cache, make_config(&dir), Some(mgr.clone()));
+
+    assert!(!mgr.replication.needs_stream_publish());
+    handle(&mut h, cmd(&["SET", "solo", "1"]));
+    assert_eq!(mgr.replication.master_repl_offset(), 0);
+    assert!(!mgr.replication.needs_stream_publish());
+
+    let v = cache2
+        .load(
+            &Bytes::from_static(b"solo"),
+            kore::entry::LoadOptions::default(),
+        )
+        .unwrap()
+        .expect("key stored despite stream skip");
+    assert_eq!(v.value.as_ref(), b"1");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -643,6 +674,9 @@ fn multiple_writes_accumulate_offset_and_partial_from_mid() {
     let cache = Cache::new_with_sweep(8, 1024 * 1024 * 10, 500 * 1024 * 1024, false);
     let mut h = CommandHandler::with_persistence(cache.clone(), make_config(&dir), Some(mgr.clone()));
 
+    // Batch GC: arm stream so client SETs append to backlog without a live replica.
+    mgr.replication.arm_stream_history();
+
     let mut offsets = vec![0u64];
     for i in 0..20 {
         handle(&mut h, cmd(&["SET", &format!("k{i}"), &format!("v{i}")]));
@@ -811,7 +845,8 @@ fn promote_resets_offset_and_backlog() {
     let cache = Cache::new_with_sweep(8, 1024 * 1024 * 10, 500 * 1024 * 1024, false);
     let mut h = CommandHandler::with_persistence(cache.clone(), make_config(&dir), Some(mgr.clone()));
 
-    // Grow offset/backlog on the master path
+    // Grow offset/backlog on the master path (Batch GC: arm stream without a feed).
+    mgr.replication.arm_stream_history();
     handle(&mut h, cmd(&["SET", "a", "1"]));
     handle(&mut h, cmd(&["SET", "b", "2"]));
     handle(&mut h, cmd(&["SET", "c", "3"]));
