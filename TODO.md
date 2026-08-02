@@ -757,14 +757,14 @@ Also tracked in `docs/roadmap.md`.
 | Compat | Redis Functions library + real FCALL (**GI** done) | **P2** | — |
 | Compat | Lua setresp + time limits (**GJ** done) | **P2** | — |
 | Security | admin HTTP auth + TLS (**GM** done) | **P2** | — |
-| Cluster | binary bus 2PC; dest prepare breadth; operator NODE bypass | P3 accepted / later | **GP** |
+| Cluster | full Redis bus; dest prepare breadth; operator NODE bypass | P3 residual (Kore peer bus lite **GP** done) | — |
 | Cluster | remote CHECKPREPARE→COMMITPREPARE two-RPC window | **done (GO)** | — |
 | Cluster | per-slot config epochs fully in nodes.conf | **done (GN)** | — |
 | Sentinel | long-lived `__sentinel__:hello` SUBSCRIBE fan-in | P3 accepted | — |
 | Sentinel | Kore **higher** priority wins vs Redis lower (documented) | P3 accepted | — |
 | Sentinel | serial INFO enrich / peer PING | P3 accepted lite | **GQ** optional |
 | Search | HNSW `max_m=1` spanning residual | **done (GR)** | — |
-| Search | search-doc access-touch for true LRU among docs | **P3** | **GS** |
+| Search | search-doc access-touch for true LRU among docs | **done (GS)** | — |
 | Search | inverted-index `_weight` unused (TF-IDF future) | **P2** | **GT** |
 | Search | larger-N ANN recall/throughput (DK `#[ignore]` N=5000) | **P2** | **GU** |
 | Keyspace / load | single-DB Arc-swap mid-fill; RENAME remove+insert TOCTOU | P3 accepted | — |
@@ -813,7 +813,7 @@ Ordered execution after **0.7.0**:
 | **GP** | P3 | Cluster | **done** — Kore peer bus lite for NODE 2PC (`KORB`; not Redis bus) |
 | **GQ** | P3 | Sentinel | **done** — parallel peer PING + replica INFO priority probes |
 | **GR** | P3 | Search | **done** — reconnect prune floor 2 for upper-layer M=1 path middles |
-| **GS** | P3 | Search | Search-doc access-touch for true LRU among docs (FZ residual) |
+| **GS** | P3 | Search | **done** — search-doc access-touch for allkeys-lru/lfu |
 | **GT** | P2 | Search | **done** — inverted-index TF + field-weight TF-IDF; FT.SEARCH WITHSCORES |
 | **GU** | P2 | Search | **done** — adaptive HNSW ef for large-k; mid-N@k=50 CI recall gate |
 
