@@ -325,6 +325,17 @@ impl Cache {
             .collect();
 
         let total = documents.len();
+        // Batch GS: mark result-page hits as recently accessed so allkeys-lru
+        // can prefer cold FT docs over a hot search subset.
+        let touch_ids: Vec<Bytes> = documents.iter().map(|d| d.id.clone()).collect();
+        drop(index_guard);
+        if !touch_ids.is_empty() {
+            index.write().touch_documents(
+                &touch_ids,
+                self.lfu_log_factor(),
+                self.lfu_decay_time(),
+            );
+        }
 
         Ok(SearchResult { total, documents })
     }

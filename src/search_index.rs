@@ -2,8 +2,49 @@ use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use parking_lot::RwLock;
 use std::sync::Arc;
+use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use crate::vector_search::{HnswGraphSnapshot, HNSWIndex};
+
+/// Per-document access metadata for maxmemory LRU/LFU scoring (Batch GS).
+///
+/// Search hits call [`SearchIndex::touch_documents`]; eviction sampling reads
+/// these values instead of treating every FT doc as permanently cold.
+#[derive(Debug, Clone)]
+pub struct DocAccessMeta {
+    pub last_access: Instant,
+    /// Packed Redis-style LFU word (`crate::lfu`).
+    pub lfu: u64,
+}
+
+impl DocAccessMeta {
+    fn new() -> Self {
+        Self {
+            last_access: Instant::now(),
+            lfu: crate::lfu::initial(),
+        }
+    }
+
+    fn touch(&mut self, log_factor: u8, decay_time: u8) {
+        self.last_access = Instant::now();
+        self.lfu = crate::lfu::on_access(self.lfu, log_factor, decay_time);
+    }
+
+    fn effective_lfu_freq(&self, decay_time: u8) -> u64 {
+        crate::lfu::effective_counter(self.lfu, decay_time) as u64
+    }
+}
+
+/// One search-document sample for maxmemory eviction (Batch FZ + GS).
+#[derive(Debug, Clone)]
+pub struct SearchEvictSample {
+    pub index_name: String,
+    pub doc_id: Bytes,
+    pub size: usize,
+    pub last_access: Instant,
+    /// Effective (decayed) LFU log counter for `allkeys-lfu` ranking.
+    pub lfu_freq: u64,
+}
 
 /// Field types supported in search indices
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -683,6 +724,8 @@ pub struct SearchIndex {
     documents: HashSet<Bytes>,
     /// Document field data storage (for returning in search results)
     document_data: HashMap<Bytes, HashMap<String, DocumentField>>,
+    /// Per-doc last access + LFU for maxmemory eviction scoring (Batch GS).
+    doc_access: HashMap<Bytes, DocAccessMeta>,
 }
 
 impl SearchIndex {
@@ -710,6 +753,7 @@ impl SearchIndex {
             hnsw_indices,
             documents: HashSet::new(),
             document_data: HashMap::new(),
+            doc_access: HashMap::new(),
         }
     }
 
@@ -724,6 +768,9 @@ impl SearchIndex {
 
         // Store document field data
         self.document_data.insert(doc_id.clone(), fields.clone());
+        // Fresh access meta on index (re-index resets LRU/LFU; Batch GS).
+        self.doc_access
+            .insert(doc_id.clone(), DocAccessMeta::new());
 
         for field_def in &self.definition.fields {
             if let Some(field_value) = fields.get(&field_def.name) {
@@ -801,6 +848,7 @@ impl SearchIndex {
     pub fn remove_document(&mut self, doc_id: &Bytes) {
         self.documents.remove(doc_id);
         self.document_data.remove(doc_id);
+        self.doc_access.remove(doc_id);
 
         for index in self.text_indices.values_mut() {
             index.remove_document(doc_id);
@@ -837,6 +885,24 @@ impl SearchIndex {
         }
         self.documents.clear();
         self.document_data.clear();
+        self.doc_access.clear();
+    }
+
+    /// Update last_access (+ LFU) for docs present in the index (Batch GS).
+    ///
+    /// Called after a successful search so returned hits rank hotter under
+    /// `allkeys-lru` / `allkeys-lfu` than never-searched docs.
+    pub fn touch_documents(&mut self, doc_ids: &[Bytes], log_factor: u8, decay_time: u8) {
+        for id in doc_ids {
+            if let Some(meta) = self.doc_access.get_mut(id) {
+                meta.touch(log_factor, decay_time);
+            }
+        }
+    }
+
+    /// Access metadata for a document, if indexed (tests / debug).
+    pub fn doc_access(&self, doc_id: &Bytes) -> Option<&DocAccessMeta> {
+        self.doc_access.get(doc_id)
     }
 
     /// Export durable HNSW graphs for RDB (Batch FV): `(field_name, snapshot)`.
@@ -1329,31 +1395,63 @@ impl SearchIndexManager {
             .sum()
     }
 
+    /// Touch access metadata for documents in `index_name` (Batch GS).
+    ///
+    /// No-op if the index is missing or `doc_ids` is empty. Only ids currently
+    /// present in the index are updated.
+    pub fn touch_documents(
+        &self,
+        index_name: &str,
+        doc_ids: &[Bytes],
+        log_factor: u8,
+        decay_time: u8,
+    ) {
+        if doc_ids.is_empty() {
+            return;
+        }
+        let Some(idx) = self.get_index(index_name) else {
+            return;
+        };
+        idx.write()
+            .touch_documents(doc_ids, log_factor, decay_time);
+    }
+
     /// Sample up to `n` documents across all indices for maxmemory eviction.
     ///
-    /// Returns `(index_name, doc_id, approx_size)` triples. Used so
+    /// Returns [`SearchEvictSample`] rows with real `last_access` / `lfu_freq`
+    /// from per-doc access meta (Batch GS). Used so
     /// [`crate::memory::MemoryCategory::Search`] can be reclaimed under
     /// `allkeys-*` policies without deleting the underlying hash key.
     ///
     /// `exclude_doc` skips a document currently being re-indexed so accounting
     /// does not double-free it while holding a stale size snapshot.
     ///
-    /// # Sampling model (Batch FZ)
+    /// `lfu_decay_time` is the cache `lfu-decay-time` (minutes) used to compute
+    /// effective LFU frequency for ranking.
+    ///
+    /// # Sampling model (Batch FZ + GS)
     ///
     /// Documents are drawn uniformly from the pooled set of all index docs.
     /// The caller chooses `n` (typically proportional to search doc count vs
-    /// keyspace size). Search docs have no TTL and are never volatile victims.
+    /// keyspace size) and then picks the LRU/LFU victim from the sample using
+    /// the returned access times. Search docs have no TTL and are never
+    /// volatile victims.
     pub fn sample_documents_for_eviction(
         &self,
         n: usize,
         exclude_doc: Option<&Bytes>,
-    ) -> Vec<(String, Bytes, usize)> {
+        lfu_decay_time: u8,
+    ) -> Vec<SearchEvictSample> {
         if n == 0 {
             return Vec::new();
         }
         use rand::seq::SliceRandom;
+        // Fallback when a doc lacks access meta (should not happen after GS).
+        let cold = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(86400 * 365 * 10))
+            .unwrap_or_else(Instant::now);
         let indices = self.indices.read();
-        let mut pool: Vec<(String, Bytes, usize)> = Vec::new();
+        let mut pool: Vec<SearchEvictSample> = Vec::new();
         for (name, idx) in indices.iter() {
             let guard = idx.read();
             for (doc_id, fields) in guard.document_data.iter() {
@@ -1361,9 +1459,20 @@ impl SearchIndexManager {
                     continue;
                 }
                 let size = SearchIndex::document_approx_size(doc_id, fields);
-                if size > 0 {
-                    pool.push((name.clone(), doc_id.clone(), size));
+                if size == 0 {
+                    continue;
                 }
+                let (last_access, lfu_freq) = match guard.doc_access.get(doc_id) {
+                    Some(meta) => (meta.last_access, meta.effective_lfu_freq(lfu_decay_time)),
+                    None => (cold, 0),
+                };
+                pool.push(SearchEvictSample {
+                    index_name: name.clone(),
+                    doc_id: doc_id.clone(),
+                    size,
+                    last_access,
+                    lfu_freq,
+                });
             }
         }
         drop(indices);
@@ -1834,5 +1943,106 @@ mod tests {
         manager.clear();
         assert!(manager.list_indices().is_empty());
         assert!(manager.list_aliases().is_empty());
+    }
+
+    #[test]
+    fn touch_documents_advances_last_access_and_sample_exposes_it() {
+        let manager = SearchIndexManager::new();
+        let definition = IndexDefinition::new(
+            "lru_idx".to_string(),
+            vec![],
+            vec![FieldDefinition {
+                name: "body".to_string(),
+                field_type: FieldType::Text {
+                    weight: 1.0,
+                    sortable: false,
+                },
+            }],
+        );
+        manager.create_index(definition).unwrap();
+
+        let cold_id = b("cold");
+        let hot_id = b("hot");
+        {
+            let idx = manager.get_index("lru_idx").unwrap();
+            let mut guard = idx.write();
+            let mut fields = HashMap::new();
+            fields.insert("body".to_string(), DocumentField::Text("shared term".into()));
+            guard.index_document(cold_id.clone(), fields.clone());
+            guard.index_document(hot_id.clone(), fields);
+        }
+
+        // Baseline sample: both docs have access meta at index time.
+        let sample0 = manager.sample_documents_for_eviction(10, None, 1);
+        assert_eq!(sample0.len(), 2);
+        let t_cold0 = sample0
+            .iter()
+            .find(|s| s.doc_id == cold_id)
+            .unwrap()
+            .last_access;
+        let t_hot0 = sample0
+            .iter()
+            .find(|s| s.doc_id == hot_id)
+            .unwrap()
+            .last_access;
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        manager.touch_documents(
+            "lru_idx",
+            &[hot_id.clone()],
+            crate::lfu::LFU_LOG_FACTOR_DEFAULT,
+            crate::lfu::LFU_DECAY_TIME_DEFAULT,
+        );
+
+        let sample1 = manager.sample_documents_for_eviction(10, None, 1);
+        let t_cold1 = sample1
+            .iter()
+            .find(|s| s.doc_id == cold_id)
+            .unwrap()
+            .last_access;
+        let t_hot1 = sample1
+            .iter()
+            .find(|s| s.doc_id == hot_id)
+            .unwrap()
+            .last_access;
+
+        assert_eq!(t_cold1, t_cold0, "untouched doc keeps last_access");
+        assert!(
+            t_hot1 > t_hot0,
+            "touch must advance last_access (before={:?} after={:?})",
+            t_hot0,
+            t_hot1
+        );
+        assert!(
+            t_hot1 > t_cold1,
+            "hot doc must sample newer Instant than cold (hot={:?} cold={:?})",
+            t_hot1,
+            t_cold1
+        );
+
+        // LFU counter also moves on touch (init path always increments at INIT_VAL).
+        let hot_freq = sample1
+            .iter()
+            .find(|s| s.doc_id == hot_id)
+            .unwrap()
+            .lfu_freq;
+        let cold_freq = sample1
+            .iter()
+            .find(|s| s.doc_id == cold_id)
+            .unwrap()
+            .lfu_freq;
+        assert!(
+            hot_freq >= cold_freq,
+            "touched doc LFU freq should not be colder (hot={} cold={})",
+            hot_freq,
+            cold_freq
+        );
+
+        // remove_document clears access meta
+        {
+            let idx = manager.get_index("lru_idx").unwrap();
+            idx.write().remove_document(&hot_id);
+            assert!(idx.read().doc_access(&hot_id).is_none());
+        }
     }
 }

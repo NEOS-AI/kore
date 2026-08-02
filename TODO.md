@@ -902,7 +902,12 @@ Checklist (active):
   - `bridge_reconnect_neighbors` reconnect prune uses `prune_m = max_m.max(2)` so NN-path middles keep both path edges when upper layers have `M=1`
   - Insert-time prune still uses bare `max_edges` (not a global degree floor / insert churn change)
   - Test: `hnsw_bridge_upper_layer_m1_path_reconnects` (M=1 multi-layer, hub remove, BFS on layer 1)
-- [ ] **`[P3]`** **Batch GS — Search-doc access-touch LRU**
+- [x] **`[P3]`** **Batch GS — Search-doc access-touch LRU**
+  - Per-doc `DocAccessMeta` (`last_access` + packed LFU) on `SearchIndex`; init on `index_document`, clear on remove/clear
+  - `touch_documents` after successful search result page; `sample_documents_for_eviction` returns real access for LRU/LFU
+  - Eviction candidates use sample last_access/lfu_freq (not `cold_instant`/0); still not volatile victims
+  - Tests: unit touch+sample; `test_hot_search_docs_tend_to_survive_allkeys_lru`; FZ dominate/volatile unchanged
+  - Residual: typed keyspace still cold for LRU; search LFU uses cache lfu-log-factor/decay
 - [x] **`[P2]`** **Batch GT — TF-IDF weight scoring**
   - `InvertedIndex` stores postings `term→(doc→tf)` + doc lengths; field WEIGHT multiplies score
   - Score: `weight * Σ (1+ln(tf)) * ln(1+N/df)`; multi-field OR sums contributions

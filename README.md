@@ -333,7 +333,7 @@ Honest gaps vs full Redis/Valkey (see [CHANGELOG](CHANGELOG.md) and [TODO.md](TO
 - Sentinel hello long-lived `SUBSCRIBE` fan-in not implemented
 - Geo DUMP restores as zset for Redis `TYPE`; foreign Redis stream listpack fixtures residual
 - Scripting: no nested `EVAL`; movablekeys catalog incomplete vs full Redis
-- Search: no BM25 parameter tuning / stemmers; ANN is approximate (HNSW)
+- Search: no BM25 parameter tuning / stemmers; ANN is approximate (HNSW); FT doc LRU uses search-hit access-touch (Batch GS), not keyspace TOUCH
 
 ---
 

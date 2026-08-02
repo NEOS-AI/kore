@@ -736,3 +736,167 @@ fn test_volatile_policy_does_not_require_search_eviction() {
         "volatile path either keeps search or evicts TTL keys"
     );
 }
+
+/// Batch GS: repeatedly searching a hot subset under `allkeys-lru` should make
+/// those FT docs more likely to survive than never-touched cold docs when
+/// search memory is under pressure. Sampling is approximate — use enough docs.
+#[test]
+fn test_hot_search_docs_tend_to_survive_allkeys_lru() {
+    use kore::EvictionPolicy;
+
+    let maxmemory = 32 * 1024;
+    let cache = make_cache(maxmemory);
+    cache.set_eviction_policy(EvictionPolicy::AllKeysLru);
+    // Larger sample → better chance hot vs cold is distinguished in the pool.
+    cache.set_eviction_sample_size(32).unwrap();
+
+    let mut h = make_handler(cache.clone());
+    handle(
+        &mut h,
+        cmd(&[
+            "FT.CREATE",
+            "gs_idx",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "g:",
+            "SCHEMA",
+            "blob",
+            "TEXT",
+        ]),
+    );
+
+    let big = "X".repeat(300);
+    // Cold docs: indexed early, never searched.
+    let cold_n = 40usize;
+    let hot_n = 8usize;
+    for i in 0..cold_n {
+        let key = format!("g:cold{}", i);
+        let _ = handle(
+            &mut h,
+            cmd(&["HSET", &key, "blob", &format!("coldtoken{} {}", i, big)]),
+        );
+    }
+    // Hot docs: shared marker for FT.SEARCH touch; also unique tokens.
+    for i in 0..hot_n {
+        let key = format!("g:hot{}", i);
+        let _ = handle(
+            &mut h,
+            cmd(&[
+                "HSET",
+                &key,
+                "blob",
+                &format!("hotmarker uniquehot{} {}", i, big),
+            ]),
+        );
+    }
+
+    // Let cold last_access age slightly relative to subsequent touches.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    // Warm the hot subset many times (Batch GS access-touch on result page).
+    for _ in 0..25 {
+        let _ = handle(&mut h, cmd(&["FT.SEARCH", "gs_idx", "hotmarker", "LIMIT", "0", "20"]));
+        let _ = cache.search("gs_idx", "hotmarker", 20, 0);
+    }
+
+    let search_before = cache.category_memory(MemoryCategory::Search);
+    assert!(search_before > 0, "need search docs before pressure");
+    let info_before = cache.get_search_index_info("gs_idx").unwrap();
+    assert!(
+        info_before.num_docs >= hot_n,
+        "expected hot docs indexed, num_docs={}",
+        info_before.num_docs
+    );
+
+    let evicted_before = cache
+        .stats
+        .evicted_lru
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    // Pressure: add many more cold-ish docs (new keys). Eviction should prefer
+    // older never-searched cold docs over the hotmarker subset.
+    for i in 0..120 {
+        let key = format!("g:press{}", i);
+        let _ = handle(
+            &mut h,
+            cmd(&["HSET", &key, "blob", &format!("press{} {}", i, big)]),
+        );
+        // Keep touching hot docs between pressure writes.
+        if i % 5 == 0 {
+            let _ = cache.search("gs_idx", "hotmarker", 20, 0);
+        }
+        assert!(
+            cache.tracked_memory() <= maxmemory,
+            "tracked {} > maxmemory {}",
+            cache.tracked_memory(),
+            maxmemory
+        );
+    }
+
+    let evicted_after = cache
+        .stats
+        .evicted_lru
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        evicted_after > evicted_before,
+        "expected eviction under pressure (before={} after={})",
+        evicted_before,
+        evicted_after
+    );
+
+    // Count remaining hot vs cold via unique-token search (index presence).
+    let mut hot_alive = 0usize;
+    for i in 0..hot_n {
+        let term = format!("uniquehot{}", i);
+        if let Ok(r) = cache.search("gs_idx", &term, 1, 0) {
+            if r.total > 0 {
+                hot_alive += 1;
+            }
+        }
+    }
+    let mut cold_alive = 0usize;
+    for i in 0..cold_n {
+        let term = format!("coldtoken{}", i);
+        if let Ok(r) = cache.search("gs_idx", &term, 1, 0) {
+            if r.total > 0 {
+                cold_alive += 1;
+            }
+        }
+    }
+
+    let hot_rate = hot_alive as f64 / hot_n as f64;
+    let cold_rate = cold_alive as f64 / cold_n as f64;
+    assert!(
+        hot_alive > 0,
+        "at least some hot docs should survive (hot_alive={} cold_alive={} hot_rate={:.2} cold_rate={:.2} docs={})",
+        hot_alive,
+        cold_alive,
+        hot_rate,
+        cold_rate,
+        cache.get_search_index_info("gs_idx").map(|i| i.num_docs).unwrap_or(0)
+    );
+    // Approximate sampling: hot survival rate should beat cold when access-touch works.
+    assert!(
+        hot_rate + 0.05 >= cold_rate || hot_alive >= cold_alive.min(hot_n),
+        "hot docs should tend to survive vs cold under allkeys-lru \
+         (hot_alive={}/{} rate={:.2}, cold_alive={}/{} rate={:.2})",
+        hot_alive,
+        hot_n,
+        hot_rate,
+        cold_alive,
+        cold_n,
+        cold_rate
+    );
+    // Stronger signal when enough cold were actually reclaimed:
+    if cold_alive + 5 < cold_n {
+        assert!(
+            hot_rate > cold_rate,
+            "when cold docs are reclaimed, hot rate must exceed cold \
+             (hot={:.2} cold={:.2})",
+            hot_rate,
+            cold_rate
+        );
+    }
+}

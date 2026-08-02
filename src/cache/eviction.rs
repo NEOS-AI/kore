@@ -26,10 +26,12 @@
 //!
 //! # LRU / LFU scoring for search docs
 //!
-//! Search docs lack access metadata; they are scored as **cold**
-//! (`cold_instant` / LFU freq 0), same as typed keys without touch tracking.
-//! Under `allkeys-lru` they lose to recently touched strings; under
-//! `allkeys-random` they compete uniformly with sampled keys.
+//! Search docs carry per-doc access metadata (Batch **GS**): FT.SEARCH / cache
+//! search hits call `touch_documents`, updating `last_access` and packed LFU.
+//! Eviction sampling uses those real times/freqs so `allkeys-lru` can prefer
+//! cold FT docs over a hot result-page subset. Typed keyspace keys still use
+//! `cold_instant` / LFU 0 when they lack touch tracking. Search docs remain
+//! **not** volatile victims (no FT TTL).
 
 use crate::error::{Error, Result};
 use crate::memory::MemoryCategory;
@@ -399,19 +401,21 @@ impl Cache {
         }
 
         // --- Search documents (allkeys only; no TTL → not volatile) ---
+        // Batch GS: use real last_access / lfu_freq from search-doc access meta
+        // (touched on search hits), not cold_instant / 0.
         if search_draw > 0 {
-            for (index_name, doc_id, size) in self
+            for sample in self
                 .search_index_manager
-                .sample_documents_for_eviction(search_draw, exclude_search_doc)
+                .sample_documents_for_eviction(search_draw, exclude_search_doc, decay)
             {
                 out.push(EvictCandidate {
-                    key: doc_id,
+                    key: sample.doc_id,
                     key_type: KeyType::None,
-                    size,
-                    last_access: cold_instant(),
-                    lfu_freq: 0,
+                    size: sample.size,
+                    last_access: sample.last_access,
+                    lfu_freq: sample.lfu_freq,
                     expires_at: None,
-                    search_index: Some(index_name),
+                    search_index: Some(sample.index_name),
                 });
             }
         }

@@ -18,11 +18,11 @@ The detailed letter-batch history lives in root [`TODO.md`](TODO.md). This file 
 - **GO** — Dual-end reshard commit: dest prepare fence only via atomic `COMMITPREPARE` (no separate CHECKPREPARE RPC).
 - **GQ** — Parallel Sentinel peer PINGs and replica `slave_priority` INFO probes.
 - **GR** — HNSW bridge reconnect prune floor `max(max_m, 2)` so upper-layer `M=1` path middles keep both spanning edges (not a global insert degree change).
+- **GS** — Search-doc access-touch for LRU/LFU: FT search hits update per-doc `last_access` (+ packed LFU); `allkeys-lru` sampling uses real times so hot FT docs can outrank cold ones. Still not volatile victims.
 
 ### Planned (see TODO.md)
 
 - **GP** — Binary cluster bus 2PC (optional / large)
-- **GS** — Search-doc access-touch LRU
 
 ## [0.7.0] — 2026-08-02
 
