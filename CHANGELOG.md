@@ -17,11 +17,12 @@ The detailed letter-batch history lives in root [`TODO.md`](TODO.md). This file 
 - **GN** — Per-slot config epochs persisted in `nodes.conf` (`# slot-epoch start end epoch`); restore on boot.
 - **GO** — Dual-end reshard commit: dest prepare fence only via atomic `COMMITPREPARE` (no separate CHECKPREPARE RPC).
 - **GQ** — Parallel Sentinel peer PINGs and replica `slave_priority` INFO probes.
+- **GR** — HNSW bridge reconnect prune floor `max(max_m, 2)` so upper-layer `M=1` path middles keep both spanning edges (not a global insert degree change).
 
 ### Planned (see TODO.md)
 
 - **GP** — Binary cluster bus 2PC (optional / large)
-- **GR / GS** — HNSW max_m=1 spanning residual; search-doc access-touch LRU
+- **GS** — Search-doc access-touch LRU
 
 ## [0.7.0] — 2026-08-02
 

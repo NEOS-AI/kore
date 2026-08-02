@@ -579,7 +579,7 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P2]`** **Code review (CU post-ship):** `prune_neighbors_keeping` can drop required must-keep edges
   - *Found*: when `|must_keep| > max_m` and slots are full of required ids, fallback `kept.pop()` may drop a required edge. Layer-0 path currently keeps deg≤2 with `max_m≥2`, so latent for multi-layer `M=1` or oversize must sets.
   - *Done (Batch CW)*: cap must set to closest `max_m` by distance before force-keep; never pop a still-required id. Test: `prune_neighbors_keeping_caps_must_keep_by_distance`.
-  - *Residual (CW post-ship)*: capping silently drops farther spanning edges — path middles need 2 force-keeps; multi-layer `max_m=1` would still break spanning.
+  - *Residual (CW post-ship)*: capping silently drops farther spanning edges — path middles need 2 force-keeps; multi-layer `max_m=1` would still break spanning. **Closed by Batch GR** (`prune_m = max_m.max(2)` on bridge reconnect only).
 - [x] **`[P3]`** **Code review (CW post-ship):** path-branch test needs degree-saturating decoys
   - *Found*: empty neighbor lists after hub clear mean bonus closest-peer density reconnects the line without proving path force-keep under pressure.
   - *Done (Batch CY)*: `hnsw_bridge_remove_path_branch_reconnects` attaches 2 decoys/leaf closer than other survivors; BFS farthest leaf + `search` for `d` still pass.
@@ -763,7 +763,7 @@ Also tracked in `docs/roadmap.md`.
 | Sentinel | long-lived `__sentinel__:hello` SUBSCRIBE fan-in | P3 accepted | — |
 | Sentinel | Kore **higher** priority wins vs Redis lower (documented) | P3 accepted | — |
 | Sentinel | serial INFO enrich / peer PING | P3 accepted lite | **GQ** optional |
-| Search | HNSW `max_m=1` spanning residual | P3 accepted / later | **GR** |
+| Search | HNSW `max_m=1` spanning residual | **done (GR)** | — |
 | Search | search-doc access-touch for true LRU among docs | **P3** | **GS** |
 | Search | inverted-index `_weight` unused (TF-IDF future) | **P2** | **GT** |
 | Search | larger-N ANN recall/throughput (DK `#[ignore]` N=5000) | **P2** | **GU** |
@@ -812,7 +812,7 @@ Ordered execution after **0.7.0**:
 | **GO** | P3 | Cluster | **done** — dest CHECKPREPARE folded into atomic COMMITPREPARE |
 | **GP** | P3 | Cluster | Binary cluster bus 2PC (large; only if Redis cluster clients demand it) |
 | **GQ** | P3 | Sentinel | **done** — parallel peer PING + replica INFO priority probes |
-| **GR** | P3 | Search | HNSW `max_m=1` spanning residual |
+| **GR** | P3 | Search | **done** — reconnect prune floor 2 for upper-layer M=1 path middles |
 | **GS** | P3 | Search | Search-doc access-touch for true LRU among docs (FZ residual) |
 | **GT** | P2 | Search | **done** — inverted-index TF + field-weight TF-IDF; FT.SEARCH WITHSCORES |
 | **GU** | P2 | Search | **done** — adaptive HNSW ef for large-k; mid-N@k=50 CI recall gate |
@@ -898,7 +898,10 @@ Checklist (active):
 - [x] **`[P3]`** **Batch GQ — Parallel Sentinel probes**
   - `count_reachable_sentinels`: parallel peer PINGs
   - `enrich_replica_priorities`: parallel INFO `slave_priority` fetches
-- [ ] **`[P3]`** **Batch GR — HNSW max_m=1 spanning**
+- [x] **`[P3]`** **Batch GR — HNSW max_m=1 spanning**
+  - `bridge_reconnect_neighbors` reconnect prune uses `prune_m = max_m.max(2)` so NN-path middles keep both path edges when upper layers have `M=1`
+  - Insert-time prune still uses bare `max_edges` (not a global degree floor / insert churn change)
+  - Test: `hnsw_bridge_upper_layer_m1_path_reconnects` (M=1 multi-layer, hub remove, BFS on layer 1)
 - [ ] **`[P3]`** **Batch GS — Search-doc access-touch LRU**
 - [x] **`[P2]`** **Batch GT — TF-IDF weight scoring**
   - `InvertedIndex` stores postings `term→(doc→tf)` + doc lengths; field WEIGHT multiplies score
@@ -968,7 +971,7 @@ Do **not** schedule these as sprint work unless a production need appears:
   - KORDB **v6** HNSW graph section after search aliases; v5- loads keep rebuild-by-readd
   - AOF residual closed by **FX** (`FT._LOADGRAPH`); query path residual closed by **FW**
   - Tests: unit snapshot round-trip; `tests/fv_rdb_hnsw_graph_test.rs` RDB SAVE/load edge-identical
-  - Residual: `max_m=1` spanning
+  - Residual: `max_m=1` spanning closed by **GR**
 
 
 - [x] **`[P1]`** **Batch FB — Cluster dual-end NODE wire 2PC (slice 1)**
@@ -1163,7 +1166,8 @@ Active product work is the **post-GB GC+** letter queue above. Remaining / accep
 | P2 | CT post-ship: undirected former-neighbor snapshot (incoming too) | done (CU) |
 | P2 | CT post-ship: multi-way / degree-saturated bridge reconnect | done (CU clique + CW path) |
 | P2 | CU post-ship: NN-path bridge reconnect unit test (n-1 > max_m) | done (CW; CY decoys) |
-| P2 | CU post-ship: prune must_keep never drops required edges | done (CW; multi-layer residual) |
+| P2 | CU post-ship: prune must_keep never drops required edges | done (CW; multi-layer residual → GR) |
+| P3 | HNSW max_m=1 upper-layer path spanning (reconnect prune floor 2) | done (GR) |
 | P3 | CW post-ship: path-branch test degree-saturating decoys | done (CY; adjacency-assert residual) |
 | P3 | CU post-ship: fuse reverse-scan + unlink / reverse index | done (CY one O(E) pass; no reverse index) |
 | P2 | HNSW recall@k / throughput numbers vs FLAT | done (CV unit gate + N=300 micro) |

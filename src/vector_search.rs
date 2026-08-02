@@ -205,6 +205,11 @@ impl PartialOrd for MaxCand {
 /// - Query search greedily descends layers `top…1` with `ef=1`, then runs layer 0
 ///   with `ef_search`.
 ///
+/// **Bridge reconnect (Batch CT–CY / GR):** on delete, former neighbors are reconnected
+/// with a spanning clique or NN-path; reconnect prune uses `max(max_edges, 2)` so path
+/// middles keep both edges even when upper layers have `M=1`. Insert-time prune still
+/// uses bare `max_edges` (not a global degree floor).
+///
 /// Deterministic tests can force levels via [`HNSWIndex::enqueue_levels`] or seed
 /// the level RNG with [`HNSWIndex::with_level_seed`].
 ///
@@ -500,8 +505,10 @@ impl HNSWIndex {
     /// single reverse pass (`unlink_collecting_undirected_former`) — O(N_layer)
     /// once, not snapshot-then-unlink twice.
     ///
-    /// Bridge repair remains a per-layer heuristic residual — not a global
-    /// non-partition guarantee under arbitrary later hub churn (same as CT–CY).
+    /// Bridge repair spans survivors under `M≥1` via a reconnect prune floor of
+    /// 2 (Batch GR) so upper-layer `max_m=1` path middles keep both path edges.
+    /// This is **not** a global insert-time degree change or a guarantee under
+    /// arbitrary later hub churn (same residual as CT–CY).
     pub fn remove(&mut self, doc_id: &Bytes) {
         if !self.vectors.contains_key(doc_id) {
             // Still scrub any orphaned layer residue (defensive).
@@ -569,6 +576,13 @@ impl HNSWIndex {
     /// reachable from an entry-adjacent survivor even under degree saturation.
     /// Extra closest-peer edges may be added for density but only spanning edges
     /// are force-kept.
+    ///
+    /// **Batch GR (M≥1 spanning on reconnect):** upper layers use
+    /// `max_edges = M`, so with `M=1` the NN-path needs path middles to hold
+    /// **two** edges while prune would otherwise cap must-keep to 1 and drop a
+    /// path edge. On the reconnect prune only, use `prune_m = max_m.max(2)` so
+    /// path middles keep both spanning edges. This is a local bridge-repair
+    /// floor, **not** a global insert-time degree change or insert churn fix.
     fn bridge_reconnect_neighbors(&mut self, former: &[Bytes], layer: usize) {
         // Dedup while preserving first-seen order.
         let mut seen: HashSet<Bytes> = HashSet::new();
@@ -584,6 +598,9 @@ impl HNSWIndex {
         }
 
         let max_m = self.max_edges(layer);
+        // Path middles need deg≤2 force-keep; upper-layer M=1 would otherwise
+        // cap must_keep to 1 and break the spanning path (Batch GR).
+        let prune_m = max_m.max(2);
         let n = survivors.len();
 
         // Spanning force-keep set per survivor (tree/clique neighbors).
@@ -674,9 +691,10 @@ impl HNSWIndex {
         }
 
         // Cap degree; force-keep spanning edges on both endpoints.
+        // prune_m floors at 2 so path middles keep both path edges under M=1.
         for u in &survivors {
             let keep = force_keep.get(u).map(|v| v.as_slice()).unwrap_or(&[]);
-            self.prune_neighbors_keeping(u, layer, max_m, keep);
+            self.prune_neighbors_keeping(u, layer, prune_m, keep);
         }
     }
 
@@ -2462,6 +2480,115 @@ mod tests {
             "non-required filler must yield to capped must-keep set (got {:?})",
             neigh
         );
+    }
+
+    /// Batch GR: upper-layer `max_edges = M = 1` forces the NN-path reconnect branch
+    /// (`n-1 > max_m`) with path middles needing deg 2. Without the reconnect prune
+    /// floor of 2, `prune_neighbors_keeping` caps must-keep to 1 and drops a path edge
+    /// under decoy pressure. Survivors on the affected upper layer must stay
+    /// BFS-reachable from the layer entry after hub remove.
+    #[test]
+    fn hnsw_bridge_upper_layer_m1_path_reconnects() {
+        // M=1 → layer 0 max_m=2, layer ≥1 max_m=1 (the residual under test).
+        let mut index = HNSWIndex::new(1, 8, DistanceMetric::L2);
+        // Force all five nodes onto layer 1 so remove reconnects on max_m=1.
+        index.enqueue_levels([1, 1, 1, 1, 1]);
+        index.add(Bytes::from("hub"), vec![0.0, 0.0]);
+        // Leaves on a line so the NN-path is a–b–c–d (middles need two path edges).
+        index.add(Bytes::from("a"), vec![1.0, 0.0]);
+        index.add(Bytes::from("b"), vec![2.0, 0.0]);
+        index.add(Bytes::from("c"), vec![3.0, 0.0]);
+        index.add(Bytes::from("d"), vec![4.0, 0.0]);
+        // One closer decoy per leaf (saturates upper max_m=1) so force-keep is
+        // load-bearing: without prune floor 2, path middles keep only the decoy.
+        index.enqueue_levels([1, 1, 1, 1]);
+        index.add(Bytes::from("da"), vec![1.0, 0.01]);
+        index.add(Bytes::from("db"), vec![2.0, 0.01]);
+        index.add(Bytes::from("dc"), vec![3.0, 0.01]);
+        index.add(Bytes::from("dd"), vec![4.0, 0.01]);
+
+        assert!(
+            index.layers.len() >= 2,
+            "expected multi-layer index for upper-layer M=1 test"
+        );
+        assert_eq!(
+            index.max_edges(1),
+            1,
+            "upper layer max_edges must be M=1 for this residual"
+        );
+
+        // Clear all layers; star on layer 1 only (the layer under test).
+        for layer in &mut index.layers {
+            for (_id, neigh) in layer.neighbors.iter_mut() {
+                neigh.clear();
+            }
+        }
+        // Ensure layer-0 shells exist so remove does not confuse layer maps, but
+        // leave them edgeless — connectivity assertion is on layer 1.
+        let layer1 = &mut index.layers[1];
+        for leaf in ["a", "b", "c", "d"] {
+            layer1.add_edge(Bytes::from(leaf), Bytes::from("hub"));
+            layer1.add_edge(Bytes::from("hub"), Bytes::from(leaf));
+        }
+        for (leaf, d) in [("a", "da"), ("b", "db"), ("c", "dc"), ("d", "dd")] {
+            layer1.add_edge(Bytes::from(leaf), Bytes::from(d));
+            layer1.add_edge(Bytes::from(d), Bytes::from(leaf));
+        }
+        // Hub not linked to decoys → former set = {a,b,c,d} only when hub is removed.
+        index.entry_point = Some(Bytes::from("a"));
+
+        index.remove(&Bytes::from("hub"));
+
+        assert!(!index.vectors.contains_key(&Bytes::from("hub")));
+        for id in ["a", "b", "c", "d"] {
+            assert!(index.vectors.contains_key(&Bytes::from(id)));
+        }
+
+        // BFS on the affected upper layer from entry (a).
+        let layer_idx = 1usize;
+        assert!(
+            index.layers.len() > layer_idx,
+            "layer 1 must still exist after hub remove"
+        );
+        let entry = Bytes::from("a");
+        let mut seen: HashSet<Bytes> = HashSet::new();
+        let mut stack = vec![entry.clone()];
+        seen.insert(entry);
+        while let Some(cur) = stack.pop() {
+            for nb in index.layers[layer_idx].get_neighbors(&cur) {
+                if seen.insert(nb.clone()) {
+                    stack.push(nb);
+                }
+            }
+        }
+        for id in [Bytes::from("a"), Bytes::from("b"), Bytes::from("c"), Bytes::from("d")] {
+            assert!(
+                seen.contains(&id),
+                "after upper-layer M=1 path-branch hub remove under decoy pressure, {:?} must be BFS-reachable on layer {layer_idx} from entry (visited {:?})",
+                id,
+                seen
+            );
+        }
+
+        // Path middles must still hold both path edges (deg ≥ 2 on the spanning path).
+        // Pre-GR prune_m=1 would leave middles with only the closer decoy.
+        for mid in ["b", "c"] {
+            let neigh = index.layers[layer_idx].get_neighbors(&Bytes::from(mid));
+            let path_peers: Vec<&Bytes> = neigh
+                .iter()
+                .filter(|n| {
+                    *n == &Bytes::from("a")
+                        || *n == &Bytes::from("b")
+                        || *n == &Bytes::from("c")
+                        || *n == &Bytes::from("d")
+                })
+                .collect();
+            assert!(
+                path_peers.len() >= 2,
+                "path middle {mid} must keep both path edges under prune floor 2 (neighbors {:?})",
+                neigh
+            );
+        }
     }
 
     /// Batch CT smoke: small M with hub remove/re-add churn — remaining ids stay
