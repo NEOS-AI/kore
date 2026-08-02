@@ -1,55 +1,83 @@
 # Kore
 
-A low-latency, high-performance **Redis/Valkey-compatible** cache and data server written in Rust (version **0.7.0**).
+A low-latency, high-performance **Redis/Valkey-compatible** cache and data server written in Rust (**v0.7.0**).
 
-Kore speaks the RESP protocol so common Redis clients (`redis-cli`, redis-py, redis-rs, ioredis, …) work against it. Beyond a sharded in-memory keyspace it includes persistence, replication, cluster/Sentinel-lite, full-text/vector search, and Kore-specific locking (Redlock, fair queues, deadlock detection).
+Kore speaks the **RESP** protocol, so common clients work out of the box (`redis-cli`, redis-py, redis-rs, ioredis, …). Beyond a sharded in-memory keyspace it includes persistence, replication, cluster/Sentinel-lite, full-text and vector search, Lua scripting with Redis Functions, and Kore-specific locking (Redlock, fair queues, deadlock detection).
+
+**Docs:** [CHANGELOG](CHANGELOG.md) · [ops runbook](docs/ops.md) · [TODO / roadmap](TODO.md) · [benchmarks](docs/benchmarks.md)
+
+---
 
 ## Features
 
 ### Core engine
-- **Sharded keyspace** — default 4096 shards; unified map for all Redis types (`KeyValue` / `KeySlot`)
-- **RESP2 + RESP3** — `HELLO 2|3`; maps/bools/push where applicable
-- **Memory & eviction** — `maxmemory` + Redis-style policies (`allkeys-lru/lfu`, `volatile-*`, `noeviction`); active expire sampling
-- **Multi-DB** — `SELECT` / `SWAPDB` / `MOVE` / `COPY` (`--databases`, default 16)
-- **Pipelines & Unix sockets** — reply coalescing; optional `--unixsocket`
+| Area | What’s implemented |
+|------|--------------------|
+| Keyspace | Sharded map (default **4096** shards); unified `KeyValue` / `KeySlot` for all types |
+| Protocol | **RESP2 + RESP3** (`HELLO 2\|3`); maps, bools, push where applicable |
+| Memory | `maxmemory` + Redis-style policies (`allkeys-lru/lfu`, `volatile-*`, `noeviction`); active expire sampling |
+| Multi-DB | `SELECT` / `SWAPDB` / `MOVE` / `COPY` (`--databases`, default 16) |
+| I/O | Pipelines with reply coalescing; optional **Unix socket** (`--unixsocket`) |
 
 ### Data types & commands
-- **Strings, hashes, lists, sets, sorted sets, streams** (incl. consumer groups / blocking ops)
-- **Bitmaps / HyperLogLog**, **geospatial**, transactions (`MULTI`/`EXEC`/`WATCH`)
-- **Lua** — `EVAL` / `EVALSHA` / `SCRIPT *` plus Redis Functions (`FUNCTION LOAD` / `FCALL`); `redis.setresp` and `lua-time-limit` (Batches **GI** / **GJ**)
-- **DUMP / RESTORE** — Redis RDB wire for string/list/set/hash/zset; geo as ZSET_2 geohash; stream type-15+KST1; legacy KDF1 still accepted
+- **Strings, hashes, lists, sets, sorted sets, streams** (consumer groups, blocking reads, claim/autoclaim)
+- **Bitmaps / HyperLogLog**, **geospatial**, transactions (`MULTI` / `EXEC` / `WATCH`)
+- **Lua** — `EVAL` / `EVALSHA` / `EVAL_RO` / `EVALSHA_RO` / `SCRIPT *`
+  - `redis.call` / `redis.pcall` whitelist for core ops
+  - `redis.setresp(2\|3)`, `CONFIG GET|SET lua-time-limit` (default 5000 ms; `0` = unlimited)
+  - Hard script timeout + real `SCRIPT KILL` / `FUNCTION KILL` (write tracking → `UNKILLABLE`)
+- **Redis Functions** — `FUNCTION LOAD|LIST|DELETE|FLUSH|DUMP|RESTORE|STATS`; real `FCALL` / `FCALL_RO` via `redis.register_function` and `#!lua name=` shebang (dump format: Kore portable **KORF1**; not yet RDB/AOF-durable)
+- **DUMP / RESTORE / MIGRATE** — Redis RDB wire for string/list/set/hash/zset; geo as ZSET_2 geohash; stream type-15+KST1; legacy KDF1 dual-detect kept
 
 ### Persistence & HA
-- **RDB** (Kore `KORDB`, incl. search/HNSW graph) — `SAVE` / `BGSAVE` / timed `--save`
-- **AOF** — append + `BGREWRITEAOF`; load prefers AOF when `--appendonly`
-- **Replication** — `REPLICAOF`, `SYNC`/`PSYNC`, backlog, `WAIT`, min-replicas write gate
-- **Failover** — coordinated `FAILOVER TO`; **Sentinel-lite** (MONITOR, ODOWN quorum, hello bus lite)
-- **Cluster** — hash slots, MOVED/ASK, gossip, reshard/`MIGRATE`, NODE prepare/commit 2PC (RESP; not binary bus)
+- **RDB** — Kore `KORDB` multi-DB + search/HNSW graph sections (`SAVE` / `BGSAVE` / timed `--save`)
+- **AOF** — append log + `BGREWRITEAOF` (incl. FT schema/aliases); load prefers AOF when `--appendonly`
+- **Replication** — `REPLICAOF`, `SYNC` / `PSYNC`, backlog, `WAIT`, min-replicas write gate
+- **Failover** — coordinated `FAILOVER TO`; promote ranking
+- **Sentinel-lite** — `MONITOR`, ODOWN quorum, hello bus lite, conf persistence, `CKQUORUM`
+- **Cluster** — hash slots, `MOVED`/`ASK`, gossip, reshard / `MIGRATE`, NODE prepare/commit **2PC over RESP** (not the binary Redis cluster bus)
+
+### Search
+- **FT.*** — `FT.CREATE` / `DROPINDEX` / `SEARCH` / `INFO` / `_LIST` / `TAGVALS` / aliases
+- Field types: **TEXT** (field-weighted **TF-IDF** ranking), **NUMERIC**, **TAG**, **VECTOR**
+- Vector algorithms: **FLAT** (exact) and **HNSW** (ANN) with Cosine / L2 / IP
+- Adaptive HNSW search `ef` for large-k queries; graph durable in RDB/AOF
+- `FT.SEARCH … WITHSCORES` / `NOCONTENT`; ACL category `@search`
 
 ### Security & ops
 - **ACL** users/categories + `ACL LOG`; boot `--aclfile`
-- **TLS** — `--tls` / cert / key; dual `--tls-port`; mTLS (`--tls-auth-clients` + `--tls-ca`); replica link (`--tls-replication`)
-- **Metrics / admin UI** — Prometheus text + deadlock dashboard; optional Bearer/Basic auth and TLS (Batch **GM**)
-- **Slowlog**, structured JSON logs (`--log-format json`)
+- **TLS** — server TLS (`--tls` / cert / key); dual plain+TLS (`--tls-port`); **mTLS** (`--tls-auth-clients` + `--tls-ca`); replica→primary TLS (`--tls-replication`)
+- **Admin HTTP** — Prometheus metrics (`--metrics-port`) + deadlock UI (`--deadlock-ui-port`)
+  - Optional **Bearer / Basic** auth, **admin TLS**, bind host (`--admin-bind`; non-loopback requires auth)
+- **Slowlog**, graceful shutdown, `HEALTH` / `HEALTH FULL`, structured logs (`--log-format json`)
+- Client smoke: `scripts/client_smoke.sh` (redis-cli + redis-py in CI)
 
 ### Kore differentiators
-- **Redlock** multi-instance locks, **fair FIFO** queueing, **deadlock detection** (+ optional web UI)
-- **FT search** — TEXT (TF-IDF + field WEIGHT) / NUMERIC / TAG / VECTOR; **HNSW** ANN with adaptive search ef and durable RDB/AOF graph
+- **Redlock** multi-instance locks, **fair FIFO** queueing, **deadlock detection** + optional web UI
+- Search + vector ANN on the same RESP server as the cache
+- Production runbook: [docs/ops.md](docs/ops.md)
 
-### Status & planning
-- Changelog: [CHANGELOG.md](CHANGELOG.md) (**0.7.0** productization cut)
-- **Operations runbook:** [docs/ops.md](docs/ops.md) — deploy, persistence, replica/Sentinel/cluster, TLS, health
-- Detailed backlog: [TODO.md](TODO.md) → *Next work queue (post-GB)*
-- High-level plan: [docs/roadmap.md](docs/roadmap.md)
-- Locking / load rules for contributors: [docs/locking.md](docs/locking.md)
+### Planning
+| Doc | Role |
+|-----|------|
+| [CHANGELOG.md](CHANGELOG.md) | Operator-facing releases (0.7.0 productization cut) |
+| [TODO.md](TODO.md) | Letter-batch backlog / next queue |
+| [docs/roadmap.md](docs/roadmap.md) | High-level plan |
+| [docs/benchmarks.md](docs/benchmarks.md) | redis-benchmark vs Valkey methodology |
+| [docs/locking.md](docs/locking.md) | Contributor lock-order rules |
+
+---
 
 ## Architecture
 
-- **Sharded Hashmap**: Default 4096 shards to minimize lock contention
-- **Unified keyspace**: strings and typed containers share one map; slot-level TTL
-- **Approximated LRU/LFU eviction**: Redis-style sampling (default 5 candidates)
-- **Background sweeping**: active expire sampling + optional full `SWEEP`
-- **Atomic stats**: hits, misses, evictions, and more via lock-free counters
+- **Sharded hashmap** — default 4096 shards to cut lock contention
+- **Unified keyspace** — strings and typed containers share one map; slot-level TTL
+- **Approximated LRU/LFU** — Redis-style candidate sampling
+- **Background expire** — active sampling + optional full `SWEEP`
+- **Atomic stats** — hits, misses, evictions via lock-free counters
+- **Standalone hot path** — pure masters skip replication stream encode/backlog until a replica is fed (Batch GC)
+
+---
 
 ## Building
 
@@ -57,21 +85,23 @@ Kore speaks the RESP protocol so common Redis clients (`redis-cli`, redis-py, re
 cargo build --release
 ```
 
-CI (GitHub Actions) runs `cargo build --all-targets` and `cargo test --all-targets -- --test-threads=1` on every push/PR to `main`.
+CI (GitHub Actions) runs `cargo build --all-targets` and `cargo test --all-targets -- --test-threads=1` on push/PR to `main`, plus optional client-smoke and TLS coverage.
+
+---
 
 ## Benchmarks
 
-See [docs/benchmarks.md](docs/benchmarks.md) for a reproducible methodology comparing Kore to Redis/Valkey with `redis-benchmark` (persistence disabled). Pipelined SET improved again in Batch GC (~+19% vs FI on M3 Pro via standalone stream skip); residual gap vs Valkey absolute throughput remains.
+See [docs/benchmarks.md](docs/benchmarks.md). Methodology: host-local `redis-benchmark` with persistence off, vs Valkey when available.
+
+Indicative (M3 Pro, Batch GC/GF): standalone SET pipeline P=16 ~**730–740k** ops/s; Valkey on the same host ~**1.6M**. Non-pipeline paths track Valkey more closely. Absolute numbers are host-dependent.
+
+---
 
 ## Running
-
-Basic usage:
 
 ```bash
 ./target/release/kore
 ```
-
-With custom options:
 
 ```bash
 ./target/release/kore \
@@ -83,487 +113,239 @@ With custom options:
   -v 2
 ```
 
-## Command Line Options
+With persistence and auth:
 
-- `-h, --host <HOST>`: Host address to bind to (default: 127.0.0.1)
-- `-p, --port <PORT>`: Port to bind to (default: 6379)
-- `--threads <THREADS>`: Number of worker threads (default: number of CPU cores)
-- `--shards <SHARDS>`: Number of shards for the hashmap (default: 4096)
-- `--maxmemory <BYTES>`: Maximum memory in bytes (default: 80% of system memory)
-- `--maxentrysize <BYTES>`: Maximum entry size in bytes (default: 524288000 = 500MB)
-- `--evict <BOOL>`: Enable eviction when memory is full (default: true)
-- `--autosweep <BOOL>`: Enable automatic sweeping of expired entries (default: true)
-- `--loadfactor <FLOAT>`: Load factor (0.55-0.95) (default: 0.75)
-- `--maxconns <COUNT>`: Maximum number of connections (default: 1024)
-- `--auth <PASSWORD>`: Authentication password (default: none)
-- `-v, --verbosity <LEVEL>`: Verbosity level 0–3 (default: **1 = WARN**). Mapping: `0` → ERROR, `1` → WARN, `2` → INFO, `3` → DEBUG
-- `--log-format <text|json>`: Log output format — human-readable `text` (default) or structured JSON lines (`json`) for log aggregators. **Boot-only** (not changeable via `CONFIG SET`). JSON includes `target` fields for aggregator indexing; text keeps targets off for quieter consoles. Optional `RUST_LOG` / `EnvFilter` overrides the verbosity floor when set (e.g. `RUST_LOG=kore=debug`)
-- `--databases <N>`: Number of logical databases (default: 16)
-- `--dir` / `--dbfilename` / `--appendonly` / `--appendfilename` / `--save`: persistence paths and policies
-- `--replicaof <host> <port>`: start as replica; `--cluster-enabled` for cluster mode
-- `--tls` / `--tls-cert` / `--tls-key`: enable TLS on the client port
-- `--unixsocket <path>`: bind a Unix domain socket in addition to TCP
-- `--metrics-port <port>`: Prometheus text endpoint (0 = off); bind via `--admin-bind` (default `127.0.0.1`)
-- `--admin-http-token` / `--admin-http-user` + `--admin-http-password`: admin HTTP auth
-- `--admin-tls` [+ `--admin-tls-cert`/`--admin-tls-key`]: TLS for metrics + deadlock UI
-- `--enable-redlock` / `--redlock-instances` / fair-queue and deadlock UI flags: see [docs/redlock.md](docs/redlock.md)
-
-For the full flag surface run `kore --help`.
-
-## Supported Commands
-
-### Basic Operations
-- `PING [message]` - Test connection
-- `ECHO message` - Echo back message
-- `AUTH password` - Authenticate
-
-### Key-Value Operations
-- `SET key value [NX|XX] [GET] [EX seconds] [PX milliseconds] [EXAT timestamp] [PXAT timestamp] [KEEPTTL]`
-- `GET key`
-- `DEL key [key ...]`
-- `EXISTS key [key ...]`
-- `MGET key [key ...]`
-- `MSET key value [key value ...]`
-
-### Distributed Lock Operations
-- `SETNX key value` - SET if Not eXists (returns 1 if set, 0 if key exists)
-- `GETDEL key` - GET and DELete atomically
-- `GETEX key [EX seconds] [PX milliseconds] [EXAT timestamp] [PXAT timestamp] [PERSIST]` - GET with expiration options
-
-**NEW: Redlock Algorithm Support**
-Kore now supports the Redlock algorithm for distributed locking across multiple instances:
-- Quorum-based lock acquisition (N/2 + 1)
-- Automatic retry with exponential backoff
-- Clock drift compensation
-- Fault-tolerant design
-- **Automatic deadlock detection** (NEW!)
-- **Fair lock queueing** (NEW!) - FIFO ordering to prevent starvation
-
-See [Redlock Documentation](docs/redlock.md), [Deadlock Detection](docs/deadlock_detection.md) for detailed usage.
-
-### Redlock Configuration
-- `--enable-redlock` - Enable Redlock distributed locking
-- `--redlock-instances <ADDRS>` - Comma-separated instance addresses
-- `--redlock-retry-count <COUNT>` - Number of retry attempts (default: 3)
-- `--redlock-retry-delay-ms <MS>` - Delay between retries (default: 200)
-
-### Numeric Operations
-- `INCR key`
-- `DECR key`
-- `INCRBY key delta`
-- `DECRBY key delta`
-
-### Expiration
-- `EXPIRE key seconds`
-- `PEXPIRE key milliseconds`
-- `TTL key` - Returns TTL in seconds
-- `PTTL key` - Returns TTL in milliseconds
-
-### Database Operations
-- `DBSIZE` - Get number of keys
-- `KEYS pattern` - Find keys matching pattern (supports * and ?)
-- `FLUSHDB` / `FLUSHALL` - Clear all keys
-- `INFO` - Get server statistics
-- `SWEEP` - Manually trigger expired entry sweep
-
-### Configuration Operations
-- `CONFIG GET parameter` - Get runtime configuration value
-- `CONFIG SET parameter value` - Set runtime configuration value
-
-#### Supported CONFIG Parameters
-- `maxentrysize` / `max-entry-size` - Maximum entry size in bytes (minimum: 1024, cannot exceed maxmemory)
-
-### Sorted Set Operations (Ranking System)
-Kore supports sorted sets, ideal for implementing leaderboards and ranking systems:
-
-- `ZADD key score member [score member ...]` - Add or update members with scores
-- `ZRANGE key start stop [WITHSCORES]` - Get members by rank (ascending order)
-- `ZREVRANGE key start stop [WITHSCORES]` - Get members by rank (descending order)
-- `ZCARD key` - Get the number of members
-- `ZSCORE key member` - Get the score of a member
-- `ZREM key member [member ...]` - Remove members
-- `ZRANK key member` - Get the rank (0-based) of a member in ascending order
-- `ZREVRANK key member` - Get the rank (0-based) of a member in descending order
-
-**Implementation Details:**
-- Uses BTreeMap for maintaining score order (O(log n) operations)
-- HashMap for fast member lookup (O(1) operations)
-- Supports Strategy pattern for different iteration strategies (forward/reverse)
-- Thread-safe with RwLock for concurrent access
-
-**Example - Leaderboard:**
 ```bash
-# Add players with scores
-ZADD leaderboard 1500 player1 1200 player2 1800 player3
-
-# Get top 3 players (highest scores)
-ZREVRANGE leaderboard 0 2 WITHSCORES
-1) "player3"
-2) "1800"
-3) "player1"
-4) "1500"
-5) "player2"
-6) "1200"
-
-# Update a player's score
-ZADD leaderboard 2000 player2
-
-# Get player's rank (0 = first place)
-ZREVRANK leaderboard player2
-(integer) 0
-
-# Get player's score
-ZSCORE leaderboard player2
-"2000"
+./target/release/kore \
+  --dir ./data \
+  --appendonly true \
+  --auth mypassword \
+  --maxmemory-policy allkeys-lru
 ```
 
-### Pub/Sub Operations (Message Broadcasting)
+TLS + dual port (plain on 6379, TLS on 6380):
 
-Kore supports Redis-style Pub/Sub for real-time message broadcasting between clients:
-
-- `PUBLISH channel message` - Publish a message to a channel
-- `SUBSCRIBE channel [channel ...]` - Subscribe to one or more channels
-- `UNSUBSCRIBE [channel ...]` - Unsubscribe from channels
-- `PSUBSCRIBE pattern [pattern ...]` - Subscribe to channels matching patterns
-- `PUNSUBSCRIBE [pattern ...]` - Unsubscribe from patterns
-- `PUBSUB CHANNELS [pattern]` - List active channels
-- `PUBSUB NUMSUB [channel ...]` - Get subscriber count per channel
-- `PUBSUB NUMPAT` - Get number of pattern subscriptions
-
-**Pattern Matching:**
-- `*` - Matches any characters
-- `?` - Matches single character
-- `[...]` - Character class matching
-- `\x` - Escape character
-
-**Implementation Details:**
-- Thread-safe with RwLock for concurrent access
-- Broadcast channels for efficient message distribution
-- Automatic client cleanup on disconnect
-- Pattern matching with glob-style syntax
-- No message persistence (memory-based)
-
-**Example - Real-time Notifications:**
 ```bash
-# Client 1 - Subscribe to notifications
-SUBSCRIBE notifications
-1) "subscribe"
-2) "notifications"
-3) (integer) 1
-
-# Client 2 - Publish a message
-PUBLISH notifications "New user registered!"
-(integer) 1  # Number of subscribers that received the message
-
-# Client 1 receives:
-1) "message"
-2) "notifications"
-3) "New user registered!"
-
-# Pattern subscription
-PSUBSCRIBE news.*
-
-# Publish to matching channels
-PUBLISH news.tech "AI breakthrough"
-PUBLISH news.sports "Team wins championship"
-
-# Client receives both messages:
-1) "pmessage"
-2) "news.*"
-3) "news.tech"
-4) "AI breakthrough"
-
-# Get statistics
-PUBSUB CHANNELS
-1) "notifications"
-2) "news.tech"
-3) "news.sports"
-
-PUBSUB NUMSUB notifications
-1) "notifications"
-2) (integer) 3
-
-PUBSUB NUMPAT
-(integer) 5
+./target/release/kore \
+  --tls --tls-cert cert.pem --tls-key key.pem \
+  --tls-port 6380
 ```
 
-**Use Cases:**
-- Real-time notifications and alerts
-- Chat applications and messaging
-- Event broadcasting and fan-out
-- Log aggregation and monitoring
-- Microservice communication
+Metrics + deadlock UI with auth:
 
-**Documentation:**
-- [Pub/Sub Guide](docs/pubsub.md)
-
-### Search Operations (Full-Text & Vector Search)
-
-Kore supports Redis-like search capabilities including full-text search and vector similarity search:
-
-**Index Management:**
-- `FT.CREATE index [PREFIX count prefix ...] SCHEMA field_name field_type [options ...]` - Create a search index
-- `FT.DROPINDEX index` - Drop a search index
-- `FT._LIST` - List all search indices
-- `FT.INFO index` - Get index information
-
-**Search:**
-- `FT.SEARCH index query [LIMIT offset count] [RETURN count field ...] [WITHSCORES] [NOCONTENT]` - Search (text ranked by TF-IDF)
-
-**Supported Field Types:**
-- **TEXT** - Full-text search with tokenization and field-weighted TF-IDF
-  - Options: `WEIGHT weight` (default: 1.0), `SORTABLE`
-- **NUMERIC** - Numeric range queries
-  - Options: `SORTABLE`
-- **TAG** - Exact matching with tags
-  - Options: `SEPARATOR separator` (default: ","), `SORTABLE`
-- **VECTOR** - Vector similarity search (KNN/ANN)
-  - Algorithms: `FLAT` (brute-force), `HNSW` (approximate)
-  - Distance metrics: `COSINE`, `L2`, `IP` (inner product)
-  - Options: `DIM dimensions`, `DISTANCE_METRIC metric`
-
-**Implementation Details:**
-- Inverted index for full-text search
-- Range indices for numeric queries
-- Tag indices for exact matching
-- Vector indices with multiple similarity metrics
-- Flat (brute-force) and HNSW algorithms for vector search
-- Thread-safe with RwLock for concurrent access
-
-**Example - Full-Text Search:**
 ```bash
-# Create an index for articles
+./target/release/kore \
+  --enable-redlock \
+  --metrics-port 9121 \
+  --deadlock-ui-port 9122 \
+  --admin-http-token s3cret
+
+curl -s -H 'Authorization: Bearer s3cret' http://127.0.0.1:9121/metrics
+```
+
+Full flag list: `./target/release/kore --help` · day-2 ops: [docs/ops.md](docs/ops.md)
+
+---
+
+## Command-line options (summary)
+
+### Server
+| Flag | Default | Notes |
+|------|---------|--------|
+| `--host` | `127.0.0.1` | Bind address |
+| `-p, --port` | `6379` | Client port |
+| `--threads` | CPU count | Worker threads (`0` = auto) |
+| `--shards` | `4096` | Hashmap shards (power of 2) |
+| `--maxconns` | `1024` | Connection cap |
+| `--unixsocket` | off | Extra Unix domain listener |
+| `--databases` | `16` | Logical DBs for `SELECT` |
+| `-v, --verbosity` | `1` (WARN) | 0=ERROR … 3=DEBUG |
+| `--log-format` | `text` | `text` or `json` (boot-only) |
+
+### Memory
+| Flag | Default | Notes |
+|------|---------|--------|
+| `--maxmemory` | ~80% RAM | `0` = auto |
+| `--maxmemory-policy` | `allkeys-lru` | Redis-compatible policy names |
+| `--maxentrysize` | 500 MiB | Per-value ceiling |
+| `--evict` | `true` | `false` forces noeviction behavior |
+| `--autosweep` | `true` | Background expire sampling |
+
+### Persistence & replication
+| Flag | Notes |
+|------|--------|
+| `--dir` / `--dbfilename` | RDB path |
+| `--appendonly` / `--appendfilename` | AOF |
+| `--save` | Timed RDB rules (`900,1 300,10 …`) |
+| `--replicaof host:port` | Start as replica |
+
+### Cluster / Sentinel
+| Flag | Notes |
+|------|--------|
+| `--cluster-enabled` | Hash-slot cluster mode |
+| `--cluster-replica-priority` / `--cluster-require-full-coverage` / `--cluster-allow-reads-when-down` / `--cluster-announce-ip` / `--cluster-announce-port` | Topology & client announce |
+
+### Security
+| Flag | Notes |
+|------|--------|
+| `--auth` | Default-user password |
+| `--aclfile` | ACL rules file for LOAD/SAVE |
+| `--tls` / `--tls-cert` / `--tls-key` | Server TLS |
+| `--tls-port` | Dual listener: plain on `--port`, TLS here (`0` = TLS-only on `--port`) |
+| `--tls-ca` / `--tls-auth-clients` | mTLS |
+| `--tls-replication` | Replica→primary TLS |
+
+### Admin HTTP (metrics + deadlock UI)
+| Flag | Notes |
+|------|--------|
+| `--metrics-port` | Prometheus text (`0` = off) |
+| `--deadlock-ui-port` | HTML `/` + JSON `/api/deadlock` (`0` = off) |
+| `--admin-bind` | Bind host (default `127.0.0.1`; non-loopback **requires** auth) |
+| `--admin-http-token` | Bearer token |
+| `--admin-http-user` / `--admin-http-password` | Basic auth (must be paired) |
+| `--admin-tls` / `--admin-tls-cert` / `--admin-tls-key` | Admin TLS (cert/key fall back to `--tls-cert`/`--tls-key`) |
+
+### Redlock / deadlock
+| Flag | Notes |
+|------|--------|
+| `--enable-redlock` | Multi-instance Redlock |
+| `--redlock-instances` | Comma-separated backends |
+| `--redlock-retry-count` / `--redlock-retry-delay-ms` | Retry policy |
+| `--enable-fair-queue` / `--fair-queue-max-size` / `--fair-queue-cleanup-ms` | FIFO waiters |
+| `--enable-deadlock-detection` / `--deadlock-max-wait-ms` / `--deadlock-auto-resolve` / `--deadlock-victim-strategy` | Detector |
+
+See also [docs/redlock.md](docs/redlock.md) and [docs/deadlock_detection.md](docs/deadlock_detection.md).
+
+---
+
+## Command surface
+
+Kore implements a large Redis-compatible subset. Use `COMMAND` / `COMMAND LIST` / `COMMAND INFO` on a running instance for the live catalog. High-level families:
+
+| Family | Examples |
+|--------|----------|
+| Connection | `PING`, `ECHO`, `AUTH`, `HELLO`, `QUIT`, `SELECT`, `SWAPDB` |
+| Strings | `GET`/`SET` (+ options), `MGET`/`MSET`, `INCR*`, `APPEND`, `GETRANGE`, `GETDEL`, `GETEX`, `SETNX`, … |
+| Keys | `DEL`, `EXISTS`, `TYPE`, `TTL`/`PTTL`, `EXPIRE*`, `RENAME`, `COPY`, `MOVE`, `SCAN`, `DUMP`/`RESTORE`, `MIGRATE`, … |
+| Hashes / lists / sets / zsets | Full core + algebra (`ZUNION`/`ZINTER`/`ZDIFF`, `LMOVE`, `LMPOP`/`ZMPOP`, …) |
+| Streams | `XADD`, `XREAD`/`XREADGROUP`, `XGROUP`, `XACK`, `XPENDING`, `XCLAIM`, `XAUTOCLAIM`, `XINFO`, … |
+| Bitmap / HLL / geo | `SETBIT`/`BITOP`/`BITFIELD`, `PFADD`/`PFCOUNT`, `GEOADD`/`GEOSEARCH`, … |
+| Pub/Sub | `PUBLISH`, `SUBSCRIBE`, `PSUBSCRIBE`, `PUBSUB *`, shard pub/sub where wired |
+| Transactions | `MULTI`/`EXEC`/`DISCARD`/`WATCH`/`UNWATCH` |
+| Scripting | `EVAL`/`EVALSHA`/`EVAL_RO`/`EVALSHA_RO`, `SCRIPT`, `FUNCTION`, `FCALL`/`FCALL_RO` |
+| Search | `FT.CREATE`/`SEARCH`/`DROPINDEX`/`INFO`/`_LIST`/`TAGVALS`/`ALIAS*` |
+| Admin | `INFO`, `CONFIG`, `CLIENT`, `COMMAND`, `SLOWLOG`, `ACL`, `MEMORY`, `DEBUG`, `SHUTDOWN`, `HEALTH` |
+| Replication / cluster / sentinel | `REPLICAOF`, `ROLE`, `WAIT`, `FAILOVER`, `CLUSTER *`, `SENTINEL *` |
+
+### Scripting quick start
+
+```bash
+# Classic EVAL
+EVAL "return redis.call('GET', KEYS[1])" 1 mykey
+
+# RESP3 bools from Lua
+EVAL "redis.setresp(3); return true" 0
+
+# Redis Functions library
+FUNCTION LOAD "#!lua name=mylib
+redis.register_function('echo', function(keys, args)
+  return args[1]
+end)"
+FCALL echo 0 hello
+```
+
+`CONFIG GET|SET lua-time-limit` controls the hard script timeout (ms; `0` = unlimited).
+
+### Search quick start
+
+```bash
 FT.CREATE articles PREFIX 1 article: SCHEMA title TEXT WEIGHT 2.0 body TEXT
+HSET article:1 title "Rust systems" body "low-level performance"
+FT.SEARCH articles "rust" WITHSCORES LIMIT 0 10
 
-# Index a document (programmatically)
-# cache.index_document("articles", "article:1", {
-#   "title": "Introduction to Rust",
-#   "body": "Rust is a systems programming language..."
-# })
-
-# Search for articles
-FT.SEARCH articles "rust programming" LIMIT 0 10
-
-# Get index info
-FT.INFO articles
-
-# List all indices
-FT._LIST
-
-# Drop an index
-FT.DROPINDEX articles
+# Vector + HNSW
+FT.CREATE emb SCHEMA v VECTOR HNSW 6 TYPE FLOAT32 DIM 128 DISTANCE_METRIC COSINE M 16 EF_CONSTRUCTION 200
 ```
 
-**Example - Vector Search:**
+Text hits are ranked with **field-weighted TF-IDF**. HNSW uses an adaptive search beam for large-k ANN.
+
+### Pub/Sub
+
 ```bash
-# Create a vector index for embeddings
-FT.CREATE embeddings SCHEMA
-  text TEXT
-  embedding VECTOR FLAT TYPE FLOAT32 DIM 128 DISTANCE_METRIC COSINE
-
-# Index documents with vectors (programmatically)
-# cache.index_document("embeddings", "doc1", {
-#   "text": "document content",
-#   "embedding": [0.1, 0.2, 0.3, ...]
-# })
-
-# Search for similar documents (programmatically via QueryFilter::Vector)
+SUBSCRIBE notifications
+PUBLISH notifications "hello"
+PSUBSCRIBE news.*
 ```
 
-**Example - Numeric Range Search:**
-```bash
-# Create an index with numeric fields
-FT.CREATE products SCHEMA name TEXT price NUMERIC SORTABLE
+Details: [docs/pubsub.md](docs/pubsub.md)
 
-# Index products (programmatically)
-# cache.index_document("products", "prod1", {
-#   "name": "Laptop",
-#   "price": 999.99
-# })
+### Distributed locks
 
-# Search with numeric filters (programmatically via QueryFilter::NumericRange)
-```
-
-**Use Cases:**
-- Full-text search for articles, documents, logs
-- Vector similarity search for semantic search, recommendations
-- Product search with filters and ranges
-- Real-time search and indexing
-- Multi-field search and ranking
-
-### Distributed Lock Pattern
-
-Kore supports both basic and advanced (Redlock) distributed locking patterns.
-
-#### Basic Mode (Single Instance)
+**Single-instance (Redis pattern):**
 
 ```bash
-# Acquire a lock with automatic expiration (prevents deadlock)
-SET mylock "unique-request-id" NX EX 10
-OK
-
-# Alternative: Use SETNX (returns 1 if acquired, 0 if failed)
-SETNX mylock "unique-request-id"
-(integer) 1
-
-# Set expiration after acquiring lock
-EXPIRE mylock 10
-(integer) 1
-
-# Check lock ownership before releasing
-GET mylock
-"unique-request-id"
-
-# Release lock atomically
+SET mylock <uuid> NX EX 10
 GETDEL mylock
-"unique-request-id"
-
-# Renew lock TTL while holding it
-GETEX mylock EX 10
-"unique-request-id"
-
-# Remove expiration from a lock (make it permanent)
-GETEX mylock PERSIST
-"unique-request-id"
 ```
 
-#### Redlock Mode (Multi-Instance)
+**Redlock (multi-instance)** — library API + CLI flags; optional fair queue and deadlock detector/UI. See [docs/redlock.md](docs/redlock.md), [docs/distributed_locks.md](docs/distributed_locks.md), [docs/deadlock_detection.md](docs/deadlock_detection.md).
 
-```rust
-use kore::{Cache, Redlock};
-use bytes::Bytes;
-use std::sync::Arc;
+---
 
-// Create multiple cache instances
-let cache1 = Arc::new(Cache::new(CacheConfig::default()));
-let cache2 = Arc::new(Cache::new(CacheConfig::default()));
-let cache3 = Arc::new(Cache::new(CacheConfig::default()));
-
-// Create Redlock (quorum = 2 for 3 instances)
-let redlock = Redlock::new(vec![cache1, cache2, cache3])?
-    .with_fair_queueing(100)  // Enable fair FIFO ordering
-    .with_deadlock_detection(5000, false);  // Enable deadlock detection
-
-// Acquire a distributed lock
-let lock = redlock.lock("my-resource", Bytes::from("unique-id"), 10000)?;
-
-// Or acquire with priority (0 = highest priority)
-let lock = redlock.lock_with_priority("my-resource", Bytes::from("unique-id"), 10000, 0)?;
-
-// Check queue position
-if let Some(pos) = redlock.get_queue_position("my-resource", &client_id) {
-    println!("Position in queue: {}", pos);
-}
-
-// Extend lock if needed
-lock.extend(5000)?;
-
-// Lock is automatically released when dropped
-```
-
-**Best Practices for Distributed Locks:**
-- Always use a unique identifier (e.g., UUID) as the lock value
-- Always set an expiration (TTL) to prevent deadlocks
-- Verify ownership before releasing (check value matches)
-- Use `GETDEL` for atomic lock release
-- Use `GETEX` to renew locks during long operations
-- **Use Redlock for multi-instance deployments** for stronger guarantees
-- **Enable fair queueing** to prevent lock starvation
-- **Enable deadlock detection** for automatic deadlock prevention
-
-**Documentation:**
-- [Distributed Locks Guide](docs/distributed_locks.md)
-- [Redlock Implementation](docs/redlock.md)
-- [Deadlock Detection](docs/deadlock_detection.md)
-- [Locking guidelines](docs/locking.md) (contributor lock orders / load commit)
-
-## Example Usage
-
-Using redis-cli or any Redis-compatible client:
+## Example session
 
 ```bash
 redis-cli -p 6379
 
 127.0.0.1:6379> SET mykey "Hello, Kore!"
 OK
-
 127.0.0.1:6379> GET mykey
 "Hello, Kore!"
-
-127.0.0.1:6379> SET counter 0
-OK
-
 127.0.0.1:6379> INCR counter
 (integer) 1
-
-127.0.0.1:6379> INCRBY counter 10
-(integer) 11
-
-127.0.0.1:6379> CONFIG GET maxentrysize
-1) "maxentrysize"
-2) "524288000"
-
-127.0.0.1:6379> CONFIG SET maxentrysize 104857600
-OK
-
-127.0.0.1:6379> INFO
+127.0.0.1:6379> ZADD leaderboard 1500 p1 1800 p2
+(integer) 2
+127.0.0.1:6379> ZREVRANGE leaderboard 0 0 WITHSCORES
+1) "p2"
+2) "1800"
+127.0.0.1:6379> HEALTH
+ready
+127.0.0.1:6379> INFO server
 # Server
-kore_version:0.7.0
-
-# Stats
-...
-
-# Memory
-used_memory:...
-maxmemory:...
-maxentrysize:104857600
-...
-
-127.0.0.1:6379> SET tempkey "expires soon" EX 60
-OK
-
-127.0.0.1:6379> TTL tempkey
-(integer) 60
-
-127.0.0.1:6379> INFO
-# Server
-kore_version:0.7.0
-
-# Stats
-total_commands_processed:7
-cmd_get:1
-cmd_set:3
-...
+…
 ```
 
-## Performance Characteristics
+Client smoke (optional):
 
-- **Concurrency**: High concurrency through sharding (default 4096 shards)
-- **Memory**: Configurable max memory with automatic eviction
-- **Latency**: Sub-microsecond operation latency for cache hits
-- **Throughput**: Scales linearly with number of cores
+```bash
+./scripts/client_smoke.sh   # redis-cli (+ redis-py when available)
+```
 
-## Implementation Details
+---
 
-### Data Structures
+## Known limitations
 
-- **Entry**: Reference-counted entry with key, value, creation time, optional expiration, flags, and CAS value
-- **Sharded Hashmap**: Uses Rust's `HashMap` with `ahash` for fast hashing
-- **Locking**: `parking_lot::RwLock` for per-shard locking (faster than std)
+Honest gaps vs full Redis/Valkey (see [CHANGELOG](CHANGELOG.md) and [TODO.md](TODO.md)):
 
-### Memory Management
+- Pipelined SET absolute throughput still below Valkey on measured hosts
+- Redis Functions dump is Kore **KORF1** (not Redis-native blob); libraries not yet in RDB/AOF
+- No binary Redis **cluster bus** (topology 2PC is RESP-based)
+- Sentinel hello long-lived `SUBSCRIBE` fan-in not implemented
+- Geo DUMP restores as zset for Redis `TYPE`; foreign Redis stream listpack fixtures residual
+- Scripting: no nested `EVAL`; movablekeys catalog incomplete vs full Redis
+- Search: no BM25 parameter tuning / stemmers; ANN is approximate (HNSW)
 
-- Tracks total memory usage across all entries
-- Eviction triggered when memory usage exceeds `maxmemory`
-- **Approximated LRU eviction algorithm**: Samples N random entries (default 5), evicts the least recently used one
-  - Much better than simple random eviction
-  - Similar to Redis's eviction strategy
-  - Low overhead (no global LRU list needed)
-  - Tracks last access time per entry using atomic operations
-- Background task sweeps expired entries every second
+---
 
-### Protocol
+## Performance characteristics
 
-- RESP (REdis Serialization Protocol) parser
-- Supports all RESP value types: simple strings, errors, integers, bulk strings, arrays
-- Zero-copy parsing where possible
+- **Concurrency** — high via sharding + async I/O (Tokio)
+- **Memory** — configurable `maxmemory` + eviction policies
+- **Latency** — microsecond-class hits on local/hot paths
+- **Throughput** — scales with cores; pipeline path improved in productization batches (GC–GE)
+
+---
+
+## License / contributing
+
+Project history and batch work live in [TODO.md](TODO.md). Prefer [docs/ops.md](docs/ops.md) for production deploy notes and [docs/locking.md](docs/locking.md) before large concurrent changes.

@@ -49,8 +49,8 @@ The detailed letter-batch history lives in root [`TODO.md`](TODO.md). This file 
 - Pipelined SET still below Valkey absolute throughput on measured host
 - Redis Functions dump is Kore `KORF1` (not Redis-native blob); libraries not yet in RDB/AOF
 - Stream foreign Redis listpack DUMP fixtures residual; geo DUMP restores as zset (Redis TYPE)
-- Admin HTTP / metrics / deadlock UI: localhost, no auth (**GM**)
 - No binary Redis cluster bus; Sentinel hello SUBSCRIBE fan-in not implemented
+- Admin HTTP has optional auth/TLS (**GM**); no admin mTLS / rate limits
 
 ## [0.6.0] — 2026-07-31
 
