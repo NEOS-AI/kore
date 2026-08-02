@@ -247,13 +247,15 @@ impl ClusterState {
         }
     }
 
-    /// Build cluster state from `CLUSTER NODES` / `SAVECONFIG` text (Batch EN/FL/FO).
+    /// Build cluster state from `CLUSTER NODES` / `SAVECONFIG` text (Batch EN/FL/FO/GN).
     ///
     /// Resolves **myself** via `myself` flag, else matching `ip:port`. Restores
     /// node id, peers, slot ownership, config epoch, live cluster flags from
-    /// header comments (Batch FL), and non-expired prepare votes (Batch FO).
-    /// Missing flag keys keep defaults (require-full=true, allow-reads=false,
-    /// announce none, priority 100). Missing prepare lines → empty prepare map.
+    /// header comments (Batch FL), per-slot epochs (Batch GN), and non-expired
+    /// prepare votes (Batch FO). Missing flag keys keep defaults
+    /// (require-full=true, allow-reads=false, announce none, priority 100).
+    /// Missing `# slot-epoch` lines fall back to stamping all owned slots with
+    /// the file/header epoch (pre-GN files). Missing prepare lines → empty map.
     /// Expired / malformed prepare lines are skipped (fail-closed).
     /// Migrating/importing annotations in the file are ignored (start stable).
     pub fn from_nodes_conf(
@@ -264,6 +266,7 @@ impl ClusterState {
         let ip = ip.into();
         let header_epoch = parse_nodes_conf_header_epoch(text);
         let live = parse_nodes_conf_live_flags(text);
+        let slot_epochs = parse_nodes_conf_slot_epochs(text);
         let prepares = parse_nodes_conf_prepares(text);
         let lines = parse_nodes_conf_lines(text)?;
         if lines.is_empty() {
@@ -327,8 +330,25 @@ impl ClusterState {
                     for slot in start..=end {
                         if slot < SLOT_COUNT {
                             g.slot_owner[slot as usize] = line.id.clone();
+                            // Pre-GN default: stamp owned slots with file epoch.
+                            // Overwritten below when `# slot-epoch` lines exist.
                             g.slot_config_epoch[slot as usize] = epoch;
                         }
+                    }
+                }
+            }
+            // Batch GN: apply per-slot / range epochs when present.
+            if !slot_epochs.is_empty() {
+                for (start, end, e) in slot_epochs {
+                    let e = e.max(1);
+                    for slot in start..=end {
+                        if slot < SLOT_COUNT {
+                            g.slot_config_epoch[slot as usize] = e;
+                        }
+                    }
+                    // current_epoch must dominate any slot epoch for future bumps.
+                    if e > g.current_epoch {
+                        g.current_epoch = e;
                     }
                 }
             }
@@ -605,6 +625,10 @@ impl ClusterState {
         }
         writeln!(f, "# replica-priority {}", self.local_repl_priority())
             .map_err(|e| format!("write error: {}", e))?;
+        // Batch GN: per-slot config epochs (range-compressed; higher-epoch-wins restore).
+        for line in self.format_slot_epoch_header_lines() {
+            writeln!(f, "{}", line).map_err(|e| format!("write error: {}", e))?;
+        }
         // Batch FO: durable prepare votes (non-expired only; slot order stable).
         for line in self.format_prepare_header_lines() {
             writeln!(f, "{}", line).map_err(|e| format!("write error: {}", e))?;
@@ -613,6 +637,35 @@ impl ClusterState {
             .map_err(|e| format!("write error: {}", e))?;
         f.sync_all().map_err(|e| format!("sync error: {}", e))?;
         Ok(path)
+    }
+
+    /// `# slot-epoch <start> <end> <epoch>` lines for SAVECONFIG (Batch GN).
+    ///
+    /// Ranges share a constant epoch (same compression as ownership snapshot).
+    /// Empty cluster emits nothing. Stable order by start slot.
+    fn format_slot_epoch_header_lines(&self) -> Vec<String> {
+        let g = self.inner.read();
+        if g.slot_config_epoch.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut start = 0u16;
+        let mut cur = g.slot_config_epoch[0];
+        for slot in 1..SLOT_COUNT {
+            let e = g.slot_config_epoch[slot as usize];
+            if e != cur {
+                out.push(format!("# slot-epoch {} {} {}", start, slot - 1, cur));
+                start = slot;
+                cur = e;
+            }
+        }
+        out.push(format!(
+            "# slot-epoch {} {} {}",
+            start,
+            SLOT_COUNT - 1,
+            cur
+        ));
+        out
     }
 
     /// `# prepare <slot> <target> <epoch> <unix_ms>` lines for SAVECONFIG (Batch FO).
@@ -2649,6 +2702,61 @@ fn parse_nodes_conf_live_flags(text: &str) -> NodesConfLiveFlags {
     flags
 }
 
+/// Parse Batch GN per-slot epochs: `# slot-epoch <start> <end> <epoch>`.
+///
+/// Also accepts a single-slot form `# slot-epoch <slot> <epoch>` (start=end).
+/// Malformed ranges are skipped. Later lines for overlapping slots overwrite.
+fn parse_nodes_conf_slot_epochs(text: &str) -> Vec<(u16, u16, u64)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if !t.starts_with('#') {
+            continue;
+        }
+        let rest = t.trim_start_matches('#').trim();
+        let mut parts = rest.split_whitespace();
+        match parts.next() {
+            Some("slot-epoch") => {}
+            _ => continue,
+        }
+        let a = match parts.next().and_then(|s| s.parse::<u16>().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let b_or_epoch = match parts.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        // Two-token form after key: slot epoch  OR  start end (need third)
+        if let Some(third) = parts.next() {
+            // start end epoch
+            let end = match b_or_epoch.parse::<u16>() {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let epoch = match third.parse::<u64>() {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if a > end || end >= SLOT_COUNT {
+                continue;
+            }
+            out.push((a, end, epoch));
+        } else {
+            // slot epoch
+            let epoch = match b_or_epoch.parse::<u64>() {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if a >= SLOT_COUNT {
+                continue;
+            }
+            out.push((a, a, epoch));
+        }
+    }
+    out
+}
+
 /// Parse Batch FO durable prepare lines: `# prepare <slot> <target> <epoch> <unix_ms>`.
 ///
 /// Malformed lines and TTL-expired votes are skipped (fail-closed partial restore).
@@ -3123,6 +3231,62 @@ mod tests {
         assert_eq!(b.my_id(), a.my_id());
         // Pre-FO files have no prepare lines → empty prepare map.
         assert!(!b.is_prepared(0));
+    }
+
+    /// Batch GN: per-slot config epochs round-trip through SAVECONFIG / load.
+    #[test]
+    fn nodes_conf_slot_epochs_round_trip() {
+        let dir = std::env::temp_dir().join(format!(
+            "kore-slot-epoch-ut-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let a = ClusterState::single_node("127.0.0.1", 7000);
+        let peer = "qq".repeat(20);
+        a.add_node(&peer, "10.0.0.2", 7001);
+        // Reassign 0-99 one-by-one → each slot gets its own rising epoch.
+        a.reassign_slot_range(0, 99, &peer).unwrap();
+        let e0 = a.slot_epoch(0);
+        let e50 = a.slot_epoch(50);
+        let e99 = a.slot_epoch(99);
+        let e100 = a.slot_epoch(100);
+        assert!(e99 > e50 && e50 > e0 && e0 > e100);
+
+        let path = a
+            .save_nodes_conf_to(dir.to_str().unwrap())
+            .expect("save");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            body.contains("# slot-epoch"),
+            "SAVECONFIG must emit slot-epoch lines: {}",
+            &body[..body.len().min(400)]
+        );
+
+        let b = ClusterState::load_or_single_node("127.0.0.1", 7000, dir.to_str().unwrap());
+        assert_eq!(b.slot_epoch(0), e0);
+        assert_eq!(b.slot_epoch(50), e50);
+        assert_eq!(b.slot_epoch(99), e99);
+        assert_eq!(b.slot_epoch(100), e100);
+        assert_eq!(b.slot_epoch(SLOT_COUNT - 1), e100);
+        assert_eq!(b.owner_id_of(0).as_deref(), Some(peer.as_str()));
+        assert!(b.owns_slot(100));
+        // current_epoch must cover the highest slot epoch after restore.
+        assert!(b.current_epoch() >= e99);
+
+        // Pre-GN file (no slot-epoch lines) still loads: all owned slots get file epoch.
+        let legacy = format!(
+            "# Kore cluster nodes.conf\n# epoch {}\n{}",
+            a.current_epoch(),
+            a.format_nodes()
+        );
+        let c = ClusterState::from_nodes_conf("127.0.0.1", 7000, &legacy).unwrap();
+        assert_eq!(c.slot_epoch(0), a.current_epoch().max(1));
+        assert_eq!(c.slot_epoch(100), a.current_epoch().max(1));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Batch FO: prepare votes round-trip through SAVECONFIG / load.

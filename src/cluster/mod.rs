@@ -49,12 +49,15 @@
 //! `failed_prepare:recheck:…` without half-apply. Prepare votes persist in
 //! `nodes.conf` as `# prepare <slot> <target> <epoch> <unix_ms>` (Batch FO);
 //! expired/malformed lines dropped on load (fail-closed).
-//! **Persistence (Batch EM/EN/EO/FL/FO):** CLUSTER SAVECONFIG → dir/nodes.conf; load on
+//! **Persistence (Batch EM/EN/EO/FL/FO/GN):** CLUSTER SAVECONFIG → dir/nodes.conf; load on
 //! boot via [`ClusterState::load_or_single_node`]; best-effort autosave after
 //! topology-mutating CLUSTER ops, failover claim, live-flag CONFIG SET, and
 //! prepare set/abort/commit. Header `# key value` comments carry require-full /
-//! allow-reads / announce / replica-priority / prepare votes (legacy files
-//! without keys keep defaults / empty prepare map).
+//! allow-reads / announce / replica-priority / **per-slot epochs** (`# slot-epoch`
+//! start end epoch — Batch **GN**) / prepare votes (legacy files without keys
+//! keep defaults / file-epoch stamp for slots / empty prepare map).
+//! **Commit re-check (Batch GO):** dest prepare fence is atomic `COMMITPREPARE`
+//! only (no separate remote CHECKPREPARE RPC).
 //!
 //! Slot migration (thin MVP): `CLUSTER MIGRATEKEYS` moves all key types over RESP.
 //! Orchestration: `CLUSTER RESHARD` runs the documented SETSLOT + MIGRATEKEYS flow

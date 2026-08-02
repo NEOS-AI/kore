@@ -1290,22 +1290,41 @@ async fn query_is_master_down(
     }
 }
 
-/// Live usable sentinel count for CKQUORUM / elect majority (Batch FN).
+/// Live usable sentinel count for CKQUORUM / elect majority (Batch FN + **GQ**).
 ///
-/// Always counts **self** as reachable. Each peer is probed with `PING`
-/// (same IO timeout as other sentinel probes). Unreachable / timed-out peers
-/// are **not** counted so dead entries cannot inflate majority or CKQUORUM.
+/// Always counts **self** as reachable. Peers are probed with `PING` **in
+/// parallel** (Batch GQ; same IO timeout as other sentinel probes). Unreachable
+/// / timed-out peers are **not** counted so dead entries cannot inflate
+/// majority or CKQUORUM.
 pub async fn count_reachable_sentinels(sentinel: &SentinelState) -> usize {
     let peers = sentinel.peers();
     if peers.is_empty() {
         return 1;
     }
+    let handles: Vec<_> = peers
+        .into_iter()
+        .map(|p| {
+            let addr = format!("{}:{}", p.ip, p.port);
+            tokio::spawn(async move {
+                match connect_and_ping(&addr).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        debug!(
+                            "sentinel: peer {} unreachable for live count: {}",
+                            addr, e
+                        );
+                        false
+                    }
+                }
+            })
+        })
+        .collect();
     let mut n = 1usize; // self
-    for p in peers {
-        let addr = format!("{}:{}", p.ip, p.port);
-        match connect_and_ping(&addr).await {
-            Ok(()) => n = n.saturating_add(1),
-            Err(e) => debug!("sentinel: peer {} unreachable for live count: {}", addr, e),
+    for h in handles {
+        match h.await {
+            Ok(true) => n = n.saturating_add(1),
+            Ok(false) => {}
+            Err(e) => debug!("sentinel: parallel peer ping task failed: {}", e),
         }
     }
     n
@@ -1704,14 +1723,37 @@ async fn fetch_slave_priority(addr: &str) -> Option<u32> {
     parse_info_slave_priority(&text)
 }
 
-/// Query each replica's INFO for live `slave_priority` (Batch FM).
+/// Query each replica's INFO for live `slave_priority` (Batch FM + **GQ**).
 ///
-/// On fetch failure or missing field keeps the existing priority (ROLE default
-/// 100, inject via `with_rank`, or a prior successful INFO refresh).
+/// Probes run **in parallel** (Batch GQ). On fetch failure or missing field
+/// keeps the existing priority (ROLE default 100, inject via `with_rank`, or a
+/// prior successful INFO refresh).
 async fn enrich_replica_priorities(replicas: &mut [ReplicaInfo]) {
+    if replicas.is_empty() {
+        return;
+    }
+    let addrs: Vec<String> = replicas.iter().map(|r| r.addr_key()).collect();
+    let handles: Vec<_> = addrs
+        .into_iter()
+        .map(|addr| {
+            tokio::spawn(async move {
+                let pri = fetch_slave_priority(&addr).await;
+                (addr, pri)
+            })
+        })
+        .collect();
+    let mut by_addr: HashMap<String, Option<u32>> = HashMap::new();
+    for h in handles {
+        match h.await {
+            Ok((addr, pri)) => {
+                by_addr.insert(addr, pri);
+            }
+            Err(e) => debug!("sentinel: parallel priority probe task failed: {}", e),
+        }
+    }
     for r in replicas.iter_mut() {
         let addr = r.addr_key();
-        match fetch_slave_priority(&addr).await {
+        match by_addr.get(&addr).and_then(|p| *p) {
             Some(p) => {
                 if r.priority != p {
                     debug!(

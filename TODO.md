@@ -746,7 +746,7 @@ Also tracked in `docs/roadmap.md`.
 
 **Shipped letter stream:** FW–GB baseline · GC–GH · GK · GL · **GC-rel**.
 
-**What remains:** optional depth — **GN+** (and P3 residuals). Accepted P3 residuals stay out of the active queue.
+**What remains:** optional P3 residuals only (binary bus, etc.). Accepted residuals stay out of the active queue.
 
 | Area | Residual | Priority | Planned batch |
 |------|----------|----------|---------------|
@@ -758,8 +758,8 @@ Also tracked in `docs/roadmap.md`.
 | Compat | Lua setresp + time limits (**GJ** done) | **P2** | — |
 | Security | admin HTTP auth + TLS (**GM** done) | **P2** | — |
 | Cluster | binary bus 2PC; dest prepare breadth; operator NODE bypass | P3 accepted / later | **GP** |
-| Cluster | remote CHECKPREPARE→COMMITPREPARE two-RPC window | P3 accepted lite | **GO** |
-| Cluster | per-slot config epochs not fully in nodes.conf | **P2** | **GN** |
+| Cluster | remote CHECKPREPARE→COMMITPREPARE two-RPC window | **done (GO)** | — |
+| Cluster | per-slot config epochs fully in nodes.conf | **done (GN)** | — |
 | Sentinel | long-lived `__sentinel__:hello` SUBSCRIBE fan-in | P3 accepted | — |
 | Sentinel | Kore **higher** priority wins vs Redis lower (documented) | P3 accepted | — |
 | Sentinel | serial INFO enrich / peer PING | P3 accepted lite | **GQ** optional |
@@ -793,8 +793,7 @@ Phases A–E P0 lists are green; prefer **P1 product/perf** over hunting accepte
 
 Ordered execution after **0.7.0**:
 
-1. **GN+** — cluster/Sentinel depth as needed
-2. Optional P3 residuals only when production needs them
+1. Optional P3 residuals only when production needs them (GP binary bus, GR/GS search polish, …)
 
 | Batch | Pri | Track | Scope |
 |-------|-----|-------|--------|
@@ -809,10 +808,10 @@ Ordered execution after **0.7.0**:
 | **GK** | P1 | Compat | **done** — `scripts/client_smoke.sh` + CI (redis-cli + redis-py; ioredis optional) |
 | **GL** | P1 | Security | **done** — mTLS (`--tls-auth-clients`/`--tls-ca`), dual port (`--tls-port`), replica TLS (`--tls-replication`) |
 | **GM** | P2 | Security | **done** — Bearer/Basic auth, admin TLS, non-loopback requires auth |
-| **GN** | P2 | Cluster | Per-slot config epochs fully in `nodes.conf` |
-| **GO** | P3 | Cluster | Collapse remote CHECKPREPARE→COMMITPREPARE two-RPC window |
+| **GN** | P2 | Cluster | **done** — `# slot-epoch` ranges in nodes.conf round-trip |
+| **GO** | P3 | Cluster | **done** — dest CHECKPREPARE folded into atomic COMMITPREPARE |
 | **GP** | P3 | Cluster | Binary cluster bus 2PC (large; only if Redis cluster clients demand it) |
-| **GQ** | P3 | Sentinel | Optional parallel `enrich_replica_priorities` / peer PING |
+| **GQ** | P3 | Sentinel | **done** — parallel peer PING + replica INFO priority probes |
 | **GR** | P3 | Search | HNSW `max_m=1` spanning residual |
 | **GS** | P3 | Search | Search-doc access-touch for true LRU among docs (FZ residual) |
 | **GT** | P2 | Search | **done** — inverted-index TF + field-weight TF-IDF; FT.SEARCH WITHSCORES |
@@ -888,10 +887,17 @@ Checklist (active):
   - Non-loopback bind requires auth; basic user/password must be paired
   - Tests: `tests/gm_admin_http_auth_tls_test.rs`; existing metrics/UI exchange tests updated
   - Residual: no mTLS for admin scrape; no rate limiting
-- [ ] **`[P2]`** **Batch GN — Per-slot epochs in nodes.conf**
-- [ ] **`[P3]`** **Batch GO — Single-RPC prepare commit window**
+- [x] **`[P2]`** **Batch GN — Per-slot epochs in nodes.conf**
+  - SAVECONFIG / autosave emit `# slot-epoch <start> <end> <epoch>` (range-compressed)
+  - Load restores per-slot epochs; pre-GN files stamp owned slots with file epoch
+  - Tests: `nodes_conf_slot_epochs_round_trip`
+- [x] **`[P3]`** **Batch GO — Single-RPC prepare commit window**
+  - Dual-end commit re-check: source `check_prepare_valid` + dest MYID only
+  - Dest prepare fence is atomic `COMMITPREPARE` (no separate CHECKPREPARE RPC)
 - [ ] **`[P3]`** **Batch GP — Binary cluster bus 2PC**
-- [ ] **`[P3]`** **Batch GQ — Parallel Sentinel probes**
+- [x] **`[P3]`** **Batch GQ — Parallel Sentinel probes**
+  - `count_reachable_sentinels`: parallel peer PINGs
+  - `enrich_replica_priorities`: parallel INFO `slave_priority` fetches
 - [ ] **`[P3]`** **Batch GR — HNSW max_m=1 spanning**
 - [ ] **`[P3]`** **Batch GS — Search-doc access-touch LRU**
 - [x] **`[P2]`** **Batch GT — TF-IDF weight scoring**

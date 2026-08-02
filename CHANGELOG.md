@@ -14,10 +14,14 @@ The detailed letter-batch history lives in root [`TODO.md`](TODO.md). This file 
 - **GT** — Real TF-IDF from inverted-index term frequencies + TEXT field WEIGHT; FT.SEARCH ranks by score; `WITHSCORES` / `NOCONTENT`.
 - **GU** — Adaptive HNSW search `ef` for large-k; mid-N (N=800, k=50) CI recall@k vs FLAT; `set_ef_search` / `search_with_ef`.
 - **GM** — Admin HTTP security: Bearer/Basic auth for metrics + deadlock UI; optional admin TLS; `--admin-bind` (non-loopback requires auth).
+- **GN** — Per-slot config epochs persisted in `nodes.conf` (`# slot-epoch start end epoch`); restore on boot.
+- **GO** — Dual-end reshard commit: dest prepare fence only via atomic `COMMITPREPARE` (no separate CHECKPREPARE RPC).
+- **GQ** — Parallel Sentinel peer PINGs and replica `slave_priority` INFO probes.
 
 ### Planned (see TODO.md)
 
-- **GN+** — cluster/Sentinel depth (optional)
+- **GP** — Binary cluster bus 2PC (optional / large)
+- **GR / GS** — HNSW max_m=1 spanning residual; search-doc access-touch LRU
 
 ## [0.7.0] — 2026-08-02
 

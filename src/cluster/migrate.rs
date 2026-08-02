@@ -28,7 +28,8 @@
 //!    ownership / MIGRATING / IMPORTING sanity; votes stamp slot config epoch
 //!    + TTL (FH). Fail → `failed_prepare` with **no** NODE (ABORTPREPARE).
 //! 2. **Commit re-check (FH):** both sides re-validate prepare (epoch/TTL/
-//!    topology / MYID) via local + `SETSLOT CHECKPREPARE` before any NODE.
+//!    topology / MYID) via local check + dest MYID; dest fence is atomic
+//!    `COMMITPREPARE` (Batch GO — no separate dest CHECKPREPARE RPC).
 //!    Fail → `failed_prepare:recheck:…` without half-apply.
 //! 3. **Commit** only after re-check: **dest** `SETSLOT COMMITPREPARE <dest>`
 //!    first (atomic check+NODE, Batch FO), then **source**
@@ -1983,8 +1984,9 @@ fn summarize_dual_end_status(source_node: &str, dest_node: &str) -> String {
 /// (local + remote RESP); votes carry slot-epoch + TTL. Fail closed →
 /// `failed_prepare` without NODE; both sides ABORTPREPARE.
 ///
-/// **Commit re-check (Batch FH):** source `check_prepare_valid` + dest
-/// `SETSLOT CHECKPREPARE` before any NODE. Fail → `failed_prepare:recheck:…`
+/// **Commit re-check (Batch FH + GO):** source `check_prepare_valid` + dest
+/// MYID; dest prepare fence runs inside atomic `COMMITPREPARE` (no separate
+/// CHECKPREPARE RPC). Fail → `failed_prepare:recheck:…`
 /// without half-apply.
 ///
 /// **Commit (Batch FO/DV):** dest `SETSLOT COMMITPREPARE` (atomic check+NODE)
@@ -2169,10 +2171,15 @@ async fn prepare_dual_end_node(
     Ok(())
 }
 
-/// Commit-phase re-check of prepare votes on source + dest (Batch FH).
+/// Commit-phase re-check before dual-end NODE (Batch FH + **GO**).
 ///
-/// Ensures epoch fence / TTL / topology still hold and dest MYID still matches
-/// before either side applies NODE. Fail closed — caller aborts prepares.
+/// - **Source:** local `check_prepare_valid` (epoch fence / TTL / topology).
+/// - **Dest:** MYID still matches. Dest prepare re-check is **not** a separate
+///   `CHECKPREPARE` RPC — Batch **GO** collapses that into the subsequent
+///   atomic `COMMITPREPARE` (check+NODE under one lock), closing the two-RPC
+///   window between CHECK and COMMIT on the dest.
+///
+/// Fail closed — caller aborts prepares.
 async fn recheck_prepare_before_commit(
     cluster: &ClusterState,
     slot: u16,
@@ -2196,20 +2203,8 @@ async fn recheck_prepare_before_commit(
             remote_id, dest_node_id
         ));
     }
-
-    let slot_s = slot.to_string();
-    dest_setslot(
-        &mut stream,
-        &[
-            "CLUSTER",
-            "SETSLOT",
-            &slot_s,
-            "CHECKPREPARE",
-            dest_node_id,
-        ],
-    )
-    .await
-    .map_err(|e| format!("dest {}", strip_err_prefix(&e)))
+    // Dest CHECKPREPARE intentionally omitted (Batch GO): COMMITPREPARE is atomic.
+    Ok(())
 }
 
 /// Dest half of prepare: MYID + owner sanity + SETSLOT PREPARE (Batch FB/EY).
