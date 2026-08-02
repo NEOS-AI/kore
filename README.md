@@ -306,10 +306,10 @@ Kore supports Redis-like search capabilities including full-text search and vect
 - `FT.INFO index` - Get index information
 
 **Search:**
-- `FT.SEARCH index query [LIMIT offset count] [RETURN count field ...]` - Search for documents
+- `FT.SEARCH index query [LIMIT offset count] [RETURN count field ...] [WITHSCORES] [NOCONTENT]` - Search (text ranked by TF-IDF)
 
 **Supported Field Types:**
-- **TEXT** - Full-text search with tokenization
+- **TEXT** - Full-text search with tokenization and field-weighted TF-IDF
   - Options: `WEIGHT weight` (default: 1.0), `SORTABLE`
 - **NUMERIC** - Numeric range queries
   - Options: `SORTABLE`
