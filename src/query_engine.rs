@@ -184,17 +184,40 @@ impl QueryExecutor {
             index.get_documents().clone()
         };
 
-        // Step 2: For vector queries, compute scores
+        // Step 2: Score candidates — vector similarity and/or text TF-IDF (Batch GT).
         let mut scored_results: Vec<(Bytes, Option<f32>)> = if let Some(ref filter) = query.filter {
-            if let Some(scores) = Self::get_vector_scores(index, filter) {
-                candidates
+            let vector_scores = Self::get_vector_scores(index, filter);
+            let text_scores = Self::get_text_scores(index, filter, &candidates);
+            match (vector_scores, text_scores) {
+                (Some(vs), Some(ts)) => {
+                    // Prefer vector scores for docs that have them; else TF-IDF.
+                    candidates
+                        .into_iter()
+                        .map(|doc_id| {
+                            let score = vs
+                                .get(&doc_id)
+                                .copied()
+                                .or_else(|| ts.get(&doc_id).copied());
+                            (doc_id, score)
+                        })
+                        .collect()
+                }
+                (Some(vs), None) => candidates
                     .into_iter()
                     .filter_map(|doc_id| {
-                        scores.get(&doc_id).map(|&score| (doc_id, Some(score)))
+                        vs.get(&doc_id).map(|&score| (doc_id, Some(score)))
                     })
-                    .collect()
-            } else {
-                candidates.into_iter().map(|doc_id| (doc_id, None)).collect()
+                    .collect(),
+                (None, Some(ts)) => candidates
+                    .into_iter()
+                    .map(|doc_id| {
+                        let score = ts.get(&doc_id).copied();
+                        (doc_id, score)
+                    })
+                    .collect(),
+                (None, None) => {
+                    candidates.into_iter().map(|doc_id| (doc_id, None)).collect()
+                }
             }
         } else {
             candidates.into_iter().map(|doc_id| (doc_id, None)).collect()
@@ -204,7 +227,7 @@ impl QueryExecutor {
         if let Some(ref sort_by) = query.sort_by {
             Self::sort_results(&mut scored_results, sort_by, document_data);
         } else if scored_results.iter().any(|(_, score)| score.is_some()) {
-            // If we have vector scores, sort by score (descending)
+            // Vector or TF-IDF scores: sort by score descending (higher is better).
             scored_results.sort_by(|a, b| {
                 b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
             });
@@ -376,6 +399,55 @@ impl QueryExecutor {
                     }
                 }
                 None
+            }
+            _ => None,
+        }
+    }
+
+    /// Field-weighted TF-IDF scores for text filters (Batch GT).
+    ///
+    /// Compound OR of text fields sums per-field scores; AND takes the
+    /// intersection candidates already computed and sums field contributions.
+    fn get_text_scores(
+        index: &SearchIndex,
+        filter: &QueryFilter,
+        candidates: &HashSet<Bytes>,
+    ) -> Option<HashMap<Bytes, f32>> {
+        match filter {
+            QueryFilter::Text { field, terms, operator } => {
+                // NOT queries: no meaningful TF-IDF ranking of non-matches.
+                if matches!(operator, QueryOperator::Not) {
+                    return None;
+                }
+                let text_index = index.get_text_index(field)?;
+                let scores = text_index.score_tf_idf(terms, candidates);
+                if scores.is_empty() {
+                    None
+                } else {
+                    Some(scores)
+                }
+            }
+            QueryFilter::Compound { operator, filters } => {
+                let mut any = false;
+                let mut combined: HashMap<Bytes, f32> = HashMap::new();
+                for sub in filters {
+                    if let Some(scores) = Self::get_text_scores(index, sub, candidates) {
+                        any = true;
+                        match operator {
+                            QueryOperator::Or | QueryOperator::And => {
+                                for (doc, s) in scores {
+                                    *combined.entry(doc).or_insert(0.0) += s;
+                                }
+                            }
+                            QueryOperator::Not => {}
+                        }
+                    }
+                }
+                if any {
+                    Some(combined)
+                } else {
+                    None
+                }
             }
             _ => None,
         }

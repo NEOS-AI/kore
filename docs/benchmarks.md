@@ -471,6 +471,10 @@ comparison:
      remove 15 + update 15, Q=24, seed `0xD1C40177`, M=8/ef=32; soft floors
      mean recall@1 ≥ **0.90** / @10 ≥ **0.85** vs FLAT after churn (bridge
      reconnect is heuristic — floors looser than the no-churn gate).
+   - `hnsw_recall_mid_n_large_k_vs_flat` (**Batch GU**): always-on mid-scale gate.
+     N=800, dim=16, Cosine, Q=24, k=**50**, seed `0xD1A6E577`, M=8/ef_construction=32;
+     adaptive `effective_ef_search` (≈2k when k is large); asserts mean recall@1 ≥ **0.95**
+     and recall@50 ≥ **0.88**. Indicative wall times only (HNSW may still lag FLAT at this N).
    - `hnsw_recall_larger_n_median_throughput` (**Batch DK**, `#[ignore]`): N=5000,
      dim=16, Cosine, Q=40, seed `0xD1A6E501`; HNSW M=16 / ef=100; soft recall
      floors ≥ 0.95 / 0.90; prints **median-of-3** search wall times (build
@@ -489,7 +493,8 @@ comparison:
    - `hnsw_m1_hub_churn_preserves_reachability` (Batch CT smoke)
    - `hnsw_multilayer_forced_levels_place_nodes_above_zero` / `hnsw_multilayer_seeded_inserts_use_upper_layers` / `hnsw_multilayer_remove_update_smoke` / `hnsw_multilayer_upper_layer_has_edges` (Batch FF)
 
-**Implementation note (Batch CQ + CS + CT + CU + CV + DK + DL + FF):** `HNSWIndex::search`
+**Implementation note (Batch CQ + CS + CT + CU + CV + DK + DL + FF + GU):** `HNSWIndex::search`
+uses adaptive `effective_ef_search(k)` (Batch **GU**: scales the layer-0 beam for large-k).
 greedily descends upper layers (`ef=1`) then walks layer-0 neighbor edges
 (SEARCH-LAYER) with candidate list size `ef_search` (defaults to
 `ef_construction`). **Batch FF** assigns each insert a random level with

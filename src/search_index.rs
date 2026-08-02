@@ -426,49 +426,92 @@ fn parse_ft_usize(tok: &[u8]) -> Option<usize> {
     std::str::from_utf8(tok).ok()?.parse().ok()
 }
 
-/// Inverted index for text search
+/// Inverted index for text search with per-posting term frequencies (Batch GT).
+///
+/// Stores `term → (doc_id → tf)` plus document lengths so FT.SEARCH can rank
+/// hits with field-weighted TF-IDF instead of presence-only matching.
 #[derive(Debug, Clone)]
 pub struct InvertedIndex {
-    /// Maps term to set of document IDs
-    terms: HashMap<String, HashSet<Bytes>>,
+    /// term → (doc_id → term frequency within that document)
+    postings: HashMap<String, HashMap<Bytes, u32>>,
+    /// doc_id → token count (for length-aware scoring / diagnostics)
+    doc_lens: HashMap<Bytes, u32>,
+    /// Schema TEXT field weight (multiplies TF-IDF at score time)
+    field_weight: f64,
 }
 
 impl InvertedIndex {
     pub fn new() -> Self {
         Self {
-            terms: HashMap::new(),
+            postings: HashMap::new(),
+            doc_lens: HashMap::new(),
+            field_weight: 1.0,
         }
+    }
+
+    /// Number of documents currently present in this field index.
+    pub fn doc_count(&self) -> usize {
+        self.doc_lens.len()
+    }
+
+    /// Field weight from the last `add_document` (schema TEXT WEIGHT).
+    pub fn field_weight(&self) -> f64 {
+        self.field_weight
+    }
+
+    /// Document frequency of a term (number of docs containing it).
+    pub fn document_frequency(&self, term: &str) -> usize {
+        let normalized = term.to_lowercase();
+        self.postings
+            .get(&normalized)
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    /// Term frequency of `term` in `doc_id`, or 0.
+    pub fn term_frequency(&self, term: &str, doc_id: &Bytes) -> u32 {
+        let normalized = term.to_lowercase();
+        self.postings
+            .get(&normalized)
+            .and_then(|m| m.get(doc_id).copied())
+            .unwrap_or(0)
     }
 
     /// Add a document to the index.
     ///
-    /// `_weight` is reserved for future TF-IDF / field-weight scoring; presence
-    /// is already used at the FT schema layer (`FieldType::Text { weight }`).
-    pub fn add_document(&mut self, doc_id: Bytes, text: &str, _weight: f64) {
+    /// `weight` is the TEXT field weight from the schema (applied at score time).
+    pub fn add_document(&mut self, doc_id: Bytes, text: &str, weight: f64) {
+        self.field_weight = if weight > 0.0 { weight } else { 1.0 };
         let tokens = Self::tokenize(text);
+        self.doc_lens.insert(doc_id.clone(), tokens.len() as u32);
+
+        let mut tf_map: HashMap<String, u32> = HashMap::new();
         for token in tokens {
-            self.terms
-                .entry(token)
-                .or_insert_with(HashSet::new)
-                .insert(doc_id.clone());
+            *tf_map.entry(token).or_insert(0) += 1;
+        }
+        for (term, tf) in tf_map {
+            self.postings
+                .entry(term)
+                .or_default()
+                .insert(doc_id.clone(), tf);
         }
     }
 
     /// Remove a document from the index
     pub fn remove_document(&mut self, doc_id: &Bytes) {
-        for (_, doc_set) in self.terms.iter_mut() {
-            doc_set.remove(doc_id);
+        self.doc_lens.remove(doc_id);
+        for posting in self.postings.values_mut() {
+            posting.remove(doc_id);
         }
-        // Clean up empty entries
-        self.terms.retain(|_, docs| !docs.is_empty());
+        self.postings.retain(|_, docs| !docs.is_empty());
     }
 
     /// Search for documents matching a term
     pub fn search(&self, term: &str) -> HashSet<Bytes> {
         let normalized = term.to_lowercase();
-        self.terms
+        self.postings
             .get(&normalized)
-            .cloned()
+            .map(|m| m.keys().cloned().collect())
             .unwrap_or_default()
     }
 
@@ -493,6 +536,45 @@ impl InvertedIndex {
             result.extend(self.search(term));
         }
         result
+    }
+
+    /// TF-IDF scores for `docs` given query `terms` (Batch GT).
+    ///
+    /// Per term contribution: `field_weight * (1 + ln(tf)) * ln(1 + N/df)`.
+    /// Multi-term queries sum contributions over terms that appear in the doc.
+    /// Documents with zero contribution are omitted.
+    pub fn score_tf_idf(
+        &self,
+        terms: &[String],
+        docs: &HashSet<Bytes>,
+    ) -> HashMap<Bytes, f32> {
+        if docs.is_empty() || terms.is_empty() {
+            return HashMap::new();
+        }
+        let n = self.doc_lens.len().max(1) as f64;
+        let w = self.field_weight as f32;
+        let mut scores: HashMap<Bytes, f32> = HashMap::new();
+
+        for term in terms {
+            let normalized = term.to_lowercase();
+            let Some(posting) = self.postings.get(&normalized) else {
+                continue;
+            };
+            let df = posting.len().max(1) as f64;
+            // Smooth IDF: ln(1 + N/df) — rare terms score higher.
+            let idf = (1.0 + n / df).ln() as f32;
+            for doc_id in docs {
+                if let Some(&tf) = posting.get(doc_id) {
+                    if tf == 0 {
+                        continue;
+                    }
+                    // Log-normalized TF so repeated tokens help but with diminishing returns.
+                    let tf_w = 1.0 + (tf as f32).ln();
+                    *scores.entry(doc_id.clone()).or_insert(0.0) += w * tf_w * idf;
+                }
+            }
+        }
+        scores
     }
 
     /// Simple tokenization (split by whitespace and punctuation)
@@ -1521,6 +1603,44 @@ mod tests {
         let results = index.search("world");
         assert_eq!(results.len(), 1);
         assert!(results.contains(&doc1));
+
+        // Batch GT: term frequencies and TF-IDF ranking
+        assert_eq!(index.term_frequency("hello", &doc1), 1);
+        assert_eq!(index.document_frequency("hello"), 2);
+        assert_eq!(index.document_frequency("world"), 1);
+
+        let candidates: HashSet<Bytes> = [doc1.clone(), doc2.clone()].into_iter().collect();
+        let scores = index.score_tf_idf(&[String::from("world")], &candidates);
+        assert!(scores.get(&doc1).copied().unwrap_or(0.0) > 0.0);
+        assert!(!scores.contains_key(&doc2));
+    }
+
+    #[test]
+    fn test_tf_idf_field_weight_and_tf() {
+        let mut index = InvertedIndex::new();
+        let rare = Bytes::from("rare_doc");
+        let common = Bytes::from("common_doc");
+        // rare_doc: term "zebra" appears twice; common_doc: once among many other docs later
+        index.add_document(rare.clone(), "zebra zebra cat", 2.0); // weight 2
+        index.add_document(common.clone(), "zebra dog", 1.0);
+        for i in 0..10 {
+            index.add_document(
+                Bytes::from(format!("filler{i}")),
+                "cat dog bird",
+                1.0,
+            );
+        }
+        let candidates: HashSet<Bytes> = [rare.clone(), common.clone()].into_iter().collect();
+        let scores = index.score_tf_idf(&[String::from("zebra")], &candidates);
+        let s_rare = scores.get(&rare).copied().unwrap_or(0.0);
+        let s_common = scores.get(&common).copied().unwrap_or(0.0);
+        // Higher TF + field weight 2.0 must outrank single TF with weight 1.0
+        assert!(
+            s_rare > s_common,
+            "tf-weighted rare {} should beat common {}",
+            s_rare,
+            s_common
+        );
     }
 
     #[test]

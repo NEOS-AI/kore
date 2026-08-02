@@ -11,10 +11,11 @@ The detailed letter-batch history lives in root [`TODO.md`](TODO.md). This file 
 
 - **GI** — Redis Functions library beyond stubs: shared `FunctionLibraryStore`; `FUNCTION LOAD`/`LIST`/`DELETE`/`FLUSH`/`DUMP`/`RESTORE`/`STATS`; real `FCALL`/`FCALL_RO` via `redis.register_function` and `#!lua name=` shebang. Dump format is Kore-portable `KORF1` (not Redis binary blob). Not yet durable in RDB/AOF.
 - **GJ** — Lua polish: `redis.setresp(2|3)`; `CONFIG GET|SET lua-time-limit` (default 5000 ms, `0` unlimited); hard script timeout; real `SCRIPT KILL` / `FUNCTION KILL` with write tracking (UNKILLABLE).
+- **GT** — Real TF-IDF from inverted-index term frequencies + TEXT field WEIGHT; FT.SEARCH ranks by score; `WITHSCORES` / `NOCONTENT`.
+- **GU** — Adaptive HNSW search `ef` for large-k; mid-N (N=800, k=50) CI recall@k vs FLAT; `set_ef_search` / `search_with_ef`.
 
 ### Planned (see TODO.md)
 
-- **GT–GU** — search scoring / ANN polish
 - **GM** — admin HTTP / metrics / deadlock UI auth + TLS
 - **GN+** — cluster/Sentinel depth (optional)
 

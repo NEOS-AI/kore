@@ -261,18 +261,54 @@ impl HNSWIndex {
 
     pub fn new(m: usize, ef_construction: usize, distance_metric: DistanceMetric) -> Self {
         let m = m.max(1);
+        let ef_construction = ef_construction.max(1);
         Self {
             vectors: HashMap::new(),
             layers: vec![HNSWLayer::new()],
             m,
-            ef_construction: ef_construction.max(1),
-            ef_search: ef_construction.max(1),
+            ef_construction,
+            // Default search ef matches construction (Redis-style); override via
+            // [`set_ef_search`]. Batch GU also scales ef dynamically for large k.
+            ef_search: ef_construction,
             distance_metric,
             entry_point: None,
             ml: Self::compute_ml(m),
             level_assign_queue: VecDeque::new(),
             level_rng: None,
         }
+    }
+
+    /// Current search-time candidate list size (`ef_search`).
+    pub fn ef_search(&self) -> usize {
+        self.ef_search
+    }
+
+    /// Construction-time candidate list size.
+    pub fn ef_construction(&self) -> usize {
+        self.ef_construction
+    }
+
+    /// Override search-time `ef` (like Redis `EF_RUNTIME`). Larger values improve
+    /// recall for large-k queries at higher CPU cost (Batch GU).
+    pub fn set_ef_search(&mut self, ef: usize) {
+        self.ef_search = ef.max(1);
+    }
+
+    /// Effective search `ef` for a top-`k` query (Batch GU).
+    ///
+    /// Always at least `max(ef_search, k)`. When `k` approaches or exceeds the
+    /// configured `ef_search`, expand the candidate list (`≈ 2k`, capped by
+    /// corpus size) so large-N / large-k recall does not collapse.
+    pub fn effective_ef_search(&self, k: usize) -> usize {
+        let base = self.ef_search.max(1);
+        let k = k.max(1);
+        let n = self.vectors.len().max(1);
+        let mut ef = base.max(k);
+        if k * 2 > base {
+            // Scale for large-k: keep a wider beam than bare k.
+            ef = ef.max(k.saturating_mul(2));
+        }
+        ef.min(n)
     }
 
     /// Seed the level-assignment RNG for reproducible multi-layer structure in tests.
@@ -679,11 +715,25 @@ impl HNSWIndex {
     /// Search for k nearest neighbors via multi-layer HNSW (Batch FF).
     ///
     /// Greedy descent on layers `top…1` with `ef=1`, then SEARCH-LAYER on layer 0
-    /// with `ef_search` (at least `k`). Approximate: only nodes reachable via
-    /// edges from the refined entry are considered on layer 0.
+    /// with adaptive `ef` (Batch GU: scales above bare `k` for large-k recall).
+    /// Approximate: only nodes reachable via edges from the refined entry are
+    /// considered on layer 0.
     /// Fallback: if the entry point is missing from `vectors`, brute-force the map
     /// (should not happen after normal `add` paths).
     pub fn search(&self, query_vector: &[f32], k: usize) -> Vec<VectorSearchResult> {
+        self.search_with_ef(query_vector, k, self.effective_ef_search(k))
+    }
+
+    /// KNN search with an explicit layer-0 candidate list size `ef`.
+    ///
+    /// `ef` is clamped to at least `k` and at most the corpus size. Used by
+    /// Batch GU benches and optional runtime tuning via [`set_ef_search`].
+    pub fn search_with_ef(
+        &self,
+        query_vector: &[f32],
+        k: usize,
+        ef: usize,
+    ) -> Vec<VectorSearchResult> {
         if self.vectors.is_empty() || k == 0 {
             return Vec::new();
         }
@@ -703,7 +753,7 @@ impl HNSWIndex {
             }
         }
 
-        let ef = self.ef_search.max(k);
+        let ef = ef.max(k).min(self.vectors.len().max(1));
         let candidates = self.search_layer(query_vector, &ep, ef, 0);
 
         candidates
@@ -2603,6 +2653,104 @@ mod tests {
         assert!(
             mean_r10 >= MIN_RECALL_AT_10,
             "mean recall@10 {mean_r10:.3} < {MIN_RECALL_AT_10} (N={N} dim={DIM} Q={Q} M={M} ef={EF})"
+        );
+    }
+
+    /// Batch GU: mid-scale N + **large k** recall@k of HNSW vs FLAT (CI-gated).
+    ///
+    /// Complements the small-N k=10 gate (`hnsw_recall_at_k_vs_flat_and_throughput`)
+    /// and the ignored N=5000 bench. Exercises adaptive `effective_ef_search` so
+    /// large-k queries keep load-bearing recall without the full 5k build cost.
+    ///
+    /// Methodology:
+    /// - N=800 unit vectors, dim=16, Cosine; fixed seed.
+    /// - HNSW M=8, ef_construction=32 (same tightness class as the unit gate).
+    /// - Q=24 queries; recall@1 / recall@50 vs FLAT top-50.
+    /// - Throughput: single-shot wall time for Q×k=50 searches (indicative).
+    ///
+    /// Thresholds:
+    /// - mean recall@1  ≥ 0.95
+    /// - mean recall@50 ≥ 0.88  (adaptive ef; bare `max(ef,k)` often undershoots)
+    #[test]
+    fn hnsw_recall_mid_n_large_k_vs_flat() {
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+        use std::time::Instant;
+
+        const N: usize = 800;
+        const DIM: usize = 16;
+        const Q: usize = 24;
+        const M: usize = 8;
+        const EF: usize = 32;
+        const K: usize = 50;
+        // Distinct from CV/DK and larger-N seeds.
+        const SEED: u64 = 0x_D1_A6_E5_77;
+
+        const MIN_RECALL_AT_1: f64 = 0.95;
+        const MIN_RECALL_AT_K: f64 = 0.88;
+
+        let mut rng = StdRng::seed_from_u64(SEED);
+        let corpus: Vec<(Bytes, Vec<f32>)> = (0..N)
+            .map(|i| (Bytes::from(format!("v{i}")), random_unit_vec(&mut rng, DIM)))
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..Q).map(|_| random_unit_vec(&mut rng, DIM)).collect();
+
+        let mut flat = FlatVectorIndex::new(DistanceMetric::Cosine);
+        let mut hnsw = HNSWIndex::new(M, EF, DistanceMetric::Cosine);
+        for (id, v) in &corpus {
+            flat.add(id.clone(), v.clone());
+            hnsw.add(id.clone(), v.clone());
+        }
+
+        // Adaptive ef should expand for k=50 when base ef_search=32.
+        assert!(
+            hnsw.effective_ef_search(K) >= K * 2 || hnsw.effective_ef_search(K) >= N,
+            "expected large-k ef scaling, got {}",
+            hnsw.effective_ef_search(K)
+        );
+
+        let t_flat = Instant::now();
+        let flat_topk: Vec<Vec<VectorSearchResult>> =
+            queries.iter().map(|q| flat.search(q, K)).collect();
+        let flat_ms = t_flat.elapsed().as_secs_f64() * 1000.0;
+
+        let t_hnsw = Instant::now();
+        let hnsw_topk: Vec<Vec<VectorSearchResult>> =
+            queries.iter().map(|q| hnsw.search(q, K)).collect();
+        let hnsw_ms = t_hnsw.elapsed().as_secs_f64() * 1000.0;
+
+        let mut sum_r1 = 0.0f64;
+        let mut sum_rk = 0.0f64;
+        for i in 0..Q {
+            let f = &flat_topk[i];
+            let h = &hnsw_topk[i];
+            assert_eq!(f.len(), K, "FLAT must return k={K} for query {i}");
+            assert_eq!(h.len(), K, "HNSW must return k={K} for query {i}");
+            sum_r1 += recall_at_k(f, h, 1);
+            sum_rk += recall_at_k(f, h, K);
+        }
+        let mean_r1 = sum_r1 / Q as f64;
+        let mean_rk = sum_rk / Q as f64;
+        let speedup = if hnsw_ms > 0.0 {
+            flat_ms / hnsw_ms
+        } else {
+            f64::INFINITY
+        };
+
+        eprintln!(
+            "hnsw_recall_mid_n_large_k_vs_flat: N={N} dim={DIM} Q={Q} M={M} ef={EF} k={K} \
+             mean_recall@1={mean_r1:.3} mean_recall@{K}={mean_rk:.3} \
+             flat={flat_ms:.3}ms hnsw={hnsw_ms:.3}ms speedup≈{speedup:.2}× \
+             (Batch GU; indicative ms; CI gates recall only)"
+        );
+
+        assert!(
+            mean_r1 >= MIN_RECALL_AT_1,
+            "mean recall@1 {mean_r1:.3} < {MIN_RECALL_AT_1}"
+        );
+        assert!(
+            mean_rk >= MIN_RECALL_AT_K,
+            "mean recall@{K} {mean_rk:.3} < {MIN_RECALL_AT_K}"
         );
     }
 

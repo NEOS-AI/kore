@@ -746,7 +746,7 @@ Also tracked in `docs/roadmap.md`.
 
 **Shipped letter stream:** FW–GB baseline · GC–GH · GK · GL · **GC-rel**.
 
-**What remains:** differentiators and optional depth — **GT–GU / GM / GN+**. Accepted P3 residuals stay out of the active queue.
+**What remains:** optional depth — **GM / GN+** (and P3 residuals). Accepted P3 residuals stay out of the active queue.
 
 | Area | Residual | Priority | Planned batch |
 |------|----------|----------|---------------|
@@ -793,9 +793,9 @@ Phases A–E P0 lists are green; prefer **P1 product/perf** over hunting accepte
 
 Ordered execution after **0.7.0**:
 
-1. **GT–GU** — search scoring / ANN polish
-2. **GM** — admin HTTP auth+TLS when exposing UI
-3. **GN+** — cluster/Sentinel depth as needed
+1. **GM** — admin HTTP auth+TLS when exposing UI
+2. **GN+** — cluster/Sentinel depth as needed
+3. Optional P3 residuals only when production needs them
 
 | Batch | Pri | Track | Scope |
 |-------|-----|-------|--------|
@@ -816,8 +816,8 @@ Ordered execution after **0.7.0**:
 | **GQ** | P3 | Sentinel | Optional parallel `enrich_replica_priorities` / peer PING |
 | **GR** | P3 | Search | HNSW `max_m=1` spanning residual |
 | **GS** | P3 | Search | Search-doc access-touch for true LRU among docs (FZ residual) |
-| **GT** | P2 | Search | Use inverted-index weight for real TF-IDF scoring |
-| **GU** | P2 | Search | Larger-N ANN recall/throughput vs FLAT |
+| **GT** | P2 | Search | **done** — inverted-index TF + field-weight TF-IDF; FT.SEARCH WITHSCORES |
+| **GU** | P2 | Search | **done** — adaptive HNSW ef for large-k; mid-N@k=50 CI recall gate |
 
 Checklist (active):
 
@@ -887,8 +887,18 @@ Checklist (active):
 - [ ] **`[P3]`** **Batch GQ — Parallel Sentinel probes**
 - [ ] **`[P3]`** **Batch GR — HNSW max_m=1 spanning**
 - [ ] **`[P3]`** **Batch GS — Search-doc access-touch LRU**
-- [ ] **`[P2]`** **Batch GT — TF-IDF weight scoring**
-- [ ] **`[P2]`** **Batch GU — Larger-N ANN bench / recall**
+- [x] **`[P2]`** **Batch GT — TF-IDF weight scoring**
+  - `InvertedIndex` stores postings `term→(doc→tf)` + doc lengths; field WEIGHT multiplies score
+  - Score: `weight * Σ (1+ln(tf)) * ln(1+N/df)`; multi-field OR sums contributions
+  - Query executor ranks text hits by TF-IDF; `FT.SEARCH … WITHSCORES` / `NOCONTENT`
+  - Tests: unit tf/df/weight; `tests/gt_tfidf_gu_ann_test.rs`
+  - Residual: no BM25 params / stemmer; scores not yet durable metadata
+- [x] **`[P2]`** **Batch GU — Larger-N ANN bench / recall**
+  - `HNSWIndex::effective_ef_search(k)` scales beam for large-k (`max(ef, 2k)` when k large)
+  - `set_ef_search` / `search_with_ef` for runtime tuning
+  - CI gate: `hnsw_recall_mid_n_large_k_vs_flat` (N=800, k=50, recall@1≥0.95, @50≥0.88)
+  - Ignored N=5000 median bench retained; see `docs/benchmarks.md`
+  - Residual: at moderate N, HNSW can still be slower than FLAT (expected overhead)
 
 #### Defer / accept (not in active queue)
 

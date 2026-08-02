@@ -34,7 +34,7 @@ Kore speaks the RESP protocol so common Redis clients (`redis-cli`, redis-py, re
 
 ### Kore differentiators
 - **Redlock** multi-instance locks, **fair FIFO** queueing, **deadlock detection** (+ optional web UI)
-- **FT search** — TEXT / NUMERIC / TAG / VECTOR; **HNSW** ANN with durable RDB/AOF graph
+- **FT search** — TEXT (TF-IDF + field WEIGHT) / NUMERIC / TAG / VECTOR; **HNSW** ANN with adaptive search ef and durable RDB/AOF graph
 
 ### Status & planning
 - Changelog: [CHANGELOG.md](CHANGELOG.md) (**0.7.0** productization cut)

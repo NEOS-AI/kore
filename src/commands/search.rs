@@ -214,6 +214,8 @@ impl CommandHandler {
         let mut limit = 10;
         let mut offset = 0;
         let mut return_fields: Option<Vec<String>> = None;
+        let mut withscores = false;
+        let mut nocontent = false;
         let mut i = 2;
 
         while i < args.len() {
@@ -250,6 +252,14 @@ impl CommandHandler {
                         }
                         return_fields = Some(fields);
                     }
+                    "WITHSCORES" => {
+                        withscores = true;
+                        i += 1;
+                    }
+                    "NOCONTENT" => {
+                        nocontent = true;
+                        i += 1;
+                    }
                     _ => {
                         i += 1;
                     }
@@ -267,6 +277,19 @@ impl CommandHandler {
 
                 for result in results.documents {
                     resp.push(RespValue::BulkString(Some(result.id.clone())));
+
+                    // Batch GT: WITHSCORES emits TF-IDF / vector score after the key.
+                    if withscores {
+                        let score_str = match result.score {
+                            Some(s) => format!("{:.6}", s),
+                            None => "0".to_string(),
+                        };
+                        resp.push(RespValue::BulkString(Some(Bytes::from(score_str))));
+                    }
+
+                    if nocontent {
+                        continue;
+                    }
 
                     let mut fields_resp = Vec::new();
                     for (field_name, field_value) in result.fields {
