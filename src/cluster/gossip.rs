@@ -1,8 +1,8 @@
-//! Thin cluster gossip over the client RESP port (not Redis binary bus).
+//! Thin cluster gossip: RESP on the client port, with peer-bus prefer (Batch HA).
 //!
-//! - MEET: TCP connect + CLUSTER MYID / CLUSTER MEETPEER exchange
-//! - Heartbeat: periodic PING; timeout → `pfail`, escalate to `fail` on quorum
-//! - After successful PING: pull `CLUSTER OWNERS` + `CLUSTER FAILREPORTS`
+//! - MEET: prefer KORB bus `MEET` on cport; fall back to CLUSTER MYID / MEETPEER
+//! - Heartbeat: prefer bus identity `PING`; fall back to RESP PING; timeout → pfail/fail
+//! - After successful PING: pull `CLUSTER OWNERS` + `CLUSTER FAILREPORTS` (RESP)
 //! - On master FAIL: replica election (Batch DY); winner claims; losers re-point
 //!   at winner (Batch DZ)
 //!
@@ -12,6 +12,7 @@
 //! offset, then max id; ROLEMAP carries offset+priority.
 //! **Loser reconfig (Batch DZ):** non-winners follow the winner.
 
+use super::bus::{self, MeetBody};
 use super::state::{OwnershipRange, RoleMapEntry};
 use super::ClusterState;
 use crate::persistence::PersistenceManager;
@@ -28,14 +29,59 @@ use tracing::{debug, info, warn};
 const PROBE_IO_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Run MEET against `ip:port`: learn peer id, announce ourselves, add peer locally.
+///
+/// Batch HA: prefer KORB bus MEET on `port+10000`; fall back to RESP MYID/MEETPEER.
 pub async fn meet_peer(
     cluster: &ClusterState,
     ip: &str,
     port: u16,
 ) -> Result<(), String> {
-    let addr = format!("{}:{}", ip, port);
     let timeout = Duration::from_millis(cluster.node_timeout_ms().max(500));
+    let (my_ip, my_port) = cluster.addr();
+    let my_id = cluster.my_id();
+    let (role, master_id_wire) = cluster.my_role_wire();
 
+    // ── Bus MEET (Batch HA) ────────────────────────────────────────────────
+    let announce = MeetBody {
+        id: my_id.clone(),
+        ip: my_ip.clone(),
+        port: my_port,
+        role: role.clone(),
+        master_id: master_id_wire.clone(),
+    };
+    match bus::bus_meet(ip, port, &announce).await {
+        Ok(peer_id) => {
+            if peer_id == my_id {
+                return Err("ERR CLUSTER MEET would meet myself".into());
+            }
+            cluster.add_node(&peer_id, ip, port);
+            cluster.touch_pong(&peer_id);
+            // Topology pull still over RESP when client port is up.
+            let addr = format!("{}:{}", ip, port);
+            if let Ok(Ok(mut stream)) =
+                tokio::time::timeout(timeout, TcpStream::connect(&addr)).await
+            {
+                let _ = stream.set_nodelay(true);
+                pull_and_merge_owners(cluster, &mut stream, timeout).await;
+                pull_and_merge_rolemap(cluster, &mut stream, timeout).await;
+            }
+            debug!("cluster MEET via peer bus to {}:{}", ip, port);
+            return Ok(());
+        }
+        Err(e) if e.is_transport() => {
+            debug!(
+                "cluster MEET bus miss {}:{} ({}); falling back to RESP",
+                ip, port, e
+            );
+        }
+        Err(e) => {
+            // Remote application error (e.g. meet myself) — surface to caller.
+            return Err(format!("ERR CLUSTER MEET {}", e.message()));
+        }
+    }
+
+    // ── RESP fallback (pre-HA path) ────────────────────────────────────────
+    let addr = format!("{}:{}", ip, port);
     let mut stream = match tokio::time::timeout(timeout, TcpStream::connect(&addr)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(format!("ERR CLUSTER MEET unable to connect to {}: {}", addr, e)),
@@ -44,7 +90,7 @@ pub async fn meet_peer(
     let _ = stream.set_nodelay(true);
 
     // Learn peer identity
-    let myid = match resp_command(&mut stream, &["CLUSTER", "MYID"], timeout).await {
+    let peer_id = match resp_command(&mut stream, &["CLUSTER", "MYID"], timeout).await {
         Ok(RespValue::BulkString(Some(b))) => String::from_utf8_lossy(&b).into_owned(),
         Ok(RespValue::Error(e)) => {
             return Err(format!(
@@ -61,14 +107,11 @@ pub async fn meet_peer(
         Err(e) => return Err(format!("ERR CLUSTER MEET {}", e)),
     };
 
-    if myid == cluster.my_id() {
+    if peer_id == my_id {
         return Err("ERR CLUSTER MEET would meet myself".into());
     }
 
     // Announce ourselves so the peer adds us to its nodes table (role fields Batch DY).
-    let (my_ip, my_port) = cluster.addr();
-    let my_id = cluster.my_id();
-    let (role, master_id_wire) = cluster.my_role_wire();
     match resp_command(
         &mut stream,
         &[
@@ -100,8 +143,8 @@ pub async fn meet_peer(
         Err(e) => return Err(format!("ERR CLUSTER MEET {}", e)),
     }
 
-    cluster.add_node(&myid, ip, port);
-    cluster.touch_pong(&myid);
+    cluster.add_node(&peer_id, ip, port);
+    cluster.touch_pong(&peer_id);
     // Best-effort: pull OWNERS + ROLEMAP so MEET learns topology (DU/DY).
     if let Ok(Ok(mut stream)) = tokio::time::timeout(timeout, TcpStream::connect(&addr)).await {
         let _ = stream.set_nodelay(true);
@@ -125,7 +168,16 @@ pub async fn gossip_tick(
             continue;
         }
         let addr = format!("{}:{}", peer.ip, peer.port);
-        match ping_and_sync(cluster, &peer.id, &addr, probe_timeout).await {
+        match ping_and_sync(
+            cluster,
+            &peer.id,
+            &peer.ip,
+            peer.port,
+            &addr,
+            probe_timeout,
+        )
+        .await
+        {
             true => {
                 cluster.touch_pong(&peer.id);
             }
@@ -141,6 +193,8 @@ pub async fn gossip_tick(
                             cluster.node_timeout_ms(),
                             cluster.fail_quorum_size()
                         );
+                        // Batch HA: best-effort FAIL fan-out over peer bus (ignore errors).
+                        bus_announce_fail_to_others(cluster, &peer.id).await;
                         maybe_failover_on_master_fail(cluster, persistence, &peer.id);
                     } else if cluster.node_is_pfail(&peer.id) {
                         debug!(
@@ -287,24 +341,49 @@ fn try_demote_if_superseded(
     follow_new_master(cluster, persistence, &other);
 }
 
+/// Best-effort FAIL announce to other live peers over the bus (Batch HA).
+async fn bus_announce_fail_to_others(cluster: &ClusterState, failed_id: &str) {
+    for p in cluster.peer_snapshots() {
+        if p.id == failed_id || p.fail {
+            continue;
+        }
+        let _ = bus::bus_fail_announce(&p.ip, p.port, failed_id).await;
+    }
+}
+
 /// PING peer; on success pull OWNERS + FAILREPORTS.
+///
+/// Batch HA: try KORB identity PING on cport first; fall back to RESP PING.
 async fn ping_and_sync(
     cluster: &ClusterState,
     peer_id: &str,
+    peer_ip: &str,
+    peer_port: u16,
     addr: &str,
     timeout: Duration,
 ) -> bool {
+    let my_id = cluster.my_id();
+    let bus_ok = match bus::bus_ping_id(peer_ip, peer_port, &my_id).await {
+        Ok(_pong_id) => true,
+        Err(e) if e.is_transport() => false,
+        Err(_) => false,
+    };
+
     let connect = TcpStream::connect(addr);
     let mut stream = match tokio::time::timeout(timeout, connect).await {
         Ok(Ok(s)) => s,
-        _ => return false,
+        _ => return bus_ok, // bus-only success still counts as reachable
     };
     let _ = stream.set_nodelay(true);
-    match resp_command(&mut stream, &["PING"], timeout).await {
-        Ok(RespValue::SimpleString(s)) if s.as_ref() == b"PONG" => {}
-        Ok(RespValue::BulkString(Some(b))) if b.as_ref() == b"PONG" => {}
-        _ => return false,
+
+    if !bus_ok {
+        match resp_command(&mut stream, &["PING"], timeout).await {
+            Ok(RespValue::SimpleString(s)) if s.as_ref() == b"PONG" => {}
+            Ok(RespValue::BulkString(Some(b))) if b.as_ref() == b"PONG" => {}
+            _ => return false,
+        }
     }
+    // Topology / fail reports still over RESP when client port is up.
     pull_and_merge_owners(cluster, &mut stream, timeout).await;
     pull_and_merge_rolemap(cluster, &mut stream, timeout).await;
     pull_and_ingest_fail_reports(cluster, peer_id, &mut stream, timeout).await;

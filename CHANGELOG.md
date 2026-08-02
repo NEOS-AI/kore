@@ -24,10 +24,12 @@ The detailed letter-batch history lives in root [`TODO.md`](TODO.md). This file 
 - **GW** — Pipeline SET residual: `MemoryTracker` running total (1 atomic vs 9); open-ACL unrestricted fast path; reuse precomputed entry size; `ensure_capacity` single check. Indicative SET P=16 ~**0.86M** ops/s (was ~0.81M GV).
 - **GX** — Connection I/O: direct write on the reader task (no per-conn write-task/mpsc hop); skip per-write timeout timer; static `+OK` append; pub/sub multiplex only when subscribed. Indicative SET P=16 ~**1.0M** ops/s (was ~0.86M GW).
 - **GY** — Redis Functions durability: KORDB **v7** global `KORF1` section; AOF rewrite emits `FUNCTION FLUSH` + `FUNCTION LOAD REPLACE`; load restores into shared `FunctionLibraryStore`. Live AOF already appended `FUNCTION` writes.
+- **GZ** — Okapi BM25 text ranking for FT.SEARCH (default; `k1=1.2`, `b=0.75`, field WEIGHT); TF-IDF kept as helper. Length normalization + TF saturation.
+- **HA** — Peer bus membership lite: KORB `MEET`/`MEET_ACK`, identity `PING`/`PONG`, `FAIL` announce; gossip prefers bus then RESP. Still not Redis binary bus wire.
 
 ### Planned (see TODO.md)
 
-- Optional further SET residual; 0.8.0 release cut; BM25; full Redis cluster bus
+- Optional further SET residual; 0.8.0 release cut; Redis-native Functions dump; Redis-compatible cluster bus wire
 
 ## [0.7.0] — 2026-08-02
 

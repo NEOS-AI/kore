@@ -35,11 +35,11 @@ Kore speaks the **RESP** protocol, so common clients work out of the box (`redis
 - **Replication** — `REPLICAOF`, `SYNC` / `PSYNC`, backlog, `WAIT`, min-replicas write gate
 - **Failover** — coordinated `FAILOVER TO`; promote ranking
 - **Sentinel-lite** — `MONITOR`, ODOWN quorum, hello bus lite, conf persistence, `CKQUORUM`
-- **Cluster** — hash slots, `MOVED`/`ASK`, gossip, reshard / `MIGRATE`, NODE prepare/commit **2PC** (Kore peer bus lite on cport when available, RESP fallback; not the Redis cluster bus); **per-slot epochs** durable in `nodes.conf`
+- **Cluster** — hash slots, `MOVED`/`ASK`, gossip, reshard / `MIGRATE`, NODE prepare/commit **2PC** (Kore peer bus `KORB` on cport: 2PC + MEET/PING/FAIL when available, RESP fallback; not Redis binary bus wire); **per-slot epochs** durable in `nodes.conf`
 
 ### Search
 - **FT.*** — `FT.CREATE` / `DROPINDEX` / `SEARCH` / `INFO` / `_LIST` / `TAGVALS` / aliases
-- Field types: **TEXT** (field-weighted **TF-IDF** ranking), **NUMERIC**, **TAG**, **VECTOR**
+- Field types: **TEXT** (field-weighted **BM25** ranking; TF-IDF helper retained), **NUMERIC**, **TAG**, **VECTOR**
 - Vector algorithms: **FLAT** (exact) and **HNSW** (ANN) with Cosine / L2 / IP
 - Adaptive HNSW search `ef` for large-k queries; graph durable in RDB/AOF
 - `FT.SEARCH … WITHSCORES` / `NOCONTENT`; ACL category `@search`
@@ -267,7 +267,7 @@ FT.SEARCH articles "rust" WITHSCORES LIMIT 0 10
 FT.CREATE emb SCHEMA v VECTOR HNSW 6 TYPE FLOAT32 DIM 128 DISTANCE_METRIC COSINE M 16 EF_CONSTRUCTION 200
 ```
 
-Text hits are ranked with **field-weighted TF-IDF**. HNSW uses an adaptive search beam for large-k ANN.
+Text hits are ranked with **field-weighted Okapi BM25** (`k1=1.2`, `b=0.75`). HNSW uses an adaptive search beam for large-k ANN.
 
 ### Pub/Sub
 
@@ -329,11 +329,11 @@ Honest gaps vs full Redis/Valkey (see [CHANGELOG](CHANGELOG.md) and [TODO.md](TO
 
 - Pipelined SET absolute throughput still below Valkey on measured hosts
 - Redis Functions dump is Kore **KORF1** (not Redis-native blob); libraries durable in RDB v7 + AOF (Batch GY); Redis-native dump blob still not supported
-- No full Redis **cluster bus** (gossip/MEET stay RESP). Dual-end NODE 2PC may use **Kore peer bus lite** (`KORB` frames on cport) with RESP `COMMITPREPARE` fallback
+- No Redis-compatible **cluster bus wire** (Kore `KORB` on cport: NODE 2PC + MEET/identity PING/FAIL; gossip still pulls topology over RESP)
 - Sentinel hello long-lived `SUBSCRIBE` fan-in not implemented
 - Geo DUMP restores as zset for Redis `TYPE`; foreign Redis stream listpack fixtures residual
 - Scripting: no nested `EVAL`; movablekeys catalog incomplete vs full Redis
-- Search: no BM25 parameter tuning / stemmers; ANN is approximate (HNSW); FT doc LRU uses search-hit access-touch (Batch GS), not keyspace TOUCH
+- Search: BM25 uses fixed `k1`/`b` (no per-index tuning / stemmers); ANN is approximate (HNSW); FT doc LRU uses search-hit access-touch (Batch GS), not keyspace TOUCH
 
 ---
 

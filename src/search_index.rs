@@ -467,17 +467,22 @@ fn parse_ft_usize(tok: &[u8]) -> Option<usize> {
     std::str::from_utf8(tok).ok()?.parse().ok()
 }
 
+/// Default Okapi BM25 `k1` (term-frequency saturation). Batch GZ.
+pub const BM25_K1: f32 = 1.2;
+/// Default Okapi BM25 `b` (length normalization). Batch GZ.
+pub const BM25_B: f32 = 0.75;
+
 /// Inverted index for text search with per-posting term frequencies (Batch GT).
 ///
 /// Stores `term → (doc_id → tf)` plus document lengths so FT.SEARCH can rank
-/// hits with field-weighted TF-IDF instead of presence-only matching.
+/// hits with field-weighted BM25 (Batch GZ; TF-IDF kept as a helper).
 #[derive(Debug, Clone)]
 pub struct InvertedIndex {
     /// term → (doc_id → term frequency within that document)
     postings: HashMap<String, HashMap<Bytes, u32>>,
     /// doc_id → token count (for length-aware scoring / diagnostics)
     doc_lens: HashMap<Bytes, u32>,
-    /// Schema TEXT field weight (multiplies TF-IDF at score time)
+    /// Schema TEXT field weight (multiplies BM25/TF-IDF at score time)
     field_weight: f64,
 }
 
@@ -579,11 +584,22 @@ impl InvertedIndex {
         result
     }
 
+    /// Average document length (tokens) across indexed docs; 1.0 if empty.
+    pub fn avg_doc_len(&self) -> f64 {
+        if self.doc_lens.is_empty() {
+            return 1.0;
+        }
+        let sum: u64 = self.doc_lens.values().map(|&l| l as u64).sum();
+        (sum as f64) / (self.doc_lens.len() as f64)
+    }
+
     /// TF-IDF scores for `docs` given query `terms` (Batch GT).
     ///
     /// Per term contribution: `field_weight * (1 + ln(tf)) * ln(1 + N/df)`.
     /// Multi-term queries sum contributions over terms that appear in the doc.
     /// Documents with zero contribution are omitted.
+    ///
+    /// Prefer [`score_bm25`] for FT.SEARCH ranking (Batch GZ).
     pub fn score_tf_idf(
         &self,
         terms: &[String],
@@ -612,6 +628,75 @@ impl InvertedIndex {
                     // Log-normalized TF so repeated tokens help but with diminishing returns.
                     let tf_w = 1.0 + (tf as f32).ln();
                     *scores.entry(doc_id.clone()).or_insert(0.0) += w * tf_w * idf;
+                }
+            }
+        }
+        scores
+    }
+
+    /// Okapi BM25 scores for `docs` given query `terms` (Batch GZ).
+    ///
+    /// ```text
+    /// IDF(q) = ln(1 + (N - df + 0.5) / (df + 0.5))
+    /// TF'    = tf * (k1 + 1) / (tf + k1 * (1 - b + b * |D| / avgdl))
+    /// score  = field_weight * sum_q IDF(q) * TF'
+    /// ```
+    /// Defaults: `k1 = 1.2`, `b = 0.75`. Zero-contribution docs are omitted.
+    pub fn score_bm25(
+        &self,
+        terms: &[String],
+        docs: &HashSet<Bytes>,
+    ) -> HashMap<Bytes, f32> {
+        self.score_bm25_params(terms, docs, BM25_K1, BM25_B)
+    }
+
+    /// BM25 with explicit `k1` / `b` (tests / tuning).
+    pub fn score_bm25_params(
+        &self,
+        terms: &[String],
+        docs: &HashSet<Bytes>,
+        k1: f32,
+        b: f32,
+    ) -> HashMap<Bytes, f32> {
+        if docs.is_empty() || terms.is_empty() {
+            return HashMap::new();
+        }
+        let n = self.doc_lens.len().max(1) as f64;
+        let avgdl = self.avg_doc_len().max(1.0) as f32;
+        let w = self.field_weight as f32;
+        let k1 = k1.max(0.0);
+        let b = b.clamp(0.0, 1.0);
+        let mut scores: HashMap<Bytes, f32> = HashMap::new();
+
+        for term in terms {
+            let normalized = term.to_lowercase();
+            let Some(posting) = self.postings.get(&normalized) else {
+                continue;
+            };
+            let df = posting.len() as f64;
+            // Robertson–Walker IDF with +1 floor (always non-negative for N≥1).
+            let idf = (1.0 + (n - df + 0.5).max(0.0) / (df + 0.5)).ln() as f32;
+            if idf <= 0.0 {
+                continue;
+            }
+            for doc_id in docs {
+                if let Some(&tf) = posting.get(doc_id) {
+                    if tf == 0 {
+                        continue;
+                    }
+                    let dl = self
+                        .doc_lens
+                        .get(doc_id)
+                        .copied()
+                        .unwrap_or(1)
+                        .max(1) as f32;
+                    let tf = tf as f32;
+                    let denom = tf + k1 * (1.0 - b + b * dl / avgdl);
+                    if denom <= 0.0 {
+                        continue;
+                    }
+                    let tf_norm = tf * (k1 + 1.0) / denom;
+                    *scores.entry(doc_id.clone()).or_insert(0.0) += w * idf * tf_norm;
                 }
             }
         }
@@ -1749,6 +1834,71 @@ mod tests {
             "tf-weighted rare {} should beat common {}",
             s_rare,
             s_common
+        );
+    }
+
+    #[test]
+    fn test_bm25_prefers_higher_tf_and_shorter_docs() {
+        let mut index = InvertedIndex::new();
+        let short_hit = Bytes::from("short");
+        let long_hit = Bytes::from("long");
+        let other = Bytes::from("other");
+        // short: "apple" once in a short doc; long: "apple" once in a long doc
+        index.add_document(short_hit.clone(), "apple pie", 1.0);
+        index.add_document(
+            long_hit.clone(),
+            "apple banana cherry date elderberry fig grape",
+            1.0,
+        );
+        index.add_document(other.clone(), "banana cherry", 1.0);
+        // Fill corpus so IDF is non-trivial
+        for i in 0..20 {
+            index.add_document(
+                Bytes::from(format!("f{i}")),
+                "banana cherry date",
+                1.0,
+            );
+        }
+        let candidates: HashSet<Bytes> =
+            [short_hit.clone(), long_hit.clone()].into_iter().collect();
+        let scores = index.score_bm25(&[String::from("apple")], &candidates);
+        let s_short = scores.get(&short_hit).copied().unwrap_or(0.0);
+        let s_long = scores.get(&long_hit).copied().unwrap_or(0.0);
+        assert!(
+            s_short > s_long,
+            "BM25 should prefer shorter doc: short={} long={}",
+            s_short,
+            s_long
+        );
+        assert!(!scores.contains_key(&other));
+    }
+
+    #[test]
+    fn test_bm25_tf_saturation() {
+        let mut index = InvertedIndex::new();
+        let once = Bytes::from("once");
+        let many = Bytes::from("many");
+        index.add_document(once.clone(), "fox", 1.0);
+        // Many repetitions of fox — BM25 should not grow linearly with TF.
+        index.add_document(
+            many.clone(),
+            "fox fox fox fox fox fox fox fox fox fox",
+            1.0,
+        );
+        for i in 0..30 {
+            index.add_document(Bytes::from(format!("z{i}")), "dog cat", 1.0);
+        }
+        let candidates: HashSet<Bytes> = [once.clone(), many.clone()].into_iter().collect();
+        let scores = index.score_bm25(&[String::from("fox")], &candidates);
+        let s_once = scores.get(&once).copied().unwrap_or(0.0);
+        let s_many = scores.get(&many).copied().unwrap_or(0.0);
+        assert!(s_many > s_once, "more TF should still rank higher");
+        // 10× TF must not yield 10× score (saturation).
+        assert!(
+            s_many < s_once * 5.0,
+            "BM25 TF saturation: many={} once={}",
+            s_many,
+            s_once
         );
     }
 

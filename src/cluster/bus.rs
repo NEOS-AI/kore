@@ -1,25 +1,31 @@
-//! Kore peer bus lite for dual-end NODE 2PC (Batch **GP**).
+//! Kore peer bus for dual-end NODE 2PC (Batch **GP**) and membership lite
+//! (Batch **HA**).
 //!
-//! Optional length-prefixed binary frames for `PREPARE` / `COMMIT` / `ABORT` /
-//! `PING` on the Redis-style cluster bus port (`client_port + 10000`). This is
-//! **not** the Redis cluster bus: no gossip opcodes, no MEET over the bus,
-//! operator `SETSLOT NODE` still goes over RESP.
+//! Length-prefixed binary frames on the Redis-style cluster bus port
+//! (`client_port + 10000`). Still **not** the Redis binary cluster bus wire
+//! (no Redis gossip packet layout); Kore uses magic `KORB` with its own types.
 //!
 //! Wire layout (little-endian body fields; magic is four ASCII bytes `KORB`):
 //! ```text
 //! magic u32 bytes = b"KORB"
 //! version u8 = 1
-//! type u8: PING=1 PONG=2 PREPARE=10 COMMIT=11 ABORT=12 OK=20 ERR=21
+//! type u8: PING=1 PONG=2 MEET=3 MEET_ACK=4 FAIL=5
+//!          PREPARE=10 COMMIT=11 ABORT=12 OK=20 ERR=21
 //! flags u8 = 0
 //! reserved u8 = 0
 //! body_len u32
 //! body...
 //! ```
-//! PREPARE / COMMIT / ABORT body: `slot u16` + length-prefixed `target_id`
-//! (`u16` length + UTF-8 bytes). ERR body: same length-prefixed string.
+//! PREPARE / COMMIT / ABORT body: `slot u16` + length-prefixed `target_id`.
+//! MEET body: id, ip, port, role, master_id (length-prefixed strings + u16 port).
+//! MEET_ACK body: peer id (length-prefixed).
+//! PING body (HA): optional peer identity (length-prefixed node id); empty OK.
+//! PONG body (HA): optional our node id.
+//! FAIL body: failed node id (length-prefixed).
 //!
 //! Dual-end reshard prefers the bus when connect succeeds, and falls back to
 //! the existing RESP `SETSLOT` path on transport failure (bus down / bind miss).
+//! MEET / heartbeat prefer the bus then fall back to RESP (Batch HA).
 
 use super::state::ClusterState;
 use std::sync::Arc;
@@ -40,6 +46,12 @@ pub const MAX_BODY_LEN: u32 = 64 * 1024;
 
 pub const TYPE_PING: u8 = 1;
 pub const TYPE_PONG: u8 = 2;
+/// Membership join request (Batch HA).
+pub const TYPE_MEET: u8 = 3;
+/// Membership join reply with peer id (Batch HA).
+pub const TYPE_MEET_ACK: u8 = 4;
+/// Announce that a node is failed (Batch HA).
+pub const TYPE_FAIL: u8 = 5;
 pub const TYPE_PREPARE: u8 = 10;
 pub const TYPE_COMMIT: u8 = 11;
 pub const TYPE_ABORT: u8 = 12;
@@ -150,6 +162,71 @@ pub fn decode_string_body(body: &[u8]) -> String {
     String::from_utf8_lossy(&body[2..2 + len]).into_owned()
 }
 
+/// MEET announce payload (Batch HA).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeetBody {
+    pub id: String,
+    pub ip: String,
+    pub port: u16,
+    /// `"master"` or `"slave"`.
+    pub role: String,
+    /// Master id when role is slave; `"-"` when master.
+    pub master_id: String,
+}
+
+fn write_lp_str(out: &mut Vec<u8>, s: &str) {
+    let b = s.as_bytes();
+    let len = b.len() as u16;
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(b);
+}
+
+fn read_lp_str(body: &[u8], off: &mut usize) -> Result<String, String> {
+    if *off + 2 > body.len() {
+        return Err("meet body truncated (len)".into());
+    }
+    let len = u16::from_le_bytes([body[*off], body[*off + 1]]) as usize;
+    *off += 2;
+    if *off + len > body.len() {
+        return Err("meet body truncated (data)".into());
+    }
+    let s = String::from_utf8_lossy(&body[*off..*off + len]).into_owned();
+    *off += len;
+    Ok(s)
+}
+
+/// Encode MEET body.
+pub fn encode_meet_body(m: &MeetBody) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    write_lp_str(&mut out, &m.id);
+    write_lp_str(&mut out, &m.ip);
+    out.extend_from_slice(&m.port.to_le_bytes());
+    write_lp_str(&mut out, &m.role);
+    write_lp_str(&mut out, &m.master_id);
+    out
+}
+
+/// Decode MEET body.
+pub fn decode_meet_body(body: &[u8]) -> Result<MeetBody, String> {
+    let mut off = 0;
+    let id = read_lp_str(body, &mut off)?;
+    let ip = read_lp_str(body, &mut off)?;
+    if off + 2 > body.len() {
+        return Err("meet body truncated (port)".into());
+    }
+    let port = u16::from_le_bytes([body[off], body[off + 1]]);
+    off += 2;
+    let role = read_lp_str(body, &mut off)?;
+    let master_id = read_lp_str(body, &mut off)?;
+    Ok(MeetBody {
+        id,
+        ip,
+        port,
+        role,
+        master_id,
+    })
+}
+
 /// Client-side bus RPC error: transport (fall back RESP) vs remote application.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BusRpcError {
@@ -258,6 +335,126 @@ pub async fn bus_abort(
     bus_rpc(ip, peer_cport(client_port), TYPE_ABORT, slot, target_id).await
 }
 
+/// MEET over the peer bus (Batch HA). Returns peer node id on success.
+///
+/// Caller should fall back to RESP `CLUSTER MEET` when this returns transport error.
+pub async fn bus_meet(
+    ip: &str,
+    client_port: u16,
+    announce: &MeetBody,
+) -> Result<String, BusRpcError> {
+    let cport = peer_cport(client_port);
+    let addr = format!("{}:{}", ip, cport);
+    let mut stream = match tokio::time::timeout(BUS_IO_TIMEOUT, TcpStream::connect(&addr)).await {
+        Ok(Ok(s)) => {
+            let _ = s.set_nodelay(true);
+            s
+        }
+        Ok(Err(e)) => {
+            return Err(BusRpcError::Transport(format!("connect {}: {}", addr, e)));
+        }
+        Err(_) => {
+            return Err(BusRpcError::Transport(format!("connect timeout {}", addr)));
+        }
+    };
+    let frame = encode_frame(TYPE_MEET, &encode_meet_body(announce));
+    match tokio::time::timeout(BUS_IO_TIMEOUT, stream.write_all(&frame)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(BusRpcError::Transport(format!("write: {}", e))),
+        Err(_) => return Err(BusRpcError::Transport("write timeout".into())),
+    }
+    let (rty, rbody) = read_frame(&mut stream).await?;
+    match rty {
+        TYPE_MEET_ACK => {
+            let peer_id = decode_string_body(&rbody);
+            if peer_id.is_empty() {
+                Err(BusRpcError::Remote("empty MEET_ACK id".into()))
+            } else {
+                Ok(peer_id)
+            }
+        }
+        TYPE_ERR => Err(BusRpcError::Remote(decode_string_body(&rbody))),
+        other => Err(BusRpcError::Remote(format!(
+            "unexpected MEET reply type {}",
+            other
+        ))),
+    }
+}
+
+/// Identity PING over the bus (Batch HA). Returns peer id from PONG when present.
+pub async fn bus_ping_id(
+    ip: &str,
+    client_port: u16,
+    my_id: &str,
+) -> Result<String, BusRpcError> {
+    let cport = peer_cport(client_port);
+    let addr = format!("{}:{}", ip, cport);
+    let mut stream = match tokio::time::timeout(BUS_IO_TIMEOUT, TcpStream::connect(&addr)).await {
+        Ok(Ok(s)) => {
+            let _ = s.set_nodelay(true);
+            s
+        }
+        Ok(Err(e)) => {
+            return Err(BusRpcError::Transport(format!("connect {}: {}", addr, e)));
+        }
+        Err(_) => {
+            return Err(BusRpcError::Transport(format!("connect timeout {}", addr)));
+        }
+    };
+    let frame = encode_frame(TYPE_PING, &encode_string_body(my_id));
+    match tokio::time::timeout(BUS_IO_TIMEOUT, stream.write_all(&frame)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(BusRpcError::Transport(format!("write: {}", e))),
+        Err(_) => return Err(BusRpcError::Transport("write timeout".into())),
+    }
+    let (rty, rbody) = read_frame(&mut stream).await?;
+    match rty {
+        TYPE_PONG => Ok(decode_string_body(&rbody)),
+        TYPE_ERR => Err(BusRpcError::Remote(decode_string_body(&rbody))),
+        other => Err(BusRpcError::Remote(format!(
+            "unexpected PING reply type {}",
+            other
+        ))),
+    }
+}
+
+/// Announce FAIL for `failed_id` to a peer over the bus (best-effort Batch HA).
+pub async fn bus_fail_announce(
+    ip: &str,
+    client_port: u16,
+    failed_id: &str,
+) -> Result<(), BusRpcError> {
+    let cport = peer_cport(client_port);
+    let addr = format!("{}:{}", ip, cport);
+    let mut stream = match tokio::time::timeout(BUS_IO_TIMEOUT, TcpStream::connect(&addr)).await {
+        Ok(Ok(s)) => {
+            let _ = s.set_nodelay(true);
+            s
+        }
+        Ok(Err(e)) => {
+            return Err(BusRpcError::Transport(format!("connect {}: {}", addr, e)));
+        }
+        Err(_) => {
+            return Err(BusRpcError::Transport(format!("connect timeout {}", addr)));
+        }
+    };
+    let frame = encode_frame(TYPE_FAIL, &encode_string_body(failed_id));
+    match tokio::time::timeout(BUS_IO_TIMEOUT, stream.write_all(&frame)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(BusRpcError::Transport(format!("write: {}", e))),
+        Err(_) => return Err(BusRpcError::Transport("write timeout".into())),
+    }
+    let (rty, rbody) = read_frame(&mut stream).await?;
+    match rty {
+        TYPE_OK => Ok(()),
+        TYPE_ERR => Err(BusRpcError::Remote(decode_string_body(&rbody))),
+        other => Err(BusRpcError::Remote(format!(
+            "unexpected FAIL reply type {}",
+            other
+        ))),
+    }
+}
+
 async fn read_frame(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), BusRpcError> {
     let mut header = [0u8; HEADER_LEN];
     match tokio::time::timeout(BUS_IO_TIMEOUT, stream.read_exact(&mut header)).await {
@@ -304,7 +501,7 @@ pub async fn run_cluster_bus(
         }
     };
     info!(
-        "Cluster peer bus lite listening on {} (NODE 2PC only; not Redis bus)",
+        "Cluster peer bus listening on {} (NODE 2PC + MEET/PING/FAIL; KORB not Redis wire)",
         addr
     );
 
@@ -359,7 +556,9 @@ async fn handle_bus_conn(
         }
 
         let reply = match msg_type {
-            TYPE_PING => encode_frame(TYPE_PONG, &[]),
+            TYPE_PING => handle_ping(&cluster, &body),
+            TYPE_MEET => handle_meet(&cluster, &body),
+            TYPE_FAIL => handle_fail(&cluster, &body),
             TYPE_PREPARE => handle_prepare(&cluster, &body),
             TYPE_COMMIT => handle_commit(&cluster, &body),
             TYPE_ABORT => handle_abort(&cluster, &body),
@@ -373,6 +572,66 @@ async fn handle_bus_conn(
             .await
             .map_err(|e| format!("write reply: {}", e))?;
     }
+}
+
+/// Identity PING: optional body = remote id (touch_pong); reply PONG with our id.
+fn handle_ping(cluster: &ClusterState, body: &[u8]) -> Vec<u8> {
+    if !body.is_empty() {
+        let remote = decode_string_body(body);
+        if !remote.is_empty() && remote != cluster.my_id() {
+            // Known peer → refresh liveness; unknown id is ignored (MEET first).
+            cluster.touch_pong(&remote);
+        }
+    }
+    encode_frame(TYPE_PONG, &encode_string_body(&cluster.my_id()))
+}
+
+/// MEET: add peer from announce body; reply MEET_ACK with our id.
+fn handle_meet(cluster: &ClusterState, body: &[u8]) -> Vec<u8> {
+    match decode_meet_body(body) {
+        Ok(m) => {
+            if m.id == cluster.my_id() {
+                return encode_frame(
+                    TYPE_ERR,
+                    &encode_string_body("ERR CLUSTER MEET would meet myself"),
+                );
+            }
+            if m.id.is_empty() || m.ip.is_empty() || m.port == 0 {
+                return encode_frame(
+                    TYPE_ERR,
+                    &encode_string_body("ERR invalid MEET body"),
+                );
+            }
+            let role_master = Some(!m.role.eq_ignore_ascii_case("slave"));
+            let role_master_id = if m.role.eq_ignore_ascii_case("slave") {
+                let mid = if m.master_id == "-" || m.master_id.is_empty() {
+                    None
+                } else {
+                    Some(m.master_id.clone())
+                };
+                Some(mid)
+            } else {
+                Some(None)
+            };
+            cluster.add_node_with_role(&m.id, &m.ip, m.port, role_master, role_master_id);
+            cluster.touch_pong(&m.id);
+            encode_frame(TYPE_MEET_ACK, &encode_string_body(&cluster.my_id()))
+        }
+        Err(e) => encode_frame(TYPE_ERR, &encode_string_body(&e)),
+    }
+}
+
+/// FAIL announce: mark the named peer failed (Batch HA).
+fn handle_fail(cluster: &ClusterState, body: &[u8]) -> Vec<u8> {
+    let failed = decode_string_body(body);
+    if failed.is_empty() || failed == cluster.my_id() {
+        return encode_frame(
+            TYPE_ERR,
+            &encode_string_body("ERR invalid FAIL target"),
+        );
+    }
+    cluster.mark_fail(&failed);
+    encode_frame(TYPE_OK, &[])
 }
 
 fn handle_prepare(cluster: &ClusterState, body: &[u8]) -> Vec<u8> {
@@ -451,6 +710,7 @@ mod tests {
         let (ty, blen) = decode_header(&f).unwrap();
         assert_eq!(ty, TYPE_PING);
         assert_eq!(blen, 0);
+        // Identity PONG body is non-empty (handled in e2e tests).
     }
 
     /// Handler path: PREPARE then COMMIT applies ownership via ClusterState APIs.
@@ -514,7 +774,7 @@ mod tests {
         assert_eq!(cluster.owner_id_of(7).as_deref(), Some(dest_id.as_str()));
         assert!(!cluster.is_prepared(7));
 
-        // PING / PONG path via raw frame.
+        // PING / PONG path via raw frame (Batch HA: PONG carries our node id).
         let mut s = TcpStream::connect(("127.0.0.1", peer_cport(port)))
             .await
             .unwrap();
@@ -523,7 +783,11 @@ mod tests {
         s.read_exact(&mut hdr).await.unwrap();
         let (ty, blen) = decode_header(&hdr).unwrap();
         assert_eq!(ty, TYPE_PONG);
-        assert_eq!(blen, 0);
+        let mut pong_body = vec![0u8; blen as usize];
+        if blen > 0 {
+            s.read_exact(&mut pong_body).await.unwrap();
+        }
+        assert_eq!(decode_string_body(&pong_body), dest_id);
 
         let _ = tx.send(true);
         let _ = handle.await;
@@ -536,5 +800,78 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.is_transport(), "expected transport, got {:?}", err);
+    }
+
+    #[test]
+    fn meet_body_roundtrip() {
+        let m = MeetBody {
+            id: "node-a".into(),
+            ip: "10.0.0.1".into(),
+            port: 7000,
+            role: "master".into(),
+            master_id: "-".into(),
+        };
+        let b = encode_meet_body(&m);
+        let d = decode_meet_body(&b).unwrap();
+        assert_eq!(d, m);
+    }
+
+    #[tokio::test]
+    async fn bus_meet_and_identity_ping_e2e() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let cluster = ClusterState::single_node("127.0.0.1", port);
+        let my_id = cluster.my_id();
+        let (tx, rx) = watch::channel(false);
+        let bus_cs = Arc::clone(&cluster);
+        let handle = tokio::spawn(async move {
+            run_cluster_bus(bus_cs, rx).await;
+        });
+        for _ in 0..50 {
+            if TcpStream::connect(("127.0.0.1", peer_cport(port)))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let announce = MeetBody {
+            id: "peer-meet-1".into(),
+            ip: "127.0.0.1".into(),
+            port: 19999,
+            role: "master".into(),
+            master_id: "-".into(),
+        };
+        let ack_id = bus_meet("127.0.0.1", port, &announce)
+            .await
+            .expect("bus meet");
+        assert_eq!(ack_id, my_id);
+        // Peer should be in the table.
+        let peers = cluster.peer_snapshots();
+        assert!(
+            peers.iter().any(|p| p.id == "peer-meet-1"),
+            "expected peer after MEET: {:?}",
+            peers
+        );
+
+        let pong_id = bus_ping_id("127.0.0.1", port, "peer-meet-1")
+            .await
+            .expect("bus ping");
+        assert_eq!(pong_id, my_id);
+
+        bus_fail_announce("127.0.0.1", port, "peer-meet-1")
+            .await
+            .expect("bus fail");
+        assert!(
+            cluster.peer_snapshots().iter().any(|p| p.id == "peer-meet-1" && p.fail),
+            "peer should be fail after FAIL announce"
+        );
+
+        let _ = tx.send(true);
+        let _ = handle.await;
     }
 }

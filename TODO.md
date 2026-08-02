@@ -794,10 +794,12 @@ Phases A–E P0 lists are green; prefer **P1 product/perf** over hunting accepte
 Ordered execution after **0.7.0**:
 
 1. **0.8.0** release cut (or optional GX+ residual if profile shows more)
-2. Optional product residuals: BM25, full Redis cluster bus
+2. Optional: Redis-native Functions dump; Redis-compatible cluster bus wire
 
 | Batch | Pri | Track | Scope |
 |-------|-----|-------|--------|
+| **HA** | P3 | Cluster | **done** — bus MEET / identity PING / FAIL; gossip prefer-bus |
+| **GZ** | P2 | Search | **done** — Okapi BM25 default FT.SEARCH text ranking |
 | **GY** | P2 | Compat | **done** — Functions RDB v7 + AOF rewrite/load (`KORF1`) |
 | **GX** | P1 | Perf | **done** — direct conn I/O (no write-task/mpsc); no per-write timeout; SET P=16 ~1.0M |
 | **GW** | P1 | Perf | **done** — MemoryTracker running total; ACL unrestricted fast path; store size reuse; SET P=16 ~860k |
@@ -816,6 +818,8 @@ Ordered execution after **0.7.0**:
 | **GN** | P2 | Cluster | **done** — `# slot-epoch` ranges in nodes.conf round-trip |
 | **GO** | P3 | Cluster | **done** — dest CHECKPREPARE folded into atomic COMMITPREPARE |
 | **GP** | P3 | Cluster | **done** — Kore peer bus lite for NODE 2PC (`KORB`; not Redis bus) |
+| **GZ** | P2 | Search | **done** — BM25 default FT.SEARCH text ranking |
+| **HA** | P3 | Cluster | **done** — bus MEET/PING/FAIL membership lite |
 | **GQ** | P3 | Sentinel | **done** — parallel peer PING + replica INFO priority probes |
 | **GR** | P3 | Search | **done** — reconnect prune floor 2 for upper-layer M=1 path middles |
 | **GS** | P3 | Search | **done** — search-doc access-touch for allkeys-lru/lfu |
@@ -824,6 +828,15 @@ Ordered execution after **0.7.0**:
 
 Checklist (active):
 
+- [x] **`[P2]`** **Batch GZ — Okapi BM25 text ranking**
+  - `InvertedIndex::score_bm25` / `score_bm25_params` (`k1=1.2`, `b=0.75`); field WEIGHT multiplies score
+  - FT.SEARCH path uses BM25 (was TF-IDF GT); `score_tf_idf` retained for helpers/tests
+  - Unit: length preference + TF saturation; GT integration still ranks high-TF docs first
+- [x] **`[P3]`** **Batch HA — Peer bus membership lite (MEET / PING / FAIL)**
+  - KORB types: MEET=3, MEET_ACK=4, FAIL=5; identity PING/PONG bodies (node id)
+  - `bus_meet` / `bus_ping_id` / `bus_fail_announce`; server handlers add peer / mark fail
+  - Gossip `meet_peer` + `ping_and_sync` prefer bus, RESP fallback; topology pull still RESP
+  - Residual: **not** Redis binary bus packet format; no FAIL fan-out storm; OWNERS still RESP
 - [x] **`[P2]`** **Batch GY — Redis Functions RDB/AOF durability**
   - KORDB **v7**: global Functions section (u32 len + `KORF1` blob) before footer; v1–v6 still load
   - AOF rewrite: `FUNCTION FLUSH` + `FUNCTION LOAD REPLACE <code>` before DB bodies; functions-only rewrite supported
