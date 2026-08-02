@@ -311,15 +311,17 @@ impl Cache {
     }
 }
 
-// ─── DUMP/RESTORE wire formats (Batch FY) ───────────────────────────────────
+// ─── DUMP/RESTORE wire formats (Batch FY + GH) ──────────────────────────────
 //
-// **DUMP format choice:** Redis-compatible RDB object wire for core types
-// (string / list / set / hash / zset). Geo and stream use Kore-native **KDF1**.
+// **DUMP format choice:** Redis-compatible RDB object wire for:
+// - string / list / set / hash / zset (FY)
+// - **geo** as ZSET_2 with geohash scores (GH; Redis GEO is a zset)
+// - **stream** as type 15 + Kore `KST1` entry body (GH; Redis listpack residual)
 //
 // **RESTORE dual-detect:** magic `KDF1` → Kore path; else Redis RDB object
 // (type + encoding + rdb_version u16 LE + crc64). See `crate::rdb_object`.
 //
-// KDF1 layout (still accepted on RESTORE; used for geo/stream DUMP):
+// KDF1 layout (still accepted on RESTORE for all types including geo/stream):
 //   magic "KDF1" | type u8 | body…  (no embedded TTL; RESTORE supplies it)
 
 const KDF_MAGIC: &[u8; 4] = b"KDF1";
@@ -334,7 +336,8 @@ const KDF_STREAM: u8 = 7;
 impl KeyPayload {
     /// Encode for DUMP (TTL is not embedded — RESTORE applies expiry).
     ///
-    /// Core types emit Redis-compatible wire; geo/stream emit KDF1.
+    /// All types emit Redis-framed wire (Batch FY + GH). Legacy KDF1 remains
+    /// accepted on RESTORE via [`Self::encode_kdf1`] / dual-detect.
     pub fn encode_dump(&self) -> Vec<u8> {
         match self {
             KeyPayload::String { value, .. } => crate::rdb_object::encode_string_dump(value),
@@ -342,11 +345,12 @@ impl KeyPayload {
             KeyPayload::Set { members, .. } => crate::rdb_object::encode_set_dump(members),
             KeyPayload::Hash { fields, .. } => crate::rdb_object::encode_hash_dump(fields),
             KeyPayload::ZSet { members, .. } => crate::rdb_object::encode_zset_dump(members),
-            KeyPayload::Geo { .. } | KeyPayload::Stream { .. } => self.encode_kdf1(),
+            KeyPayload::Geo { members, .. } => crate::rdb_object::encode_geo_dump(members),
+            KeyPayload::Stream { state, .. } => crate::rdb_object::encode_stream_dump(state),
         }
     }
 
-    /// Kore-native KDF1 encoding (geo/stream DUMP; still accepted by RESTORE).
+    /// Kore-native KDF1 encoding (still accepted by RESTORE for dual-detect).
     pub fn encode_kdf1(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(64);
         out.extend_from_slice(KDF_MAGIC);
@@ -435,6 +439,10 @@ impl KeyPayload {
             },
             RdbObject::ZSet(members) => KeyPayload::ZSet {
                 members,
+                pttl: -1,
+            },
+            RdbObject::Stream(state) => KeyPayload::Stream {
+                state,
                 pttl: -1,
             },
         })
@@ -560,13 +568,13 @@ impl KeyPayload {
 }
 
 impl Cache {
-    /// DUMP key — Redis wire for core types, KDF1 for geo/stream; None if missing.
+    /// DUMP key — Redis-framed wire for all types (Batch FY + GH); None if missing.
     pub fn dump_serialized(&self, key: &Bytes) -> Option<Bytes> {
         let payload = self.dump_key(key)?;
         Some(Bytes::from(payload.encode_dump()))
     }
 
-    /// RESTORE key from DUMP blob (Redis wire or KDF1). Returns Ok(true) on success.
+    /// RESTORE key from DUMP blob (Redis wire or legacy KDF1). Returns Ok(true) on success.
     /// Err string is Redis-style message (BUSYKEY / bad payload).
     pub fn restore_serialized(
         &self,

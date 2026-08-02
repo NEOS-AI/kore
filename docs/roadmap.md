@@ -5,7 +5,7 @@
 - [x] Support for Redis Pub-Sub
 - **Committed through FW–GB** (ANN HNSW, AOF graph, Redis DUMP/RESTORE, search eviction, Entry TTL retirement, repl publish barrier). Baseline A–E green; `main` synced with origin.
 - **Next stream (post-GB):** productization / perf / compat — letter batches **GC+**. See root `TODO.md` → *Next work queue (post-GB)*.
-  - **[x] GC–GG** perf/bench/migrate. **[x] GK** client smoke CI. **[x] GL** TLS mTLS/dual/replica. Next: **GH** / **GI** / **GT–GU**.
+  - **[x] GC–GH** through geo/stream DUMP wire. **[x] GK/GL** smoke+TLS. Next: **GI** / **GT–GU** / **GM**.
 
 ## Persistence / search letter batches (recent)
 
@@ -120,7 +120,8 @@ Tracked in detail in root `TODO.md`. High level:
   - [x] GD CommandId enum dispatch + ACL lower alloc
   - [x] GE ordered deferred repl fan-out
   - [x] GF full re-bench vs Valkey 9
-  - [x] GG MIGRATE via DUMP/RESTORE (core types; geo/stream recreate residual)
+  - [x] GG MIGRATE via DUMP/RESTORE (core types)
+  - [x] GH geo/stream Redis-framed DUMP; MIGRATE dump path for all types
   - [x] GK client smoke CI (redis-cli + redis-py)
   - [x] GL TLS mTLS / dual listener / replica TLS
   - [ ] Optional GI Functions or GT/GU search polish

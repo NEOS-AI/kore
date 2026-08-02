@@ -16,7 +16,8 @@ The detailed letter-batch history lives in root [`TODO.md`](TODO.md). This file 
 
 ### Compatibility
 
-- **Batch GG** — `MIGRATE` uses DUMP→RESTORE wire for string/list/set/hash/zset (Redis RDB object from FY); geo/stream still RESP recreate. Absolute expire via `RESTORE ABSTTL`.
+- **Batch GG** — `MIGRATE` uses DUMP→RESTORE wire for string/list/set/hash/zset (Redis RDB object from FY). Absolute expire via `RESTORE ABSTTL`.
+- **Batch GH** — Geo DUMP as Redis ZSET_2 (geohash scores); stream DUMP as type-15 + Kore `KST1` body; MIGRATE uses DUMP for geo/stream. Legacy KDF1 still accepted on RESTORE.
 - **Batch GK** — client smoke script (`scripts/client_smoke.sh`) + GitHub Actions job for redis-cli and redis-py.
 
 ### Security

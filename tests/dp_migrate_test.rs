@@ -826,9 +826,10 @@ async fn migrate_zset_with_ttl_dump_restore() {
     shutdown(pair).await;
 }
 
-/// Batch GG: geo still migrates via recreate path (not Redis DUMP wire).
+/// Batch GH: geo migrates via DUMP→RESTORE (Redis zset geohash wire).
+/// Dest TYPE is zset (Redis-compatible); member present with geohash score.
 #[tokio::test(flavor = "multi_thread")]
-async fn migrate_geo_recreate_path() {
+async fn migrate_geo_dump_restore_as_zset() {
     let pair = spawn_standalone_pair(16922, 16923).await;
     let mut sa = TcpStream::connect(("127.0.0.1", pair.port_a)).await.unwrap();
     let mut sb = TcpStream::connect(("127.0.0.1", pair.port_b)).await.unwrap();
@@ -853,11 +854,69 @@ async fn migrate_geo_recreate_path() {
         send_cmd(&mut sa, &["EXISTS", "cities"]).await,
         RespValue::Integer(0)
     );
-    // TYPE geo reports zset; membership via GEOPOS
-    match send_cmd(&mut sb, &["GEOPOS", "cities", "Palermo"]).await {
-        RespValue::Array(a) => assert_eq!(a.len(), 1),
-        other => panic!("GEOPOS: {:?}", other),
+    // Redis GEO DUMP is a zset; RESTORE materializes as zset on Kore.
+    let ty = match send_cmd(&mut sb, &["TYPE", "cities"]).await {
+        RespValue::SimpleString(s) | RespValue::BulkString(Some(s)) => {
+            String::from_utf8_lossy(&s).into_owned()
+        }
+        other => panic!("TYPE: {:?}", other),
+    };
+    assert_eq!(ty, "zset");
+    assert_eq!(
+        send_cmd(&mut sb, &["ZCARD", "cities"]).await,
+        RespValue::Integer(1)
+    );
+    match send_cmd(&mut sb, &["ZSCORE", "cities", "Palermo"]).await {
+        RespValue::BulkString(Some(_)) => {}
+        other => panic!("expected geohash score bulk, got {:?}", other),
     }
+
+    shutdown(pair).await;
+}
+
+/// Batch GH: stream MIGRATE via DUMP→RESTORE (type-15 + KST1).
+#[tokio::test(flavor = "multi_thread")]
+async fn migrate_stream_dump_restore() {
+    let pair = spawn_standalone_pair(16924, 16925).await;
+    let mut sa = TcpStream::connect(("127.0.0.1", pair.port_a)).await.unwrap();
+    let mut sb = TcpStream::connect(("127.0.0.1", pair.port_b)).await.unwrap();
+
+    match send_cmd(
+        &mut sa,
+        &["XADD", "mystream", "*", "f1", "v1", "f2", "v2"],
+    )
+    .await
+    {
+        RespValue::BulkString(Some(_)) => {}
+        other => panic!("XADD: {:?}", other),
+    }
+    assert_eq!(
+        send_cmd(&mut sa, &["XLEN", "mystream"]).await,
+        RespValue::Integer(1)
+    );
+    let port_b = pair.port_b.to_string();
+    assert!(is_ok(
+        &send_cmd(
+            &mut sa,
+            &["MIGRATE", "127.0.0.1", &port_b, "mystream", "0", "3000"]
+        )
+        .await
+    ));
+    assert_eq!(
+        send_cmd(&mut sa, &["EXISTS", "mystream"]).await,
+        RespValue::Integer(0)
+    );
+    let ty = match send_cmd(&mut sb, &["TYPE", "mystream"]).await {
+        RespValue::SimpleString(s) | RespValue::BulkString(Some(s)) => {
+            String::from_utf8_lossy(&s).into_owned()
+        }
+        other => panic!("TYPE: {:?}", other),
+    };
+    assert_eq!(ty, "stream");
+    assert_eq!(
+        send_cmd(&mut sb, &["XLEN", "mystream"]).await,
+        RespValue::Integer(1)
+    );
 
     shutdown(pair).await;
 }

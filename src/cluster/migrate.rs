@@ -831,15 +831,21 @@ pub struct MigrateDestAuth {
     pub dest_db: i64,
 }
 
-/// True when MIGRATE should use DUMP→RESTORE (Redis RDB wire, Batch FY/GG).
+/// True when MIGRATE should use DUMP→RESTORE (Redis RDB wire, Batch FY/GG/GH).
 ///
-/// Geo/stream stay on the RESP recreate path: their DUMP is Kore KDF1, which
-/// plain Redis/Valkey RESTORE rejects.
+/// Batch GH: geo (zset geohash wire) and stream (type-15 + KST1) use DUMP too.
+/// Geo RESTORE materializes as a zset (Redis TYPE); stream round-trips on Kore.
 #[inline]
 fn migrate_uses_dump_restore(ty: KeyType) -> bool {
     matches!(
         ty,
-        KeyType::String | KeyType::List | KeyType::Set | KeyType::Hash | KeyType::ZSet
+        KeyType::String
+            | KeyType::List
+            | KeyType::Set
+            | KeyType::Hash
+            | KeyType::ZSet
+            | KeyType::Geo
+            | KeyType::Stream
     )
 }
 
@@ -3004,15 +3010,15 @@ mod tests {
     }
 
     #[test]
-    fn dump_restore_path_selected_for_core_types_not_geo_stream() {
-        // Batch GG: Redis RDB DUMP wire for core types; geo/stream stay recreate.
+    fn dump_restore_path_selected_for_all_types() {
+        // Batch GG + GH: all Redis key types use DUMP→RESTORE on MIGRATE.
         assert!(migrate_uses_dump_restore(KeyType::String));
         assert!(migrate_uses_dump_restore(KeyType::List));
         assert!(migrate_uses_dump_restore(KeyType::Set));
         assert!(migrate_uses_dump_restore(KeyType::Hash));
         assert!(migrate_uses_dump_restore(KeyType::ZSet));
-        assert!(!migrate_uses_dump_restore(KeyType::Geo));
-        assert!(!migrate_uses_dump_restore(KeyType::Stream));
+        assert!(migrate_uses_dump_restore(KeyType::Geo));
+        assert!(migrate_uses_dump_restore(KeyType::Stream));
         assert!(!migrate_uses_dump_restore(KeyType::None));
     }
 

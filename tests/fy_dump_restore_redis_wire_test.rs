@@ -383,15 +383,15 @@ fn restore_real_redis_listpack_fixtures() {
 fn restore_still_accepts_kdf1() {
     let mut h = make_handler(make_cache());
 
-    // Geo DUMP stays KDF1 (Redis geo is a zset encoding residual).
+    // Batch GH: Geo DUMP is Redis ZSET_2 (geohash scores); RESTORE → zset.
     handle(
         &mut h,
         cmd(&["GEOADD", "g", "13.361389", "38.115556", "Palermo"]),
     );
     let dump = as_bulk(&handle(&mut h, cmd(&["DUMP", "g"]))).unwrap();
     assert!(
-        dump.starts_with(b"KDF1"),
-        "geo still uses KDF1, got {:?}",
+        !dump.starts_with(b"KDF1") && dump.first() == Some(&5),
+        "geo DUMP should be Redis ZSET_2 (type 5), got {:?}",
         &dump[..dump.len().min(8)]
     );
     assert_eq!(
@@ -406,9 +406,15 @@ fn restore_still_accepts_kdf1() {
         ),
         RespValue::ok()
     );
-    match handle(&mut h, cmd(&["GEOPOS", "g2", "Palermo"])) {
-        RespValue::Array(items) => assert_eq!(items.len(), 1),
-        other => panic!("geopos {:?}", other),
+    match handle(&mut h, cmd(&["TYPE", "g2"])) {
+        RespValue::SimpleString(s) | RespValue::BulkString(Some(s)) => {
+            assert_eq!(s.as_ref(), b"zset");
+        }
+        other => panic!("TYPE {:?}", other),
+    }
+    match handle(&mut h, cmd(&["ZSCORE", "g2", "Palermo"])) {
+        RespValue::BulkString(Some(_)) => {}
+        other => panic!("zscore after geo dump restore {:?}", other),
     }
 
     // Explicit KDF1 string still restorable (dual-detect).
@@ -527,3 +533,44 @@ fn crc64_and_our_string_dump_self_consistent() {
         _ => panic!(),
     }
 }
+
+#[test]
+fn geo_and_stream_redis_framed_dump_roundtrip() {
+    let mut h = make_handler(make_cache());
+
+    // Stream DUMP is type 15 Redis framing (not KDF1).
+    handle(
+        &mut h,
+        cmd(&["XADD", "s", "*", "a", "1", "b", "2"]),
+    );
+    let dump = as_bulk(&handle(&mut h, cmd(&["DUMP", "s"]))).unwrap();
+    assert_eq!(dump.first().copied(), Some(15), "stream type opcode 15");
+    assert!(!dump.starts_with(b"KDF1"));
+    assert_eq!(
+        handle(
+            &mut h,
+            RespValue::Array(vec![
+                bulk("DEL"),
+                bulk("s"),
+            ]),
+        ),
+        RespValue::Integer(1)
+    );
+    assert_eq!(
+        handle(
+            &mut h,
+            RespValue::Array(vec![
+                bulk("RESTORE"),
+                bulk("s"),
+                bulk("0"),
+                bulk_bytes(dump),
+            ]),
+        ),
+        RespValue::ok()
+    );
+    assert_eq!(
+        handle(&mut h, cmd(&["XLEN", "s"])),
+        RespValue::Integer(1)
+    );
+}
+

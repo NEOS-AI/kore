@@ -17,7 +17,7 @@ Kore speaks the RESP protocol so common Redis clients (`redis-cli`, redis-py, re
 - **Strings, hashes, lists, sets, sorted sets, streams** (incl. consumer groups / blocking ops)
 - **Bitmaps / HyperLogLog**, **geospatial**, transactions (`MULTI`/`EXEC`/`WATCH`)
 - **Lua** — `EVAL` / `EVALSHA` / `SCRIPT *` (Functions library still stub — see roadmap)
-- **DUMP / RESTORE** — Redis RDB wire for string/list/set/hash/zset; Kore KDF1 for geo/stream
+- **DUMP / RESTORE** — Redis RDB wire for string/list/set/hash/zset; geo as ZSET_2 geohash; stream type-15+KST1; legacy KDF1 still accepted
 
 ### Persistence & HA
 - **RDB** (Kore `KORDB`, incl. search/HNSW graph) — `SAVE` / `BGSAVE` / timed `--save`

@@ -1,23 +1,25 @@
-//! Redis RDB object codec for DUMP / RESTORE wire compatibility (Batch FY).
+//! Redis RDB object codec for DUMP / RESTORE wire compatibility (Batch FY + GH).
 //!
 //! # DUMP format choice
 //!
-//! Kore `DUMP` emits **Redis-compatible** payloads for core types:
-//! string, list, set, hash, zset (classic RDB type opcodes 0/1/2/4/5).
-//! Geo and stream stay on Kore **KDF1** (see `cache::key_xfer`).
+//! Kore `DUMP` emits **Redis-compatible** payloads for:
+//! - string, list, set, hash, zset (classic opcodes 0/1/2/4/5)
+//! - **geo** as **ZSET_2** with Redis geohash scores (Batch GH; Redis GEO is a zset)
+//! - **stream** as type **15** with Redis-7 metadata + Kore `KST1` entry body
+//!   when listpacks are empty (full Redis listpack stream fixtures are residual)
+//!
+//! Legacy **KDF1** geo/stream dumps remain accepted by `RESTORE`.
 //!
 //! Payload layout (Redis classic DUMP):
 //! ```text
 //!   type_opcode:u8 | type-specific encoding | rdb_version:u16_le | crc64:u64_le
 //! ```
 //!
-//! `RESTORE` dual-detects: magic `KDF1` → Kore path; otherwise Redis RDB object
-//! decode (classic encodings + common listpack / quicklist2 forms from real Redis).
-//!
 //! RDB version written: **9** (widely accepted by Redis/Valkey RESTORE).
 //! CRC64: Redis Jones poly (reflected `0x95ac9329ac4bc9b5`), init 0, no final xor.
 
 use bytes::Bytes;
+use crate::stream_type::StreamStateSnapshot;
 
 /// RDB version embedded in DUMP payloads we produce.
 pub const RDB_VERSION: u16 = 9;
@@ -131,16 +133,23 @@ impl<'a> Cursor<'a> {
 
 // ─── Length / string encoding ───────────────────────────────────────────────
 
-/// Encode a Redis RDB length.
+/// Encode a Redis RDB length (supports 6/14/32/64-bit forms).
 pub fn encode_len(out: &mut Vec<u8>, n: usize) {
+    encode_len_u64(out, n as u64);
+}
+
+fn encode_len_u64(out: &mut Vec<u8>, n: u64) {
     if n < (1 << 6) {
         out.push(n as u8);
     } else if n < (1 << 14) {
         out.push(((n >> 8) as u8) | 0x40);
         out.push((n & 0xff) as u8);
-    } else {
-        out.push(0x80);
+    } else if n <= u32::MAX as u64 {
+        out.push(0x80); // RDB_32BITLEN
         out.extend_from_slice(&(n as u32).to_be_bytes());
+    } else {
+        out.push(0x81); // RDB_64BITLEN
+        out.extend_from_slice(&n.to_be_bytes());
     }
 }
 
@@ -155,12 +164,26 @@ fn decode_len(c: &mut Cursor<'_>) -> Result<(u64, bool), String> {
             let n = (((byte & 0x3F) as u64) << 8) | (next as u64);
             Ok((n, false))
         }
-        2 => {
-            let b = c.raw(4)?;
-            let n = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64;
-            Ok((n, false))
+        2 | 3 => {
+            // Special single-byte markers 0x80 / 0x81 (not 6-bit ENCVAL with high bits 11
+            // when value is 0x80/0x81 exactly), or ENCVAL for other 11xxxxxx.
+            if byte == 0x80 {
+                let b = c.raw(4)?;
+                let n = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64;
+                Ok((n, false))
+            } else if byte == 0x81 {
+                let b = c.raw(8)?;
+                let n = u64::from_be_bytes([
+                    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                ]);
+                Ok((n, false))
+            } else if (byte & 0xC0) == 0xC0 {
+                Ok(((byte & 0x3F) as u64, true))
+            } else {
+                // 10xxxxxx that is not 0x80/0x81 — treat as corrupt
+                Err(ERR.into())
+            }
         }
-        3 => Ok(((byte & 0x3F) as u64, true)),
         _ => unreachable!(),
     }
 }
@@ -551,6 +574,8 @@ pub enum RdbObject {
     Set(Vec<Bytes>),
     Hash(Vec<(Bytes, Bytes)>),
     ZSet(Vec<(Bytes, f64)>),
+    /// Stream restored from type-15 Redis framing (Batch GH).
+    Stream(StreamStateSnapshot),
 }
 
 // ─── Encode (DUMP) ──────────────────────────────────────────────────────────
@@ -614,6 +639,201 @@ pub fn encode_zset_dump(members: &[(Bytes, f64)]) -> Vec<u8> {
         body.extend_from_slice(&score.to_le_bytes());
     }
     finish_dump(body)
+}
+
+/// Encode geo members as Redis DUMP (ZSET_2 with 52-bit geohash scores).
+///
+/// Redis stores GEO as a sorted set; DUMP of a geo key is a zset payload.
+/// Scores are `geohash_encode(lon, lat) as f64` (Batch GH).
+pub fn encode_geo_dump(members: &[(Bytes, f64, f64)]) -> Vec<u8> {
+    let mut zset = Vec::with_capacity(members.len());
+    for (m, lon, lat) in members {
+        let score = crate::geospatial::geohash_encode(*lon, *lat) as f64;
+        zset.push((m.clone(), score));
+    }
+    encode_zset_dump(&zset)
+}
+
+/// Magic after Redis-7 stream metadata when listpacks are empty (Batch GH).
+/// Full Redis listpack nodes remain residual for foreign DUMP fixtures.
+const STREAM_KORE_MARK: &[u8; 4] = b"KST1";
+
+/// Encode a stream as Redis type-15 DUMP framing (Batch GH).
+///
+/// Layout (after type byte):
+/// - `num_listpacks = 0` (entries live in Kore `KST1` block; Redis listpack residual)
+/// - Redis-7 fields: length, last_id, first_id, max_deleted, entries_added
+/// - `num_cgroups` + simplified groups (name, last_id, entries_read=0, empty PEL/consumers
+///   then Kore consumer/PEL detail inside `KST1`)
+/// - `KST1` + entry/group body (Kore round-trip; Redis RESTORE of this body may fail)
+pub fn encode_stream_dump(state: &StreamStateSnapshot) -> Vec<u8> {
+    use crate::stream_type::StreamId;
+    let mut body = Vec::with_capacity(128);
+    body.push(RDB_TYPE_STREAM_LISTPACKS);
+    encode_len_u64(&mut body, 0); // listpacks
+    encode_len_u64(&mut body, state.entries.len() as u64);
+    let last = state.last_generated_id;
+    encode_len_u64(&mut body, last.ms);
+    encode_len_u64(&mut body, last.seq);
+    let first = state
+        .entries
+        .first()
+        .map(|(id, _)| *id)
+        .unwrap_or(StreamId::ZERO);
+    encode_len_u64(&mut body, first.ms);
+    encode_len_u64(&mut body, first.seq);
+    // max_deleted — not tracked fully in snapshot; use ZERO
+    encode_len_u64(&mut body, 0);
+    encode_len_u64(&mut body, 0);
+    encode_len_u64(&mut body, state.entries.len() as u64); // entries_added approx
+    // Consumer groups: emit count 0 here; full group state in KST1 block.
+    encode_len_u64(&mut body, 0);
+
+    body.extend_from_slice(STREAM_KORE_MARK);
+    // entries
+    encode_len_u64(&mut body, state.entries.len() as u64);
+    for (id, fields) in &state.entries {
+        encode_len_u64(&mut body, id.ms);
+        encode_len_u64(&mut body, id.seq);
+        encode_len_u64(&mut body, fields.len() as u64);
+        for (k, v) in fields {
+            encode_raw_string(&mut body, k);
+            encode_raw_string(&mut body, v);
+        }
+    }
+    // groups
+    encode_len_u64(&mut body, state.groups.len() as u64);
+    for g in &state.groups {
+        encode_raw_string(&mut body, &g.name);
+        encode_len_u64(&mut body, g.last_delivered_id.ms);
+        encode_len_u64(&mut body, g.last_delivered_id.seq);
+        encode_len_u64(&mut body, g.pending.len() as u64);
+        for p in &g.pending {
+            encode_len_u64(&mut body, p.id.ms);
+            encode_len_u64(&mut body, p.id.seq);
+            encode_raw_string(&mut body, &p.consumer);
+            encode_len_u64(&mut body, p.delivery_time_ms);
+            encode_len_u64(&mut body, p.delivery_count);
+        }
+        encode_len_u64(&mut body, g.consumers.len() as u64);
+        for c in &g.consumers {
+            encode_raw_string(&mut body, &c.name);
+            encode_len_u64(&mut body, c.seen_time_ms);
+            encode_len_u64(&mut body, c.pending as u64);
+        }
+    }
+    finish_dump(body)
+}
+
+fn decode_rdb_len(c: &mut Cursor<'_>) -> Result<u64, String> {
+    let (n, enc) = decode_len(c)?;
+    if enc {
+        return Err(ERR.into());
+    }
+    Ok(n)
+}
+
+fn decode_stream_type15(c: &mut Cursor<'_>) -> Result<RdbObject, String> {
+    use crate::stream_type::{
+        ConsumerSnapshot, GroupSnapshot, PendingEntrySnapshot, StreamId, StreamStateSnapshot,
+    };
+    let num_listpacks = decode_rdb_len(c)?;
+    if num_listpacks > 0 {
+        // Real Redis listpack stream nodes — residual for foreign fixtures.
+        return Err(ERR.into());
+    }
+    let length = decode_rdb_len(c)?;
+    let last_ms = decode_rdb_len(c)?;
+    let last_seq = decode_rdb_len(c)?;
+    let _first_ms = decode_rdb_len(c)?;
+    let _first_seq = decode_rdb_len(c)?;
+    let _max_del_ms = decode_rdb_len(c)?;
+    let _max_del_seq = decode_rdb_len(c)?;
+    let _entries_added = decode_rdb_len(c)?;
+    let num_cgroups = decode_rdb_len(c)?;
+    // Skip Redis-style group blobs if present (we emit 0).
+    for _ in 0..num_cgroups {
+        let _name = decode_string(c)?;
+        let _ = decode_rdb_len(c)?;
+        let _ = decode_rdb_len(c)?;
+        let _ = decode_rdb_len(c)?; // entries_read
+        // PEL + consumers — not emitted by encode; if present, fail closed.
+        return Err(ERR.into());
+    }
+
+    // Kore KST1 entry body (required for non-empty streams; optional for empty).
+    if c.pos >= c.data.len() {
+        if length == 0 {
+            return Ok(RdbObject::Stream(StreamStateSnapshot {
+                last_generated_id: StreamId::new(last_ms, last_seq),
+                entries: Vec::new(),
+                groups: Vec::new(),
+            }));
+        }
+        return Err(ERR.into());
+    }
+    let mark = c.raw(4)?;
+    if mark != STREAM_KORE_MARK {
+        return Err(ERR.into());
+    }
+    let n_entries = decode_rdb_len(c)? as usize;
+    let mut entries = Vec::with_capacity(n_entries);
+    for _ in 0..n_entries {
+        let ms = decode_rdb_len(c)?;
+        let seq = decode_rdb_len(c)?;
+        let nf = decode_rdb_len(c)? as usize;
+        let mut fields = Vec::with_capacity(nf);
+        for _ in 0..nf {
+            let k = decode_string(c)?;
+            let v = decode_string(c)?;
+            fields.push((k, v));
+        }
+        entries.push((StreamId::new(ms, seq), fields));
+    }
+    let n_groups = decode_rdb_len(c)? as usize;
+    let mut groups = Vec::with_capacity(n_groups);
+    for _ in 0..n_groups {
+        let name = decode_string(c)?;
+        let ld_ms = decode_rdb_len(c)?;
+        let ld_seq = decode_rdb_len(c)?;
+        let np = decode_rdb_len(c)? as usize;
+        let mut pending = Vec::with_capacity(np);
+        for _ in 0..np {
+            let id = StreamId::new(decode_rdb_len(c)?, decode_rdb_len(c)?);
+            let consumer = decode_string(c)?;
+            let delivery_time_ms = decode_rdb_len(c)?;
+            let delivery_count = decode_rdb_len(c)?;
+            pending.push(PendingEntrySnapshot {
+                id,
+                consumer,
+                delivery_time_ms,
+                delivery_count,
+            });
+        }
+        let nc = decode_rdb_len(c)? as usize;
+        let mut consumers = Vec::with_capacity(nc);
+        for _ in 0..nc {
+            let cname = decode_string(c)?;
+            let seen_time_ms = decode_rdb_len(c)?;
+            let pending_n = decode_rdb_len(c)? as usize;
+            consumers.push(ConsumerSnapshot {
+                name: cname,
+                seen_time_ms,
+                pending: pending_n,
+            });
+        }
+        groups.push(GroupSnapshot {
+            name,
+            last_delivered_id: StreamId::new(ld_ms, ld_seq),
+            pending,
+            consumers,
+        });
+    }
+    Ok(RdbObject::Stream(StreamStateSnapshot {
+        last_generated_id: StreamId::new(last_ms, last_seq),
+        entries,
+        groups,
+    }))
 }
 
 // ─── Decode (RESTORE) ───────────────────────────────────────────────────────
@@ -802,8 +1022,9 @@ fn decode_rdb_object(data: &[u8]) -> Result<RdbObject, String> {
             let blob = decode_string(&mut c)?;
             RdbObject::Set(decode_intset(&blob)?)
         }
-        // zipmap / stream RDB object: residual (use KDF1 for streams)
-        RDB_TYPE_HASH_ZIPMAP | RDB_TYPE_STREAM_LISTPACKS => return Err(ERR.into()),
+        RDB_TYPE_STREAM_LISTPACKS => decode_stream_type15(&mut c)?,
+        // zipmap residual
+        RDB_TYPE_HASH_ZIPMAP => return Err(ERR.into()),
         _ => return Err(ERR.into()),
     };
     if c.pos != c.data.len() {
@@ -1020,6 +1241,52 @@ mod tests {
         let last = d.len() - 1;
         d[last] ^= 0xff;
         assert!(decode_redis_dump(&d).is_err());
+    }
+
+    #[test]
+    fn geo_dump_is_zset2_with_geohash_score() {
+        let members = vec![(
+            Bytes::from_static(b"Palermo"),
+            13.361389_f64,
+            38.115556_f64,
+        )];
+        let dump = encode_geo_dump(&members);
+        assert_eq!(dump[0], RDB_TYPE_ZSET_2);
+        match decode_redis_dump(&dump).unwrap() {
+            RdbObject::ZSet(m) => {
+                assert_eq!(m.len(), 1);
+                assert_eq!(&m[0].0[..], b"Palermo");
+                let expected = crate::geospatial::geohash_encode(13.361389, 38.115556) as f64;
+                assert!((m[0].1 - expected).abs() < 1.0); // exact integer score
+            }
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn stream_dump_kst1_roundtrip() {
+        use crate::stream_type::{StreamId, StreamStateSnapshot};
+        let state = StreamStateSnapshot {
+            last_generated_id: StreamId::new(1_700_000_000_000, 0),
+            entries: vec![(
+                StreamId::new(1_700_000_000_000, 0),
+                vec![
+                    (Bytes::from_static(b"a"), Bytes::from_static(b"1")),
+                    (Bytes::from_static(b"b"), Bytes::from_static(b"2")),
+                ],
+            )],
+            groups: vec![],
+        };
+        let dump = encode_stream_dump(&state);
+        assert_eq!(dump[0], RDB_TYPE_STREAM_LISTPACKS);
+        match decode_redis_dump(&dump).unwrap() {
+            RdbObject::Stream(s) => {
+                assert_eq!(s.entries.len(), 1);
+                assert_eq!(s.entries[0].1.len(), 2);
+                assert_eq!(s.last_generated_id.ms, 1_700_000_000_000);
+            }
+            other => panic!("{:?}", other),
+        }
     }
 
     fn hex_to_bytes(s: &str) -> Vec<u8> {

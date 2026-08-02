@@ -758,7 +758,7 @@ Also tracked in `docs/roadmap.md`.
 | Docs / release | README under-sells features; no CHANGELOG; TODO status drift | **done** | **GC-docs** |
 | Perf | Pipeline SET gap vs Valkey (GC/GD ~0.74M P=16; Valkey FI ~1.59M) | **P1 residual** | **GE / GF** (GC+GD shipped) |
 | Ops | Global repl backlog ordered publish residual (after GB) | P3 residual | **GE** (if multi-replica write path matters) |
-| Compat | MIGRATE DUMP→RESTORE core types (**GG**); geo/stream recreate residual | **P2 residual** | **GH** (geo/stream Redis wire) |
+| Compat | MIGRATE DUMP→RESTORE all types (**GG+GH**); stream listpack foreign fixtures residual | **P3 residual** | — |
 | Compat | DUMP geo/stream still KDF1 (not Redis RDB wire) | **P2** | **GH** |
 | Compat | Redis Functions / FCALL stubs only | **P2** | **GI** |
 | Compat | Lua: no script time limits / `redis.setresp` full depth | **P2** | **GJ** |
@@ -807,7 +807,7 @@ Ordered execution for the next ~2 weeks of work:
 | **GE** | P2 | Perf/ops | **done** — ordered deferred fan-out (short backlog lock; `fanout_order` serializes sends) |
 | **GF** | P1 | Perf | **done** — full re-bench vs Valkey 9; SET P=16 ~730k vs Valkey ~1.59M |
 | **GG** | P1 | Compat | **done** — MIGRATE DUMP→RESTORE for core types; geo/stream recreate residual |
-| **GH** | P2 | Compat | DUMP Redis wire for **geo/stream** (still KDF1) |
+| **GH** | P2 | Compat | **done** — geo ZSET_2 geohash; stream type-15+KST1; KDF1 dual-detect kept |
 | **GI** | P2 | Compat | Redis Functions library (`FUNCTION LOAD` / real `FCALL` beyond stubs) |
 | **GJ** | P2 | Compat | Lua polish: script time limits, `redis.setresp`, deeper `redis.call` surface |
 | **GK** | P1 | Compat | **done** — `scripts/client_smoke.sh` + CI (redis-cli + redis-py; ioredis optional) |
@@ -853,7 +853,13 @@ Checklist (active):
   - TTL: ABSTTL absolute Unix-ms end (DT honesty on dump path)
   - Tests: unit path selection + dump/restore hash; e2e zset+TTL + geo recreate; full `dp_migrate_test` 16/16
   - Residual: geo/stream Redis DUMP wire → **GH**; MIGRATE still not binary-compatible with Redis DUMP of geo/stream
-- [ ] **`[P2]`** **Batch GH — DUMP Redis wire for geo/stream**
+- [x] **`[P2]`** **Batch GH — DUMP Redis wire for geo/stream**
+  - Geo: Redis **ZSET_2** with 52-bit geohash scores (Redis GEO shape); RESTORE → zset
+  - Stream: type **15** Redis-7 metadata + Kore `KST1` entry/group body; RESTORE → stream
+  - Legacy **KDF1** still dual-detected on RESTORE
+  - MIGRATE uses DUMP→RESTORE for geo/stream (all types)
+  - Residual: foreign Redis listpack stream DUMP fixtures; GEO* after geo DUMP restore is zset (Redis TYPE)
+  - Tests: rdb_object geo/stream; fy dump wire; migrate geo/stream e2e
 - [ ] **`[P2]`** **Batch GI — Redis Functions library**
 - [ ] **`[P2]`** **Batch GJ — Lua script limits + setresp polish**
 - [x] **`[P1]`** **Batch GK — Multi-language client smoke + CI**
