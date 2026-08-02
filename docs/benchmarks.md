@@ -436,8 +436,9 @@ p99: **not reported** by this `valkey-benchmark -q` build.
 | **GD** | 2026-08-02 | ~741k | (not re-run) | CommandId; stays in GC band |
 | **GF** | 2026-08-02 | **~730k** | **~1.59M** | full suite; same host class |
 | **GV** | 2026-08-02 | **~807k** | **~1.30M** | store headroom skip; peer Valkey re-run this session (~1.2–1.3M) |
+| **GW** | 2026-08-02 | **~861k** | **~1.30M** | running total + ACL open path + size reuse |
 
-Non-pipeline SET/GET/INCR: Kore **~93–94%** of Valkey on GF (e.g. SET P=1 196k vs 210k). Pipelined SET: GF ~**46%** of Valkey (~0.73M vs ~1.59M); **GV** ~**62%** of same-session Valkey (~0.81M vs ~1.30M) after store pre-check cut.
+Non-pipeline SET/GET/INCR: Kore **~93–94%** of Valkey on GF (e.g. SET P=1 196k vs 210k). Pipelined SET: GF ~**46%** of Valkey (~0.73M vs ~1.59M); **GV** ~**62%** of same-session Valkey (~0.81M vs ~1.30M); **GW** ~**66%** (~0.86M vs ~1.30M).
 
 #### Batch GV (2026-08-02) — SET capacity pre-check + plain SET fast path
 
@@ -458,13 +459,35 @@ Non-pipeline SET/GET/INCR: Kore **~93–94%** of Valkey on GF (e.g. SET P=1 196k
 
 **Interpretation:** ~**+10–12%** pipelined SET vs GF band without changing semantics. Residual ~**0.6×** Valkey on this host — still multi-worker Tokio + remaining store/accounting cost. **No portable claim.**
 
+#### Batch GW (2026-08-02) — MemoryTracker total + ACL open path + store reuse
+
+**Problem:** After GV, each plain SET still paid (1) a **9-atomic sum** for `total_memory()` on the headroom path, (2) full ACL key-spec walk for open default users, (3) a second `estimate_string_entry` after `Entry::new`, and (4) double capacity checks in `ensure_capacity`.
+
+**Cuts:**
+1. `MemoryTracker` maintains a running `total` atomic updated on account/deallocate/reset/keyspace swap — `total_memory()` is one load.
+2. `AclStore::is_unrestricted` + `check_acl_permission` early-out for enabled +all cmds/keys/channels (redis-benchmark default).
+3. Store path reuses precomputed `entry_size` as `new_size`; `ensure_capacity` uses `can_allocate` only.
+4. Slowlog clock skipped when `slowlog-log-slower-than < 0`.
+
+**Host-local spot check** (same host class, Kore `--save ""` :6380; Valkey :6378):
+
+| Workload | Kore | Valkey |
+|----------|------|--------|
+| SET P=16 n=200k (3×) | **862k / 862k / 862k** | **1.29M / 1.30M / 1.30M** |
+| SET P=16 n=500k (3×) | **865k / 861k / 861k** | **1.29M / 1.30M / 1.30M** |
+| GET P=16 n=200k | ~1.43M | (not re-run) |
+| SET P=1 n=200k | ~197k | (not re-run) |
+
+**Interpretation:** ~**+6–7%** pipelined SET vs GV (~0.81M → ~0.86M) without semantic change. Residual ~**0.66×** same-session Valkey — still multi-worker Tokio + Entry Instant / dual string counters / shard lock. **No portable claim.**
+
 ### Interpretation (host-local only)
 
 - **GC+GD delivered:** SET P=16 in the **~0.73–0.74M** band (GF full suite).
 - **GV:** SET P=16 **~0.81M** band (+~10% vs GF); same-session Valkey ~1.3M (lower than GF’s 1.59M — host/version variance).
+- **GW:** SET P=16 **~0.86M** band (+~6–7% vs GV); same-session Valkey ~1.3M (~**66%** of Valkey).
 - **Non-pipelined** workloads stay close to Valkey.
-- **Pipelined SET** remains the clear gap; next wins need deeper store/Tokio work, not repl stream.
-- **GET P=16** is healthy (~1.5M); not the primary target.
+- **Pipelined SET** remains the clear gap; next wins need deeper Tokio/runtime or Entry layout work.
+- **GET P=16** is healthy (~1.4–1.5M); not the primary target.
 - **No Redis column** — package may be Valkey under `redis-*` names. **No portable performance claim.**
 - **CI microbench smoke:** skipped (noisy absolute ops/s); rely on this document + release-time re-run.
 

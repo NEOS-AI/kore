@@ -97,6 +97,10 @@ impl AclUser {
     }
 
     pub fn can_execute(&self, cmd: &str) -> bool {
+        // Batch GW: open superuser (+@all, no denylists) — no String alloc / hash lookup.
+        if self.all_commands && self.disallowed_commands.is_empty() {
+            return true;
+        }
         let cmd = cmd.to_ascii_lowercase();
         if self.disallowed_commands.contains(&cmd) {
             return false;
@@ -105,6 +109,16 @@ impl AclUser {
             return true;
         }
         self.allowed_commands.contains(&cmd)
+    }
+
+    /// Fully open user: any command, any key, any channel (default redis-benchmark path).
+    #[inline]
+    pub fn is_unrestricted(&self) -> bool {
+        self.enabled
+            && self.all_commands
+            && self.disallowed_commands.is_empty()
+            && self.all_keys
+            && self.all_channels
     }
 
     pub fn can_access_key(&self, key: &str) -> bool {
@@ -460,6 +474,20 @@ impl AclStore {
             .users
             .get(username)
             .map(|u| u.can_execute(cmd))
+            .unwrap_or(false)
+    }
+
+    /// True when `username` is an enabled open superuser (all cmds/keys/channels).
+    ///
+    /// Batch GW: single lock + flag check; skips command/key/channel work on the
+    /// default open-ACL path used by redis-benchmark.
+    #[inline]
+    pub fn is_unrestricted(&self, username: &str) -> bool {
+        self.inner
+            .read()
+            .users
+            .get(username)
+            .map(|u| u.is_unrestricted())
             .unwrap_or(false)
     }
 

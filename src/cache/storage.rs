@@ -238,13 +238,11 @@ impl Cache {
             return Ok(());
         }
 
-        let tracker_ok = self
+        // Batch GW: can_allocate already loads the running total + limit; no second sum.
+        if self
             .memory_tracker
-            .can_allocate(needed, MemoryCategory::Cache);
-        let total = self.memory_tracker.total_memory();
-        let usage_ok = total.saturating_add(needed) <= max_memory;
-
-        if tracker_ok && usage_ok {
+            .can_allocate(needed, MemoryCategory::Cache)
+        {
             return Ok(());
         }
 
@@ -367,11 +365,12 @@ impl Cache {
 
             // key still cloned for Entry + map slot; value is moved (single owner).
             // Slot owns TTL (Batch GA: Entry has no expires_at).
+            // Batch GW: reuse precomputed `entry_size` — same estimate as Entry::size().
             let entry = Entry::new(key.clone(), value)
                 .with_flags(flags)
                 .with_cas(next_cas);
             let entry = Arc::new(entry);
-            let new_size = entry.size();
+            let new_size = entry_size;
 
             // New slot expire: explicit EX/PX/…, else KEEPTTL from previous slot, else clear.
             let new_slot_exp = if let Some(exp) = expires_at {

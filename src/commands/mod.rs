@@ -679,7 +679,15 @@ impl CommandHandler {
 
     pub async fn handle(&mut self, value: RespValue) -> Result<RespValue> {
         self.suppress_reply = false;
-        let handle_start = std::time::Instant::now();
+        // Batch GW: only start the slowlog clock when logging is enabled (threshold >= 0).
+        // Default Redis/Kore threshold is 10_000µs so this still times the common path;
+        // CONFIG SET slowlog-log-slower-than -1 skips Instant entirely.
+        let slowlog_threshold = self.cache.slowlog.slower_than_us();
+        let handle_start = if slowlog_threshold >= 0 {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         let args = match value.as_array() {
             Some(arr) => arr,
@@ -1167,23 +1175,24 @@ impl CommandHandler {
 
         // Slow log (skip SLOWLOG itself and transaction control).
         // Build argv only when the command exceeds the threshold (Batch FI).
-        if !matches!(
-            cmd_id,
-            CommandId::Slowlog
-                | CommandId::Exec
-                | CommandId::Multi
-                | CommandId::Discard
-                | CommandId::Watch
-                | CommandId::Unwatch
-        ) {
-            let duration_us = handle_start.elapsed().as_micros() as i64;
-            let threshold = self.cache.slowlog.slower_than_us();
-            if threshold >= 0 && duration_us >= threshold {
-                let argv: Vec<Bytes> = args
-                    .iter()
-                    .filter_map(|a| a.as_bulk_string().cloned())
-                    .collect();
-                self.cache.slowlog.maybe_push(duration_us, argv);
+        if let Some(start) = handle_start {
+            if !matches!(
+                cmd_id,
+                CommandId::Slowlog
+                    | CommandId::Exec
+                    | CommandId::Multi
+                    | CommandId::Discard
+                    | CommandId::Watch
+                    | CommandId::Unwatch
+            ) {
+                let duration_us = start.elapsed().as_micros() as i64;
+                if duration_us >= slowlog_threshold {
+                    let argv: Vec<Bytes> = args
+                        .iter()
+                        .filter_map(|a| a.as_bulk_string().cloned())
+                        .collect();
+                    self.cache.slowlog.maybe_push(duration_us, argv);
+                }
             }
         }
 
@@ -1216,6 +1225,11 @@ impl CommandHandler {
     /// Returns `Some(error)` when denied, `None` when allowed.
     fn check_acl_permission(&self, cmd_upper: &str, args: &[RespValue]) -> Option<RespValue> {
         let username = self.username.as_deref().unwrap_or("default");
+        // Batch GW: open superuser — one flag check, no key-spec walk / channel extract.
+        if self.acl.is_unrestricted(username) {
+            return None;
+        }
+
         // Batch GD: stack lowercase — avoid `to_ascii_lowercase` String on every command.
         let mut lower_buf = [0u8; 64];
         let cmd_lower_cow = ascii_lowercase_from_upper(cmd_upper.as_bytes(), &mut lower_buf);

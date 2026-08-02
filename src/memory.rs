@@ -122,6 +122,11 @@ pub struct MemoryTracker {
     streams_memory: AtomicUsize,
     /// Memory used by search indexes (document + inverted index approx)
     search_memory: AtomicUsize,
+    /// Running sum of all category counters (Batch GW).
+    ///
+    /// Hot paths (`store` headroom, `can_allocate`) read this instead of summing
+    /// nine atomics. Updated on every account / deallocate / reset / keyspace swap.
+    total: AtomicUsize,
     /// Total memory limit (live-updatable via CONFIG SET maxmemory)
     max_memory: AtomicUsize,
     /// Maximum message size for Pub/Sub
@@ -140,6 +145,7 @@ impl MemoryTracker {
             sets_memory: AtomicUsize::new(0),
             streams_memory: AtomicUsize::new(0),
             search_memory: AtomicUsize::new(0),
+            total: AtomicUsize::new(0),
             max_memory: AtomicUsize::new(max_memory),
             max_message_size,
         }
@@ -193,8 +199,12 @@ impl MemoryTracker {
     /// Unconditionally record allocated memory (no capacity check).
     /// Use after a successful insert when accounting must not fail.
     pub fn account(&self, size: usize, category: MemoryCategory) {
+        if size == 0 {
+            return;
+        }
         self.category_atomic(category)
             .fetch_add(size, Ordering::Relaxed);
+        self.total.fetch_add(size, Ordering::Relaxed);
     }
 
     /// Allocate memory for a category
@@ -209,10 +219,24 @@ impl MemoryTracker {
 
     /// Deallocate memory for a category (saturates at zero — never underflows)
     pub fn deallocate(&self, size: usize, category: MemoryCategory) {
+        if size == 0 {
+            return;
+        }
         let atomic = self.category_atomic(category);
-        let _ = atomic.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            Some(current.saturating_sub(size))
-        });
+        // Subtract only what the category actually held so `total` stays consistent.
+        let prev = atomic
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(size))
+            })
+            .unwrap_or_else(|c| c);
+        let actual = prev.min(size);
+        if actual > 0 {
+            let _ = self
+                .total
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+                    Some(t.saturating_sub(actual))
+                });
+        }
     }
 
     /// Reset all category counters to zero
@@ -226,6 +250,7 @@ impl MemoryTracker {
         self.sets_memory.store(0, Ordering::Relaxed);
         self.streams_memory.store(0, Ordering::Relaxed);
         self.search_memory.store(0, Ordering::Relaxed);
+        self.total.store(0, Ordering::Relaxed);
     }
 
     /// Keyspace categories moved by scratch-load swap (everything except PubSub).
@@ -243,9 +268,18 @@ impl MemoryTracker {
     /// Take keyspace category counters (zeros them). PubSub is left untouched.
     pub fn take_keyspace_counts(&self) -> [(MemoryCategory, usize); 8] {
         let mut out = [(MemoryCategory::Cache, 0usize); 8];
+        let mut taken = 0usize;
         for (i, cat) in Self::KEYSPACE_CATEGORIES.iter().enumerate() {
             let v = self.category_atomic(*cat).swap(0, Ordering::Relaxed);
             out[i] = (*cat, v);
+            taken = taken.saturating_add(v);
+        }
+        if taken > 0 {
+            let _ = self
+                .total
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+                    Some(t.saturating_sub(taken))
+                });
         }
         out
     }
@@ -255,29 +289,37 @@ impl MemoryTracker {
     /// Always writes the fixed [`Self::KEYSPACE_CATEGORIES`] slots; the category
     /// tags in `counts` are ignored so a fabricated PubSub entry cannot clobber
     /// the PubSub counter.
+    ///
+    /// Call after [`take_keyspace_counts`] (or when keyspace categories are zero)
+    /// so the running total stays consistent.
     pub fn install_keyspace_counts(&self, counts: &[(MemoryCategory, usize); 8]) {
+        let mut installed = 0usize;
         for (i, cat) in Self::KEYSPACE_CATEGORIES.iter().enumerate() {
-            self.category_atomic(*cat)
-                .store(counts[i].1, Ordering::Relaxed);
+            let v = counts[i].1;
+            self.category_atomic(*cat).store(v, Ordering::Relaxed);
+            installed = installed.saturating_add(v);
+        }
+        if installed > 0 {
+            self.total.fetch_add(installed, Ordering::Relaxed);
         }
     }
 
     /// Reset a single category counter to zero
     pub fn reset_category(&self, category: MemoryCategory) {
-        self.category_atomic(category).store(0, Ordering::Relaxed);
+        let prev = self.category_atomic(category).swap(0, Ordering::Relaxed);
+        if prev > 0 {
+            let _ = self
+                .total
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+                    Some(t.saturating_sub(prev))
+                });
+        }
     }
 
-    /// Get total memory usage
+    /// Get total memory usage (single atomic load — Batch GW).
+    #[inline]
     pub fn total_memory(&self) -> usize {
-        self.cache_memory.load(Ordering::Relaxed)
-            + self.pubsub_memory.load(Ordering::Relaxed)
-            + self.sorted_sets_memory.load(Ordering::Relaxed)
-            + self.geo_sets_memory.load(Ordering::Relaxed)
-            + self.hashes_memory.load(Ordering::Relaxed)
-            + self.lists_memory.load(Ordering::Relaxed)
-            + self.sets_memory.load(Ordering::Relaxed)
-            + self.streams_memory.load(Ordering::Relaxed)
-            + self.search_memory.load(Ordering::Relaxed)
+        self.total.load(Ordering::Relaxed)
     }
 
     /// Get memory usage for a specific category
@@ -403,6 +445,11 @@ mod tests {
             4096,
             "PubSub must not be taken with keyspace counts"
         );
+        assert_eq!(
+            tracker.total_memory(),
+            4096,
+            "running total must drop keyspace after take"
+        );
 
         // Install scratch-like totals without touching PubSub.
         let mut scratch = taken;
@@ -422,6 +469,29 @@ mod tests {
             4096,
             "PubSub must survive keyspace install"
         );
+        assert_eq!(
+            tracker.total_memory(),
+            4096 + 100 + 50,
+            "running total after install"
+        );
+    }
+
+    #[test]
+    fn running_total_tracks_account_deallocate_reset() {
+        let tracker = MemoryTracker::new(1024 * 1024, 1024);
+        tracker.account(100, MemoryCategory::Cache);
+        tracker.account(50, MemoryCategory::Hashes);
+        assert_eq!(tracker.total_memory(), 150);
+        tracker.deallocate(30, MemoryCategory::Cache);
+        assert_eq!(tracker.total_memory(), 120);
+        tracker.deallocate(999, MemoryCategory::Cache); // saturates
+        assert_eq!(tracker.category_memory(MemoryCategory::Cache), 0);
+        assert_eq!(tracker.total_memory(), 50);
+        tracker.reset_category(MemoryCategory::Hashes);
+        assert_eq!(tracker.total_memory(), 0);
+        tracker.account(10, MemoryCategory::PubSub);
+        tracker.reset();
+        assert_eq!(tracker.total_memory(), 0);
     }
 
     #[test]

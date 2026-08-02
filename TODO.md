@@ -793,11 +793,12 @@ Phases A–E P0 lists are green; prefer **P1 product/perf** over hunting accepte
 
 Ordered execution after **0.7.0**:
 
-1. **GV+** — further SET pipeline residual vs Valkey (or 0.8.0 release cut)
+1. **GW+** — further SET pipeline residual vs Valkey (Tokio / deeper store) or **0.8.0** release cut
 2. Optional product residuals: Functions RDB/AOF, BM25, full Redis bus
 
 | Batch | Pri | Track | Scope |
 |-------|-----|-------|--------|
+| **GW** | P1 | Perf | **done** — MemoryTracker running total; ACL unrestricted fast path; store size reuse; SET P=16 ~860k |
 | **GV** | P1 | Perf | **done** — SET under-maxmemory skip pre-read; plain SET fast path; SET P=16 ~807k |
 | **GC** | P1 | Perf | **done** — standalone stream skip + store/argv cuts; SET P=16 ~741k vs FI ~621k |
 | **GD** | P1 | Perf | **done** — `CommandId` length-first dispatch; stack ACL lowercase; enum `is_write` |
@@ -821,6 +822,13 @@ Ordered execution after **0.7.0**:
 
 Checklist (active):
 
+- [x] **`[P1]`** **Batch GW — Pipeline SET accounting / ACL / store residual**
+  - `MemoryTracker::total` running atomic: `total_memory()` is 1 load (was 9-category sum) on every SET headroom check
+  - Open superuser ACL: `is_unrestricted` early-out skips key-spec walk + cmd lowercase on default open ACL
+  - Store: reuse precomputed `entry_size` as `new_size` (no second `estimate_string_entry`); `ensure_capacity` relies on `can_allocate` alone
+  - Slowlog: skip `Instant::now` when `slowlog-log-slower-than < 0`
+  - Bench (host-local): SET c=50 P=16 ~**860–865k** ops/s (n=500k, 3 passes; was GV ~807k); peer Valkey ~1.29–1.30M same session
+  - Residual: still ~0.66× Valkey pipelined SET; multi-worker Tokio + Entry Instant / dual string counters
 - [x] **`[P1]`** **Batch GV — Pipeline SET store pre-check cut**
   - Skip `get_string_entry` replace-size probe + `ensure_capacity` when `used + entry_size ≤ maxmemory`
   - Plain `SET key value` (2-arg) skips option parse loop
