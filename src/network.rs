@@ -406,7 +406,9 @@ impl Server {
         info!("Worker threads: {}", self.config.num_threads());
         info!("Max connections: {}", self.config.maxconns);
         if self.cluster.is_some() {
-            info!("Cluster mode: enabled (gossip over client RESP; single-observer fail)");
+            info!(
+                "Cluster mode: enabled (gossip over client RESP; peer bus lite on cport; single-observer fail)"
+            );
         } else {
             info!("Cluster mode: disabled");
         }
@@ -423,6 +425,13 @@ impl Server {
                     gossip_shutdown,
                 )
                 .await;
+            });
+            // Batch GP: Kore peer bus lite for dual-end NODE 2PC (client_port+10000).
+            // Soft-fail inside run_cluster_bus if bind fails → RESP-only prepare/commit.
+            let bus_cluster = Arc::clone(cluster);
+            let bus_shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                crate::cluster::run_cluster_bus(bus_cluster, bus_shutdown).await;
             });
         }
 

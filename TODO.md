@@ -311,7 +311,7 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P1]`** Hash slots / key hashing compatible with Redis Cluster clients
   - *Done (MVP)*: Redis CRC16-XMODEM + hash tags (`SLOT_COUNT=16384`); single-node `ClusterState` owns all slots; `--cluster-enabled`; `CLUSTER KEYSLOT/MYID/INFO/NODES/SLOTS/SETSLOT`; `ASKING` one-shot; gate after ACL (`CROSSSLOT` / `MOVED` / `ASK`); `SELECT` rejected in cluster mode; standalone path unchanged.
 - [x] **`[P1]`** Gossip / membership and failover
-  - *Done (thin MVP + Batch DW–EC)*: `CLUSTER MEET` over client RESP; PING heartbeat; **`pfail` → quorum `fail`**; FAILREPORTS; NODES `fail?`/`fail`. On master fail: **priority → offset → id** (EB/EA/DY); **losers re-point** (DZ). Operator **`CLUSTER FAILOVER [FORCE|TAKEOVER]`** (EC). Gaps: no binary cluster bus, no full Sentinel process.
+  - *Done (thin MVP + Batch DW–EC + GP)*: `CLUSTER MEET` over client RESP; PING heartbeat; **`pfail` → quorum `fail`**; FAILREPORTS; NODES `fail?`/`fail`. On master fail: **priority → offset → id** (EB/EA/DY); **losers re-point** (DZ). Operator **`CLUSTER FAILOVER [FORCE|TAKEOVER]`** (EC). Dual-end NODE 2PC: Kore peer bus lite + RESP fallback (**GP**). Gaps: not full Redis cluster bus, no full Sentinel process.
 - [x] **`[P1]`** Resharding / slot migration (thin MVP)
   - *Done*: `keys_in_slot` / `string_keys_in_slot`; `CLUSTER MIGRATEKEYS <slot> <ip> <port>` moves **all key types** via RESP (ASKING + type-specific recreate + DEL: SET/HSET/RPUSH/SADD/ZADD/GEOADD/XADD+groups); SETSLOT MIGRATING/IMPORTING/NODE/STABLE operator flow; MIGRATING miss → ASK; final NODE → MOVED.
   - *Done (Batch Y)*: multi-type MIGRATEKEYS (string/hash/list/set/zset/geo/stream)
@@ -328,7 +328,7 @@ Also tracked in `docs/roadmap.md`.
   - *Residual (FH / FB / FO)*:
     - **done FO** prepare durable on disk (`nodes.conf` `# prepare` lines + restore).
     - **done FO** atomic local `COMMITPREPARE` (dual-end path); bare `SETSLOT NODE` still operator bypass.
-    - **P3** no Redis **binary cluster bus** 2PC (RESP-only prepare/commit).
+    - **P3** full Redis **binary cluster bus** still not implemented; NODE 2PC uses Kore peer bus lite + RESP (**GP**).
     - **P3** dest-side `set_prepare_node(myself)` accepts unbound **or any known-peer owner** (broad vote; intentional for mid-reshard but weak fencing).
     - **P3** operator `SETSLOT NODE` still bypasses prepare (FINISH/recovery intentional; dual-end path enforces prepare + COMMITPREPARE).
     - **P3** remote dest still CHECKPREPARE then COMMITPREPARE as **two RPCs** (local source commit atomic; wire window accepted lite).
@@ -810,7 +810,7 @@ Ordered execution after **0.7.0**:
 | **GM** | P2 | Security | **done** — Bearer/Basic auth, admin TLS, non-loopback requires auth |
 | **GN** | P2 | Cluster | **done** — `# slot-epoch` ranges in nodes.conf round-trip |
 | **GO** | P3 | Cluster | **done** — dest CHECKPREPARE folded into atomic COMMITPREPARE |
-| **GP** | P3 | Cluster | Binary cluster bus 2PC (large; only if Redis cluster clients demand it) |
+| **GP** | P3 | Cluster | **done** — Kore peer bus lite for NODE 2PC (`KORB`; not Redis bus) |
 | **GQ** | P3 | Sentinel | **done** — parallel peer PING + replica INFO priority probes |
 | **GR** | P3 | Search | **done** — reconnect prune floor 2 for upper-layer M=1 path middles |
 | **GS** | P3 | Search | Search-doc access-touch for true LRU among docs (FZ residual) |
@@ -894,7 +894,12 @@ Checklist (active):
 - [x] **`[P3]`** **Batch GO — Single-RPC prepare commit window**
   - Dual-end commit re-check: source `check_prepare_valid` + dest MYID only
   - Dest prepare fence is atomic `COMMITPREPARE` (no separate CHECKPREPARE RPC)
-- [ ] **`[P3]`** **Batch GP — Binary cluster bus 2PC**
+- [x] **`[P3]`** **Batch GP — Kore peer bus lite for NODE 2PC**
+  - `src/cluster/bus.rs`: length-prefixed frames magic `KORB` v1; types PING/PONG/PREPARE/COMMIT/ABORT/OK/ERR
+  - Accept loop on `client_port+10000` (soft-fail bind → RESP-only); handlers call `set_prepare_node` / `commit_prepare_node` / `abort_prepare_node`
+  - Dual-end migrate: prefer bus for dest PREPARE/COMMIT/ABORT; transport failure → existing RESP path
+  - Tests: encode/decode + wrong magic; PREPARE then COMMIT ownership; TCP e2e; transport-when-down
+  - Residual: **not Redis bus** (no gossip/MEET/fail opcodes over binary bus; operator NODE stays RESP)
 - [x] **`[P3]`** **Batch GQ — Parallel Sentinel probes**
   - `count_reachable_sentinels`: parallel peer PINGs
   - `enrich_replica_priorities`: parallel INFO `slave_priority` fetches
@@ -1050,7 +1055,7 @@ Do **not** schedule these as sprint work unless a production need appears:
   - Closed FL residual (prepare not in conf) + FH residual (durable + atomic commit)
   - Tests: state prepare round-trip / expired not restored / COMMITPREPARE; migrate unit + **42/42** e2e; `cluster_test` Config compile fix
   - *Post-ship review (2026-07-29):* dual-end dest-first COMMITPREPARE + source local atomic path green; recheck inject still fail-closed; remote dest still two RPCs (CHECKPREPARE then COMMITPREPARE) — accepted lite; no correctness bug
-  - Residual: binary cluster bus 2PC; dest prepare breadth; operator NODE bypass (intentional); per-slot epochs not fully persisted in nodes.conf (file-epoch stamp + prepare fence)
+  - Residual: dest prepare breadth; operator NODE bypass (intentional); binary Redis bus (not Kore peer bus lite) — closed for dual-end NODE by **GP**; per-slot epochs later **GN**
 - [x] **`[P3]`** **Batch FP — Expire slot header** (`0fa2ed6`)
   - Folded side `typed_expires` into [`KeySlot::expires_at`] on the unified `key_values` map
   - Map type: `ShardedKeyMap<KeySlot>`; `KeyspacePayload` carries slots only (no sibling expires map)

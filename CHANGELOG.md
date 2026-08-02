@@ -16,13 +16,14 @@ The detailed letter-batch history lives in root [`TODO.md`](TODO.md). This file 
 - **GM** — Admin HTTP security: Bearer/Basic auth for metrics + deadlock UI; optional admin TLS; `--admin-bind` (non-loopback requires auth).
 - **GN** — Per-slot config epochs persisted in `nodes.conf` (`# slot-epoch start end epoch`); restore on boot.
 - **GO** — Dual-end reshard commit: dest prepare fence only via atomic `COMMITPREPARE` (no separate CHECKPREPARE RPC).
+- **GP** — Kore peer bus lite for dual-end NODE 2PC: length-prefixed `KORB` frames (PREPARE/COMMIT/ABORT/PING) on `client_port+10000`; prefer bus when cport accepts, RESP fallback on transport failure. **Not** the Redis cluster bus (no gossip/MEET opcodes).
 - **GQ** — Parallel Sentinel peer PINGs and replica `slave_priority` INFO probes.
 - **GR** — HNSW bridge reconnect prune floor `max(max_m, 2)` so upper-layer `M=1` path middles keep both spanning edges (not a global insert degree change).
 - **GS** — Search-doc access-touch for LRU/LFU: FT search hits update per-doc `last_access` (+ packed LFU); `allkeys-lru` sampling uses real times so hot FT docs can outrank cold ones. Still not volatile victims.
 
 ### Planned (see TODO.md)
 
-- **GP** — Binary cluster bus 2PC (optional / large)
+- Optional further residuals only (full Redis cluster bus, BM25 stemmers, …)
 
 ## [0.7.0] — 2026-08-02
 
@@ -54,7 +55,7 @@ The detailed letter-batch history lives in root [`TODO.md`](TODO.md). This file 
 - Pipelined SET still below Valkey absolute throughput on measured host
 - Redis Functions dump is Kore `KORF1` (not Redis-native blob); libraries not yet in RDB/AOF
 - Stream foreign Redis listpack DUMP fixtures residual; geo DUMP restores as zset (Redis TYPE)
-- No binary Redis cluster bus; Sentinel hello SUBSCRIBE fan-in not implemented
+- No full Redis cluster bus (Kore peer bus lite covers dual-end NODE 2PC only; **GP**); Sentinel hello SUBSCRIBE fan-in not implemented
 - Admin HTTP has optional auth/TLS (**GM**); no admin mTLS / rate limits
 
 ## [0.6.0] — 2026-07-31

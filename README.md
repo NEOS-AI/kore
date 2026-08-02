@@ -35,7 +35,7 @@ Kore speaks the **RESP** protocol, so common clients work out of the box (`redis
 - **Replication** — `REPLICAOF`, `SYNC` / `PSYNC`, backlog, `WAIT`, min-replicas write gate
 - **Failover** — coordinated `FAILOVER TO`; promote ranking
 - **Sentinel-lite** — `MONITOR`, ODOWN quorum, hello bus lite, conf persistence, `CKQUORUM`
-- **Cluster** — hash slots, `MOVED`/`ASK`, gossip, reshard / `MIGRATE`, NODE prepare/commit **2PC over RESP** (not the binary Redis cluster bus); **per-slot epochs** durable in `nodes.conf`
+- **Cluster** — hash slots, `MOVED`/`ASK`, gossip, reshard / `MIGRATE`, NODE prepare/commit **2PC** (Kore peer bus lite on cport when available, RESP fallback; not the Redis cluster bus); **per-slot epochs** durable in `nodes.conf`
 
 ### Search
 - **FT.*** — `FT.CREATE` / `DROPINDEX` / `SEARCH` / `INFO` / `_LIST` / `TAGVALS` / aliases
@@ -329,7 +329,7 @@ Honest gaps vs full Redis/Valkey (see [CHANGELOG](CHANGELOG.md) and [TODO.md](TO
 
 - Pipelined SET absolute throughput still below Valkey on measured hosts
 - Redis Functions dump is Kore **KORF1** (not Redis-native blob); libraries not yet in RDB/AOF
-- No binary Redis **cluster bus** (topology 2PC is RESP-based; dual-end NODE is RESP `COMMITPREPARE`)
+- No full Redis **cluster bus** (gossip/MEET stay RESP). Dual-end NODE 2PC may use **Kore peer bus lite** (`KORB` frames on cport) with RESP `COMMITPREPARE` fallback
 - Sentinel hello long-lived `SUBSCRIBE` fan-in not implemented
 - Geo DUMP restores as zset for Redis `TYPE`; foreign Redis stream listpack fixtures residual
 - Scripting: no nested `EVAL`; movablekeys catalog incomplete vs full Redis

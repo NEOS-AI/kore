@@ -7,8 +7,9 @@
 //! 4. both:   CLUSTER SETSLOT <s> NODE <dest-id>
 //!
 //! `CLUSTER RESHARD` runs steps 1–4 on the source for one slot or an inclusive
-//! range. Dual-end NODE uses a **RESP prepare/vote then commit** path (Batch FB
-//! + FH 2PC slices) — not Redis binary cluster-bus 2PC. After each side's NODE,
+//! range. Dual-end NODE uses prepare/vote then commit (Batch FB + FH 2PC) over
+//! the **Kore peer bus lite** when cport accepts (Batch GP), with **RESP
+//! fallback** — not Redis binary cluster-bus 2PC. After each side's NODE,
 //! ownership is re-checked and failed NODE is retried a few times (Batch DN).
 //! Partial failures leave honest status fields; operators can complete with
 //! `CLUSTER RESHARD FINISH` or manual SETSLOT.
@@ -2208,6 +2209,10 @@ async fn recheck_prepare_before_commit(
 }
 
 /// Dest half of prepare: MYID + owner sanity + SETSLOT PREPARE (Batch FB/EY).
+///
+/// **Batch GP:** prefer Kore peer bus (`cport = dest_port+10000`) for the
+/// PREPARE RPC when connect succeeds; fall back to RESP on transport failure.
+/// Application ERR from the bus is not retried as RESP (fail closed).
 async fn prepare_dest_vote(
     slot: u16,
     dest_node_id: &str,
@@ -2217,6 +2222,18 @@ async fn prepare_dest_vote(
 ) -> Result<(), String> {
     if take_dest_prepare_inject_fail(dest_port) {
         return Err("injected dest PREPARE failure".into());
+    }
+
+    // Prefer bus for the prepare vote itself (Batch GP). Topology readiness is
+    // enforced by dest `set_prepare_node` (myself + importing/owner rules).
+    match super::bus::bus_prepare(dest_ip, dest_port, slot, dest_node_id).await {
+        Ok(()) => return Ok(()),
+        Err(e) if e.is_transport() => {
+            // Bus down / unbound cport → RESP path below.
+        }
+        Err(e) => {
+            return Err(format!("dest prepare:{}", strip_err_prefix(e.message())));
+        }
     }
 
     let mut stream = connect_dest(dest_ip, dest_port)
@@ -2254,7 +2271,15 @@ async fn prepare_dest_vote(
 }
 
 /// Best-effort dest ABORTPREPARE (clear prepare vote without NODE).
+///
+/// Prefers peer bus (Batch GP); falls back to RESP on transport failure.
 async fn abort_dest_prepare(slot: u16, dest_ip: &str, dest_port: u16) -> Result<(), String> {
+    // Target id unused by abort handler; empty is fine for wire shape.
+    match super::bus::bus_abort(dest_ip, dest_port, slot, "").await {
+        Ok(()) => return Ok(()),
+        Err(e) if e.is_transport() => {}
+        Err(e) => return Err(e.message().to_string()),
+    }
     let slot_s = slot.to_string();
     let mut stream = connect_dest(dest_ip, dest_port).await?;
     dest_setslot(
@@ -2390,8 +2415,11 @@ fn source_owns_as(cluster: &ClusterState, slot: u16, node_id: &str) -> bool {
 
 /// Remote dest `SETSLOT COMMITPREPARE` + CLUSTER SLOTS verify, with retries (Batch FO).
 ///
+/// **Batch GP:** prefer Kore peer bus `COMMIT` (atomic `commit_prepare_node` on
+/// dest) when cport accepts; transport failure falls back to RESP.
+///
 /// Falls back to bare `SETSLOT NODE` only if dest rejects unknown subcommand
-/// (older peer without FO) — still verifies ownership after either path.
+/// (older peer without FO) — still verifies ownership after RESP path.
 async fn apply_dest_node_with_retry(
     slot: u16,
     dest_node_id: &str,
@@ -2408,6 +2436,21 @@ async fn apply_dest_node_with_retry(
                 tokio::time::sleep(NODE_RETRY_DELAY).await;
             }
             continue;
+        }
+
+        // Prefer peer bus COMMIT (Batch GP) — atomic check+NODE on dest.
+        match super::bus::bus_commit(dest_ip, dest_port, slot, dest_node_id).await {
+            Ok(()) => return "ok".to_string(),
+            Err(e) if e.is_transport() => {
+                // Fall through to RESP.
+            }
+            Err(e) => {
+                last_err = e.message().to_string();
+                if attempt + 1 < NODE_SET_ATTEMPTS {
+                    tokio::time::sleep(NODE_RETRY_DELAY).await;
+                }
+                continue;
+            }
         }
 
         match connect_dest(dest_ip, dest_port).await {

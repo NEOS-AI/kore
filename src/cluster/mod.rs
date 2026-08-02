@@ -2,8 +2,10 @@
 //!
 //! Internal ahash-based cache sharding is independent of CRC16 cluster slots.
 //!
-//! Gossip uses the client RESP port (not Redis binary cluster bus). Fail
-//! detection is **single-observer** (not Redis multi-node quorum).
+//! Gossip uses the client RESP port (not Redis binary cluster bus). Dual-end
+//! NODE 2PC may use the Kore peer bus lite on cport (`+10000`) with RESP
+//! fallback (Batch GP). Fail detection is **single-observer** (not Redis
+//! multi-node quorum).
 //!
 //! **Ownership epochs (Batch DU):** each slot has a config epoch stamped on
 //! local `SETSLOT NODE` / reassign. Heartbeats pull `CLUSTER OWNERS` from peers
@@ -58,6 +60,10 @@
 //! keep defaults / file-epoch stamp for slots / empty prepare map).
 //! **Commit re-check (Batch GO):** dest prepare fence is atomic `COMMITPREPARE`
 //! only (no separate remote CHECKPREPARE RPC).
+//! **Peer bus lite (Batch GP):** optional binary frames on `client_port+10000`
+//! for dual-end NODE PREPARE/COMMIT/ABORT only (magic `KORB`). Prefer bus when
+//! cport accepts; RESP fallback on transport failure. **Not** the Redis cluster
+//! bus (no gossip/MEET opcodes; operator NODE stays RESP).
 //!
 //! Slot migration (thin MVP): `CLUSTER MIGRATEKEYS` moves all key types over RESP.
 //! Orchestration: `CLUSTER RESHARD` runs the documented SETSLOT + MIGRATEKEYS flow
@@ -66,11 +72,17 @@
 //! non-`complete` status (Batch DO). Redis key-level `MIGRATE` reuses the same
 //! recreate path (Batch DP).
 
+mod bus;
 mod crc16;
 mod gossip;
 mod migrate;
 mod state;
 
+pub use bus::{
+    bus_abort, bus_commit, bus_prepare, bus_rpc, decode_header, decode_slot_target, encode_frame,
+    encode_slot_target, peer_cport, run_cluster_bus, BusRpcError, HEADER_LEN, MAGIC, MAX_BODY_LEN,
+    TYPE_ABORT, TYPE_COMMIT, TYPE_ERR, TYPE_OK, TYPE_PING, TYPE_PONG, TYPE_PREPARE, VERSION,
+};
 pub use crc16::{crc16, key_hash_slot, SLOT_COUNT};
 pub use gossip::{
     force_mark_fail, gossip_tick, meet_peer, parse_fail_reports_reply, parse_owners_reply,
