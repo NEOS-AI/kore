@@ -10,17 +10,18 @@ The detailed letter-batch history lives in root [`TODO.md`](TODO.md). This file 
 ### Performance
 
 - **Batch GC** — pure-standalone masters skip replication stream encode/backlog when no replica has ever been fed; SET path drops extra type probe, static write-cmd bytes, in-place map overwrite. Indicative SET pipeline (c=50 P=16) ~**+19%** vs Batch FI on M3 Pro (~741k ops/s). See `docs/benchmarks.md`.
+- **Batch GD** — `CommandId` enum dispatch (length-first match on stack-uppercased name); ACL/cluster key-spec use stack lowercase instead of allocating `String`. SET P=16 remains in the GC band (~741k); structural hygiene for further path work.
 
 ### Planned (see TODO.md → *Next work queue (post-GB)*)
 
-- **GD–GF** — further SET path / re-bench vs Valkey
+- **GE–GF** — multi-replica publish residual / full re-bench vs Valkey
 - **GG / GK** — MIGRATE over DUMP/RESTORE; multi-language client smoke CI
 - **GL** — TLS depth (mTLS, dual listener, optional replica-link TLS)
 - **GI / GT–GU** — Redis Functions or search scoring/ANN polish (pick one track)
 
 ### Docs
 
-- Stamped post-GB / post-GC status; README feature matrix; this changelog; roadmap pointer to **GC+**
+- Stamped post-GB / post-GC / post-GD status; README feature matrix; this changelog; roadmap pointer to **GC+**
 
 ## [0.6.0] — 2026-07-31
 

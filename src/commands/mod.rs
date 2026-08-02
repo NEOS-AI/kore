@@ -1,3 +1,4 @@
+mod cmd_id;
 mod basic;
 mod key_value;
 mod counter;
@@ -20,6 +21,7 @@ mod sentinel;
 mod bitmap;
 mod hyperloglog;
 mod scripting;
+use cmd_id::CommandId;
 
 use crate::acl::AclStore;
 use crate::cache::Cache;
@@ -595,8 +597,14 @@ impl CommandHandler {
     }
 
     /// Log write to AOF + replicas when the command mutated data successfully.
-    fn maybe_persist_write(&self, cmd: &str, args: &[RespValue], response: &RespValue) {
-        if !is_write_command(cmd) {
+    fn maybe_persist_write(
+        &self,
+        cmd_id: CommandId,
+        cmd_upper: &str,
+        args: &[RespValue],
+        response: &RespValue,
+    ) {
+        if !cmd_id.is_write() {
             return;
         }
         if !response_indicates_success(response) {
@@ -613,10 +621,13 @@ impl CommandHandler {
                 p.mark_dirty();
                 return;
             }
-            // Avoid `cmd.to_string()` heap alloc on every write (Batch FI).
-            // Static slices for common write names (Batch GC).
+            // Batch GD: prefer static Bytes from CommandId; fallback to copy.
             let mut argv = Vec::with_capacity(args.len() + 1);
-            argv.push(static_write_cmd_bytes(cmd));
+            argv.push(
+                cmd_id
+                    .static_name()
+                    .unwrap_or_else(|| Bytes::copy_from_slice(cmd_upper.as_bytes())),
+            );
             for a in args {
                 if let Some(b) = a.as_bulk_string() {
                     argv.push(b.clone());
@@ -651,13 +662,15 @@ impl CommandHandler {
             None => return Ok(RespValue::error("ERR invalid command")),
         };
 
-        // Stack buffer for ASCII uppercase — avoids heap alloc on the hot path.
+        // Batch GD: uppercase once into a stack buffer, then identify as CommandId
+        // so dispatch / is_write match on an enum instead of long string arms.
         let mut cmd_buf = [0u8; 64];
         let cmd_upper_cow = ascii_uppercase_cmd(cmd, &mut cmd_buf);
         let cmd_upper = cmd_upper_cow.as_ref();
+        let cmd_id = CommandId::from_upper(cmd_upper.as_bytes());
 
         // CLIENT REPLY: decide suppress before any early return (except CLIENT REPLY itself).
-        let is_client_reply = cmd_upper == "CLIENT"
+        let is_client_reply = cmd_id == CommandId::Client
             && args
                 .get(1)
                 .and_then(|a| a.as_bulk_string())
@@ -673,10 +686,10 @@ impl CommandHandler {
         }
 
         // AUTH / HELLO don't require prior authentication (HELLO may AUTH inline)
-        if cmd_upper == "AUTH" {
+        if cmd_id == CommandId::Auth {
             return self.handle_auth(&args[1..]);
         }
-        if cmd_upper == "HELLO" {
+        if cmd_id == CommandId::Hello {
             return self.handle_hello(&args[1..]).await;
         }
 
@@ -698,7 +711,7 @@ impl CommandHandler {
 
         // ASKING one-shot: capture flag for this command, then clear (except ASKING itself).
         let asking_flag = self.asking;
-        if cmd_upper != "ASKING" {
+        if cmd_id != CommandId::Asking {
             self.asking = false;
         }
 
@@ -710,19 +723,19 @@ impl CommandHandler {
         }
 
         // ── Transaction control (always immediate; never queued) ───────────────
-        match cmd_upper {
-            "MULTI" => return self.handle_multi(),
-            "EXEC" => return self.handle_exec().await,
-            "DISCARD" => return self.handle_discard(),
-            "WATCH" => return self.handle_watch(&args[1..]),
-            "UNWATCH" => return self.handle_unwatch(),
+        match cmd_id {
+            CommandId::Multi => return self.handle_multi(),
+            CommandId::Exec => return self.handle_exec().await,
+            CommandId::Discard => return self.handle_discard(),
+            CommandId::Watch => return self.handle_watch(&args[1..]),
+            CommandId::Unwatch => return self.handle_unwatch(),
             _ => {}
         }
 
         // Reject writes on readonly replica (except SYNC is primary-only).
         // SORT is a write only when STORE is present (Redis replica semantics).
-        let is_write = is_write_command(cmd_upper)
-            || (cmd_upper == "SORT" && sort_has_store(&args[1..]));
+        let is_write = cmd_id.is_write()
+            || (cmd_id == CommandId::Sort && sort_has_store(&args[1..]));
         if is_write {
             if let Some(p) = self.persistence.as_ref() {
                 if p.replication.readonly() {
@@ -748,11 +761,16 @@ impl CommandHandler {
         // Once a client has at least one active subscription only the listed
         // commands are accepted.  PING has a special array-reply in this mode.
         if self.in_pubsub_mode() {
-            match cmd_upper {
-                "SUBSCRIBE" | "UNSUBSCRIBE" | "PSUBSCRIBE" | "PUNSUBSCRIBE"
-                | "SSUBSCRIBE" | "SUNSUBSCRIBE"
-                | "RESET" | "QUIT" => {}
-                "PING" => {
+            match cmd_id {
+                CommandId::Subscribe
+                | CommandId::Unsubscribe
+                | CommandId::Psubscribe
+                | CommandId::Punsubscribe
+                | CommandId::Ssubscribe
+                | CommandId::Sunsubscribe
+                | CommandId::Reset
+                | CommandId::Quit => {}
+                CommandId::Ping => {
                     // In Pub/Sub mode PING returns *2\r\n$4\r\npong\r\n$<n>\r\n<msg>\r\n
                     let msg = args.get(1)
                         .and_then(|v| v.as_bulk_string())
@@ -772,34 +790,34 @@ impl CommandHandler {
             }
         }
 
-        let result = match cmd_upper {
+        let result = match cmd_id {
             // Basic commands
-            "PING" => self.handle_ping(&args[1..]),
-            "ECHO" => self.handle_echo(&args[1..]),
-            "TIME" => self.handle_time(&args[1..]),
-            "LOLWUT" => self.handle_lolwut(&args[1..]),
-            "READONLY" => self.handle_readonly(&args[1..]),
-            "READWRITE" => self.handle_readwrite(&args[1..]),
-            "QUIT" => {
+            CommandId::Ping => self.handle_ping(&args[1..]),
+            CommandId::Echo => self.handle_echo(&args[1..]),
+            CommandId::TimeCmd => self.handle_time(&args[1..]),
+            CommandId::Lolwut => self.handle_lolwut(&args[1..]),
+            CommandId::Readonly => self.handle_readonly(&args[1..]),
+            CommandId::Readwrite => self.handle_readwrite(&args[1..]),
+            CommandId::Quit => {
                 self.close_after_reply = true;
                 Ok(RespValue::ok())
             }
-            "SHUTDOWN" => self.handle_shutdown(&args[1..]),
-            "DEBUG" => self.handle_debug(&args[1..]),
+            CommandId::Shutdown => self.handle_shutdown(&args[1..]),
+            CommandId::Debug => self.handle_debug(&args[1..]),
 
             // Client handshake / introspection
-            "CLIENT" => self.handle_client(&args[1..]),
-            "COMMAND" => self.handle_command(&args[1..]),
-            "ACL" => self.handle_acl(&args[1..]),
+            CommandId::Client => self.handle_client(&args[1..]),
+            CommandId::Command => self.handle_command(&args[1..]),
+            CommandId::Acl => self.handle_acl(&args[1..]),
             // Cluster
-            "CLUSTER" => self.handle_cluster(&args[1..]).await,
-            "SENTINEL" => self.handle_sentinel(&args[1..]).await,
-            "ASKING" => self.handle_asking(&args[1..]),
+            CommandId::Cluster => self.handle_cluster(&args[1..]).await,
+            CommandId::Sentinel => self.handle_sentinel(&args[1..]).await,
+            CommandId::Asking => self.handle_asking(&args[1..]),
             // HELLO handled before auth gate
 
             // RESET: exit pub/sub mode, multi, and watches (Redis 6.2+)
             // Also re-selects DB 0 (Redis RESET behavior).
-            "RESET" => {
+            CommandId::Reset => {
                 self.pubsub_subscriptions = 0;
                 self.shard_subscriptions = 0;
                 self.in_multi = false;
@@ -829,283 +847,283 @@ impl CommandHandler {
             }
 
             // Key-Value commands
-            "SET" => self.handle_set(&args[1..]),
-            "GET" => self.handle_get(&args[1..]),
-            "DEL" => self.handle_del(&args[1..]),
-            "EXISTS" => self.handle_exists(&args[1..]),
-            "TYPE" => self.handle_type(&args[1..]),
-            "MGET" => self.handle_mget(&args[1..]),
-            "MSET" => self.handle_mset(&args[1..]),
-            "MSETNX" => self.handle_msetnx(&args[1..]),
-            "APPEND" => self.handle_append(&args[1..]),
-            "STRLEN" => self.handle_strlen(&args[1..]),
-            "GETRANGE" => self.handle_getrange(&args[1..]),
-            "SUBSTR" => self.handle_substr(&args[1..]),
-            "SETRANGE" => self.handle_setrange(&args[1..]),
-            "SETEX" => self.handle_setex(&args[1..]),
-            "PSETEX" => self.handle_psetex(&args[1..]),
-            "GETSET" => self.handle_getset(&args[1..]),
-            "UNLINK" => self.handle_unlink(&args[1..]),
-            "RENAME" => self.handle_rename(&args[1..]),
-            "RENAMENX" => self.handle_renamenx(&args[1..]),
-            "MOVE" => self.handle_move(&args[1..]),
-            "COPY" => self.handle_copy(&args[1..]),
-            "MIGRATE" => self.handle_migrate(&args[1..]).await,
-            "RANDOMKEY" => self.handle_randomkey(&args[1..]),
-            "TOUCH" => self.handle_touch(&args[1..]),
+            CommandId::Set => self.handle_set(&args[1..]),
+            CommandId::Get => self.handle_get(&args[1..]),
+            CommandId::Del => self.handle_del(&args[1..]),
+            CommandId::Exists => self.handle_exists(&args[1..]),
+            CommandId::TypeCmd => self.handle_type(&args[1..]),
+            CommandId::Mget => self.handle_mget(&args[1..]),
+            CommandId::Mset => self.handle_mset(&args[1..]),
+            CommandId::Msetnx => self.handle_msetnx(&args[1..]),
+            CommandId::Append => self.handle_append(&args[1..]),
+            CommandId::Strlen => self.handle_strlen(&args[1..]),
+            CommandId::Getrange => self.handle_getrange(&args[1..]),
+            CommandId::Substr => self.handle_substr(&args[1..]),
+            CommandId::Setrange => self.handle_setrange(&args[1..]),
+            CommandId::Setex => self.handle_setex(&args[1..]),
+            CommandId::Psetex => self.handle_psetex(&args[1..]),
+            CommandId::Getset => self.handle_getset(&args[1..]),
+            CommandId::Unlink => self.handle_unlink(&args[1..]),
+            CommandId::Rename => self.handle_rename(&args[1..]),
+            CommandId::Renamenx => self.handle_renamenx(&args[1..]),
+            CommandId::MoveCmd => self.handle_move(&args[1..]),
+            CommandId::CopyCmd => self.handle_copy(&args[1..]),
+            CommandId::Migrate => self.handle_migrate(&args[1..]).await,
+            CommandId::Randomkey => self.handle_randomkey(&args[1..]),
+            CommandId::Touch => self.handle_touch(&args[1..]),
 
             // Distributed lock commands
-            "SETNX" => self.handle_setnx(&args[1..]),
-            "GETDEL" => self.handle_getdel(&args[1..]),
-            "GETEX" => self.handle_getex(&args[1..]),
-            "LCS" => self.handle_lcs(&args[1..]),
-            "DUMP" => self.handle_dump(&args[1..]),
-            "RESTORE" => self.handle_restore(&args[1..]),
+            CommandId::Setnx => self.handle_setnx(&args[1..]),
+            CommandId::Getdel => self.handle_getdel(&args[1..]),
+            CommandId::Getex => self.handle_getex(&args[1..]),
+            CommandId::Lcs => self.handle_lcs(&args[1..]),
+            CommandId::Dump => self.handle_dump(&args[1..]),
+            CommandId::Restore => self.handle_restore(&args[1..]),
 
             // Counter commands
-            "INCR" => self.handle_incr(&args[1..]),
-            "DECR" => self.handle_decr(&args[1..]),
-            "INCRBY" => self.handle_incrby(&args[1..]),
-            "DECRBY" => self.handle_decrby(&args[1..]),
-            "INCRBYFLOAT" => self.handle_incrbyfloat(&args[1..]),
+            CommandId::Incr => self.handle_incr(&args[1..]),
+            CommandId::Decr => self.handle_decr(&args[1..]),
+            CommandId::Incrby => self.handle_incrby(&args[1..]),
+            CommandId::Decrby => self.handle_decrby(&args[1..]),
+            CommandId::Incrbyfloat => self.handle_incrbyfloat(&args[1..]),
 
             // Bitmap commands
-            "SETBIT" => self.handle_setbit(&args[1..]),
-            "GETBIT" => self.handle_getbit(&args[1..]),
-            "BITCOUNT" => self.handle_bitcount(&args[1..]),
-            "BITPOS" => self.handle_bitpos(&args[1..]),
-            "BITOP" => self.handle_bitop(&args[1..]),
-            "BITFIELD" => self.handle_bitfield(&args[1..]),
-            "BITFIELD_RO" => self.handle_bitfield_ro(&args[1..]),
+            CommandId::Setbit => self.handle_setbit(&args[1..]),
+            CommandId::Getbit => self.handle_getbit(&args[1..]),
+            CommandId::Bitcount => self.handle_bitcount(&args[1..]),
+            CommandId::Bitpos => self.handle_bitpos(&args[1..]),
+            CommandId::Bitop => self.handle_bitop(&args[1..]),
+            CommandId::Bitfield => self.handle_bitfield(&args[1..]),
+            CommandId::BitfieldRo => self.handle_bitfield_ro(&args[1..]),
 
             // HyperLogLog
-            "PFADD" => self.handle_pfadd(&args[1..]),
-            "PFCOUNT" => self.handle_pfcount(&args[1..]),
-            "PFMERGE" => self.handle_pfmerge(&args[1..]),
+            CommandId::Pfadd => self.handle_pfadd(&args[1..]),
+            CommandId::Pfcount => self.handle_pfcount(&args[1..]),
+            CommandId::Pfmerge => self.handle_pfmerge(&args[1..]),
 
             // Expiration commands
-            "EXPIRE" => self.handle_expire(&args[1..]),
-            "PEXPIRE" => self.handle_pexpire(&args[1..]),
-            "EXPIREAT" => self.handle_expireat(&args[1..]),
-            "PEXPIREAT" => self.handle_pexpireat(&args[1..]),
-            "PERSIST" => self.handle_persist(&args[1..]),
-            "TTL" => self.handle_ttl(&args[1..]),
-            "PTTL" => self.handle_pttl(&args[1..]),
-            "EXPIRETIME" => self.handle_expiretime(&args[1..]),
-            "PEXPIRETIME" => self.handle_pexpiretime(&args[1..]),
+            CommandId::Expire => self.handle_expire(&args[1..]),
+            CommandId::Pexpire => self.handle_pexpire(&args[1..]),
+            CommandId::Expireat => self.handle_expireat(&args[1..]),
+            CommandId::Pexpireat => self.handle_pexpireat(&args[1..]),
+            CommandId::Persist => self.handle_persist(&args[1..]),
+            CommandId::Ttl => self.handle_ttl(&args[1..]),
+            CommandId::Pttl => self.handle_pttl(&args[1..]),
+            CommandId::Expiretime => self.handle_expiretime(&args[1..]),
+            CommandId::Pexpiretime => self.handle_pexpiretime(&args[1..]),
 
             // Admin commands
-            "SELECT" => self.handle_select(&args[1..]),
-            "SWAPDB" => self.handle_swapdb(&args[1..]),
-            "DBSIZE" => self.handle_dbsize(&args[1..]),
-            "KEYS" => self.handle_keys(&args[1..]),
-            "SCAN" => self.handle_scan(&args[1..]),
-            "FLUSHDB" => self.handle_flushdb(&args[1..]),
-            "FLUSHALL" => self.handle_flushall(&args[1..]),
-            "INFO" => self.handle_info(&args[1..]),
-            "HEALTH" => self.handle_health(&args[1..]),
-            "SWEEP" => self.handle_sweep(&args[1..]),
-            "CONFIG" => self.handle_config(&args[1..]),
-            "MEMORY" => self.handle_memory(&args[1..]),
-            "OBJECT" => self.handle_object(&args[1..]),
-            "SLOWLOG" => self.handle_slowlog(&args[1..]),
-            "LATENCY" => self.handle_latency(&args[1..]),
-            "MODULE" => self.handle_module(&args[1..]),
+            CommandId::SelectCmd => self.handle_select(&args[1..]),
+            CommandId::Swapdb => self.handle_swapdb(&args[1..]),
+            CommandId::Dbsize => self.handle_dbsize(&args[1..]),
+            CommandId::Keys => self.handle_keys(&args[1..]),
+            CommandId::Scan => self.handle_scan(&args[1..]),
+            CommandId::Flushdb => self.handle_flushdb(&args[1..]),
+            CommandId::Flushall => self.handle_flushall(&args[1..]),
+            CommandId::Info => self.handle_info(&args[1..]),
+            CommandId::Health => self.handle_health(&args[1..]),
+            CommandId::Sweep => self.handle_sweep(&args[1..]),
+            CommandId::Config => self.handle_config(&args[1..]),
+            CommandId::Memory => self.handle_memory(&args[1..]),
+            CommandId::Object => self.handle_object(&args[1..]),
+            CommandId::Slowlog => self.handle_slowlog(&args[1..]),
+            CommandId::Latency => self.handle_latency(&args[1..]),
+            CommandId::ModuleCmd => self.handle_module(&args[1..]),
 
             // Persistence
-            "SAVE" => self.handle_save(&args[1..]),
-            "BGSAVE" => self.handle_bgsave(&args[1..]),
-            "LASTSAVE" => self.handle_lastsave(&args[1..]),
-            "BGREWRITEAOF" => self.handle_bgrewriteaof(&args[1..]),
-            "SYNC" => self.handle_sync(&args[1..]),
-            "PSYNC" => self.handle_psync(&args[1..]),
-            "REPLCONF" => self.handle_replconf(&args[1..]),
-            "ROLE" => self.handle_role(&args[1..]),
-            "REPLICAOF" | "SLAVEOF" => self.handle_replicaof(&args[1..]),
-            "FAILOVER" => self.handle_failover(&args[1..]).await,
-            "WAIT" => self.handle_wait(&args[1..]).await,
+            CommandId::Save => self.handle_save(&args[1..]),
+            CommandId::Bgsave => self.handle_bgsave(&args[1..]),
+            CommandId::Lastsave => self.handle_lastsave(&args[1..]),
+            CommandId::Bgrewriteaof => self.handle_bgrewriteaof(&args[1..]),
+            CommandId::Sync => self.handle_sync(&args[1..]),
+            CommandId::Psync => self.handle_psync(&args[1..]),
+            CommandId::Replconf => self.handle_replconf(&args[1..]),
+            CommandId::RoleCmd => self.handle_role(&args[1..]),
+            CommandId::Replicaof | CommandId::Slaveof => self.handle_replicaof(&args[1..]),
+            CommandId::Failover => self.handle_failover(&args[1..]).await,
+            CommandId::WaitCmd => self.handle_wait(&args[1..]).await,
 
             // Sorted Set commands
-            "ZADD" => self.handle_zadd(&args[1..]),
-            "ZRANGE" => self.handle_zrange(&args[1..]),
-            "ZRANGESTORE" => self.handle_zrangestore(&args[1..]),
-            "ZREVRANGE" => self.handle_zrevrange(&args[1..]),
-            "ZCARD" => self.handle_zcard(&args[1..]),
-            "ZSCORE" => self.handle_zscore(&args[1..]),
-            "ZMSCORE" => self.handle_zmscore(&args[1..]),
-            "ZREM" => self.handle_zrem(&args[1..]),
-            "ZRANK" => self.handle_zrank(&args[1..]),
-            "ZREVRANK" => self.handle_zrevrank(&args[1..]),
-            "ZINCRBY" => self.handle_zincrby(&args[1..]),
-            "ZRANGEBYSCORE" => self.handle_zrangebyscore(&args[1..]),
-            "ZREVRANGEBYSCORE" => self.handle_zrevrangebyscore(&args[1..]),
-            "ZCOUNT" => self.handle_zcount(&args[1..]),
-            "ZREMRANGEBYRANK" => self.handle_zremrangebyrank(&args[1..]),
-            "ZREMRANGEBYSCORE" => self.handle_zremrangebyscore(&args[1..]),
-            "ZRANGEBYLEX" => self.handle_zrangebylex(&args[1..]),
-            "ZREVRANGEBYLEX" => self.handle_zrevrangebylex(&args[1..]),
-            "ZLEXCOUNT" => self.handle_zlexcount(&args[1..]),
-            "ZREMRANGEBYLEX" => self.handle_zremrangebylex(&args[1..]),
-            "ZRANDMEMBER" => self.handle_zrandmember(&args[1..]),
-            "ZSCAN" => self.handle_zscan(&args[1..]),
-            "ZUNION" => self.handle_zunion(&args[1..]),
-            "ZINTER" => self.handle_zinter(&args[1..]),
-            "ZDIFF" => self.handle_zdiff(&args[1..]),
-            "ZINTERCARD" => self.handle_zintercard(&args[1..]),
-            "ZUNIONSTORE" => self.handle_zunionstore(&args[1..]),
-            "ZINTERSTORE" => self.handle_zinterstore(&args[1..]),
-            "ZDIFFSTORE" => self.handle_zdiffstore(&args[1..]),
-            "ZPOPMIN" => self.handle_zpopmin(&args[1..]),
-            "ZPOPMAX" => self.handle_zpopmax(&args[1..]),
-            "ZMPOP" => self.handle_zmpop(&args[1..]),
-            "BZPOPMIN" => self.handle_bzpopmin(&args[1..]).await,
-            "BZPOPMAX" => self.handle_bzpopmax(&args[1..]).await,
-            "BZMPOP" => self.handle_bzmpop(&args[1..]).await,
+            CommandId::Zadd => self.handle_zadd(&args[1..]),
+            CommandId::Zrange => self.handle_zrange(&args[1..]),
+            CommandId::Zrangestore => self.handle_zrangestore(&args[1..]),
+            CommandId::Zrevrange => self.handle_zrevrange(&args[1..]),
+            CommandId::Zcard => self.handle_zcard(&args[1..]),
+            CommandId::Zscore => self.handle_zscore(&args[1..]),
+            CommandId::Zmscore => self.handle_zmscore(&args[1..]),
+            CommandId::Zrem => self.handle_zrem(&args[1..]),
+            CommandId::Zrank => self.handle_zrank(&args[1..]),
+            CommandId::Zrevrank => self.handle_zrevrank(&args[1..]),
+            CommandId::Zincrby => self.handle_zincrby(&args[1..]),
+            CommandId::Zrangebyscore => self.handle_zrangebyscore(&args[1..]),
+            CommandId::Zrevrangebyscore => self.handle_zrevrangebyscore(&args[1..]),
+            CommandId::Zcount => self.handle_zcount(&args[1..]),
+            CommandId::Zremrangebyrank => self.handle_zremrangebyrank(&args[1..]),
+            CommandId::Zremrangebyscore => self.handle_zremrangebyscore(&args[1..]),
+            CommandId::Zrangebylex => self.handle_zrangebylex(&args[1..]),
+            CommandId::Zrevrangebylex => self.handle_zrevrangebylex(&args[1..]),
+            CommandId::Zlexcount => self.handle_zlexcount(&args[1..]),
+            CommandId::Zremrangebylex => self.handle_zremrangebylex(&args[1..]),
+            CommandId::Zrandmember => self.handle_zrandmember(&args[1..]),
+            CommandId::Zscan => self.handle_zscan(&args[1..]),
+            CommandId::Zunion => self.handle_zunion(&args[1..]),
+            CommandId::Zinter => self.handle_zinter(&args[1..]),
+            CommandId::Zdiff => self.handle_zdiff(&args[1..]),
+            CommandId::Zintercard => self.handle_zintercard(&args[1..]),
+            CommandId::Zunionstore => self.handle_zunionstore(&args[1..]),
+            CommandId::Zinterstore => self.handle_zinterstore(&args[1..]),
+            CommandId::Zdiffstore => self.handle_zdiffstore(&args[1..]),
+            CommandId::Zpopmin => self.handle_zpopmin(&args[1..]),
+            CommandId::Zpopmax => self.handle_zpopmax(&args[1..]),
+            CommandId::Zmpop => self.handle_zmpop(&args[1..]),
+            CommandId::Bzpopmin => self.handle_bzpopmin(&args[1..]).await,
+            CommandId::Bzpopmax => self.handle_bzpopmax(&args[1..]).await,
+            CommandId::Bzmpop => self.handle_bzmpop(&args[1..]).await,
 
             // Geospatial commands
-            "GEOADD" => self.handle_geoadd(&args[1..]),
-            "GEOSEARCH" => self.handle_geosearch(&args[1..]),
-            "GEOSEARCHSTORE" => self.handle_geosearchstore(&args[1..]),
-            "GEODIST" => self.handle_geodist(&args[1..]),
-            "GEOPOS" => self.handle_geopos(&args[1..]),
-            "GEOHASH" => self.handle_geohash(&args[1..]),
-            "GEORADIUS" => self.handle_georadius(&args[1..]),
-            "GEORADIUS_RO" => self.handle_georadius_ro(&args[1..]),
-            "GEORADIUSBYMEMBER" => self.handle_georadiusbymember(&args[1..]),
-            "GEORADIUSBYMEMBER_RO" => self.handle_georadiusbymember_ro(&args[1..]),
+            CommandId::Geoadd => self.handle_geoadd(&args[1..]),
+            CommandId::Geosearch => self.handle_geosearch(&args[1..]),
+            CommandId::Geosearchstore => self.handle_geosearchstore(&args[1..]),
+            CommandId::Geodist => self.handle_geodist(&args[1..]),
+            CommandId::Geopos => self.handle_geopos(&args[1..]),
+            CommandId::Geohash => self.handle_geohash(&args[1..]),
+            CommandId::Georadius => self.handle_georadius(&args[1..]),
+            CommandId::GeoradiusRo => self.handle_georadius_ro(&args[1..]),
+            CommandId::Georadiusbymember => self.handle_georadiusbymember(&args[1..]),
+            CommandId::GeoradiusbymemberRo => self.handle_georadiusbymember_ro(&args[1..]),
 
             // Hash commands
-            "HSET" => self.handle_hset(&args[1..]),
-            "HSETNX" => self.handle_hsetnx(&args[1..]),
-            "HGET" => self.handle_hget(&args[1..]),
-            "HMGET" => self.handle_hmget(&args[1..]),
-            "HDEL" => self.handle_hdel(&args[1..]),
-            "HGETDEL" => self.handle_hgetdel(&args[1..]),
-            "HGETALL" => self.handle_hgetall(&args[1..]),
-            "HLEN" => self.handle_hlen(&args[1..]),
-            "HEXISTS" => self.handle_hexists(&args[1..]),
-            "HKEYS" => self.handle_hkeys(&args[1..]),
-            "HVALS" => self.handle_hvals(&args[1..]),
-            "HINCRBY" => self.handle_hincrby(&args[1..]),
-            "HINCRBYFLOAT" => self.handle_hincrbyfloat(&args[1..]),
-            "HSTRLEN" => self.handle_hstrlen(&args[1..]),
-            "HMSET" => self.handle_hmset(&args[1..]),
-            "HRANDFIELD" => self.handle_hrandfield(&args[1..]),
-            "HSCAN" => self.handle_hscan(&args[1..]),
+            CommandId::Hset => self.handle_hset(&args[1..]),
+            CommandId::Hsetnx => self.handle_hsetnx(&args[1..]),
+            CommandId::Hget => self.handle_hget(&args[1..]),
+            CommandId::Hmget => self.handle_hmget(&args[1..]),
+            CommandId::Hdel => self.handle_hdel(&args[1..]),
+            CommandId::Hgetdel => self.handle_hgetdel(&args[1..]),
+            CommandId::Hgetall => self.handle_hgetall(&args[1..]),
+            CommandId::Hlen => self.handle_hlen(&args[1..]),
+            CommandId::Hexists => self.handle_hexists(&args[1..]),
+            CommandId::Hkeys => self.handle_hkeys(&args[1..]),
+            CommandId::Hvals => self.handle_hvals(&args[1..]),
+            CommandId::Hincrby => self.handle_hincrby(&args[1..]),
+            CommandId::Hincrbyfloat => self.handle_hincrbyfloat(&args[1..]),
+            CommandId::Hstrlen => self.handle_hstrlen(&args[1..]),
+            CommandId::Hmset => self.handle_hmset(&args[1..]),
+            CommandId::Hrandfield => self.handle_hrandfield(&args[1..]),
+            CommandId::Hscan => self.handle_hscan(&args[1..]),
 
             // List commands
-            "LPUSH" => self.handle_lpush(&args[1..]),
-            "RPUSH" => self.handle_rpush(&args[1..]),
-            "LPUSHX" => self.handle_lpushx(&args[1..]),
-            "RPUSHX" => self.handle_rpushx(&args[1..]),
-            "LPOP" => self.handle_lpop(&args[1..]),
-            "RPOP" => self.handle_rpop(&args[1..]),
-            "BLPOP" => self.handle_blpop(&args[1..]).await,
-            "BRPOP" => self.handle_brpop(&args[1..]).await,
-            "LRANGE" => self.handle_lrange(&args[1..]),
-            "LLEN" => self.handle_llen(&args[1..]),
-            "LINDEX" => self.handle_lindex(&args[1..]),
-            "LSET" => self.handle_lset(&args[1..]),
-            "LREM" => self.handle_lrem(&args[1..]),
-            "LTRIM" => self.handle_ltrim(&args[1..]),
-            "LINSERT" => self.handle_linsert(&args[1..]),
-            "LPOS" => self.handle_lpos(&args[1..]),
-            "LMOVE" => self.handle_lmove(&args[1..]),
-            "BLMOVE" => self.handle_blmove(&args[1..]).await,
-            "RPOPLPUSH" => self.handle_rpoplpush(&args[1..]),
-            "BRPOPLPUSH" => self.handle_brpoplpush(&args[1..]).await,
-            "LMPOP" => self.handle_lmpop(&args[1..]),
-            "BLMPOP" => self.handle_blmpop(&args[1..]).await,
-            "SORT" => self.handle_sort(&args[1..]),
+            CommandId::Lpush => self.handle_lpush(&args[1..]),
+            CommandId::Rpush => self.handle_rpush(&args[1..]),
+            CommandId::Lpushx => self.handle_lpushx(&args[1..]),
+            CommandId::Rpushx => self.handle_rpushx(&args[1..]),
+            CommandId::Lpop => self.handle_lpop(&args[1..]),
+            CommandId::Rpop => self.handle_rpop(&args[1..]),
+            CommandId::Blpop => self.handle_blpop(&args[1..]).await,
+            CommandId::Brpop => self.handle_brpop(&args[1..]).await,
+            CommandId::Lrange => self.handle_lrange(&args[1..]),
+            CommandId::Llen => self.handle_llen(&args[1..]),
+            CommandId::Lindex => self.handle_lindex(&args[1..]),
+            CommandId::Lset => self.handle_lset(&args[1..]),
+            CommandId::Lrem => self.handle_lrem(&args[1..]),
+            CommandId::Ltrim => self.handle_ltrim(&args[1..]),
+            CommandId::Linsert => self.handle_linsert(&args[1..]),
+            CommandId::Lpos => self.handle_lpos(&args[1..]),
+            CommandId::Lmove => self.handle_lmove(&args[1..]),
+            CommandId::Blmove => self.handle_blmove(&args[1..]).await,
+            CommandId::Rpoplpush => self.handle_rpoplpush(&args[1..]),
+            CommandId::Brpoplpush => self.handle_brpoplpush(&args[1..]).await,
+            CommandId::Lmpop => self.handle_lmpop(&args[1..]),
+            CommandId::Blmpop => self.handle_blmpop(&args[1..]).await,
+            CommandId::Sort => self.handle_sort(&args[1..]),
 
             // Set commands
-            "SADD" => self.handle_sadd(&args[1..]),
-            "SREM" => self.handle_srem(&args[1..]),
-            "SMEMBERS" => self.handle_smembers(&args[1..]),
-            "SISMEMBER" => self.handle_sismember(&args[1..]),
-            "SMISMEMBER" => self.handle_smismember(&args[1..]),
-            "SCARD" => self.handle_scard(&args[1..]),
-            "SINTER" => self.handle_sinter(&args[1..]),
-            "SINTERCARD" => self.handle_sintercard(&args[1..]),
-            "SUNION" => self.handle_sunion(&args[1..]),
-            "SDIFF" => self.handle_sdiff(&args[1..]),
-            "SINTERSTORE" => self.handle_sinterstore(&args[1..]),
-            "SUNIONSTORE" => self.handle_sunionstore(&args[1..]),
-            "SDIFFSTORE" => self.handle_sdiffstore(&args[1..]),
-            "SMOVE" => self.handle_smove(&args[1..]),
-            "SPOP" => self.handle_spop(&args[1..]),
-            "SRANDMEMBER" => self.handle_srandmember(&args[1..]),
-            "SSCAN" => self.handle_sscan(&args[1..]),
+            CommandId::Sadd => self.handle_sadd(&args[1..]),
+            CommandId::Srem => self.handle_srem(&args[1..]),
+            CommandId::Smembers => self.handle_smembers(&args[1..]),
+            CommandId::Sismember => self.handle_sismember(&args[1..]),
+            CommandId::Smismember => self.handle_smismember(&args[1..]),
+            CommandId::Scard => self.handle_scard(&args[1..]),
+            CommandId::Sinter => self.handle_sinter(&args[1..]),
+            CommandId::Sintercard => self.handle_sintercard(&args[1..]),
+            CommandId::Sunion => self.handle_sunion(&args[1..]),
+            CommandId::Sdiff => self.handle_sdiff(&args[1..]),
+            CommandId::Sinterstore => self.handle_sinterstore(&args[1..]),
+            CommandId::Sunionstore => self.handle_sunionstore(&args[1..]),
+            CommandId::Sdiffstore => self.handle_sdiffstore(&args[1..]),
+            CommandId::Smove => self.handle_smove(&args[1..]),
+            CommandId::Spop => self.handle_spop(&args[1..]),
+            CommandId::Srandmember => self.handle_srandmember(&args[1..]),
+            CommandId::Sscan => self.handle_sscan(&args[1..]),
 
             // Stream commands
-            "XADD" => self.handle_xadd(&args[1..]),
-            "XLEN" => self.handle_xlen(&args[1..]),
-            "XRANGE" => self.handle_xrange(&args[1..]),
-            "XREVRANGE" => self.handle_xrevrange(&args[1..]),
-            "XDEL" => self.handle_xdel(&args[1..]),
-            "XTRIM" => self.handle_xtrim(&args[1..]),
-            "XREAD" => self.handle_xread(&args[1..]).await,
-            "XGROUP" => self.handle_xgroup(&args[1..]),
-            "XREADGROUP" => self.handle_xreadgroup(&args[1..]).await,
-            "XACK" => self.handle_xack(&args[1..]),
-            "XPENDING" => self.handle_xpending(&args[1..]),
-            "XCLAIM" => self.handle_xclaim(&args[1..]),
-            "XAUTOCLAIM" => self.handle_xautoclaim(&args[1..]),
-            "XSETID" => self.handle_xsetid(&args[1..]),
-            "XINFO" => self.handle_xinfo(&args[1..]),
+            CommandId::Xadd => self.handle_xadd(&args[1..]),
+            CommandId::Xlen => self.handle_xlen(&args[1..]),
+            CommandId::Xrange => self.handle_xrange(&args[1..]),
+            CommandId::Xrevrange => self.handle_xrevrange(&args[1..]),
+            CommandId::Xdel => self.handle_xdel(&args[1..]),
+            CommandId::Xtrim => self.handle_xtrim(&args[1..]),
+            CommandId::Xread => self.handle_xread(&args[1..]).await,
+            CommandId::Xgroup => self.handle_xgroup(&args[1..]),
+            CommandId::Xreadgroup => self.handle_xreadgroup(&args[1..]).await,
+            CommandId::Xack => self.handle_xack(&args[1..]),
+            CommandId::Xpending => self.handle_xpending(&args[1..]),
+            CommandId::Xclaim => self.handle_xclaim(&args[1..]),
+            CommandId::Xautoclaim => self.handle_xautoclaim(&args[1..]),
+            CommandId::Xsetid => self.handle_xsetid(&args[1..]),
+            CommandId::Xinfo => self.handle_xinfo(&args[1..]),
 
             // Pub/Sub commands (async — no block_in_place)
-            "PUBLISH" => self.handle_publish(&args[1..]).await,
-            "SUBSCRIBE" => self.handle_subscribe(&args[1..]).await,
-            "UNSUBSCRIBE" => self.handle_unsubscribe(&args[1..]).await,
-            "PSUBSCRIBE" => self.handle_psubscribe(&args[1..]).await,
-            "PUNSUBSCRIBE" => self.handle_punsubscribe(&args[1..]).await,
-            "PUBSUB" => self.handle_pubsub(&args[1..]).await,
+            CommandId::Publish => self.handle_publish(&args[1..]).await,
+            CommandId::Subscribe => self.handle_subscribe(&args[1..]).await,
+            CommandId::Unsubscribe => self.handle_unsubscribe(&args[1..]).await,
+            CommandId::Psubscribe => self.handle_psubscribe(&args[1..]).await,
+            CommandId::Punsubscribe => self.handle_punsubscribe(&args[1..]).await,
+            CommandId::Pubsub => self.handle_pubsub(&args[1..]).await,
 
             // Search commands
-            "FT.CREATE" => self.handle_ft_create(&args[1..]),
-            "FT.DROPINDEX" => self.handle_ft_dropindex(&args[1..]),
-            "FT._LIST" => self.handle_ft_list(&args[1..]),
-            "FT.INFO" => self.handle_ft_info(&args[1..]),
-            "FT.SEARCH" => self.handle_ft_search(&args[1..]),
-            "FT.TAGVALS" => self.handle_ft_tagvals(&args[1..]),
-            "FT.ALIASADD" => self.handle_ft_aliasadd(&args[1..]),
-            "FT.ALIASDEL" => self.handle_ft_aliasdel(&args[1..]),
-            "FT.ALIASUPDATE" => self.handle_ft_aliasupdate(&args[1..]),
+            CommandId::FtCreate => self.handle_ft_create(&args[1..]),
+            CommandId::FtDropindex => self.handle_ft_dropindex(&args[1..]),
+            CommandId::FtList => self.handle_ft_list(&args[1..]),
+            CommandId::FtInfo => self.handle_ft_info(&args[1..]),
+            CommandId::FtSearch => self.handle_ft_search(&args[1..]),
+            CommandId::FtTagvals => self.handle_ft_tagvals(&args[1..]),
+            CommandId::FtAliasadd => self.handle_ft_aliasadd(&args[1..]),
+            CommandId::FtAliasdel => self.handle_ft_aliasdel(&args[1..]),
+            CommandId::FtAliasupdate => self.handle_ft_aliasupdate(&args[1..]),
 
             // Shard Pub/Sub commands (Redis 7.0+)
-            "SSUBSCRIBE" => self.handle_ssubscribe(&args[1..]).await,
-            "SUNSUBSCRIBE" => self.handle_sunsubscribe(&args[1..]).await,
-            "SPUBLISH" => self.handle_spublish(&args[1..]).await,
+            CommandId::Ssubscribe => self.handle_ssubscribe(&args[1..]).await,
+            CommandId::Sunsubscribe => self.handle_sunsubscribe(&args[1..]).await,
+            CommandId::Spublish => self.handle_spublish(&args[1..]).await,
 
             // Lua scripting / Redis Functions (FUNCTION is a stub; use EVAL for scripts)
-            "EVAL" => self.handle_eval(&args[1..]),
-            "EVAL_RO" => self.handle_eval_ro(&args[1..]),
-            "EVALSHA" => self.handle_evalsha(&args[1..]),
-            "EVALSHA_RO" => self.handle_evalsha_ro(&args[1..]),
-            "SCRIPT" => self.handle_script(&args[1..]),
-            "FUNCTION" => self.handle_function(&args[1..]),
-            "FCALL" => self.handle_fcall(&args[1..]),
-            "FCALL_RO" => self.handle_fcall_ro(&args[1..]),
+            CommandId::Eval => self.handle_eval(&args[1..]),
+            CommandId::EvalRo => self.handle_eval_ro(&args[1..]),
+            CommandId::Evalsha => self.handle_evalsha(&args[1..]),
+            CommandId::EvalshaRo => self.handle_evalsha_ro(&args[1..]),
+            CommandId::Script => self.handle_script(&args[1..]),
+            CommandId::Function => self.handle_function(&args[1..]),
+            CommandId::Fcall => self.handle_fcall(&args[1..]),
+            CommandId::FcallRo => self.handle_fcall_ro(&args[1..]),
 
-            _ => Ok(RespValue::error(format!("ERR unknown command '{}'", cmd_upper))),
+            CommandId::Unknown | _ => Ok(RespValue::error(format!("ERR unknown command '{}'", cmd_upper))),
         };
 
         if let Ok(ref resp) = result {
             // SORT only mutates (and must be AOF/repl propagated) when STORE is used.
             // MIGRATE propagates per-key DEL inside the handler (not the MIGRATE form).
-            if cmd_upper == "SORT" {
+            if cmd_id == CommandId::Sort {
                 if sort_has_store(&args[1..]) {
-                    self.maybe_persist_write(cmd_upper, &args[1..], resp);
+                    self.maybe_persist_write(cmd_id, cmd_upper, &args[1..], resp);
                     if response_indicates_success(resp) {
                         self.notify_watch_after_write(cmd_upper, &args[1..]);
                     }
                 }
-            } else if cmd_upper == "MIGRATE" {
+            } else if cmd_id == CommandId::Migrate {
                 // Watch + AOF/repl handled inside handle_migrate.
             } else {
-                self.maybe_persist_write(cmd_upper, &args[1..], resp);
-                if is_write_command(cmd_upper)
+                self.maybe_persist_write(cmd_id, cmd_upper, &args[1..], resp);
+                if cmd_id.is_write()
                     && response_indicates_success(resp)
                     && !is_noop_write(cmd_upper, resp)
                 {
@@ -1117,8 +1135,13 @@ impl CommandHandler {
         // Slow log (skip SLOWLOG itself and transaction control).
         // Build argv only when the command exceeds the threshold (Batch FI).
         if !matches!(
-            cmd_upper,
-            "SLOWLOG" | "EXEC" | "MULTI" | "DISCARD" | "WATCH" | "UNWATCH"
+            cmd_id,
+            CommandId::Slowlog
+                | CommandId::Exec
+                | CommandId::Multi
+                | CommandId::Discard
+                | CommandId::Watch
+                | CommandId::Unwatch
         ) {
             let duration_us = handle_start.elapsed().as_micros() as i64;
             let threshold = self.cache.slowlog.slower_than_us();
@@ -1160,13 +1183,16 @@ impl CommandHandler {
     /// Returns `Some(error)` when denied, `None` when allowed.
     fn check_acl_permission(&self, cmd_upper: &str, args: &[RespValue]) -> Option<RespValue> {
         let username = self.username.as_deref().unwrap_or("default");
-        let cmd_lower = cmd_upper.to_ascii_lowercase();
+        // Batch GD: stack lowercase — avoid `to_ascii_lowercase` String on every command.
+        let mut lower_buf = [0u8; 64];
+        let cmd_lower_cow = ascii_lowercase_from_upper(cmd_upper.as_bytes(), &mut lower_buf);
+        let cmd_lower = cmd_lower_cow.as_ref();
         let client_id = self.client_id.unwrap_or(0);
 
-        if !self.acl.can_execute(username, &cmd_lower) {
+        if !self.acl.can_execute(username, cmd_lower) {
             self.cache
                 .acl_log
-                .push("command", &cmd_lower, username, client_id);
+                .push("command", cmd_lower, username, client_id);
             return Some(RespValue::error(format!(
                 "NOPERM this user has no permissions to run the '{}' command",
                 cmd_lower
@@ -1199,7 +1225,7 @@ impl CommandHandler {
                     ));
                 }
             }
-        } else if let Some((first_key, last_key, step)) = meta::command_key_spec(&cmd_lower) {
+        } else if let Some((first_key, last_key, step)) = meta::command_key_spec(cmd_lower) {
             if first_key > 0 {
                 let keys = extract_command_keys(args, first_key, last_key, step);
                 for key in keys {
@@ -1262,8 +1288,10 @@ impl CommandHandler {
             extract_migrate_key_bytes(args)
         } else {
             // Commands without key specs (or first_key=0) are not redirected.
-            let cmd_lower = cmd_upper.to_ascii_lowercase();
-            let (first_key, last_key, step) = meta::command_key_spec(&cmd_lower)?;
+            let mut lower_buf = [0u8; 64];
+            let cmd_lower_cow = ascii_lowercase_from_upper(cmd_upper.as_bytes(), &mut lower_buf);
+            let cmd_lower = cmd_lower_cow.as_ref();
+            let (first_key, last_key, step) = meta::command_key_spec(cmd_lower)?;
             if first_key <= 0 {
                 return None;
             }
@@ -1289,8 +1317,9 @@ impl CommandHandler {
         }
         let slot = slot?;
 
-        let is_write = is_write_command(cmd_upper)
-            || (cmd_upper == "SORT" && sort_has_store(args));
+        let cmd_id = CommandId::from_upper(cmd_upper.as_bytes());
+        let is_write =
+            cmd_id.is_write() || (cmd_id == CommandId::Sort && sort_has_store(args));
 
         // Batch EQ/ES: when cluster_state is fail, refuse key commands unless:
         // - ASKING on IMPORTING (reshard), or
@@ -1517,38 +1546,19 @@ fn ascii_uppercase_cmd<'a>(cmd: &[u8], buf: &'a mut [u8; 64]) -> std::borrow::Co
     }
 }
 
-/// Static `Bytes` for common write command names (Batch GC).
-///
-/// Avoids `Bytes::copy_from_slice` on the SET/DEL/… hot path when building AOF/repl argv.
-fn static_write_cmd_bytes(cmd: &str) -> Bytes {
-    match cmd {
-        "SET" => Bytes::from_static(b"SET"),
-        "DEL" => Bytes::from_static(b"DEL"),
-        "MSET" => Bytes::from_static(b"MSET"),
-        "INCR" => Bytes::from_static(b"INCR"),
-        "DECR" => Bytes::from_static(b"DECR"),
-        "INCRBY" => Bytes::from_static(b"INCRBY"),
-        "DECRBY" => Bytes::from_static(b"DECRBY"),
-        "LPUSH" => Bytes::from_static(b"LPUSH"),
-        "RPUSH" => Bytes::from_static(b"RPUSH"),
-        "LPOP" => Bytes::from_static(b"LPOP"),
-        "RPOP" => Bytes::from_static(b"RPOP"),
-        "HSET" => Bytes::from_static(b"HSET"),
-        "HDEL" => Bytes::from_static(b"HDEL"),
-        "SADD" => Bytes::from_static(b"SADD"),
-        "SREM" => Bytes::from_static(b"SREM"),
-        "ZADD" => Bytes::from_static(b"ZADD"),
-        "ZREM" => Bytes::from_static(b"ZREM"),
-        "EXPIRE" => Bytes::from_static(b"EXPIRE"),
-        "PEXPIRE" => Bytes::from_static(b"PEXPIRE"),
-        "GETDEL" => Bytes::from_static(b"GETDEL"),
-        "SETNX" => Bytes::from_static(b"SETNX"),
-        "APPEND" => Bytes::from_static(b"APPEND"),
-        "XADD" => Bytes::from_static(b"XADD"),
-        "UNLINK" => Bytes::from_static(b"UNLINK"),
-        "FLUSHDB" => Bytes::from_static(b"FLUSHDB"),
-        "FLUSHALL" => Bytes::from_static(b"FLUSHALL"),
-        _ => Bytes::copy_from_slice(cmd.as_bytes()),
+/// Lowercase an already-uppercased ASCII command name into `buf` (Batch GD).
+fn ascii_lowercase_from_upper<'a>(
+    upper: &[u8],
+    buf: &'a mut [u8; 64],
+) -> std::borrow::Cow<'a, str> {
+    if upper.len() <= buf.len() {
+        for (i, &b) in upper.iter().enumerate() {
+            buf[i] = b.to_ascii_lowercase();
+        }
+        let s = std::str::from_utf8(&buf[..upper.len()]).unwrap_or("");
+        std::borrow::Cow::Borrowed(s)
+    } else {
+        std::borrow::Cow::Owned(String::from_utf8_lossy(upper).to_ascii_lowercase())
     }
 }
 
@@ -1594,123 +1604,10 @@ fn sort_has_store(args: &[RespValue]) -> bool {
 
 /// Whether `cmd` mutates keyspace / server state (for replica write gate + EVAL_RO).
 pub(super) fn is_write_command(cmd: &str) -> bool {
-    matches!(
-        cmd,
-        "SET"
-            | "DEL"
-            | "MSET"
-            | "MSETNX"
-            | "SETRANGE"
-            | "SETNX"
-            | "GETDEL"
-            | "GETEX"
-            | "HGETDEL"
-            | "APPEND"
-            | "SETEX"
-            | "PSETEX"
-            | "GETSET"
-            | "INCRBYFLOAT"
-            | "UNLINK"
-            | "ZRANGESTORE"
-            | "LPUSHX"
-            | "RPUSHX"
-            | "RENAME"
-            | "RENAMENX"
-            | "MOVE"
-            | "COPY"
-            | "MIGRATE"
-            | "TOUCH"
-            | "INCR"
-            | "DECR"
-            | "INCRBY"
-            | "DECRBY"
-            | "EXPIRE"
-            | "PEXPIRE"
-            | "EXPIREAT"
-            | "PEXPIREAT"
-            | "PERSIST"
-            | "FLUSHDB"
-            | "FLUSHALL"
-            | "ZADD"
-            | "ZREM"
-            | "ZINCRBY"
-            | "ZREMRANGEBYRANK"
-            | "ZREMRANGEBYSCORE"
-            | "ZREMRANGEBYLEX"
-            | "ZUNIONSTORE"
-            | "ZINTERSTORE"
-            | "ZDIFFSTORE"
-            | "ZPOPMIN"
-            | "ZPOPMAX"
-            | "ZMPOP"
-            | "BZPOPMIN"
-            | "BZPOPMAX"
-            | "BZMPOP"
-            | "GEOADD"
-            | "GEOSEARCHSTORE"
-            | "GEORADIUS"
-            | "GEORADIUSBYMEMBER"
-            | "SWAPDB"
-            | "RESTORE"
-            | "HSET"
-            | "HSETNX"
-            | "HMSET"
-            | "HDEL"
-            | "HINCRBY"
-            | "HINCRBYFLOAT"
-            | "LPUSH"
-            | "RPUSH"
-            | "LPOP"
-            | "RPOP"
-            | "BLPOP"
-            | "BRPOP"
-            | "LSET"
-            | "LREM"
-            | "LTRIM"
-            | "LINSERT"
-            | "LMOVE"
-            | "BLMOVE"
-            | "RPOPLPUSH"
-            | "BRPOPLPUSH"
-            | "LMPOP"
-            | "BLMPOP"
-            | "SADD"
-            | "SREM"
-            | "SINTERSTORE"
-            | "SUNIONSTORE"
-            | "SDIFFSTORE"
-            | "SMOVE"
-            | "SPOP"
-            | "XADD"
-            | "XDEL"
-            | "XTRIM"
-            | "XGROUP"
-            | "XACK"
-            | "XCLAIM"
-            | "XAUTOCLAIM"
-            | "XSETID"
-            // XREADGROUP mutates PEL / last_delivered
-            | "XREADGROUP"
-            | "SETBIT"
-            | "BITOP"
-            | "BITFIELD"
-            | "PFADD"
-            | "PFMERGE"
-            // Scripts may mutate; propagate whole EVAL/EVALSHA (Redis-style).
-            // EVAL_RO / EVALSHA_RO are intentionally omitted (read-only).
-            | "EVAL"
-            | "EVALSHA"
-            // FCALL may mutate; FCALL_RO is read-only.
-            | "FCALL"
-            | "FUNCTION"
-            // RediSearch index/alias mutations (AOF + replica feed + READONLY gate).
-            | "FT.CREATE"
-            | "FT.DROPINDEX"
-            | "FT.ALIASADD"
-            | "FT.ALIASDEL"
-            | "FT.ALIASUPDATE"
-    )
+    CommandId::from_upper(cmd.as_bytes()).is_write()
 }
+
+
 
 fn response_indicates_success(response: &RespValue) -> bool {
     match response {

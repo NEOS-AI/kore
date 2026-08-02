@@ -388,7 +388,8 @@ Also tracked in `docs/roadmap.md`.
 - [x] **`[P1]`** RESP3 support (`HELLO 3`, maps, bools, push)
   - *Done*: `RespValue::{Map,Bool,Null,Push}` serialize+parse; `HELLO 3` map + `protocol_version`; `HGETALL`/`CONFIG GET` as maps on proto 3; pub/sub confirmations + fan-out as **push** for RESP3 clients; `CLIENT INFO` `resp=`; `RESET` → proto 2.
 - [x] **`[P1]`** Zero/low-alloc command dispatch (avoid per-command `String` uppercasing; static table / perfect hash)
-  - *Done (MVP)*: stack `[u8;64]` ASCII uppercase via `ascii_uppercase_cmd` (heap only if name > 64 bytes); mixed-case dispatch covered by tests. Perfect-hash / enum dispatch still optional later.
+  - *Done (MVP)*: stack `[u8;64]` ASCII uppercase via `ascii_uppercase_cmd` (heap only if name > 64 bytes); mixed-case dispatch covered by tests.
+  - *Done (Batch GD)*: `CommandId` enum + length-first `from_upper`; dispatch/`is_write`/slowlog/pubsub on enum; stack ACL lowercase.
 - [x] **`[P2]`** Pipelining / write batching optimizations under load
   - *Done*: coalesce pipeline replies into fewer response-channel sends per read; write task drains/`try_recv` into up to 64KiB `write_all` batches.
 
@@ -755,7 +756,7 @@ Also tracked in `docs/roadmap.md`.
 | Area | Residual | Priority | Planned batch |
 |------|----------|----------|---------------|
 | Docs / release | README under-sells features; no CHANGELOG; TODO status drift | **done** | **GC-docs** |
-| Perf | Pipeline SET gap vs Valkey (GC ~0.74M P=16; Valkey FI ~1.59M) | **P1 residual** | **GD / GF** (GC shipped) |
+| Perf | Pipeline SET gap vs Valkey (GC/GD ~0.74M P=16; Valkey FI ~1.59M) | **P1 residual** | **GE / GF** (GC+GD shipped) |
 | Ops | Global repl backlog ordered publish residual (after GB) | P3 residual | **GE** (if multi-replica write path matters) |
 | Compat | MIGRATE still recreate-only (DUMP/RESTORE cmds exist) | **P1** | **GG** |
 | Compat | DUMP geo/stream still KDF1 (not Redis RDB wire) | **P2** | **GH** |
@@ -789,13 +790,14 @@ Phases A–E P0 lists are green; prefer **P1 product/perf** over hunting accepte
 - [x] **`[P0]`** Standing: tests land with each feature (process rule — never closed as a checklist item; always applies)
 - [x] **`[P1]`** **Batch GC-docs** — stamp post-GB status; `CHANGELOG.md`; README feature matrix; roadmap pointer
 - [x] **`[P1]`** **Batch GC — Pipeline SET profile + hot-path cuts** (standalone stream skip; ~+19% SET P=16 vs FI on M3 Pro)
+- [x] **`[P1]`** **Batch GD — CommandId enum dispatch + ACL lower alloc**
 - [ ] **`[P1]`** **Batch GC-rel** — decide release cut (`0.6.0` tag vs `0.7.0` for FW–GB story); production runbook (deploy flags, AOF/RDB, replica+Sentinel, cluster bootstrap, health/metrics)
 
 #### Recommended letter queue (start here)
 
 Ordered execution for the next ~2 weeks of work:
 
-1. **GD–GF** — further SET path / re-bench (GC shipped)
+1. **GE–GF** — multi-replica publish / re-bench (GC+GD shipped; SET P=16 in ~0.74M band)
 2. **GG + GK** — MIGRATE over DUMP/RESTORE + client-compat CI smoke
 3. **GL** — TLS depth if selling production drop-in
 4. **One differentiator** — either **GI** (Functions) or **GT/GU** (search polish), not both in parallel
@@ -803,7 +805,7 @@ Ordered execution for the next ~2 weeks of work:
 | Batch | Pri | Track | Scope |
 |-------|-----|-------|--------|
 | **GC** | P1 | Perf | **done** — standalone stream skip + store/argv cuts; SET P=16 ~741k vs FI ~621k |
-| **GD** | P1 | Perf | Zero-copy / enum or perfect-hash command dispatch (FI optional follow-up) |
+| **GD** | P1 | Perf | **done** — `CommandId` length-first dispatch; stack ACL lowercase; enum `is_write` |
 | **GE** | P2 | Perf/ops | Further repl publish parallelization (async fanout / concurrent snapshot + backlog) — only if multi-replica write path matters |
 | **GF** | P1 | Perf | Re-run FD bench suite post-GC/GD; optional Redis (non-Valkey) column; optional CI microbench smoke |
 | **GG** | P1 | Compat | **MIGRATE via DUMP/RESTORE** (FY wire for core types; path still recreate-only) |
@@ -829,7 +831,11 @@ Checklist (active):
   - `maybe_persist` / `on_write_command` early path; static write-cmd Bytes; SET option parse without String; drop pre-store type probe; map overwrite without key clone
   - Tests: `standalone_cold_skips_stream_until_armed_or_replica`; `standalone_set_skips_repl_stream`; repl/failover arm stream where offset required
   - Bench: SET c=50 P=16 median **~740k** ops/s (FI **~621k**, **~+19%**); residual vs Valkey still large — see `docs/benchmarks.md` Batch GC
-- [ ] **`[P1]`** **Batch GD — Command dispatch / alloc reduction**
+- [x] **`[P1]`** **Batch GD — Command dispatch / alloc reduction**
+  - `src/commands/cmd_id.rs`: `CommandId` (248 cmds), length-first `from_upper`, `is_write()`, `static_name()`
+  - Main dispatch + write gate + slowlog skip + pubsub allowlist match on enum
+  - ACL / cluster key-spec: stack lowercase (no `to_ascii_lowercase` String)
+  - Bench: SET P=16 stays in GC band (~741k median); structural/hygiene win — see `docs/benchmarks.md` Batch GD
 - [ ] **`[P2]`** **Batch GE — Repl publish further parallelization** (optional)
 - [ ] **`[P1]`** **Batch GF — Re-bench vs Valkey (+ optional Redis column / CI smoke)**
 - [ ] **`[P1]`** **Batch GG — MIGRATE over DUMP/RESTORE**

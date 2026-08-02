@@ -317,6 +317,24 @@ Pass-level raw ops/s (FI):
 
 **Correctness notes:** PSYNC after a replica has been fed is unchanged. Never-replicated masters no longer grow `master_repl_offset` until a replica connects (or history is armed). Tests that asserted offset without a feed now call `arm_stream_history()`.
 
+#### Batch GD (2026-08-02) — CommandId enum dispatch + ACL lower alloc
+
+**Shipped:**
+
+1. **`CommandId`** (`src/commands/cmd_id.rs`) — 248 known commands; `from_upper` matches length-first then byte equality on a stack uppercased name (no heap for names ≤64).
+2. **Dispatch** — main `handle` match arms use `CommandId` instead of long `&str` arms; `is_write` / persist / slowlog skip / pubsub allowlist / transaction control use the enum.
+3. **ACL / cluster key-spec** — stack `ascii_lowercase_from_upper` replaces `to_ascii_lowercase()` `String` alloc per command.
+4. **Persist argv** — `CommandId::static_name()` for common writes (extends GC static-bytes path).
+
+**Re-measure (same host, 2026-08-02, post-GC baseline):**
+
+| Workload | Kore GC | Kore GD | Notes |
+|----------|---------|---------|-------|
+| SET c=50 P=16 | **~740,741** | **~740,741** | median of 3; passes ~725k / 741k / 769k (noise band) |
+| GET c=50 P=16 | ~1.5M | ~1.4M | host variance; not the GD target |
+
+**Interpretation:** After GC removed standalone stream work, enum dispatch is a **structure / alloc hygiene** win (no extra `String` lowercasing; cheaper write classification). Absolute SET P=16 stays in the GC band; further gains need store-path / Tokio path work (**GE** / dual-key `Entry` residual) rather than more dispatch micro-opts. No Valkey re-measure this batch.
+
 ## Vector search (HNSW vs FLAT) — methodology
 
 Generic `redis-benchmark` does not cover RediSearch vectors. For Kore-internal
