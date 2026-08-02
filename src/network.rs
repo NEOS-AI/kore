@@ -20,7 +20,6 @@ use tokio::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, watch, Semaphore};
-use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
@@ -47,12 +46,11 @@ pub struct Server {
 }
 
 const BUFFER_SIZE: usize = 8192;
-const RESPONSE_QUEUE_SIZE: usize = 256; // Pending response buffers per client
-const SLOW_CLIENT_THRESHOLD: usize = 200; // Warn when free capacity drops below this
-const WRITE_TIMEOUT_SECS: u64 = 5; // Timeout for write operations
 /// Cap coalesced write size so one slow flush cannot hold unbounded memory.
 const WRITE_BATCH_MAX_BYTES: usize = 64 * 1024;
 const MAX_CLIENTS_ERR: &[u8] = b"-ERR max number of clients reached\r\n";
+/// Static RESP for the common SET/write OK reply (Batch FI / GX).
+const RESP_OK: &[u8] = b"+OK\r\n";
 
 /// Load a rustls server acceptor from PEM cert/key paths (no client auth).
 /// Fails fast if files are missing or contain invalid PEM material.
@@ -710,29 +708,46 @@ async fn accept_unix_optional(
 
 
 
-/// Enqueue a response buffer with backpressure / slow-client detection.
-async fn send_response_buf(
-    tx: &mpsc::Sender<Vec<u8>>,
-    data: Vec<u8>,
-) -> Result<(), ()> {
-    let current_capacity = tx.capacity();
-    if current_capacity < (RESPONSE_QUEUE_SIZE.saturating_sub(SLOW_CLIENT_THRESHOLD)) {
-        warn!(
-            "Response queue filling up: {}/{} capacity remaining - slow client detected",
-            current_capacity, RESPONSE_QUEUE_SIZE
-        );
+/// Write a response buffer on the connection task (Batch GX).
+///
+/// Hot path skips a per-write `timeout` timer (timerfd/mach port tax under
+/// pipeline SET). TCP backpressure still stalls the connection task — same
+/// practical slow-client behaviour as Redis/Valkey single-thread loops.
+/// Pub/sub lag disconnect remains on the broadcast ring path.
+async fn write_response_buf<W>(
+    writer: &mut W,
+    cache: &Cache,
+    data: &[u8],
+) -> Result<(), ()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if data.is_empty() {
+        return Ok(());
     }
-    match timeout(Duration::from_millis(100), tx.send(data)).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(_)) => {
-            warn!("Response channel closed");
+    match writer.write_all(data).await {
+        Ok(()) => {
+            cache.stats.incr_bytes_sent(data.len());
+            Ok(())
+        }
+        Err(e) => {
+            warn!("Failed to write response: {}", e);
             Err(())
         }
-        Err(_) => {
-            warn!("Response queue send timeout - client not consuming responses fast enough");
-            Err(())
+    }
+}
+
+/// Append a RESP reply into the pipeline coalesce buffer (hot-path OK is static).
+#[inline]
+fn append_resp_reply(pipeline_buf: &mut Vec<u8>, response: &RespValue) {
+    if let RespValue::SimpleString(s) = response {
+        if s.as_ref() == b"OK" {
+            pipeline_buf.extend_from_slice(RESP_OK);
+            return;
         }
     }
+    let serialized = response.serialize();
+    pipeline_buf.extend_from_slice(&serialized);
 }
 
 async fn handle_connection<S>(
@@ -757,7 +772,7 @@ where
     let cache = databases.db0();
     cache.stats.incr_connections();
 
-    // Register client for pub/sub
+    // Register client for pub/sub (receiver polled only while subscribed — Batch GX).
     let (client_id, mut pubsub_rx) = cache.pubsub.register_client().await;
 
     // RESP (REdis Serialization Protocol) parser and command handler
@@ -777,114 +792,37 @@ where
     handler.set_client_id(client_id);
     let mut buf = vec![0u8; BUFFER_SIZE]; // 8KB buffer
 
-    // Create a channel for sending responses
-    let (response_tx, mut response_rx) = mpsc::channel::<Vec<u8>>(RESPONSE_QUEUE_SIZE);
-
-    // Split socket into reader and writer (works for TcpStream and TlsStream)
+    // Batch GX: keep read+write on one task (no per-connection write-task / mpsc hop).
+    // redis-benchmark / normal clients never subscribed → no select! vs pubsub.
+    // Pub/sub clients multiplex reads and push deliveries in the same task.
     let (mut reader, mut writer) = tokio::io::split(socket);
+    // Reused across pipeline batches to avoid per-read Vec alloc (Batch GX).
+    let mut pipeline_buf: Vec<u8> = Vec::with_capacity(4096);
 
-    // Spawn a task to handle outgoing messages (both responses and pub/sub messages).
-    // Response path coalesces queued buffers into larger writes (pipeline-friendly).
-    let cache_clone = cache.clone();
-    let write_task = tokio::spawn(async move {
-        let mut slow_client_warnings = 0;
+    // Outcome of processing one read's worth of complete RESP commands.
+    enum PipelineOutcome {
+        Continue,
+        Close,
+        /// Enter replica feed after writing `raw` handshake (already flushed pipeline).
+        ReplicaFeed {
+            raw: bytes::Bytes,
+            feed_rx: mpsc::Receiver<bytes::Bytes>,
+        },
+    }
 
-        loop {
-            tokio::select! {
-                // Handle pub/sub messages
-                msg = pubsub_rx.recv() => {
-                    match msg {
-                        Ok(value) => {
-                            // Message left the broadcast buffer — free fan-out accounting.
-                            cache_clone.note_pubsub_delivered(client_id).await;
-
-                            let data = value.serialize();
-
-                            // Write with timeout
-                            match timeout(Duration::from_secs(WRITE_TIMEOUT_SECS), writer.write_all(&data)).await {
-                                Ok(Ok(_)) => {
-                                    cache_clone.stats.incr_bytes_sent(data.len());
-                                }
-                                Ok(Err(e)) => {
-                                    warn!("Failed to write pub/sub message: {}", e);
-                                    break;
-                                }
-                                Err(_) => {
-                                    warn!("Pub/sub write timeout - slow client detected");
-                                    slow_client_warnings += 1;
-                                    if slow_client_warnings >= 3 {
-                                        warn!("Client too slow, disconnecting");
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        // Slow consumer: broadcast ring overwrote unread messages.
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            warn!(
-                                "Pub/sub client {} lagged by {} message(s) — disconnecting slow client",
-                                client_id, n
-                            );
-                            let freed = cache_clone.pubsub.note_lagged(client_id, n).await;
-                            cache_clone.release_pubsub_memory(freed);
-                            break;
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-                // Handle command responses — drain/coalesce for pipelined clients
-                Some(data) = response_rx.recv() => {
-                    let mut batch = data;
-                    while batch.len() < WRITE_BATCH_MAX_BYTES {
-                        match response_rx.try_recv() {
-                            Ok(more) => {
-                                batch.extend_from_slice(&more);
-                            }
-                            Err(_) => break,
-                        }
-                    }
-
-                    match timeout(Duration::from_secs(WRITE_TIMEOUT_SECS), writer.write_all(&batch)).await {
-                        Ok(Ok(_)) => {
-                            cache_clone.stats.incr_bytes_sent(batch.len());
-                        }
-                        Ok(Err(e)) => {
-                            warn!("Failed to write response: {}", e);
-                            break;
-                        }
-                        Err(_) => {
-                            warn!("Response write timeout - slow client detected");
-                            slow_client_warnings += 1;
-                            if slow_client_warnings >= 3 {
-                                warn!("Client too slow, disconnecting");
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    // Main loop for handling client commands
-    let result = 'conn: loop {
-        // Read data from socket
-        let n = match reader.read(&mut buf).await {
-            Ok(0) => break Ok(()), // Connection closed
-            Ok(n) => n,
-            Err(e) => break Err(e.into()),
-        };
-
-        // Feed data to parser
-        parser.feed(&buf[..n]);
-
-        // Track bytes received
-        cache.stats.incr_bytes_received(n);
-
-        // Parse and handle all complete commands available after this read
-        // (Redis pipelining). Coalesce serialized replies into fewer channel sends.
-        let mut pipeline_buf: Vec<u8> = Vec::new();
-
+    /// Parse + handle every complete command currently in `parser`, coalesce
+    /// replies into `pipeline_buf`, and flush when full / done / close.
+    async fn process_available_commands<W>(
+        parser: &mut RespParser,
+        handler: &mut CommandHandler,
+        writer: &mut W,
+        cache: &Cache,
+        pipeline_buf: &mut Vec<u8>,
+    ) -> anyhow::Result<PipelineOutcome>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        pipeline_buf.clear();
         while let Some(value) = parser.parse()? {
             let response = match handler.handle(value).await {
                 Ok(resp) => resp,
@@ -897,7 +835,7 @@ where
             // CLIENT REPLY OFF/SKIP: execute command but omit response on the wire.
             if handler.take_suppress_reply() {
                 if handler.take_close_after_reply() {
-                    break 'conn Ok(());
+                    return Ok(PipelineOutcome::Close);
                 }
                 continue;
             }
@@ -907,120 +845,199 @@ where
             // SYNC / PSYNC: flush any prior pipeline bytes, then handshake + feed.
             if let Some(raw) = handler.take_raw_response() {
                 if !pipeline_buf.is_empty() {
-                    if send_response_buf(&response_tx, pipeline_buf).await.is_err() {
-                        break 'conn Ok(());
+                    if write_response_buf(writer, cache, pipeline_buf).await.is_err() {
+                        return Ok(PipelineOutcome::Close);
                     }
-                    pipeline_buf = Vec::new();
+                    pipeline_buf.clear();
                 }
-                let feed_rx = handler.take_replica_feed();
-                let _ = response_tx.send(raw.to_vec()).await;
-                if let Some(mut feed_rx) = feed_rx {
-                    info!("Connection entered replica feed mode");
-                    let repl: Option<Arc<crate::persistence::replication::ReplicationManager>> =
-                        handler
-                            .persistence()
-                            .map(|p| Arc::clone(&p.replication));
-                    let announce_host = handler.replica_announce_ip().map(|s| s.to_string());
-                    let announce_port = handler.replica_announce_port();
-                    let mut ack_parser = RespParser::new();
-                    let mut ack_buf = vec![0u8; 4096];
-                    let mut getack_tick =
-                        tokio::time::interval(Duration::from_secs(1));
-                    getack_tick.set_missed_tick_behavior(
-                        tokio::time::MissedTickBehavior::Delay,
-                    );
-                    // Skip the immediate first tick so we don't probe before the
-                    // handshake bytes have left the write queue.
-                    getack_tick.tick().await;
-
-                    loop {
-                        tokio::select! {
-                            cmd = feed_rx.recv() => {
-                                match cmd {
-                                    Some(cmd_bytes) => {
-                                        if response_tx.send(cmd_bytes.to_vec()).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    None => break,
-                                }
-                            }
-                            read_res = reader.read(&mut ack_buf) => {
-                                match read_res {
-                                    Ok(0) => break,
-                                    Ok(n) => {
-                                        ack_parser.feed(&ack_buf[..n]);
-                                        loop {
-                                            match ack_parser.parse() {
-                                                Ok(Some(val)) => {
-                                                    if let Some(off) =
-                                                        crate::persistence::replication::parse_replconf_ack_offset(
-                                                            &val,
-                                                        )
-                                                    {
-                                                        if let Some(ref r) = repl {
-                                                            r.note_replica_ack(
-                                                                announce_host.as_deref(),
-                                                                announce_port,
-                                                                off,
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                                Ok(None) => break,
-                                                Err(e) => {
-                                                    warn!("replica feed ACK parse error: {}", e);
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!("replica feed read error: {}", e);
-                                        break;
-                                    }
-                                }
-                            }
-                            _ = getack_tick.tick() => {
-                                // Probe without backlog so master_repl_offset stays
-                                // stable for FAILOVER TO catch-up.
-                                if let Some(ref r) = repl {
-                                    r.send_getack_probe_to_feeds(
-                                        announce_host.as_deref(),
-                                        announce_port,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    // Replica feed ends the client loop (no further pipeline flush).
-                    break 'conn Ok(());
+                if let Some(feed_rx) = handler.take_replica_feed() {
+                    return Ok(PipelineOutcome::ReplicaFeed { raw, feed_rx });
+                }
+                // Raw response without feed (e.g. partial handshake error path).
+                if write_response_buf(writer, cache, raw.as_ref()).await.is_err() {
+                    return Ok(PipelineOutcome::Close);
                 }
                 continue;
             }
 
-            let serialized = response.serialize();
-            pipeline_buf.extend_from_slice(&serialized);
+            append_resp_reply(pipeline_buf, &response);
             // Bound memory if a huge pipeline arrives in one read.
             if pipeline_buf.len() >= WRITE_BATCH_MAX_BYTES {
-                if send_response_buf(&response_tx, std::mem::take(&mut pipeline_buf))
-                    .await
-                    .is_err()
-                {
-                    break 'conn Ok(());
+                if write_response_buf(writer, cache, pipeline_buf).await.is_err() {
+                    return Ok(PipelineOutcome::Close);
                 }
+                pipeline_buf.clear();
             }
             // QUIT / SHUTDOWN / CLIENT KILL: flush reply then close.
             if close_after {
-                if !pipeline_buf.is_empty() {
-                    let _ = send_response_buf(&response_tx, std::mem::take(&mut pipeline_buf)).await;
+                if !pipeline_buf.is_empty()
+                    && write_response_buf(writer, cache, pipeline_buf).await.is_err()
+                {
+                    return Ok(PipelineOutcome::Close);
                 }
-                break 'conn Ok(());
+                return Ok(PipelineOutcome::Close);
             }
         }
 
-        if !pipeline_buf.is_empty() {
-            if send_response_buf(&response_tx, pipeline_buf).await.is_err() {
+        if !pipeline_buf.is_empty()
+            && write_response_buf(writer, cache, pipeline_buf).await.is_err()
+        {
+            return Ok(PipelineOutcome::Close);
+        }
+        Ok(PipelineOutcome::Continue)
+    }
+
+    // Main loop for handling client commands
+    let result = 'conn: loop {
+        // When subscribed, also drain pub/sub push messages between reads.
+        // When not, a plain read avoids select! wakeups (Batch GX redis-benchmark path).
+        let n = if handler.in_pubsub_mode() {
+            loop {
+                tokio::select! {
+                    msg = pubsub_rx.recv() => {
+                        match msg {
+                            Ok(value) => {
+                                cache.note_pubsub_delivered(client_id).await;
+                                let data = value.serialize();
+                                if write_response_buf(&mut writer, &cache, data.as_ref())
+                                    .await
+                                    .is_err()
+                                {
+                                    break 'conn Ok(());
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                warn!(
+                                    "Pub/sub client {} lagged by {} message(s) — disconnecting slow client",
+                                    client_id, n
+                                );
+                                let freed = cache.pubsub.note_lagged(client_id, n).await;
+                                cache.release_pubsub_memory(freed);
+                                break 'conn Ok(());
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                break 'conn Ok(());
+                            }
+                        }
+                    }
+                    read_res = reader.read(&mut buf) => {
+                        break match read_res {
+                            Ok(0) => break 'conn Ok(()),
+                            Ok(n) => n,
+                            Err(e) => break 'conn Err(e.into()),
+                        };
+                    }
+                }
+            }
+        } else {
+            match reader.read(&mut buf).await {
+                Ok(0) => break Ok(()),
+                Ok(n) => n,
+                Err(e) => break Err(e.into()),
+            }
+        };
+
+        parser.feed(&buf[..n]);
+        cache.stats.incr_bytes_received(n);
+
+        match process_available_commands(
+            &mut parser,
+            &mut handler,
+            &mut writer,
+            &cache,
+            &mut pipeline_buf,
+        )
+        .await?
+        {
+            PipelineOutcome::Continue => {}
+            PipelineOutcome::Close => break Ok(()),
+            PipelineOutcome::ReplicaFeed { raw, mut feed_rx } => {
+                if write_response_buf(&mut writer, &cache, raw.as_ref())
+                    .await
+                    .is_err()
+                {
+                    break Ok(());
+                }
+                info!("Connection entered replica feed mode");
+                let repl: Option<Arc<crate::persistence::replication::ReplicationManager>> =
+                    handler
+                        .persistence()
+                        .map(|p| Arc::clone(&p.replication));
+                let announce_host = handler.replica_announce_ip().map(|s| s.to_string());
+                let announce_port = handler.replica_announce_port();
+                let mut ack_parser = RespParser::new();
+                let mut ack_buf = vec![0u8; 4096];
+                let mut getack_tick = tokio::time::interval(Duration::from_secs(1));
+                getack_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // Skip the immediate first tick so we don't probe before the
+                // handshake bytes have left the socket.
+                getack_tick.tick().await;
+
+                loop {
+                    tokio::select! {
+                        cmd = feed_rx.recv() => {
+                            match cmd {
+                                Some(cmd_bytes) => {
+                                    if write_response_buf(
+                                        &mut writer,
+                                        &cache,
+                                        cmd_bytes.as_ref(),
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                        read_res = reader.read(&mut ack_buf) => {
+                            match read_res {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    ack_parser.feed(&ack_buf[..n]);
+                                    loop {
+                                        match ack_parser.parse() {
+                                            Ok(Some(val)) => {
+                                                if let Some(off) =
+                                                    crate::persistence::replication::parse_replconf_ack_offset(
+                                                        &val,
+                                                    )
+                                                {
+                                                    if let Some(ref r) = repl {
+                                                        r.note_replica_ack(
+                                                            announce_host.as_deref(),
+                                                            announce_port,
+                                                            off,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Ok(None) => break,
+                                            Err(e) => {
+                                                warn!("replica feed ACK parse error: {}", e);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("replica feed read error: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                        _ = getack_tick.tick() => {
+                            if let Some(ref r) = repl {
+                                r.send_getack_probe_to_feeds(
+                                    announce_host.as_deref(),
+                                    announce_port,
+                                );
+                            }
+                        }
+                    }
+                }
                 break Ok(());
             }
         }
@@ -1029,7 +1046,6 @@ where
     // Cleanup: unregister client (frees any remaining pub/sub pending memory) and stats
     cache.unregister_pubsub_client(client_id).await;
     cache.stats.decr_active_connections();
-    write_task.abort();
 
     result
 }

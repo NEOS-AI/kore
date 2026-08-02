@@ -437,8 +437,9 @@ p99: **not reported** by this `valkey-benchmark -q` build.
 | **GF** | 2026-08-02 | **~730k** | **~1.59M** | full suite; same host class |
 | **GV** | 2026-08-02 | **~807k** | **~1.30M** | store headroom skip; peer Valkey re-run this session (~1.2–1.3M) |
 | **GW** | 2026-08-02 | **~861k** | **~1.30M** | running total + ACL open path + size reuse |
+| **GX** | 2026-08-02 | **~1.01M** | **~1.28M** | direct conn I/O; no per-write timeout |
 
-Non-pipeline SET/GET/INCR: Kore **~93–94%** of Valkey on GF (e.g. SET P=1 196k vs 210k). Pipelined SET: GF ~**46%** of Valkey (~0.73M vs ~1.59M); **GV** ~**62%** of same-session Valkey (~0.81M vs ~1.30M); **GW** ~**66%** (~0.86M vs ~1.30M).
+Non-pipeline SET/GET/INCR: Kore **~93–94%** of Valkey on GF (e.g. SET P=1 196k vs 210k). Pipelined SET: GF ~**46%** of Valkey (~0.73M vs ~1.59M); **GV** ~**62%** (~0.81M vs ~1.30M); **GW** ~**66%** (~0.86M vs ~1.30M); **GX** ~**79%** (~1.01M vs ~1.28M).
 
 #### Batch GV (2026-08-02) — SET capacity pre-check + plain SET fast path
 
@@ -480,13 +481,34 @@ Non-pipeline SET/GET/INCR: Kore **~93–94%** of Valkey on GF (e.g. SET P=1 196k
 
 **Interpretation:** ~**+6–7%** pipelined SET vs GV (~0.81M → ~0.86M) without semantic change. Residual ~**0.66×** same-session Valkey — still multi-worker Tokio + Entry Instant / dual string counters / shard lock. **No portable claim.**
 
+#### Batch GX (2026-08-02) — Direct connection I/O (drop write-task hop)
+
+**Problem:** Each connection always spawned a **write task** + **mpsc** for replies, and every write wrapped `write_all` in `timeout()` (timer tax). redis-benchmark never uses pub/sub, so the extra task + channel + timer were pure pipeline overhead vs single-thread Valkey.
+
+**Cuts:**
+1. Read + write on one connection task; no per-conn write task / response mpsc.
+2. Drop per-write `timeout` — rely on TCP backpressure (pub/sub lag still disconnects).
+3. Static `+OK\r\n` append; reuse pipeline coalesce buffer.
+4. Pub/sub `select!` only while the client is subscribed.
+
+**Host-local spot check** (same host class, Kore `--save ""` :6380; Valkey :6378; `n=500000`):
+
+| Workload | Kore (5× SET P=16) | Valkey (3×) |
+|----------|--------------------|-------------|
+| SET P=16 | **1.11M / 1.05M / 0.98M / 1.01M / 0.98M** (median ~**1.01M**) | **1.28M / 1.30M / 1.28M** |
+| GET P=16 | ~1.55M | (not re-run) |
+| SET P=1 | ~197k | (not re-run) |
+
+**Interpretation:** ~**+17%** pipelined SET vs GW (~0.86M → ~1.01M); ~**79%** of same-session Valkey. Residual is store/Entry clock / multi-worker contention, not the write path. **No portable claim.**
+
 ### Interpretation (host-local only)
 
 - **GC+GD delivered:** SET P=16 in the **~0.73–0.74M** band (GF full suite).
 - **GV:** SET P=16 **~0.81M** band (+~10% vs GF); same-session Valkey ~1.3M (lower than GF’s 1.59M — host/version variance).
 - **GW:** SET P=16 **~0.86M** band (+~6–7% vs GV); same-session Valkey ~1.3M (~**66%** of Valkey).
+- **GX:** SET P=16 **~1.0M** band (+~17% vs GW); same-session Valkey ~1.28M (~**79%** of Valkey).
 - **Non-pipelined** workloads stay close to Valkey.
-- **Pipelined SET** remains the clear gap; next wins need deeper Tokio/runtime or Entry layout work.
+- **Pipelined SET** gap narrowed substantially; remaining residual is deeper store/runtime.
 - **GET P=16** is healthy (~1.4–1.5M); not the primary target.
 - **No Redis column** — package may be Valkey under `redis-*` names. **No portable performance claim.**
 - **CI microbench smoke:** skipped (noisy absolute ops/s); rely on this document + release-time re-run.

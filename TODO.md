@@ -793,11 +793,12 @@ Phases A–E P0 lists are green; prefer **P1 product/perf** over hunting accepte
 
 Ordered execution after **0.7.0**:
 
-1. **GW+** — further SET pipeline residual vs Valkey (Tokio / deeper store) or **0.8.0** release cut
+1. **0.8.0** release cut (or optional GX+ residual if profile shows more)
 2. Optional product residuals: Functions RDB/AOF, BM25, full Redis bus
 
 | Batch | Pri | Track | Scope |
 |-------|-----|-------|--------|
+| **GX** | P1 | Perf | **done** — direct conn I/O (no write-task/mpsc); no per-write timeout; SET P=16 ~1.0M |
 | **GW** | P1 | Perf | **done** — MemoryTracker running total; ACL unrestricted fast path; store size reuse; SET P=16 ~860k |
 | **GV** | P1 | Perf | **done** — SET under-maxmemory skip pre-read; plain SET fast path; SET P=16 ~807k |
 | **GC** | P1 | Perf | **done** — standalone stream skip + store/argv cuts; SET P=16 ~741k vs FI ~621k |
@@ -822,6 +823,12 @@ Ordered execution after **0.7.0**:
 
 Checklist (active):
 
+- [x] **`[P1]`** **Batch GX — Connection I/O for pipeline SET**
+  - Direct write on the connection/reader task: drop per-connection write task + response mpsc hop
+  - No per-write `timeout()` timer (TCP backpressure only; pub/sub lag still disconnects)
+  - Static `+OK\r\n` append; reuse `pipeline_buf`; pub/sub `select!` only while subscribed
+  - Bench (host-local): SET c=50 P=16 ~**0.98–1.11M** ops/s (n=500k, 5 passes; median ~**1.01M**; was GW ~860k); peer Valkey ~1.28M same session (~**79%**)
+  - Residual: still ~0.8× Valkey; store/Entry Instant / multi-worker contention
 - [x] **`[P1]`** **Batch GW — Pipeline SET accounting / ACL / store residual**
   - `MemoryTracker::total` running atomic: `total_memory()` is 1 load (was 9-category sum) on every SET headroom check
   - Open superuser ACL: `is_unrestricted` early-out skips key-spec walk + cmd lowercase on default open ACL

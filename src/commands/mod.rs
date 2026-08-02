@@ -673,7 +673,10 @@ impl CommandHandler {
     }
 
     /// Returns true when the client is in Pub/Sub mode (regular or shard subscriptions).
-    fn in_pubsub_mode(&self) -> bool {
+    ///
+    /// Used by the network loop (Batch GX) to decide whether to multiplex pub/sub
+    /// push delivery with socket reads on the connection task.
+    pub fn in_pubsub_mode(&self) -> bool {
         self.pubsub_subscriptions > 0 || self.shard_subscriptions > 0
     }
 
