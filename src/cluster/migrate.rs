@@ -41,21 +41,21 @@
 //! in `nodes.conf` (`# prepare …`; Batch FO) with wall-clock TTL — expired /
 //! missing votes fail closed on commit re-check.
 //!
-//! **Redis `MIGRATE` (Batch DP/DQ):** key-level transfer reuses
-//! [`snapshot_key`] / [`recreate_commands`] / ASKING / RESP I/O. Options:
-//! `COPY`, `REPLACE`, `AUTH`/`AUTH2`, multi-key via `KEYS`, `timeout` ms,
-//! `destination-db` (SELECT on dest). No DUMP/RESTORE wire format.
+//! **Redis `MIGRATE` (Batch DP/DQ + GG):** key-level transfer. **Batch GG**
+//! prefers **DUMP → RESTORE** wire for core types (string/list/set/hash/zset —
+//! Redis RDB object from Batch FY). Geo/stream still use the RESP
+//! [`snapshot_key`] / [`recreate_commands`] path (KDF1 DUMP is Kore-only;
+//! recreate works against plain Redis dests). Options: `COPY`, `REPLACE`,
+//! `AUTH`/`AUTH2`, multi-key via `KEYS`, `timeout` ms, `destination-db`
+//! (SELECT on dest).
 //!
-//! Supports string, hash, list, set, zset, geo, and stream keys. Dest writes use
-//! ASKING so IMPORTING slots accept the transfer. Complex types are recreated
-//! with the same RESP commands as AOF rewrite (no DUMP/RESTORE).
+//! Dest writes use ASKING so IMPORTING slots accept the transfer.
 //!
-//! **TTL (Batch DT):** expire is snapshotted as **absolute Unix-ms** end time
-//! (`Cache::expire_time_unix_ms`) and applied on dest via string `SET … PXAT` or
-//! trailing `PEXPIREAT`. This preserves the wall-clock end time under migrate
-//! RTT/processing delay (Batch DQ used remaining-ms `PX`/`PEXPIRE`, which could
-//! shrink lifetime). Multi-key mid-batch failure after ≥1 success returns
-//! Redis-style `IOERR` including `migrated=` / `skipped=` counts (Batch DQ).
+//! **TTL (Batch DT + GG):** DUMP/RESTORE path uses `RESTORE … ABSTTL` with
+//! absolute Unix-ms end time when the key has an expire; recreate path still
+//! uses `SET … PXAT` / trailing `PEXPIREAT`. Multi-key mid-batch failure after
+//! ≥1 success returns Redis-style `IOERR` including `migrated=` / `skipped=`
+//! counts (Batch DQ).
 
 use super::crc16::{key_hash_slot, SLOT_COUNT};
 use super::state::ClusterState;
@@ -831,11 +831,124 @@ pub struct MigrateDestAuth {
     pub dest_db: i64,
 }
 
+/// True when MIGRATE should use DUMP→RESTORE (Redis RDB wire, Batch FY/GG).
+///
+/// Geo/stream stay on the RESP recreate path: their DUMP is Kore KDF1, which
+/// plain Redis/Valkey RESTORE rejects.
+#[inline]
+fn migrate_uses_dump_restore(ty: KeyType) -> bool {
+    matches!(
+        ty,
+        KeyType::String | KeyType::List | KeyType::Set | KeyType::Hash | KeyType::ZSet
+    )
+}
+
 /// Transfer a single key over an open destination stream.
 ///
-/// Steps: snapshot → (optional EXISTS/DEL) → ASKING + recreate cmds → source DEL
-/// unless `copy`. Returns [`MigrateOneOutcome::Missing`] when the key is gone or empty.
+/// **Batch GG:** core types use local [`Cache::dump_serialized`] + dest
+/// `RESTORE` (optional `REPLACE` / `ABSTTL`). Geo/stream fall back to
+/// snapshot → ASKING + recreate cmds (Batch DP/DT). Source DEL unless `copy`.
+/// Returns [`MigrateOneOutcome::Missing`] when the key is gone or empty.
 pub async fn migrate_one_key_on_stream(
+    cache: &Cache,
+    stream: &mut TcpStream,
+    key: &Bytes,
+    opts: &MigrateKeyOpts,
+) -> Result<MigrateOneOutcome, String> {
+    let ty = cache.key_type(key);
+    if ty == KeyType::None {
+        return Ok(MigrateOneOutcome::Missing);
+    }
+
+    if migrate_uses_dump_restore(ty) {
+        return migrate_one_key_dump_restore(cache, stream, key, opts).await;
+    }
+
+    migrate_one_key_recreate(cache, stream, key, opts).await
+}
+
+/// Batch GG: DUMP locally, RESTORE on dest (Redis MIGRATE shape).
+async fn migrate_one_key_dump_restore(
+    cache: &Cache,
+    stream: &mut TcpStream,
+    key: &Bytes,
+    opts: &MigrateKeyOpts,
+) -> Result<MigrateOneOutcome, String> {
+    let ctx = "MIGRATE";
+    let payload = match cache.dump_serialized(key) {
+        Some(p) => p,
+        None => return Ok(MigrateOneOutcome::Missing),
+    };
+
+    // Absolute Unix-ms end when set; RESTORE ABSTTL preserves wall-clock expiry
+    // under RTT (same honesty as Batch DT recreate PXAT/PEXPIREAT).
+    let expire_unix_ms = cache.expire_time_unix_ms(key);
+    if expire_unix_ms == -2 {
+        return Ok(MigrateOneOutcome::Missing);
+    }
+
+    let (ttl_arg, use_absttl) = if expire_unix_ms > 0 {
+        (expire_unix_ms, true)
+    } else {
+        (0i64, false)
+    };
+
+    let mut parts: Vec<RespValue> = Vec::with_capacity(6);
+    parts.push(bulk_static(b"RESTORE"));
+    parts.push(RespValue::BulkString(Some(key.clone())));
+    parts.push(RespValue::BulkString(Some(Bytes::from(ttl_arg.to_string()))));
+    parts.push(RespValue::BulkString(Some(payload)));
+    if opts.replace {
+        parts.push(bulk_static(b"REPLACE"));
+    }
+    if use_absttl {
+        parts.push(bulk_static(b"ABSTTL"));
+    }
+
+    issue_asking(stream, opts).await?;
+    match resp_command_bytes(stream, &parts, opts.io_timeout).await {
+        Ok(RespValue::SimpleString(s)) if s.as_ref() == b"OK" => {}
+        Ok(RespValue::Error(e)) => {
+            let msg = String::from_utf8_lossy(&e);
+            // Redis-style BUSYKEY when REPLACE omitted and key exists.
+            if msg.contains("BUSYKEY") {
+                return Err("BUSYKEY Target key name already exists.".into());
+            }
+            return Err(format!(
+                "ERR {} RESTORE failed for key {}: {}",
+                ctx,
+                String::from_utf8_lossy(key),
+                msg
+            ));
+        }
+        Ok(other) => {
+            return Err(format!(
+                "ERR {} unexpected RESTORE reply for key {}: {:?}",
+                ctx,
+                String::from_utf8_lossy(key),
+                other
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "ERR {} RESTORE I/O for key {}: {}",
+                ctx,
+                String::from_utf8_lossy(key),
+                e
+            ));
+        }
+    }
+
+    if !opts.copy {
+        cache
+            .delete(key)
+            .map_err(|e| format!("ERR {} DEL failed after migrate: {}", ctx, e))?;
+    }
+    Ok(MigrateOneOutcome::Migrated)
+}
+
+/// Legacy / geo-stream path: snapshot + multi-command RESP recreate (Batch DP/DT).
+async fn migrate_one_key_recreate(
     cache: &Cache,
     stream: &mut TcpStream,
     key: &Bytes,
@@ -2888,6 +3001,46 @@ mod tests {
             | KeySnapshot::Geo { expire_unix_ms, .. }
             | KeySnapshot::Stream { expire_unix_ms, .. } => *expire_unix_ms,
         }
+    }
+
+    #[test]
+    fn dump_restore_path_selected_for_core_types_not_geo_stream() {
+        // Batch GG: Redis RDB DUMP wire for core types; geo/stream stay recreate.
+        assert!(migrate_uses_dump_restore(KeyType::String));
+        assert!(migrate_uses_dump_restore(KeyType::List));
+        assert!(migrate_uses_dump_restore(KeyType::Set));
+        assert!(migrate_uses_dump_restore(KeyType::Hash));
+        assert!(migrate_uses_dump_restore(KeyType::ZSet));
+        assert!(!migrate_uses_dump_restore(KeyType::Geo));
+        assert!(!migrate_uses_dump_restore(KeyType::Stream));
+        assert!(!migrate_uses_dump_restore(KeyType::None));
+    }
+
+    #[test]
+    fn dump_serialized_roundtrip_matches_restore_for_hash() {
+        // Sanity: FY DUMP payload restores locally (MIGRATE wire uses the same blob).
+        let cache = Cache::new_with_sweep(4, 1024 * 1024, 1024 * 1024, false);
+        let k = Bytes::from_static(b"h-gg");
+        let h = cache.get_or_create_hash(&k).unwrap();
+        {
+            let mut g = h.write();
+            g.hset(Bytes::from_static(b"a"), Bytes::from_static(b"1"));
+            g.hset(Bytes::from_static(b"b"), Bytes::from_static(b"2"));
+        }
+        let blob = cache.dump_serialized(&k).expect("dump");
+        let dest = Cache::new_with_sweep(4, 1024 * 1024, 1024 * 1024, false);
+        dest.restore_serialized(&k, &blob, 0, true, false)
+            .expect("restore");
+        let dh = dest.get_hash(&k).expect("hash on dest");
+        let guard = dh.read();
+        assert_eq!(
+            guard.hget(&Bytes::from_static(b"a")).unwrap().as_ref(),
+            b"1"
+        );
+        assert_eq!(
+            guard.hget(&Bytes::from_static(b"b")).unwrap().as_ref(),
+            b"2"
+        );
     }
 
     #[test]

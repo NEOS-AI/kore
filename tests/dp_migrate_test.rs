@@ -1,4 +1,5 @@
-//! Batch DP/DQ/DT: Redis key-level MIGRATE (RESP recreate; absolute expire).
+//! Batch DP/DQ/DT/GG: Redis key-level MIGRATE (DUMP→RESTORE for core types;
+//! recreate for geo/stream; absolute expire).
 
 use bytes::Bytes;
 use kore::config::Config;
@@ -768,4 +769,91 @@ async fn migrate_cluster_importing_via_asking() {
     let _ = shut_b.send(true);
     let _ = ha.await;
     let _ = hb.await;
+}
+
+/// Batch GG: zset + TTL migrate via DUMP→RESTORE (ABSTTL on dest).
+#[tokio::test(flavor = "multi_thread")]
+async fn migrate_zset_with_ttl_dump_restore() {
+    let pair = spawn_standalone_pair(16920, 16921).await;
+    let mut sa = TcpStream::connect(("127.0.0.1", pair.port_a)).await.unwrap();
+    let mut sb = TcpStream::connect(("127.0.0.1", pair.port_b)).await.unwrap();
+
+    assert_eq!(
+        send_cmd(&mut sa, &["ZADD", "zk", "1.5", "m1", "2.5", "m2"]).await,
+        RespValue::Integer(2)
+    );
+    assert_eq!(
+        send_cmd(&mut sa, &["PEXPIRE", "zk", "60000"]).await,
+        RespValue::Integer(1)
+    );
+    let abs_before = match send_cmd(&mut sa, &["PEXPIRETIME", "zk"]).await {
+        RespValue::Integer(n) => n,
+        other => panic!("PEXPIRETIME: {:?}", other),
+    };
+    assert!(abs_before > 0);
+
+    let port_b = pair.port_b.to_string();
+    assert!(is_ok(
+        &send_cmd(
+            &mut sa,
+            &["MIGRATE", "127.0.0.1", &port_b, "zk", "0", "3000"]
+        )
+        .await
+    ));
+
+    assert_eq!(
+        send_cmd(&mut sa, &["EXISTS", "zk"]).await,
+        RespValue::Integer(0)
+    );
+    assert_eq!(
+        send_cmd(&mut sb, &["ZCARD", "zk"]).await,
+        RespValue::Integer(2)
+    );
+    let abs_after = match send_cmd(&mut sb, &["PEXPIRETIME", "zk"]).await {
+        RespValue::Integer(n) => n,
+        other => panic!("dest PEXPIRETIME: {:?}", other),
+    };
+    // Wall-clock end preserved within a small RTT/processing window.
+    assert!(
+        (abs_after - abs_before).abs() <= 2000,
+        "ABSTTL drift too large: before={abs_before} after={abs_after}"
+    );
+
+    shutdown(pair).await;
+}
+
+/// Batch GG: geo still migrates via recreate path (not Redis DUMP wire).
+#[tokio::test(flavor = "multi_thread")]
+async fn migrate_geo_recreate_path() {
+    let pair = spawn_standalone_pair(16922, 16923).await;
+    let mut sa = TcpStream::connect(("127.0.0.1", pair.port_a)).await.unwrap();
+    let mut sb = TcpStream::connect(("127.0.0.1", pair.port_b)).await.unwrap();
+
+    assert_eq!(
+        send_cmd(
+            &mut sa,
+            &["GEOADD", "cities", "13.361389", "38.115556", "Palermo"]
+        )
+        .await,
+        RespValue::Integer(1)
+    );
+    let port_b = pair.port_b.to_string();
+    assert!(is_ok(
+        &send_cmd(
+            &mut sa,
+            &["MIGRATE", "127.0.0.1", &port_b, "cities", "0", "3000"]
+        )
+        .await
+    ));
+    assert_eq!(
+        send_cmd(&mut sa, &["EXISTS", "cities"]).await,
+        RespValue::Integer(0)
+    );
+    // TYPE geo reports zset; membership via GEOPOS
+    match send_cmd(&mut sb, &["GEOPOS", "cities", "Palermo"]).await {
+        RespValue::Array(a) => assert_eq!(a.len(), 1),
+        other => panic!("GEOPOS: {:?}", other),
+    }
+
+    shutdown(pair).await;
 }

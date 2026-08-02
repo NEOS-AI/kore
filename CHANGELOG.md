@@ -14,9 +14,13 @@ The detailed letter-batch history lives in root [`TODO.md`](TODO.md). This file 
 - **Batch GE** — replication publish: backlog mutex no longer held across replica `try_send`; ordered deferred fan-out via `fanout_order` (feed order still matches backlog). Multi-replica write path only.
 - **Batch GF** — full FD-style re-bench vs Valkey 9 post-GC/GD (Kore SET P=16 ~730k vs Valkey ~1.59M on M3 Pro; host-local only). See `docs/benchmarks.md`.
 
+### Compatibility
+
+- **Batch GG** — `MIGRATE` uses DUMP→RESTORE wire for string/list/set/hash/zset (Redis RDB object from FY); geo/stream still RESP recreate. Absolute expire via `RESTORE ABSTTL`.
+
 ### Planned (see TODO.md → *Next work queue (post-GB)*)
 
-- **GG / GK** — MIGRATE over DUMP/RESTORE; multi-language client smoke CI
+- **GK** — multi-language client smoke CI
 - **GL** — TLS depth (mTLS, dual listener, optional replica-link TLS)
 - **GI / GT–GU** — Redis Functions or search scoring/ANN polish (pick one track)
 

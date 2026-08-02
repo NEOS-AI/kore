@@ -797,7 +797,7 @@ Phases A–E P0 lists are green; prefer **P1 product/perf** over hunting accepte
 
 Ordered execution for the next ~2 weeks of work:
 
-1. **GG + GK** — MIGRATE over DUMP/RESTORE + client-compat CI smoke (GE+GF shipped)
+1. **GK** — multi-language client smoke CI (GG shipped)
 2. **GL** — TLS depth if selling production drop-in
 3. **One differentiator** — either **GI** (Functions) or **GT/GU** (search polish), not both in parallel
 
@@ -807,7 +807,7 @@ Ordered execution for the next ~2 weeks of work:
 | **GD** | P1 | Perf | **done** — `CommandId` length-first dispatch; stack ACL lowercase; enum `is_write` |
 | **GE** | P2 | Perf/ops | **done** — ordered deferred fan-out (short backlog lock; `fanout_order` serializes sends) |
 | **GF** | P1 | Perf | **done** — full re-bench vs Valkey 9; SET P=16 ~730k vs Valkey ~1.59M |
-| **GG** | P1 | Compat | **MIGRATE via DUMP/RESTORE** (FY wire for core types; path still recreate-only) |
+| **GG** | P1 | Compat | **done** — MIGRATE DUMP→RESTORE for core types; geo/stream recreate residual |
 | **GH** | P2 | Compat | DUMP Redis wire for **geo/stream** (still KDF1) |
 | **GI** | P2 | Compat | Redis Functions library (`FUNCTION LOAD` / real `FCALL` beyond stubs) |
 | **GJ** | P2 | Compat | Lua polish: script time limits, `redis.setresp`, deeper `redis.call` surface |
@@ -848,7 +848,12 @@ Checklist (active):
   - SET P=16 median **~729,927** ops/s (GC/GD band); Valkey **~1,587,302**; non-pipeline ~93–94% of Valkey
   - CI microbench smoke skipped (absolute ops/s noisy)
   - See `docs/benchmarks.md` → Batch GF
-- [ ] **`[P1]`** **Batch GG — MIGRATE over DUMP/RESTORE**
+- [x] **`[P1]`** **Batch GG — MIGRATE over DUMP/RESTORE**
+  - Core types (string/list/set/hash/zset): local `dump_serialized` + dest `RESTORE` (+ `REPLACE` / `ABSTTL`)
+  - Geo/stream: still RESP recreate (KDF1 DUMP is Kore-only; recreate works vs Redis dest)
+  - TTL: ABSTTL absolute Unix-ms end (DT honesty on dump path)
+  - Tests: unit path selection + dump/restore hash; e2e zset+TTL + geo recreate; full `dp_migrate_test` 16/16
+  - Residual: geo/stream Redis DUMP wire → **GH**; MIGRATE still not binary-compatible with Redis DUMP of geo/stream
 - [ ] **`[P2]`** **Batch GH — DUMP Redis wire for geo/stream**
 - [ ] **`[P2]`** **Batch GI — Redis Functions library**
 - [ ] **`[P2]`** **Batch GJ — Lua script limits + setresp polish**
