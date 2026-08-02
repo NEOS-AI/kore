@@ -17,12 +17,17 @@ The detailed letter-batch history lives in root [`TODO.md`](TODO.md). This file 
 ### Compatibility
 
 - **Batch GG** — `MIGRATE` uses DUMP→RESTORE wire for string/list/set/hash/zset (Redis RDB object from FY); geo/stream still RESP recreate. Absolute expire via `RESTORE ABSTTL`.
+- **Batch GK** — client smoke script (`scripts/client_smoke.sh`) + GitHub Actions job for redis-cli and redis-py.
+
+### Security
+
+- **Batch GL** — dual TLS listener (`--tls-port`), mTLS (`--tls-auth-clients` + `--tls-ca`), replica→primary TLS (`--tls-replication`).
 
 ### Planned (see TODO.md → *Next work queue (post-GB)*)
 
-- **GK** — multi-language client smoke CI
-- **GL** — TLS depth (mTLS, dual listener, optional replica-link TLS)
+- **GH** — Redis DUMP wire for geo/stream
 - **GI / GT–GU** — Redis Functions or search scoring/ANN polish (pick one track)
+- **GM** — admin HTTP auth + TLS
 
 ### Docs
 

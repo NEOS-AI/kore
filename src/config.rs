@@ -167,6 +167,27 @@ pub struct Config {
     #[arg(long, default_value = "")]
     pub tls_key: String,
 
+    /// Dedicated TLS listen port (Batch GL dual listener).
+    /// When `--tls` and this is **0**, TLS-only on `--port` (legacy).
+    /// When `--tls` and this is **>0**, plain RESP on `--port` and TLS on `--tls-port`.
+    #[arg(long, default_value = "0")]
+    pub tls_port: u16,
+
+    /// CA / client-trust PEM for mTLS and/or replica TLS (Batch GL).
+    /// With `--tls-auth-clients`, clients must present a cert chain trusted by this CA.
+    /// With `--tls-replication`, used as trust root when connecting to the primary
+    /// (falls back to `--tls-cert` if empty).
+    #[arg(long, default_value = "")]
+    pub tls_ca: String,
+
+    /// Require client certificates (mTLS). Requires `--tls` and `--tls-ca`.
+    #[arg(long, default_value = "false")]
+    pub tls_auth_clients: bool,
+
+    /// Use TLS when this node is a replica connecting to its primary (Batch GL).
+    #[arg(long, default_value = "false")]
+    pub tls_replication: bool,
+
     /// Path to ACL rules file for ACL LOAD / ACL SAVE (empty = not configured).
     #[arg(long, default_value = "")]
     pub aclfile: String,
@@ -243,6 +264,10 @@ impl Default for Config {
             tls: false,
             tls_cert: String::new(),
             tls_key: String::new(),
+            tls_port: 0,
+            tls_ca: String::new(),
+            tls_auth_clients: false,
+            tls_replication: false,
             aclfile: String::new(),
             cluster_enabled: false,
             cluster_replica_priority: 100,
@@ -455,9 +480,64 @@ impl Config {
                     self.tls_key
                 )));
             }
+            if self.tls_port != 0 && self.tls_port == self.port {
+                return Err(Error::ConfigError(
+                    "--tls-port must differ from --port (or be 0 for TLS-only)".to_string(),
+                ));
+            }
+            if self.tls_auth_clients {
+                if self.tls_ca.is_empty() {
+                    return Err(Error::ConfigError(
+                        "--tls-auth-clients requires --tls-ca".to_string(),
+                    ));
+                }
+                if !std::path::Path::new(&self.tls_ca).is_file() {
+                    return Err(Error::ConfigError(format!(
+                        "TLS CA file not found: {}",
+                        self.tls_ca
+                    )));
+                }
+            }
+        } else if self.tls_auth_clients || self.tls_port > 0 {
+            return Err(Error::ConfigError(
+                "--tls-auth-clients / --tls-port require --tls".to_string(),
+            ));
+        }
+
+        if self.tls_replication {
+            // Need a trust root: explicit CA or server cert as pin for self-signed.
+            let trust = if !self.tls_ca.is_empty() {
+                self.tls_ca.as_str()
+            } else if !self.tls_cert.is_empty() {
+                self.tls_cert.as_str()
+            } else {
+                return Err(Error::ConfigError(
+                    "--tls-replication requires --tls-ca or --tls-cert as trust root".to_string(),
+                ));
+            };
+            if !std::path::Path::new(trust).is_file() {
+                return Err(Error::ConfigError(format!(
+                    "TLS trust root file not found: {}",
+                    trust
+                )));
+            }
         }
 
         Ok(())
+    }
+
+    /// Trust root path for replica TLS (CA preferred, else server cert).
+    pub fn tls_replication_trust_path(&self) -> Option<&str> {
+        if !self.tls_replication {
+            return None;
+        }
+        if !self.tls_ca.is_empty() {
+            Some(self.tls_ca.as_str())
+        } else if !self.tls_cert.is_empty() {
+            Some(self.tls_cert.as_str())
+        } else {
+            None
+        }
     }
 
     /// Update a configuration value at runtime

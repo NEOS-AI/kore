@@ -797,9 +797,8 @@ Phases A–E P0 lists are green; prefer **P1 product/perf** over hunting accepte
 
 Ordered execution for the next ~2 weeks of work:
 
-1. **GK** — multi-language client smoke CI (GG shipped)
-2. **GL** — TLS depth if selling production drop-in
-3. **One differentiator** — either **GI** (Functions) or **GT/GU** (search polish), not both in parallel
+1. **GH** / differentiator — geo stream Redis DUMP, or **GI** / **GT–GU** (GK+GL shipped)
+2. **GM** — admin HTTP auth+TLS when exposing UI
 
 | Batch | Pri | Track | Scope |
 |-------|-----|-------|--------|
@@ -811,8 +810,8 @@ Ordered execution for the next ~2 weeks of work:
 | **GH** | P2 | Compat | DUMP Redis wire for **geo/stream** (still KDF1) |
 | **GI** | P2 | Compat | Redis Functions library (`FUNCTION LOAD` / real `FCALL` beyond stubs) |
 | **GJ** | P2 | Compat | Lua polish: script time limits, `redis.setresp`, deeper `redis.call` surface |
-| **GK** | P1 | Compat | Client-compat suite (redis-py / redis-rs / ioredis smoke) + CI job |
-| **GL** | P1 | Security | TLS: mTLS, dual listener (plain+TLS), optional replica-link TLS |
+| **GK** | P1 | Compat | **done** — `scripts/client_smoke.sh` + CI (redis-cli + redis-py; ioredis optional) |
+| **GL** | P1 | Security | **done** — mTLS (`--tls-auth-clients`/`--tls-ca`), dual port (`--tls-port`), replica TLS (`--tls-replication`) |
 | **GM** | P2 | Security | admin_http / metrics / deadlock UI: auth + TLS |
 | **GN** | P2 | Cluster | Per-slot config epochs fully in `nodes.conf` |
 | **GO** | P3 | Cluster | Collapse remote CHECKPREPARE→COMMITPREPARE two-RPC window |
@@ -857,8 +856,14 @@ Checklist (active):
 - [ ] **`[P2]`** **Batch GH — DUMP Redis wire for geo/stream**
 - [ ] **`[P2]`** **Batch GI — Redis Functions library**
 - [ ] **`[P2]`** **Batch GJ — Lua script limits + setresp polish**
-- [ ] **`[P1]`** **Batch GK — Multi-language client smoke + CI**
-- [ ] **`[P1]`** **Batch GL — TLS mTLS / dual listener / replica TLS**
+- [x] **`[P1]`** **Batch GK — Multi-language client smoke + CI**
+  - `scripts/client_smoke.sh`: redis-cli (string/hash/list/set/zset, multi-DB `-n`); optional redis-py / ioredis
+  - CI: `.github/workflows/client-smoke.yml` (redis-tools + python3-redis + release build)
+- [x] **`[P1]`** **Batch GL — TLS mTLS / dual listener / replica TLS**
+  - `--tls-port`: plain on `--port` + TLS on dedicated port; `tls_port==0` keeps TLS-only on `--port`
+  - `--tls-auth-clients` + `--tls-ca`: mTLS via rustls `WebPkiClientVerifier`
+  - `--tls-replication`: replica→primary TLS; trust `--tls-ca` or `--tls-cert`
+  - Tests: dual listener, mTLS reject anonymous / accept client cert; existing TLS suite green
 - [ ] **`[P2]`** **Batch GM — Admin HTTP auth + TLS**
 - [ ] **`[P2]`** **Batch GN — Per-slot epochs in nodes.conf**
 - [ ] **`[P3]`** **Batch GO — Single-RPC prepare commit window**

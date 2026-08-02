@@ -16,7 +16,7 @@ use std::io::BufReader;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, watch, Semaphore};
@@ -50,9 +50,22 @@ const WRITE_TIMEOUT_SECS: u64 = 5; // Timeout for write operations
 const WRITE_BATCH_MAX_BYTES: usize = 64 * 1024;
 const MAX_CLIENTS_ERR: &[u8] = b"-ERR max number of clients reached\r\n";
 
-/// Load a rustls server acceptor from PEM cert/key paths.
+/// Load a rustls server acceptor from PEM cert/key paths (no client auth).
 /// Fails fast if files are missing or contain invalid PEM material.
 pub fn load_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<TlsAcceptor> {
+    load_tls_acceptor_ex(cert_path, key_path, None, false)
+}
+
+/// Load TLS acceptor with optional mTLS (Batch GL).
+///
+/// When `require_client_auth` is true, `ca_path` must point at a PEM CA; clients
+/// must present a certificate chain trusted by that CA.
+pub fn load_tls_acceptor_ex(
+    cert_path: &str,
+    key_path: &str,
+    ca_path: Option<&str>,
+    require_client_auth: bool,
+) -> anyhow::Result<TlsAcceptor> {
     let cert_file = File::open(cert_path).map_err(|e| {
         anyhow::anyhow!("Failed to open TLS certificate '{}': {}", cert_path, e)
     })?;
@@ -71,12 +84,55 @@ pub fn load_tls_acceptor(cert_path: &str, key_path: &str) -> anyhow::Result<TlsA
         .map_err(|e| anyhow::anyhow!("Failed to parse TLS private key '{}': {}", key_path, e))?
         .ok_or_else(|| anyhow::anyhow!("No private key found in '{}'", key_path))?;
 
-    let server_config = RustlsServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| anyhow::anyhow!("Invalid TLS cert/key pair: {}", e))?;
+    let server_config = if require_client_auth {
+        let ca = ca_path.ok_or_else(|| {
+            anyhow::anyhow!("mTLS requires a CA path (--tls-ca)")
+        })?;
+        let roots = load_root_store(ca)?;
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|e| anyhow::anyhow!("Invalid TLS client verifier: {}", e))?;
+        RustlsServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs, key)
+            .map_err(|e| anyhow::anyhow!("Invalid TLS cert/key pair: {}", e))?
+    } else {
+        RustlsServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| anyhow::anyhow!("Invalid TLS cert/key pair: {}", e))?
+    };
 
     Ok(TlsAcceptor::from(Arc::new(server_config)))
+}
+
+/// Load PEM CA certs into a rustls root store (mTLS / replica trust).
+pub fn load_root_store(ca_path: &str) -> anyhow::Result<rustls::RootCertStore> {
+    let f = File::open(ca_path)
+        .map_err(|e| anyhow::anyhow!("Failed to open TLS CA '{}': {}", ca_path, e))?;
+    let mut reader = BufReader::new(f);
+    let mut roots = rustls::RootCertStore::empty();
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("Failed to parse TLS CA '{}': {}", ca_path, e))?;
+    if certs.is_empty() {
+        anyhow::bail!("No certificates found in CA file '{}'", ca_path);
+    }
+    for c in certs {
+        roots
+            .add(c)
+            .map_err(|e| anyhow::anyhow!("Failed to add CA cert from '{}': {}", ca_path, e))?;
+    }
+    Ok(roots)
+}
+
+/// Client TLS connector trusting `ca_path` PEMs (replica → primary, Batch GL).
+pub fn load_tls_connector(ca_path: &str) -> anyhow::Result<tokio_rustls::TlsConnector> {
+    let roots = load_root_store(ca_path)?;
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(tokio_rustls::TlsConnector::from(Arc::new(client_config)))
 }
 
 impl Server {
@@ -232,7 +288,37 @@ impl Server {
         let shutdown_tx = shutdown_tx.map(Arc::new);
         let shutdown_nosave = Arc::clone(&self.shutdown_nosave);
         let addr = self.config.socket_addr();
-        let listener = TcpListener::bind(&addr).await?;
+
+        // Batch GL dual listener:
+        // - !tls: plain on --port
+        // - tls && tls_port==0: TLS-only on --port
+        // - tls && tls_port>0: plain on --port, TLS on --tls-port
+        let dual_tls = self.config.tls && self.config.tls_port > 0;
+        let plain_listener = if !self.config.tls || dual_tls {
+            let l = TcpListener::bind(&addr).await?;
+            info!("Kore server listening (plain) on {}", addr);
+            Some(l)
+        } else {
+            None
+        };
+        let tls_listener = if self.config.tls {
+            let tls_addr = if dual_tls {
+                format!("{}:{}", self.config.host, self.config.tls_port)
+                    .parse()
+                    .expect("Invalid TLS socket address")
+            } else {
+                addr
+            };
+            let l = TcpListener::bind(&tls_addr).await?;
+            info!("Kore server listening (TLS) on {}", tls_addr);
+            Some(l)
+        } else {
+            None
+        };
+        // At least one TCP listener must exist.
+        if plain_listener.is_none() && tls_listener.is_none() {
+            return Err(anyhow::anyhow!("no TCP listeners configured"));
+        }
 
         // Optional Unix domain socket (in addition to TCP).
         #[cfg(unix)]
@@ -284,10 +370,23 @@ impl Server {
 
         // Load TLS material once at server start (fail fast on invalid cert/key).
         let tls_acceptor = if self.config.tls {
-            let acceptor = load_tls_acceptor(&self.config.tls_cert, &self.config.tls_key)?;
+            let ca = if self.config.tls_auth_clients {
+                Some(self.config.tls_ca.as_str())
+            } else {
+                None
+            };
+            let acceptor = load_tls_acceptor_ex(
+                &self.config.tls_cert,
+                &self.config.tls_key,
+                ca,
+                self.config.tls_auth_clients,
+            )?;
             info!(
-                "TLS enabled for client connections (cert={}, key={})",
-                self.config.tls_cert, self.config.tls_key
+                "TLS enabled (cert={}, key={}, mTLS={}, dual_port={})",
+                self.config.tls_cert,
+                self.config.tls_key,
+                self.config.tls_auth_clients,
+                dual_tls
             );
             Some(acceptor)
         } else {
@@ -295,7 +394,6 @@ impl Server {
         };
 
         let cache = self.databases.db0();
-        info!("Kore server listening on {}", addr);
         info!("Shards: {}", self.config.shards);
         info!("Databases: {}", self.databases.len());
         info!("Max memory: {} bytes", cache.max_memory());
@@ -355,7 +453,25 @@ impl Server {
                             break;
                         }
                     }
-                    accept = listener.accept() => {
+                    accept = accept_tcp_optional(&plain_listener) => {
+                        match accept {
+                            Ok((socket, peer_addr)) => {
+                                if let Err(e) = socket.set_nodelay(true) {
+                                    warn!("Failed to set TCP_NODELAY for {}: {}", peer_addr, e);
+                                }
+                                self.spawn_client(
+                                    socket,
+                                    peer_addr.to_string(),
+                                    conn_limit.clone(),
+                                    None, // plain
+                                    shutdown_tx.clone(),
+                                    Arc::clone(&shutdown_nosave),
+                                );
+                            }
+                            Err(e) => error!("Failed to accept connection: {}", e),
+                        }
+                    }
+                    accept = accept_tcp_optional(&tls_listener) => {
                         match accept {
                             Ok((socket, peer_addr)) => {
                                 if let Err(e) = socket.set_nodelay(true) {
@@ -370,7 +486,7 @@ impl Server {
                                     Arc::clone(&shutdown_nosave),
                                 );
                             }
-                            Err(e) => error!("Failed to accept connection: {}", e),
+                            Err(e) => error!("Failed to accept TLS connection: {}", e),
                         }
                     }
                     accept = accept_unix_optional(&unix_listener) => {
@@ -400,7 +516,25 @@ impl Server {
                             break;
                         }
                     }
-                    accept = listener.accept() => {
+                    accept = accept_tcp_optional(&plain_listener) => {
+                        match accept {
+                            Ok((socket, peer_addr)) => {
+                                if let Err(e) = socket.set_nodelay(true) {
+                                    warn!("Failed to set TCP_NODELAY for {}: {}", peer_addr, e);
+                                }
+                                self.spawn_client(
+                                    socket,
+                                    peer_addr.to_string(),
+                                    conn_limit.clone(),
+                                    None,
+                                    shutdown_tx.clone(),
+                                    Arc::clone(&shutdown_nosave),
+                                );
+                            }
+                            Err(e) => error!("Failed to accept connection: {}", e),
+                        }
+                    }
+                    accept = accept_tcp_optional(&tls_listener) => {
                         match accept {
                             Ok((socket, peer_addr)) => {
                                 if let Err(e) = socket.set_nodelay(true) {
@@ -415,7 +549,7 @@ impl Server {
                                     Arc::clone(&shutdown_nosave),
                                 );
                             }
-                            Err(e) => error!("Failed to accept connection: {}", e),
+                            Err(e) => error!("Failed to accept TLS connection: {}", e),
                         }
                     }
                 }
@@ -529,6 +663,16 @@ impl Server {
                 debug!("Connection closed from {}", peer_label);
             }
         });
+    }
+}
+
+/// Accept on an optional TCP listener; pending forever when `None` (Batch GL dual).
+async fn accept_tcp_optional(
+    listener: &Option<TcpListener>,
+) -> std::io::Result<(TcpStream, std::net::SocketAddr)> {
+    match listener {
+        Some(l) => l.accept().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -907,6 +1051,10 @@ mod tests {
             tls: false,
             tls_cert: String::new(),
             tls_key: String::new(),
+            tls_port: 0,
+            tls_ca: String::new(),
+            tls_auth_clients: false,
+            tls_replication: false,
             aclfile: String::new(),
             cluster_enabled: false,
             cluster_replica_priority: 100,

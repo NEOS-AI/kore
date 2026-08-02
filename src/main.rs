@@ -160,7 +160,21 @@ fn main() -> anyhow::Result<()> {
         databases.start_background_sweep_all();
 
         // Announce this instance's listen port for REPLCONF / FAILOVER TO matching.
-        persistence.replication.set_announce_port(config.port);
+        // Dual TLS: announce the TLS port when clients should reach us there.
+        let announce = if config.tls && config.tls_port > 0 {
+            config.tls_port
+        } else {
+            config.port
+        };
+        persistence.replication.set_announce_port(announce);
+
+        // Batch GL: replica→primary TLS trust root.
+        if let Some(ca) = config.tls_replication_trust_path() {
+            info!("Replica TLS enabled (trust={})", ca);
+            persistence
+                .replication
+                .set_replica_tls_ca(Some(ca.to_string()));
+        }
 
         // Optional replica-of at startup
         if !config.replicaof.is_empty() {

@@ -215,6 +215,8 @@ pub struct ReplicationManager {
     /// Also held across partial-PSYNC feed registration so a deferred send
     /// cannot duplicate bytes already included in the CONTINUE history.
     fanout_order: Mutex<()>,
+    /// Batch GL: when set, replica → primary link uses TLS with this trust PEM.
+    replica_tls_ca: Mutex<Option<String>>,
 }
 
 impl ReplicationManager {
@@ -244,7 +246,18 @@ impl ReplicationManager {
             slave_priority: AtomicU32::new(100),
             stream_history: AtomicBool::new(false),
             fanout_order: Mutex::new(()),
+            replica_tls_ca: Mutex::new(None),
         })
+    }
+
+    /// Enable TLS on the replica→primary link (Batch GL). `ca_path` is a PEM
+    /// trust root (CA or self-signed server cert). `None` disables.
+    pub fn set_replica_tls_ca(&self, ca_path: Option<String>) {
+        *self.replica_tls_ca.lock() = ca_path;
+    }
+
+    pub fn replica_tls_ca(&self) -> Option<String> {
+        self.replica_tls_ca.lock().clone()
     }
 
     pub fn primary_link_epoch(&self) -> u64 {
@@ -1587,6 +1600,7 @@ impl Default for ReplicationManager {
             slave_priority: AtomicU32::new(100),
             stream_history: AtomicBool::new(false),
             fanout_order: Mutex::new(()),
+            replica_tls_ca: Mutex::new(None),
         }
     }
 }
@@ -1733,11 +1747,47 @@ async fn sync_from_primary(
     addr: &str,
 ) -> Result<()> {
     let link_epoch = repl.primary_link_epoch();
-    let mut stream = TcpStream::connect(addr)
+    let tcp = TcpStream::connect(addr)
         .await
         .map_err(|e| Error::NetworkError(format!("connect primary: {}", e)))?;
-    stream.set_nodelay(true)?;
+    tcp.set_nodelay(true)?;
 
+    // Batch GL: optional TLS wrap for replica→primary.
+    if let Some(ca) = repl.replica_tls_ca() {
+        let connector = crate::network::load_tls_connector(&ca)
+            .map_err(|e| Error::NetworkError(format!("replica TLS config: {}", e)))?;
+        // SNI / name: use hostname portion of addr when present, else localhost.
+        let host = addr
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(addr);
+        let name_str = if host == "127.0.0.1" || host == "::1" {
+            "localhost"
+        } else {
+            host
+        };
+        let server_name = rustls::pki_types::ServerName::try_from(name_str.to_string())
+            .map_err(|e| Error::NetworkError(format!("TLS server name: {}", e)))?;
+        let tls_stream = connector
+            .connect(server_name, tcp)
+            .await
+            .map_err(|e| Error::NetworkError(format!("replica TLS handshake: {}", e)))?;
+        return sync_from_primary_on(databases, repl, addr, link_epoch, tls_stream).await;
+    }
+
+    sync_from_primary_on(databases, repl, addr, link_epoch, tcp).await
+}
+
+async fn sync_from_primary_on<S>(
+    databases: Arc<Databases>,
+    repl: Arc<ReplicationManager>,
+    addr: &str,
+    link_epoch: u64,
+    mut stream: S,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     // Redis-style handshake: announce listening-port before PSYNC so the primary
     // can match FAILOVER TO host port against connected replicas.
     let announce = repl.announce_port();
@@ -1960,11 +2010,14 @@ fn encode_replconf_ack(offset: u64) -> Bytes {
     .serialize()
 }
 
-async fn read_one_value(
-    stream: &mut TcpStream,
+async fn read_one_value<S>(
+    stream: &mut S,
     parser: &mut RespParser,
     buf: &mut [u8],
-) -> Result<RespValue> {
+) -> Result<RespValue>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
     loop {
         if let Some(val) = parser.parse()? {
             return Ok(val);

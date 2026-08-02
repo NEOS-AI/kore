@@ -76,6 +76,10 @@ fn base_config(port: u16) -> Config {
         tls: false,
         tls_cert: String::new(),
         tls_key: String::new(),
+        tls_port: 0,
+        tls_ca: String::new(),
+        tls_auth_clients: false,
+        tls_replication: false,
         aclfile: String::new(),
         cluster_enabled: false,
             cluster_replica_priority: 100,
@@ -302,6 +306,202 @@ async fn tls_reject_plaintext_when_tls_enabled() {
             // Connection closed / timeout / read error is also acceptable.
         }
     }
+
+    drop(stream);
+    server_handle.abort();
+    sleep(Duration::from_millis(100)).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Batch GL: plain on --port and TLS on --tls-port simultaneously.
+#[tokio::test(flavor = "multi_thread")]
+async fn dual_listener_plain_and_tls() {
+    let plain_port = 16610;
+    let tls_port = 16611;
+    let dir = unique_cert_dir("dual");
+    let (cert_path, key_path, cert_der) = write_self_signed_certs(&dir);
+
+    let mut config = base_config(plain_port);
+    config.tls = true;
+    config.tls_port = tls_port;
+    config.tls_cert = cert_path.to_string_lossy().into_owned();
+    config.tls_key = key_path.to_string_lossy().into_owned();
+    config.validate().expect("dual config");
+    let config = Arc::new(config);
+    let cache = Cache::new(config.shards, config.maxmemory);
+    let server = Server::new(cache, config);
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    sleep(Duration::from_millis(300)).await;
+
+    // Plain PING on --port
+    let mut plain = timeout(
+        Duration::from_secs(2),
+        TcpStream::connect(format!("127.0.0.1:{}", plain_port)),
+    )
+    .await
+    .expect("plain connect timeout")
+    .expect("plain connect");
+    let resp = send_command_plain(&mut plain, "*1\r\n$4\r\nPING\r\n")
+        .await
+        .expect("plain PING");
+    assert!(
+        resp.starts_with(b"+PONG"),
+        "plain port should PONG, got {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    // TLS PING on --tls-port
+    let connector = tls_connector_for_cert(&cert_der);
+    let tcp = timeout(
+        Duration::from_secs(2),
+        TcpStream::connect(format!("127.0.0.1:{}", tls_port)),
+    )
+    .await
+    .expect("tls connect timeout")
+    .expect("tls connect");
+    let server_name = ServerName::try_from("localhost").expect("server name");
+    let mut tls = timeout(Duration::from_secs(3), connector.connect(server_name, tcp))
+        .await
+        .expect("handshake timeout")
+        .expect("handshake");
+    let resp = send_command_tls(&mut tls, "*1\r\n$4\r\nPING\r\n")
+        .await
+        .expect("tls PING");
+    assert!(
+        resp.starts_with(b"+PONG"),
+        "tls port should PONG, got {:?}",
+        String::from_utf8_lossy(&resp)
+    );
+
+    drop(plain);
+    drop(tls);
+    server_handle.abort();
+    sleep(Duration::from_millis(100)).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Batch GL: mTLS rejects clients without a cert; accepts with client cert.
+#[tokio::test(flavor = "multi_thread")]
+async fn mtls_requires_client_certificate() {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose,
+    };
+
+    let dir = unique_cert_dir("mtls");
+    let _ = std::fs::create_dir_all(&dir);
+
+    // CA
+    let mut ca_params = CertificateParams::new(vec!["kore-test-ca".into()]).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    let ca_key = KeyPair::generate().unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let ca_path = dir.join("ca.pem");
+    std::fs::write(&ca_path, ca_cert.pem()).unwrap();
+
+    // Server cert signed by CA
+    let mut server_params =
+        CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
+    server_params
+        .distinguished_name
+        .push(DnType::CommonName, "kore-server");
+    let server_key = KeyPair::generate().unwrap();
+    let server_cert = server_params
+        .signed_by(&server_key, &ca_cert, &ca_key)
+        .unwrap();
+    let server_cert_path = dir.join("server.pem");
+    let server_key_path = dir.join("server-key.pem");
+    std::fs::write(&server_cert_path, server_cert.pem()).unwrap();
+    std::fs::write(&server_key_path, server_key.serialize_pem()).unwrap();
+
+    // Client cert signed by CA
+    let mut client_params = CertificateParams::new(vec!["client".into()]).unwrap();
+    client_params
+        .distinguished_name
+        .push(DnType::CommonName, "kore-client");
+    let client_key = KeyPair::generate().unwrap();
+    let client_cert = client_params
+        .signed_by(&client_key, &ca_cert, &ca_key)
+        .unwrap();
+
+    let port = 16612;
+    let mut config = base_config(port);
+    config.tls = true;
+    config.tls_auth_clients = true;
+    config.tls_cert = server_cert_path.to_string_lossy().into_owned();
+    config.tls_key = server_key_path.to_string_lossy().into_owned();
+    config.tls_ca = ca_path.to_string_lossy().into_owned();
+    config.validate().expect("mtls config");
+    let config = Arc::new(config);
+    let cache = Cache::new(config.shards, config.maxmemory);
+    let server = Server::new(cache, config);
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    sleep(Duration::from_millis(300)).await;
+
+    // Client without cert → must not get a working session (handshake fail or
+    // connection drop before/during first command).
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(ca_cert.der().as_ref().to_vec()))
+        .unwrap();
+    let no_client = ClientConfig::builder()
+        .with_root_certificates(roots.clone())
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(no_client));
+    let tcp = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .expect("tcp");
+    let name = ServerName::try_from("localhost").unwrap();
+    let no_cert = timeout(Duration::from_secs(3), connector.connect(name.clone(), tcp)).await;
+    let no_cert_ok = match no_cert {
+        Ok(Ok(mut s)) => {
+            // Some stacks complete the record layer before rejecting; first app
+            // data must not return a clean PONG.
+            match send_command_tls(&mut s, "*1\r\n$4\r\nPING\r\n").await {
+                Ok(resp) if resp.starts_with(b"+PONG") => false,
+                _ => true,
+            }
+        }
+        Ok(Err(_)) | Err(_) => true,
+    };
+    assert!(
+        no_cert_ok,
+        "mTLS must reject anonymous client (handshake or first PING)"
+    );
+
+    // Client with cert → PING works
+    let client_cert_der = CertificateDer::from(client_cert.der().as_ref().to_vec());
+    let client_key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(client_key.serialize_der()),
+    );
+    let with_client = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(vec![client_cert_der], client_key_der)
+        .expect("client auth cert");
+    let connector = TlsConnector::from(Arc::new(with_client));
+    let tcp = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .expect("tcp2");
+    let mut stream = timeout(Duration::from_secs(3), connector.connect(name, tcp))
+        .await
+        .expect("hs timeout")
+        .expect("hs with client cert");
+    let resp = send_command_tls(&mut stream, "*1\r\n$4\r\nPING\r\n")
+        .await
+        .expect("PING");
+    assert!(
+        resp.starts_with(b"+PONG"),
+        "got {:?}",
+        String::from_utf8_lossy(&resp)
+    );
 
     drop(stream);
     server_handle.abort();

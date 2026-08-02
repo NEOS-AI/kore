@@ -28,7 +28,7 @@ Kore speaks the RESP protocol so common Redis clients (`redis-cli`, redis-py, re
 
 ### Security & ops
 - **ACL** users/categories + `ACL LOG`; boot `--aclfile`
-- **TLS** server (`--tls` / cert / key); mTLS / dual listener still TODO
+- **TLS** — `--tls` / cert / key; dual `--tls-port`; mTLS (`--tls-auth-clients` + `--tls-ca`); replica link (`--tls-replication`)
 - **Metrics** — Prometheus text on `--metrics-port`; `HEALTH` / richer `INFO`
 - **Slowlog**, structured JSON logs (`--log-format json`)
 
