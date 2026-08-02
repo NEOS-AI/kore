@@ -30,6 +30,14 @@ impl CommandHandler {
         // the shard write lock — no separate ensure_string_or_absent probe
         // (that was an extra shard read lock per SET).
 
+        // Batch GV: redis-benchmark / plain SET key value — skip option scan.
+        if args.len() == 2 {
+            return match self.cache.store(key, value, StoreOptions::default()) {
+                Ok(_) => Ok(RespValue::ok()),
+                Err(e) => Ok(RespValue::error(e.to_resp_string())),
+            };
+        }
+
         let mut opts = StoreOptions::default();
         let mut i = 2;
 

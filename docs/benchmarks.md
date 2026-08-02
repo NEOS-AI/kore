@@ -435,17 +435,38 @@ p99: **not reported** by this `valkey-benchmark -q` build.
 | **GC** | 2026-08-02 | ~741k | (not re-run) | standalone stream skip |
 | **GD** | 2026-08-02 | ~741k | (not re-run) | CommandId; stays in GC band |
 | **GF** | 2026-08-02 | **~730k** | **~1.59M** | full suite; same host class |
+| **GV** | 2026-08-02 | **~807k** | **~1.30M** | store headroom skip; peer Valkey re-run this session (~1.2–1.3M) |
 
-Non-pipeline SET/GET/INCR: Kore **~93–94%** of Valkey on this run (e.g. SET P=1 196k vs 210k). Pipelined SET: Kore **~46%** of Valkey (~0.73M vs ~1.59M) — gap magnitude matches FI-era Valkey absolute; GC closed most of the multi-threaded standalone tax but pipeline write path remains the dominant residual.
+Non-pipeline SET/GET/INCR: Kore **~93–94%** of Valkey on GF (e.g. SET P=1 196k vs 210k). Pipelined SET: GF ~**46%** of Valkey (~0.73M vs ~1.59M); **GV** ~**62%** of same-session Valkey (~0.81M vs ~1.30M) after store pre-check cut.
+
+#### Batch GV (2026-08-02) — SET capacity pre-check + plain SET fast path
+
+**Problem:** Even with GC standalone stream skip, each `store` under non-zero maxmemory did a **shard read** (`get_string_entry`) to credit replace size, then `ensure_capacity` re-summed totals — pure tax when far under the cap (default maxmemory ≈ 80% RAM).
+
+**Cuts:**
+1. If `used + entry_size ≤ maxmemory`, skip replace-size probe and skip `ensure_capacity` (mutate still accounts).
+2. Near the cap: keep existing-size credit so replace under pressure can succeed.
+3. Plain `SET key value` (arity 2) skips the option-token scan loop.
+
+**Host-local spot check** (M3-class, `redis-benchmark -c 50 -n 200000`, Kore `--save ""` :6380; Valkey :6378):
+
+| Workload | Kore (3 passes) | Valkey (3 passes) |
+|----------|-----------------|-------------------|
+| SET P=16 | **803k / 806k / 813k** | **1.20M / 1.31M / 1.29M** |
+| GET P=16 | ~1.50M | (not re-run) |
+| SET P=1 | ~188k | (not re-run) |
+
+**Interpretation:** ~**+10–12%** pipelined SET vs GF band without changing semantics. Residual ~**0.6×** Valkey on this host — still multi-worker Tokio + remaining store/accounting cost. **No portable claim.**
 
 ### Interpretation (host-local only)
 
-- **GC+GD delivered:** SET P=16 remains in the **~0.73–0.74M** band (within noise of GC/GD spot checks; GF full suite median slightly below GC’s ~741k single-workload focus — expected host variance).
-- **Non-pipelined** workloads are close to Valkey (single-digit to low-teens percent gap) — same story as FD.
-- **Pipelined SET** is still the clear gap (~2.2× Valkey on this host). Likely residual: multi-worker Tokio contention + store/write path cost (not standalone repl stream — GC already skipped that). Optional **GE** (multi-replica publish parallelization) does **not** address this pure-standalone redis-benchmark path.
-- **GET P=16** is healthy (~1.5M) but below Valkey’s ~2.0M on this run; not the primary investigation target.
-- **No Redis column** — package is Valkey under `redis-*` names. **No portable performance claim.**
-- **CI microbench smoke:** skipped (would be noisy absolute ops/s or a slow job); rely on this document + release-time re-run.
+- **GC+GD delivered:** SET P=16 in the **~0.73–0.74M** band (GF full suite).
+- **GV:** SET P=16 **~0.81M** band (+~10% vs GF); same-session Valkey ~1.3M (lower than GF’s 1.59M — host/version variance).
+- **Non-pipelined** workloads stay close to Valkey.
+- **Pipelined SET** remains the clear gap; next wins need deeper store/Tokio work, not repl stream.
+- **GET P=16** is healthy (~1.5M); not the primary target.
+- **No Redis column** — package may be Valkey under `redis-*` names. **No portable performance claim.**
+- **CI microbench smoke:** skipped (noisy absolute ops/s); rely on this document + release-time re-run.
 
 ## Vector search (HNSW vs FLAT) — methodology
 

@@ -288,19 +288,25 @@ impl Cache {
             std::mem::size_of::<Entry>(),
         );
 
-        // Rough pre-check: account for memory that would be freed on replace.
-        // When maxmemory is unlimited, skip the extra shard read (Batch FI).
+        // Capacity pre-check (Batch GV):
+        // - unlimited maxmemory → no probe
+        // - under headroom for a *full new* entry → skip shard read *and* ensure_capacity
+        //   (redis-benchmark / typical loads stay here; avoids 2× shard traffic per SET)
+        // - near the cap → credit existing size so replace under pressure can succeed
         let max_memory = self.max_memory.load(Ordering::Relaxed);
-        let net_memory_change = if max_memory == 0 {
-            entry_size
-        } else {
-            let existing_size = self
-                .get_string_entry(&key)
-                .map(|e| e.size())
-                .unwrap_or(0);
-            entry_size.saturating_sub(existing_size)
-        };
-        self.ensure_capacity(net_memory_change)?;
+        if max_memory != 0 {
+            let used = self.memory_tracker.total_memory();
+            if used.saturating_add(entry_size) > max_memory {
+                let existing_size = self
+                    .get_string_entry(&key)
+                    .map(|e| e.size())
+                    .unwrap_or(0);
+                let net = entry_size.saturating_sub(existing_size);
+                self.ensure_capacity(net)?;
+            }
+            // else: headroom for a full new entry — mutate path still accounts;
+            // over-account risk on concurrent alloc is handled by ensure on tight path.
+        }
 
         // Resolve absolute expiration outside the lock (keepttl handled under lock)
         let expires_at = Self::resolve_expiration(&opts);

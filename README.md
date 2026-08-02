@@ -93,7 +93,7 @@ CI (GitHub Actions) runs `cargo build --all-targets` and `cargo test --all-targe
 
 See [docs/benchmarks.md](docs/benchmarks.md). Methodology: host-local `redis-benchmark` with persistence off, vs Valkey when available.
 
-Indicative (M3 Pro, Batch GC/GF): standalone SET pipeline P=16 ~**730–740k** ops/s; Valkey on the same host ~**1.6M**. Non-pipeline paths track Valkey more closely. Absolute numbers are host-dependent.
+Indicative (host-local): SET pipeline P=16 ~**0.81M** ops/s after Batch **GV** (GF band ~0.73M; GC ~0.74M). Same-session Valkey ~**1.2–1.3M** (GF-era Valkey ~1.6M — host variance). Non-pipeline paths track Valkey more closely. See [docs/benchmarks.md](docs/benchmarks.md).
 
 ---
 

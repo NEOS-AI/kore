@@ -20,10 +20,11 @@ The detailed letter-batch history lives in root [`TODO.md`](TODO.md). This file 
 - **GQ** — Parallel Sentinel peer PINGs and replica `slave_priority` INFO probes.
 - **GR** — HNSW bridge reconnect prune floor `max(max_m, 2)` so upper-layer `M=1` path middles keep both spanning edges (not a global insert degree change).
 - **GS** — Search-doc access-touch for LRU/LFU: FT search hits update per-doc `last_access` (+ packed LFU); `allkeys-lru` sampling uses real times so hot FT docs can outrank cold ones. Still not volatile victims.
+- **GV** — Pipeline SET: skip replace-size shard read / ensure_capacity when under maxmemory headroom; 2-arg SET fast path. Indicative SET P=16 ~**0.81M** ops/s (was ~0.73M GF band).
 
 ### Planned (see TODO.md)
 
-- Optional further residuals only (full Redis cluster bus, BM25 stemmers, …)
+- Further SET residual vs Valkey; optional 0.8.0 release cut; Functions RDB/AOF; BM25
 
 ## [0.7.0] — 2026-08-02
 

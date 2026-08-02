@@ -751,7 +751,7 @@ Also tracked in `docs/roadmap.md`.
 | Area | Residual | Priority | Planned batch |
 |------|----------|----------|---------------|
 | Docs / release | **0.7.0** + `docs/ops.md` | **done** | **GC-rel** |
-| Perf | Pipeline SET gap vs Valkey (~0.73M vs ~1.59M GF) | P1 residual | store path later |
+| Perf | Pipeline SET gap vs Valkey (GV ~0.81M vs ~1.3M host-local; was ~0.73M GF) | P1 residual | further store/Tokio |
 | Ops | Global repl backlog ordered publish residual | P3 residual | after GE |
 | Compat | stream listpack foreign DUMP fixtures; geo restore as zset | P3 residual | — |
 | Compat | Redis Functions library + real FCALL (**GI** done) | **P2** | — |
@@ -793,10 +793,12 @@ Phases A–E P0 lists are green; prefer **P1 product/perf** over hunting accepte
 
 Ordered execution after **0.7.0**:
 
-1. Optional P3 residuals only when production needs them (GP binary bus, GR/GS search polish, …)
+1. **GV+** — further SET pipeline residual vs Valkey (or 0.8.0 release cut)
+2. Optional product residuals: Functions RDB/AOF, BM25, full Redis bus
 
 | Batch | Pri | Track | Scope |
 |-------|-----|-------|--------|
+| **GV** | P1 | Perf | **done** — SET under-maxmemory skip pre-read; plain SET fast path; SET P=16 ~807k |
 | **GC** | P1 | Perf | **done** — standalone stream skip + store/argv cuts; SET P=16 ~741k vs FI ~621k |
 | **GD** | P1 | Perf | **done** — `CommandId` length-first dispatch; stack ACL lowercase; enum `is_write` |
 | **GE** | P2 | Perf/ops | **done** — ordered deferred fan-out (short backlog lock; `fanout_order` serializes sends) |
@@ -819,6 +821,11 @@ Ordered execution after **0.7.0**:
 
 Checklist (active):
 
+- [x] **`[P1]`** **Batch GV — Pipeline SET store pre-check cut**
+  - Skip `get_string_entry` replace-size probe + `ensure_capacity` when `used + entry_size ≤ maxmemory`
+  - Plain `SET key value` (2-arg) skips option parse loop
+  - Bench (host-local): SET c=50 P=16 ~**803–813k** ops/s (3 passes; was GF ~730k); peer Valkey ~1.2–1.3M same session
+  - Residual: still ~0.6× Valkey pipelined SET; multi-worker Tokio + remaining store cost
 - [x] **`[P1]`** **Batch GC — Pipeline SET profile + hot-path cuts**
   - Standalone `needs_stream_publish` skip (encode + backlog); `arm_stream_history` for tests
   - `maybe_persist` / `on_write_command` early path; static write-cmd Bytes; SET option parse without String; drop pre-store type probe; map overwrite without key clone
