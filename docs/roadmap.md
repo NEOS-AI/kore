@@ -5,7 +5,7 @@
 - [x] Support for Redis Pub-Sub
 - **Committed through FW–GB** (ANN HNSW, AOF graph, Redis DUMP/RESTORE, search eviction, Entry TTL retirement, repl publish barrier). Baseline A–E green; `main` synced with origin.
 - **Next stream (post-GB):** productization / perf / compat — letter batches **GC+**. See root `TODO.md` → *Next work queue (post-GB)*.
-  - **[x] GC** pipeline SET standalone skip (~+19% SET P=16 vs FI). **[x] GD** `CommandId` enum dispatch. Next: **GE–GF** → **GG/GK** MIGRATE wire + client smoke → **GL** TLS → one differentiator (**GI** / **GT–GU**).
+  - **[x] GC** pipeline SET standalone skip. **[x] GD** `CommandId` dispatch. **[x] GE** ordered deferred repl fan-out. **[x] GF** re-bench vs Valkey. Next: **GG/GK** MIGRATE wire + client smoke → **GL** TLS → one differentiator (**GI** / **GT–GU**).
 
 ## Persistence / search letter batches (recent)
 
@@ -118,7 +118,8 @@ Tracked in detail in root `TODO.md`. High level:
 - [ ] **Next (see `TODO.md` post-GB):** GC+ productization / perf / compat
   - [x] GC pipeline SET standalone skip + hot-path cuts
   - [x] GD CommandId enum dispatch + ACL lower alloc
-  - [ ] GE–GF multi-replica publish / re-bench (optional)
+  - [x] GE ordered deferred repl fan-out
+  - [x] GF full re-bench vs Valkey 9
   - [ ] GG MIGRATE via DUMP/RESTORE; GK client smoke CI
   - [ ] GL TLS depth; optional GI Functions or GT/GU search polish
 - [x] 데드락 감지 고급 기능

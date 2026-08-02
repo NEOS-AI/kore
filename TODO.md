@@ -797,17 +797,16 @@ Phases A–E P0 lists are green; prefer **P1 product/perf** over hunting accepte
 
 Ordered execution for the next ~2 weeks of work:
 
-1. **GE–GF** — multi-replica publish / re-bench (GC+GD shipped; SET P=16 in ~0.74M band)
-2. **GG + GK** — MIGRATE over DUMP/RESTORE + client-compat CI smoke
-3. **GL** — TLS depth if selling production drop-in
-4. **One differentiator** — either **GI** (Functions) or **GT/GU** (search polish), not both in parallel
+1. **GG + GK** — MIGRATE over DUMP/RESTORE + client-compat CI smoke (GE+GF shipped)
+2. **GL** — TLS depth if selling production drop-in
+3. **One differentiator** — either **GI** (Functions) or **GT/GU** (search polish), not both in parallel
 
 | Batch | Pri | Track | Scope |
 |-------|-----|-------|--------|
 | **GC** | P1 | Perf | **done** — standalone stream skip + store/argv cuts; SET P=16 ~741k vs FI ~621k |
 | **GD** | P1 | Perf | **done** — `CommandId` length-first dispatch; stack ACL lowercase; enum `is_write` |
-| **GE** | P2 | Perf/ops | Further repl publish parallelization (async fanout / concurrent snapshot + backlog) — only if multi-replica write path matters |
-| **GF** | P1 | Perf | Re-run FD bench suite post-GC/GD; optional Redis (non-Valkey) column; optional CI microbench smoke |
+| **GE** | P2 | Perf/ops | **done** — ordered deferred fan-out (short backlog lock; `fanout_order` serializes sends) |
+| **GF** | P1 | Perf | **done** — full re-bench vs Valkey 9; SET P=16 ~730k vs Valkey ~1.59M |
 | **GG** | P1 | Compat | **MIGRATE via DUMP/RESTORE** (FY wire for core types; path still recreate-only) |
 | **GH** | P2 | Compat | DUMP Redis wire for **geo/stream** (still KDF1) |
 | **GI** | P2 | Compat | Redis Functions library (`FUNCTION LOAD` / real `FCALL` beyond stubs) |
@@ -836,8 +835,19 @@ Checklist (active):
   - Main dispatch + write gate + slowlog skip + pubsub allowlist match on enum
   - ACL / cluster key-spec: stack lowercase (no `to_ascii_lowercase` String)
   - Bench: SET P=16 stays in GC band (~741k median); structural/hygiene win — see `docs/benchmarks.md` Batch GD
-- [ ] **`[P2]`** **Batch GE — Repl publish further parallelization** (optional)
-- [ ] **`[P1]`** **Batch GF — Re-bench vs Valkey (+ optional Redis column / CI smoke)**
+- [x] **`[P2]`** **Batch GE — Repl publish ordered deferred fan-out**
+  - Under backlog lock: SELECT + append + offset only; release before `try_send`
+  - `fanout_order` taken while holding backlog (append order == send order); N==0 skips fan-out
+  - Partial PSYNC holds `fanout_order` across register (no CONTINUE/history double-send)
+  - Fullsync barrier unchanged; FI-2 multi-DB atomicity preserved
+  - Tests: `multi_writer_live_feeds_match_backlog_order`, `multi_replica_serial_set_same_ordered_payloads`, `partial_psync_no_duplicate_with_concurrent_publish`
+  - Residual: backlog still serializes append; fan-out globally ordered (not parallel per-replica)
+- [x] **`[P1]`** **Batch GF — Re-bench vs Valkey (+ optional Redis column / CI smoke)**
+  - Full FD suite (SET/GET P=1 & P=16, INCR, d=256); warm-up + 3 passes; median ops/s + p50
+  - Kore **0.6.0** git `ffefd35` vs Valkey **9.0.0** on :6378; Redis column N/A (Homebrew redis → Valkey)
+  - SET P=16 median **~729,927** ops/s (GC/GD band); Valkey **~1,587,302**; non-pipeline ~93–94% of Valkey
+  - CI microbench smoke skipped (absolute ops/s noisy)
+  - See `docs/benchmarks.md` → Batch GF
 - [ ] **`[P1]`** **Batch GG — MIGRATE over DUMP/RESTORE**
 - [ ] **`[P2]`** **Batch GH — DUMP Redis wire for geo/stream**
 - [ ] **`[P2]`** **Batch GI — Redis Functions library**

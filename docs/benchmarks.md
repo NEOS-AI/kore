@@ -335,6 +335,118 @@ Pass-level raw ops/s (FI):
 
 **Interpretation:** After GC removed standalone stream work, enum dispatch is a **structure / alloc hygiene** win (no extra `String` lowercasing; cheaper write classification). Absolute SET P=16 stays in the GC band; further gains need store-path / Tokio path work (**GE** / dual-key `Entry` residual) rather than more dispatch micro-opts. No Valkey re-measure this batch.
 
+#### Batch GE (2026-08-02) — Repl publish ordered deferred fan-out
+
+**Problem:** After GB, every `propagate_*` still held the global backlog mutex across lazy SELECT + append **and** `try_send` to every live replica feed. With N>0 replicas, concurrent writers serialized appends behind fan-out work (and partial PSYNC held backlog across register).
+
+**Shipped (ordered deferred fan-out — not true parallel send):**
+
+1. Under the backlog mutex: SELECT decision, append, `master_repl_offset` only.
+2. When `connected_replicas > 0`, acquire `fanout_order` **while still holding** the backlog lock (so acquisition order matches append order), then **release backlog** and `try_send` under `fanout_order` + the replicas list lock.
+3. When `connected_replicas == 0`, no fan-out work (unchanged fast path; GC standalone skip still applies).
+4. Partial PSYNC takes `fanout_order` across feed registration so CONTINUE history and a deferred send cannot double-deliver the same payload.
+5. Fullsync barrier (`publish_enter` / `writers_in_publish` / `fullsync_in_progress`) unchanged.
+
+**Invariant preserved:** feed order across concurrent writers matches backlog append order (FI-2 / GB). Partial PSYNC still uses the same backlog.
+
+**Not claimed:** True parallel fan-out to replicas (unsafe without a global sequencer for feed order); Valkey pipeline SET parity; no redis-benchmark re-measure this batch (multi-replica path is not the FD standalone SET workload).
+
+**Residual:** Backlog mutex still serializes SELECT+append (inherent with stream `selected_db`); fan-out remains **globally ordered** on `fanout_order` (one publisher sends at a time). Full-resync still blocks publishers for RDB snapshot duration. Further wins would need concurrent snapshot + backlog catch-up or accepting unordered feeds (not Redis-compatible).
+
+**Tests:** lib `multi_writer_live_feeds_match_backlog_order`, `multi_replica_serial_set_same_ordered_payloads`, `partial_psync_no_duplicate_with_concurrent_publish`; existing `persistence::replication` + `aof_select_concurrency_test` + `replication_test`.
+
+## Batch GF (2026-08-02) — Full re-bench vs Valkey post-GC/GD
+
+Full FD-style suite after Batches **GC** (standalone stream skip + store cuts) and **GD** (`CommandId` dispatch). Same methodology as Batch FD: warm-up discarded, **3** measured passes, **median** ops/s and p50. Host-local only — **not** a portable win claim.
+
+### Environment
+
+| Field | Value |
+|-------|--------|
+| Date | 2026-08-02 |
+| Host / CPU | Apple M3 Pro (11 logical CPUs), 18 GB RAM |
+| OS | macOS 26.3.1 (Darwin 25.3.0 arm64) |
+| Kore | **0.6.0** release post-GC+GD; git `ffefd35`; `cargo build --release`; default `--threads 0` (= ncpu); `--host 127.0.0.1 --port 6380 --save ""` (AOF off); `--dir /tmp/kore-bench-gf` |
+| Redis | **Not measured** — Homebrew `redis-server` is a symlink to **Valkey 9.0.0** (no separate Redis package on this host); port 6379 held by unrelated long-running Valkey (did not stop user daemons) |
+| Valkey | **9.0.0** (`valkey-server` Homebrew build `28c4ffd24ca1d1ff`); `127.0.0.1:6378 --save "" --appendonly no --dir /tmp/valkey-bench-gf` |
+| Client | `valkey-benchmark` 9.0.0 (`redis-benchmark` symlink); loopback only |
+| Power | default turbo / power management (not pinned) |
+| Method | warm-up suite discarded; **3** measured passes alternating Kore/Valkey; table = **median** ops/s (and median p50) |
+
+### Flags used (identical client flags on both servers)
+
+```text
+# baseline
+valkey-benchmark -h 127.0.0.1 -p PORT -t set,get -n 100000 -q -c 50 -P 1
+# pipelined
+valkey-benchmark -h 127.0.0.1 -p PORT -t set,get -n 100000 -q -c 50 -P 16
+# INCR
+valkey-benchmark -h 127.0.0.1 -p PORT -t incr -n 100000 -q -c 50
+# larger values
+valkey-benchmark -h 127.0.0.1 -p PORT -t set,get -n 100000 -q -c 50 -d 256
+```
+
+Quiet mode (`-q`) reports **p50 only** (no p99 in this client build).
+
+### Throughput (ops/s, median of 3)
+
+| Workload | Kore | Redis | Valkey 9.0.0 (:6378) | Notes |
+|----------|------|-------|----------------------|-------|
+| SET c=50 P=1 | **196,078** | — | **209,644** | baseline; value size default (3 bytes) |
+| GET c=50 P=1 | **195,695** | — | **209,205** | |
+| SET c=50 P=16 | **729,927** | — | **1,587,302** | pipeline; primary residual |
+| GET c=50 P=16 | **1,492,537** | — | **2,000,000** | |
+| INCR c=50 | **193,424** | — | **209,205** | |
+| SET c=50 P=1 d=256 | **191,939** | — | **207,900** | larger payload |
+| GET c=50 P=1 d=256 | **194,175** | — | **209,644** | |
+
+Pass-level raw ops/s (for audit):
+
+| Workload | Kore passes | Valkey passes |
+|----------|-------------|---------------|
+| SET P=1 | 196464 / 196078 / 192308 | 212314 / 207900 / 209644 |
+| GET P=1 | 195695 / 194932 / 195695 | 209205 / 209205 / 210970 |
+| SET P=16 | 724638 / 729927 / 740741 | 1587302 / 1587302 / 1587302 |
+| GET P=16 | 1492537 / 1492537 / 1492537 | 2000000 / 2000000 / 1960784 |
+| INCR | 196078 / 192678 / 193424 | 210970 / 209205 / 200401 |
+| SET d=256 | 191939 / 188324 / 192308 | 207900 / 207469 / 208333 |
+| GET d=256 | 194175 / 192308 / 194553 | 210084 / 209205 / 209644 |
+
+### Latency p50 (msec, median of 3)
+
+| Workload | Kore p50 | Valkey p50 | Notes |
+|----------|----------|------------|-------|
+| SET c=50 P=1 | 0.135 | 0.127 | |
+| GET c=50 P=1 | 0.135 | 0.127 | |
+| SET c=50 P=16 | 1.071 | 0.447 | pipeline batch latency (higher is expected) |
+| GET c=50 P=16 | 0.431 | 0.343 | |
+| INCR c=50 | 0.135 | 0.127 | |
+| SET c=50 P=1 d=256 | 0.143 | 0.127 | |
+| GET c=50 P=1 d=256 | 0.143 | 0.127 | |
+
+p99: **not reported** by this `valkey-benchmark -q` build.
+
+### Comparison to FD / FI / GC / GD (SET pipeline focus)
+
+| Batch | Date | Kore SET P=16 | Valkey SET P=16 | Notes |
+|-------|------|---------------|-----------------|-------|
+| **FD** | 2026-07-25 | ~498k | ~1.52M | pre-FI baseline |
+| **FI** | 2026-07-25 | ~621k | ~1.59M | AOF-off / repl hot-path cuts |
+| **GC** | 2026-08-02 | ~741k | (not re-run) | standalone stream skip |
+| **GD** | 2026-08-02 | ~741k | (not re-run) | CommandId; stays in GC band |
+| **GF** | 2026-08-02 | **~730k** | **~1.59M** | full suite; same host class |
+
+Non-pipeline SET/GET/INCR: Kore **~93–94%** of Valkey on this run (e.g. SET P=1 196k vs 210k). Pipelined SET: Kore **~46%** of Valkey (~0.73M vs ~1.59M) — gap magnitude matches FI-era Valkey absolute; GC closed most of the multi-threaded standalone tax but pipeline write path remains the dominant residual.
+
+### Interpretation (host-local only)
+
+- **GC+GD delivered:** SET P=16 remains in the **~0.73–0.74M** band (within noise of GC/GD spot checks; GF full suite median slightly below GC’s ~741k single-workload focus — expected host variance).
+- **Non-pipelined** workloads are close to Valkey (single-digit to low-teens percent gap) — same story as FD.
+- **Pipelined SET** is still the clear gap (~2.2× Valkey on this host). Likely residual: multi-worker Tokio contention + store/write path cost (not standalone repl stream — GC already skipped that). Optional **GE** (multi-replica publish parallelization) does **not** address this pure-standalone redis-benchmark path.
+- **GET P=16** is healthy (~1.5M) but below Valkey’s ~2.0M on this run; not the primary investigation target.
+- **No Redis column** — package is Valkey under `redis-*` names. **No portable performance claim.**
+- **CI microbench smoke:** skipped (would be noisy absolute ops/s or a slow job); rely on this document + release-time re-run.
+
 ## Vector search (HNSW vs FLAT) — methodology
 
 Generic `redis-benchmark` does not cover RediSearch vectors. For Kore-internal

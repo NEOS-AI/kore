@@ -191,7 +191,8 @@ pub struct ReplicationManager {
     /// [`Self::publish_enter`] and the fullsync path waits for
     /// [`Self::writers_in_publish`] to reach zero before snapshot+register.
     /// Replaces a process-wide `Mutex` gate so the common path (no fullsync)
-    /// only serializes on the backlog lock for SELECT+append+ordered fanout.
+    /// only serializes on the backlog lock for SELECT+append (fan-out is
+    /// ordered separately — Batch GE).
     fullsync_in_progress: AtomicBool,
     /// Count of threads inside the publish section (after `publish_enter`,
     /// before `publish_exit`). Fullsync spins until this is 0.
@@ -207,6 +208,13 @@ pub struct ReplicationManager {
     /// partial can still cover disconnect windows. Cleared with the backlog
     /// on promote / clear.
     stream_history: AtomicBool,
+    /// Batch GE: serializes ordered feed sends across concurrent publishers.
+    /// Acquired **while still holding the backlog mutex** (after append) so
+    /// acquisition order matches backlog order, then the backlog is released
+    /// before `try_send` so other writers can append during fan-out.
+    /// Also held across partial-PSYNC feed registration so a deferred send
+    /// cannot duplicate bytes already included in the CONTINUE history.
+    fanout_order: Mutex<()>,
 }
 
 impl ReplicationManager {
@@ -235,6 +243,7 @@ impl ReplicationManager {
             writers_in_publish: AtomicUsize::new(0),
             slave_priority: AtomicU32::new(100),
             stream_history: AtomicBool::new(false),
+            fanout_order: Mutex::new(()),
         })
     }
 
@@ -279,7 +288,8 @@ impl ReplicationManager {
     // Invariant: a full-resync never snapshots+registers while a writer is in
     // the publish section, and a writer never appends/fanouts while a
     // full-resync is between setting `fullsync_in_progress` and clearing it
-    // after register. Common path: no Mutex — only the backlog lock.
+    // after register. Common path: backlog lock for SELECT+append; Batch GE
+    // releases backlog before try_send under `fanout_order`.
 
     /// Enter the publish section. Waits out any in-progress full-resync.
     #[inline]
@@ -617,9 +627,17 @@ impl ReplicationManager {
     /// writers can encode in parallel. Under the backlog mutex (Batch GB:
     /// no separate `fullsync_gate` Mutex on the hot path):
     /// decide whether to emit `SELECT`, append SELECT+cmd (one payload) or
-    /// cmd alone, update `selected_db`, and fan out under the same lock so
-    /// feed order matches backlog order. The fullsync barrier
-    /// ([`Self::publish_enter`]) only waits when a full-resync is in progress.
+    /// cmd alone, and update `selected_db` + offset.
+    ///
+    /// **Batch GE:** when live replicas exist, `fanout_order` is taken while
+    /// still holding the backlog lock (so feed send order matches append
+    /// order), then the backlog is **released before** `try_send` so concurrent
+    /// writers can append during fan-out. When `connected_replicas == 0`, no
+    /// fan-out work (fast path). Partial PSYNC registration also takes
+    /// `fanout_order` so CONTINUE history and deferred sends do not double-deliver.
+    ///
+    /// The fullsync barrier ([`Self::publish_enter`]) only waits when a
+    /// full-resync is in progress.
     ///
     /// That critical section prevents the AOF-off multi-DB race where one
     /// writer’s SELECT-less command could land on the stream before another
@@ -653,7 +671,10 @@ impl ReplicationManager {
         // two atomic ops only — no Mutex.
         self.publish_enter();
 
-        {
+        // Batch GE: under backlog only SELECT + append + offset; acquire
+        // `fanout_order` before dropping backlog so send order == append order,
+        // then fan out after the backlog mutex is free.
+        let fanout = {
             let mut bl = self.backlog.lock();
             let emit_select = match bl.selected_db {
                 Some(prev) => prev != db,
@@ -675,10 +696,19 @@ impl ReplicationManager {
             self.note_stream_append();
             self.master_repl_offset
                 .store(bl.end_offset(), Ordering::Relaxed);
-            // Fan-out under the backlog lock so (1) feed order matches append
-            // order across writers and (2) partial PSYNC (also takes backlog)
-            // cannot register between SELECT+cmd append and send.
-            self.fanout_to_replicas_locked(&payload);
+
+            if self.connected_replicas.load(Ordering::Relaxed) == 0 {
+                None
+            } else {
+                // Hold fanout_order across the backlog drop so a later appender
+                // cannot overtake us on the feeds.
+                let order = self.fanout_order.lock();
+                Some((order, payload))
+            }
+        };
+
+        if let Some((_order, payload)) = fanout {
+            self.fanout_to_replicas(&payload);
         }
 
         self.publish_exit();
@@ -699,15 +729,24 @@ impl ReplicationManager {
         self.publish_enter();
 
         // Always append to backlog (even with no replicas) so reconnecting
-        // replicas can PSYNC if they reconnect quickly. Fan-out under the
-        // same lock for stream order (see `propagate_write_encoded`).
-        {
+        // replicas can PSYNC if they reconnect quickly. Ordered fan-out is
+        // deferred off the backlog lock (Batch GE; see `propagate_write_encoded`).
+        let fanout = {
             let mut bl = self.backlog.lock();
             bl.append(&data);
             self.note_stream_append();
             self.master_repl_offset
                 .store(bl.end_offset(), Ordering::Relaxed);
-            self.fanout_to_replicas_locked(&data);
+            if self.connected_replicas.load(Ordering::Relaxed) == 0 {
+                None
+            } else {
+                let order = self.fanout_order.lock();
+                Some((order, data))
+            }
+        };
+
+        if let Some((_order, data)) = fanout {
+            self.fanout_to_replicas(&data);
         }
 
         self.publish_exit();
@@ -724,9 +763,10 @@ impl ReplicationManager {
 
     /// Fan-out a payload to live replica feeds.
     ///
-    /// Caller must hold `self.backlog` (and be inside `publish_enter`) so a
-    /// concurrent partial register or fullsync barrier cannot open a gap.
-    fn fanout_to_replicas_locked(&self, data: &Bytes) {
+    /// Caller must hold `fanout_order` (Batch GE) and be inside `publish_enter`
+    /// so concurrent publishers send in append order and partial PSYNC cannot
+    /// register a feed between ordered sends of the same stream position.
+    fn fanout_to_replicas(&self, data: &Bytes) {
         // Fast path: no connected replicas — skip the feed list lock.
         // `connected_replicas` is updated under `replicas` lock on register/drop;
         // a stale 0 is safe (miss one send → full resync later). A stale non-zero
@@ -803,11 +843,15 @@ impl ReplicationManager {
             || replid_req != our_id.as_str();
 
         if !want_full {
-            // Try partial under lock so backlog + feed registration is atomic
+            // Try partial under lock so backlog + feed registration is atomic.
+            // Batch GE: also hold `fanout_order` across register so a publisher
+            // that already appended (payload in `history`) but has not yet
+            // try_send'd cannot deliver the same bytes on the new feed.
             let bl = self.backlog.lock();
             let off = offset as u64;
             if bl.can_partial(off) {
                 if let Some(history) = bl.get_from(off) {
+                    let _fanout_order = self.fanout_order.lock();
                     let (tx, rx) = mpsc::channel(REPLICA_CHANNEL_CAP);
                     self.replicas.lock().push(ReplicaFeed {
                         tx,
@@ -822,6 +866,7 @@ impl ReplicationManager {
                     raw.extend_from_slice(b"+CONTINUE\r\n");
                     raw.extend_from_slice(&history);
                     drop(bl);
+                    drop(_fanout_order);
                     return Ok(SyncStart::Partial {
                         raw_response: raw.freeze(),
                         feed: rx,
@@ -1541,6 +1586,7 @@ impl Default for ReplicationManager {
             writers_in_publish: AtomicUsize::new(0),
             slave_priority: AtomicU32::new(100),
             stream_history: AtomicBool::new(false),
+            fanout_order: Mutex::new(()),
         }
     }
 }
@@ -2558,6 +2604,185 @@ mod tests {
                         .is_none());
                 }
             }
+        }
+    }
+
+    /// Batch GE: concurrent writers with live feed(s) produce a feed stream
+    /// identical to the backlog (append order == send order).
+    #[test]
+    fn multi_writer_live_feeds_match_backlog_order() {
+        use std::thread;
+
+        let repl = ReplicationManager::new();
+        let mut feed_a = repl.register_replica();
+        let mut feed_b = repl.register_replica();
+
+        const N_THREADS: usize = 8;
+        const M_WRITES: usize = 40;
+        let mut handles = Vec::with_capacity(N_THREADS);
+        for t in 0..N_THREADS {
+            let repl = Arc::clone(&repl);
+            handles.push(thread::spawn(move || {
+                for i in 0..M_WRITES {
+                    repl.propagate_write(
+                        0,
+                        &[
+                            Bytes::from_static(b"SET"),
+                            Bytes::from(format!("w{t}:{i}")),
+                            Bytes::from(format!("v{t}:{i}")),
+                        ],
+                    );
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let expected = repl.backlog.lock().get_from(0).expect("backlog");
+        assert_eq!(expected.len() as u64, repl.master_repl_offset());
+
+        let drain = |feed: &mut mpsc::Receiver<Bytes>| {
+            let mut out = Vec::new();
+            while let Ok(msg) = feed.try_recv() {
+                out.extend_from_slice(&msg);
+            }
+            out
+        };
+        let got_a = drain(&mut feed_a);
+        let got_b = drain(&mut feed_b);
+        assert_eq!(got_a.as_slice(), expected.as_ref(), "feed A order/bytes");
+        assert_eq!(got_b.as_slice(), expected.as_ref(), "feed B order/bytes");
+        assert_eq!(got_a, got_b, "all live feeds must see the same ordered stream");
+    }
+
+    /// Batch GE: multi-replica serial publishes all receive identical payloads
+    /// in backlog order (sanity for fanout after backlog release).
+    #[test]
+    fn multi_replica_serial_set_same_ordered_payloads() {
+        let repl = ReplicationManager::new();
+        let mut feeds: Vec<_> = (0..3).map(|_| repl.register_replica()).collect();
+
+        for i in 0..20 {
+            repl.propagate_write(
+                0,
+                &[
+                    Bytes::from_static(b"SET"),
+                    Bytes::from(format!("k{i}")),
+                    Bytes::from(format!("v{i}")),
+                ],
+            );
+        }
+
+        let expected = repl.backlog.lock().get_from(0).expect("backlog");
+        for (idx, feed) in feeds.iter_mut().enumerate() {
+            let mut got = Vec::new();
+            while let Ok(msg) = feed.try_recv() {
+                got.extend_from_slice(&msg);
+            }
+            assert_eq!(
+                got.as_slice(),
+                expected.as_ref(),
+                "replica feed {idx} must match backlog"
+            );
+        }
+    }
+
+    /// Batch GE: partial PSYNC history + live feed must not double-deliver a
+    /// write that was in the backlog when CONTINUE was built (fanout_order).
+    #[test]
+    fn partial_psync_no_duplicate_with_concurrent_publish() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        let repl = ReplicationManager::new();
+        let cache = Cache::new_with_sweep(4, 1024 * 1024, 1024 * 1024, false);
+        let databases = Databases::single(cache);
+
+        // Seed backlog so partial is possible.
+        for i in 0..5 {
+            repl.propagate_command(&[
+                Bytes::from_static(b"SET"),
+                Bytes::from(format!("seed{i}")),
+                Bytes::from_static(b"1"),
+            ]);
+        }
+        let id = repl.replid();
+        let start_off = 0i64;
+
+        let barrier = Arc::new(Barrier::new(2));
+        let repl_w = Arc::clone(&repl);
+        let b_w = Arc::clone(&barrier);
+        let writer = thread::spawn(move || {
+            b_w.wait();
+            for i in 0..100 {
+                repl_w.propagate_command(&[
+                    Bytes::from_static(b"SET"),
+                    Bytes::from(format!("c{i}")),
+                    Bytes::from_static(b"v"),
+                ]);
+            }
+        });
+
+        let repl_s = Arc::clone(&repl);
+        let b_s = Arc::clone(&barrier);
+        let syncer = thread::spawn(move || {
+            b_s.wait();
+            let mut feeds = Vec::new();
+            for _ in 0..6 {
+                match repl_s
+                    .start_psync(&databases, &id, start_off)
+                    .expect("psync")
+                {
+                    SyncStart::Partial {
+                        raw_response,
+                        feed,
+                    } => {
+                        feeds.push((raw_response, feed));
+                    }
+                    SyncStart::Full { feed, .. } => {
+                        // Fall back acceptable under race; still drain feed.
+                        feeds.push((Bytes::new(), feed));
+                    }
+                }
+            }
+            feeds
+        });
+
+        writer.join().unwrap();
+        let mut feeds = syncer.join().unwrap();
+
+        // For each partial: history + subsequent feed bytes must equal
+        // backlog[offset..] without obvious duplication of the entire history
+        // as a second copy immediately after CONTINUE body.
+        for (raw, feed) in feeds.iter_mut() {
+            if raw.is_empty() {
+                while feed.try_recv().is_ok() {}
+                continue;
+            }
+            assert!(raw.starts_with(b"+CONTINUE\r\n"));
+            let history = &raw[b"+CONTINUE\r\n".len()..];
+            let mut live = Vec::new();
+            while let Ok(msg) = feed.try_recv() {
+                live.extend_from_slice(&msg);
+            }
+            // If the first live chunk equals the entire history, we double-sent.
+            if !history.is_empty() && live.len() >= history.len() {
+                assert_ne!(
+                    &live[..history.len()],
+                    history,
+                    "partial feed must not re-send CONTINUE history prefix"
+                );
+            }
+            // Combined stream length must not exceed master offset (history is
+            // a prefix of the stream from start_off=0).
+            let combined = history.len() as u64 + live.len() as u64;
+            assert!(
+                combined <= repl.master_repl_offset(),
+                "history+live {} > master offset {}",
+                combined,
+                repl.master_repl_offset()
+            );
         }
     }
 
